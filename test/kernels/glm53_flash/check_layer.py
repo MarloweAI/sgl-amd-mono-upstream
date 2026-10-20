@@ -6,7 +6,8 @@ finish with no error word set and the same output (the TP sums run in rank order
 ``--compare-shuffled``: a sparse-attention launch on AITER-shuffled FP8 projections
 equals the row-major one bitwise; ``--check-routing``: the top-8 equals SGLang's on
 keys that tie in bf16; ``--check-keys``: rows past 2048 tokens attend to the selected
-pools and then their tail, as SGLang's kpool top-k selects."""
+pools and then their tail, as SGLang's kpool top-k selects; ``--replays N``: a graph
+of ``--layers`` launches replays the eager step bitwise."""
 
 import argparse
 import os
@@ -620,6 +621,101 @@ def check_keys(args, rank, tp, group, device) -> bool:
     return ok
 
 
+def check_replays(args, rank, tp, group, device) -> bool:
+    """A step of ``--layers`` launches of one kind on one runtime (each layer its own
+    state or caches, inputs chained), captured in a graph after an eager step: from the
+    same state, each of ``--replays`` replays gives the eager step's outputs and writes
+    bitwise, with no error word set, and every rank the same output."""
+    from msgspec.structs import astuple
+
+    from sgl_amd_mono.common import guard
+    from sgl_amd_mono.glm53_flash.gfx950.kernel import FlashBuild
+    from sgl_amd_mono.glm53_flash.gfx950.runner import FlashLayerOp, FlashRuntime
+
+    kda, dsa, L = args.kind == "kda", args.kind == "dsa", args.layers
+    key = FlashBuild(
+        rows=args.rows,
+        tp=tp,
+        launches_per_step=L,
+        inter=GLOBAL_INTER // tp,
+        kda=kda,
+        dsa=dsa,
+        max_pools=args.max_pools if dsa else 0,
+        stop=False,
+    )
+    rt = FlashRuntime(key, rank, group, device)
+    rt.set_deadline(args.deadline)
+    ffn = ffn_weights(rank, tp, device)
+    attn = kda_weights(rank, tp, device) if kda else None
+    attn = dsa_weights(rank, tp, device) if dsa else attn
+    x, res, post, comb = layer_inputs(args.rows, device)
+    if not (kda or dsa):
+        x = x / tp
+    ops, extra, held = [], [], []
+    for n in range(L):
+        ops.append(
+            FlashLayerOp(
+                rt, ffn, n, kda=attn if kda else None, dsa=attn if dsa else None
+            )
+        )
+        if kda:
+            state, idx = kda_state(args.rows, tp, device)
+            extra.append({"state": state, "state_idx": idx})
+            held += list(astuple(state))
+        elif dsa:
+            lens = list(LENS[: args.rows - 1]) + [0]
+            caches, table, pt = dsa_caches(args.rows, device, lens)
+            extra.append({"caches": caches, "rows": table, "page_table": pt})
+            held += list(astuple(caches))
+        else:
+            extra.append({})
+    saved = [t.clone() for t in held]
+
+    def restore():
+        for t, v in zip(held, saved):
+            t.copy_(v)
+
+    def step():
+        h = (x, res, post, comb)
+        for op, kw in zip(ops, extra):
+            h = op.launch(*(h if kda or dsa else (x, *h[1:])), **kw)
+        rt.advance_step()
+        return h
+
+    # eager first: the launch loads its code outside the capture
+    want = [t.clone() for t in step()]
+    torch.cuda.synchronize()
+    want_held = [t.clone() for t in held]
+    restore()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        got = step()
+    ok = True
+    for n in range(args.replays):
+        restore()
+        dist.barrier(group=group)
+        graph.replay()
+        torch.cuda.synchronize()
+        same = all(torch.equal(a, b) for a, b in zip(got, want)) and all(
+            torch.equal(a, b) for a, b in zip(held, want_held)
+        )
+        if not same:
+            print(f"rank {rank} replay {n}: differs from the eager step", flush=True)
+            ok = False
+            break
+    words = rt.epoch[guard.ERR_DEADLINE : guard.ERR_FAULT + 1].tolist()
+    xs = [None] * tp
+    dist.all_gather_object(xs, got[0].cpu())
+    agree = all(torch.equal(xs[0], t) for t in xs)
+    print(
+        f"rank {rank}: {args.replays} replays of {L} {args.kind} launches equal the eager "
+        f"step {ok}, error words {words}, ranks agree {agree}",
+        flush=True,
+    )
+    rt.close()
+    return ok and not any(words) and agree
+
+
 def _changed_rows(before: torch.Tensor, after: torch.Tensor) -> set:
     d = (before != after).reshape(before.shape[0], -1).any(1)
     return set(d.nonzero().flatten().tolist())
@@ -684,6 +780,8 @@ def main() -> int:
     ap.add_argument("--compare-shuffled", action="store_true")
     ap.add_argument("--check-routing", action="store_true")
     ap.add_argument("--check-keys", action="store_true")
+    ap.add_argument("--replays", type=int, default=0, help="graph replays of a step")
+    ap.add_argument("--layers", type=int, default=1, help="launches a step (--replays)")
     ap.add_argument("--pad-rows", type=int, default=0, help="trailing pad rows")
     ap.add_argument(
         "--writes", action="store_true", help="check the rows a launch writes"
@@ -700,6 +798,8 @@ def main() -> int:
         return 0 if check_routing(args, rank, tp, group, device) else 1
     if args.check_keys:
         return 0 if check_keys(args, rank, tp, group, device) else 1
+    if args.replays:
+        return 0 if check_replays(args, rank, tp, group, device) else 1
     kda, dsa = args.kind == "kda", args.kind == "dsa"
     key = FlashBuild(
         rows=args.rows,
