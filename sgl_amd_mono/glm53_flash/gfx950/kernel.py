@@ -102,6 +102,7 @@ from .config import (
     FlashShard,
 )
 from .layout import (
+    BASE_SPLITS,
     DSA_TAB,
     FGB_TILE,
     IN_TILE,
@@ -122,6 +123,7 @@ from .layout import (
     ROW_SLOT,
     ROW_TAIL_SLOT,
     ROW_WORDS,
+    SEL_STRIDE,
     SPLIT_KEYS,
     UK_TILE,
     UV_TILE,
@@ -155,9 +157,24 @@ SOURCES = kernel_sources(__name__)
 
 # 5-key descending sorting network (lane's router candidates)
 SORT5 = ((0, 1), (3, 4), (2, 4), (2, 3), (0, 3), (0, 2), (1, 4), (1, 3), (1, 2))
-# ID encoding for the tie-break: the larger of (ID_BASE - id) is the smaller id
-ID_BASE = 511
-assert N_EXPERTS < ID_BASE and ROUTER_CANDIDATES == 5
+# equal keys go to the lower tie rank (AITER's grouped top-k order); a pick's wave
+# maximum is (RANK_BASE - rank) << ID_BITS | id
+RANK_BASE = 2047
+ID_BITS = 9
+assert N_EXPERTS < 1 << ID_BITS and ROUTER_CANDIDATES == 5
+
+
+def tie_rank(expert):
+    """AITER's ``legacy_topk_tie_rank``: the lane order in which its one-wave grouped
+    top-k (vec4 per lane, lane + 64 r) keeps one of two equal scores."""
+    vec4 = expert >> 2
+    lane = vec4 & 63
+    lane_rank = (
+        ((~lane) & 0x38)
+        | ((((lane >> 2) ^ (lane >> 3)) & 1) << 2)
+        | ((lane & 3) ^ (((lane >> 2) & 1) * 3))
+    )
+    return (lane_rank << 5) | (((vec4 >> 6) << 2) | (expert & 3))
 
 
 class FlashBuild(msgspec.Struct, frozen=True):
@@ -767,17 +784,18 @@ def build_flash_kernel(key: FlashBuild):
                 return lane + 64 * i
 
             def load_bias():
-                """This lane's candidate biases (issue before the scores wait)."""
+                """This lane's candidate biases, bf16 as SGLang holds them (issue before
+                the scores wait)."""
                 return [
-                    ld_f32(_rsrc(bias), fx.min(candidate(i), N_EXPERTS - 1))
+                    bf16_round(ld_f32(_rsrc(bias), fx.min(candidate(i), N_EXPERTS - 1)))
                     for i in range(ROUTER_CANDIDATES)
                 ]
 
             def route_top8(s, bs):
                 """Top-8 of sample s over 288 experts (one whole wave, after the scores).
 
-                Every FP32 bit of (sigmoid + bias) is kept; equal keys go to the smaller
-                expert id. Returns (expert id, route weight = raw score / sum of the 8 raw
+                Every FP32 bit of (sigmoid + bias) is kept; equal keys go to the lower
+                ``tie_rank``. Returns (expert id, route weight = raw score / sum of the 8 raw
                 scores * ROUTE_SCALE) of pick ``lane``, valid in lanes < TOP_K."""
                 raws = getf_many(
                     [
@@ -788,31 +806,46 @@ def build_flash_kernel(key: FlashBuild):
                         for i in range(ROUTER_CANDIDATES)
                     ]
                 )
-                ks, ids = [], []
+                ks, ids, rks = [], [], []
                 for i in range_constexpr(ROUTER_CANDIDATES):
                     kb = (raws[i] + bs[i]).bitcast(fx.Int32)
                     ok = (kb >= 0).select(kb ^ fx.Int32(-(2**31)), ~kb)
                     valid = candidate(i) < N_EXPERTS
                     ks.append(valid.select(fx.Uint32(ok), fx.Uint32(0)))
                     ids.append(valid.select(candidate(i), fx.Int32(N_EXPERTS)))
+                    rks.append(
+                        valid.select(tie_rank(candidate(i)), fx.Int32(RANK_BASE))
+                    )
                 for a, b in SORT5:
-                    first = (ks[a] > ks[b]) | ((ks[a] == ks[b]) & (ids[a] < ids[b]))
-                    ka, kb, ia, ib = ks[a], ks[b], ids[a], ids[b]
+                    first = (ks[a] > ks[b]) | ((ks[a] == ks[b]) & (rks[a] < rks[b]))
+                    ka, kb, ia, ib, ra, rb = (
+                        ks[a],
+                        ks[b],
+                        ids[a],
+                        ids[b],
+                        rks[a],
+                        rks[b],
+                    )
                     ks[a], ks[b] = first.select(ka, kb), first.select(kb, ka)
                     ids[a], ids[b] = first.select(ia, ib), first.select(ib, ia)
+                    rks[a], rks[b] = first.select(ra, rb), first.select(rb, ra)
                 ks = [fx.Int32(k) for k in ks] + [fx.Int32(0)]
                 ids = ids + [fx.Int32(N_EXPERTS)]
+                rks = rks + [fx.Int32(RANK_BASE)]
                 mv = fx.Int32(0)  # lane k: the expert ID of pick k
                 for k in range_constexpr(TOP_K):
                     m = wave_umax(ks[0])
                     winner = wave_umax(
-                        (ks[0] == m).select(ID_BASE - ids[0], fx.Int32(0))
+                        (ks[0] == m).select(
+                            ((RANK_BASE - rks[0]) << ID_BITS) | ids[0], fx.Int32(0)
+                        )
                     )
-                    expert = ID_BASE - winner
+                    expert = winner & fx.Int32((1 << ID_BITS) - 1)
                     hit = (ks[0] == m) & (ids[0] == expert)
                     n = ROUTER_CANDIDATES
                     ks = [hit.select(ks[i + 1], ks[i]) for i in range(n)] + [ks[n]]
                     ids = [hit.select(ids[i + 1], ids[i]) for i in range(n)] + [ids[n]]
+                    rks = [hit.select(rks[i + 1], rks[i]) for i in range(n)] + [rks[n]]
                     mv = write_lane_i32(expert, k, mv)
                 e = mv
                 src = (e % 64) * 4
@@ -1483,6 +1516,15 @@ def build_flash_kernel(key: FlashBuild):
                 """First task of a stage whose task 0 runs on CTA ``b``."""
                 return (bid + (G - b % G)) & (G - 1)
 
+            def row_keys(pos):
+                """(complete pools, scored, keys attended) of a row at ``pos``: a row
+                with more than TOPK_POOLS complete pools attends to the selected pools'
+                tokens plus its tail, any other row to every token."""
+                bound = (pos + 1) // KPOOL
+                scored = bound > TOPK_POOLS
+                nk = scored.select(TOPK_TOKENS + (pos + 1) - bound * KPOOL, pos + 1)
+                return bound, scored, nk
+
             def unit_fp8_rm(
                 w_rsrc, s_rsrc, row0, kb, K, rows, b_word, scale_cols, shuffled
             ):
@@ -1937,7 +1979,8 @@ def build_flash_kernel(key: FlashBuild):
 
             # ===== index scores of a row's complete pools: 256 pools a task
             # score(p) = kscale(p) * sum_h w'_h relu(q8_h . k8_p), FP8 x FP8 MFMAs. Rows
-            # of at most 2048 tokens select every token and are not scored.
+            # of at most TOPK_POOLS complete pools attend to every token and are not
+            # scored.
             MAXP = max(max_pools, 1)
             QW8 = INDEX_DIM // 4  # words of one head's FP8 query
 
@@ -1951,9 +1994,8 @@ def build_flash_kernel(key: FlashBuild):
                 one = fx.Int32(127)  # E8M0 1.0
                 for s in range_constexpr(S):
                     pos = row_word(s, ROW_POS)
-                    n_pools = (pos >= TOPK_TOKENS).select(
-                        (pos + 1) // KPOOL, fx.Int32(0)
-                    )
+                    bound, scored, _ = row_keys(pos)
+                    n_pools = scored.select(bound, fx.Int32(0))
                     n_tiles = (n_pools + POOLS_PER_TASK - 1) // POOLS_PER_TASK
                     first = start_at(base["iscore"] + s * (G // S))
                     if first < n_tiles:
@@ -2081,10 +2123,9 @@ def build_flash_kernel(key: FlashBuild):
                                     put(mb("iscores"), s * MAXP + pw, val * ksc)
                         gpu.barrier()
 
-            # ====== top-512 pools of a row (one CTA a row), then the 2048 attended
-            # tokens: the pools' tokens and the row's tail tokens past the last
-            # complete pool; when there is a tail, the last positions of the last
-            # selected pool (one of the lowest-scored) make room for it.
+            # ====== top-512 pools of a row (one CTA a row), then the attended tokens:
+            # the pools' 2048 tokens, then the row's tail tokens past its last complete
+            # pool.
             def dsa_iselect(tv, t32):
                 hist = fx.recast_iter(fx.Int32, xs)
                 r_scores = _rsrc(mb("iscores"))
@@ -2122,8 +2163,8 @@ def build_flash_kernel(key: FlashBuild):
                 for t in range(start("iselect"), S, G):
                     s = fx.Int32(t)
                     pos = row_word(s, ROW_POS)
-                    if pos >= TOPK_TOKENS:
-                        bound = (pos + 1) // KPOOL
+                    bound, scored, _ = row_keys(pos)
+                    if scored:
                         count = fx.Int32(TOPK_POOLS)
                         n_chunks = (bound + SEL_CHUNK - 1) // SEL_CHUNK
 
@@ -2282,18 +2323,20 @@ def build_flash_kernel(key: FlashBuild):
                         def publish_all():
                             """red[0 .. 512) holds the pools; write the row's tokens."""
                             gpu.barrier()
-                            tail_n = (pos + 1) - bound * KPOOL
-                            keep = TOPK_TOKENS - tail_n
                             for b in range_constexpr(TOPK_TOKENS // THREADS):
                                 j = tid + b * THREADS
                                 pool = lds_ld(red, j // KPOOL).bitcast(fx.Int32)
-                                tok = (j < keep).select(
-                                    pool * KPOOL + j % KPOOL, bound * KPOOL + (j - keep)
-                                )
                                 bo.buffer_store(
-                                    tok,
+                                    pool * KPOOL + j % KPOOL,
                                     r_sel,
-                                    s * TOPK_TOKENS + j,
+                                    s * SEL_STRIDE + j,
+                                    cache_modifier=CM_DEV,
+                                )
+                            if tid < (pos + 1) - bound * KPOOL:
+                                bo.buffer_store(
+                                    bound * KPOOL + tid,
+                                    r_sel,
+                                    s * SEL_STRIDE + TOPK_TOKENS + tid,
                                     cache_modifier=CM_DEV,
                                 )
 
@@ -2485,8 +2528,8 @@ def build_flash_kernel(key: FlashBuild):
                             put(mb("tok_ready"), s, fx.Int32(1))
 
             # ================= sparse MLA split: 64 selected keys x 8 heads a task
-            # Rows of at most 2048 tokens attend to every token, longer rows the 2048
-            # the index selected. Splits past the row's keys do nothing (split 0
+            # Scored rows attend to the tokens the index selected plus their tail, other
+            # rows to every token. Splits past the row's keys do nothing (split 0
             # always publishes, so empty rows merge to zero).
             def dsa_split(tv, t32):
                 KVB = t32["kv_block_tokens"]
@@ -2502,11 +2545,10 @@ def build_flash_kernel(key: FlashBuild):
                     hg = (tt // N_SPLIT) % HG
                     t = tt % N_SPLIT
                     pos = row_word(s, ROW_POS)
-                    nk = fx.min(pos + 1, fx.Int32(TOPK_TOKENS))
+                    _, long_row, nk = row_keys(pos)
                     n_used = fx.max((nk + SPLIT_KEYS - 1) // SPLIT_KEYS, fx.Int32(1))
                     if t < n_used:
                         bt = row_word(s, ROW_BT)
-                        long_row = pos >= TOPK_TOKENS
                         if long_row:
                             if wave == 0:
                                 if lane == 0:
@@ -2519,17 +2561,19 @@ def build_flash_kernel(key: FlashBuild):
                                 )
                         if wave == 0:
                             kidx = t * SPLIT_KEYS + lane
-                            tok = (kidx < nk).select(kidx, fx.Int32(0))
                             picked = fx.Int32(
                                 bo.buffer_load(
                                     _rsrc(mb("tok_sel")),
-                                    s * TOPK_TOKENS + fx.min(kidx, TOPK_TOKENS - 1),
+                                    s * SEL_STRIDE + kidx,
                                     vec_width=1,
                                     dtype=T.i32,
                                     cache_modifier=CM_DEV,
                                 )
                             )
-                            tok = long_row.select(picked, tok)
+                            # keys past the row's address its first token (masked)
+                            tok = (kidx < nk).select(
+                                long_row.select(picked, kidx), fx.Int32(0)
+                            )
                             tok_blk = ld_i32(r_bt, bt * pt_stride + tok // KVB)
                             lds_st(keys, lane, tok_blk)
                             lds_st(keys, SPLIT_KEYS + lane, tok % KVB)
@@ -2686,14 +2730,14 @@ def build_flash_kernel(key: FlashBuild):
                 UV_R = UV_TILE // 16
                 UV_WPR = WAVES // UV_R
                 UV_CPW = KV_LORA // 64 // UV_WPR
-                SPH = N_SPLIT // 2
+                SPH = BASE_SPLITS // 2
                 for tt in range(start("uv"), S * MH * (V_DIM // UV_TILE), G):
                     tt = fx.Int32(tt)
                     s = tt // (MH * (V_DIM // UV_TILE))
                     head = (tt // (V_DIM // UV_TILE)) % MH
                     tile = tt % (V_DIM // UV_TILE)
                     pos = row_word(s, ROW_POS)
-                    nk = fx.min(pos + 1, fx.Int32(TOPK_TOKENS))
+                    _, _, nk = row_keys(pos)
                     n_used = fx.max((nk + SPLIT_KEYS - 1) // SPLIT_KEYS, fx.Int32(1))
                     row0 = head * (NOPE_DIM + V_DIM) + NOPE_DIM + tile * UV_TILE
                     row0 = row0 + (wave // UV_WPR) * 16
@@ -2753,6 +2797,24 @@ def build_flash_kernel(key: FlashBuild):
                     for q in range_constexpr(SPH):
                         wj = lds_ld(misc, hf * SPH + q)
                         a0, a1 = bf2_f32(got[q][0])
+                        o0 = o0 + a0 * wj
+                        o1 = o1 + a1 * wj
+                    # the split past the first BASE_SPLITS (the tail's keys) joins the
+                    # second half
+                    if (n_used > BASE_SPLITS) & (hf == 1):
+                        last = poll(
+                            [
+                                (
+                                    mb("sp_acc"),
+                                    ((s * N_SPLIT + BASE_SPLITS) * MH + head)
+                                    * (KV_LORA // 2)
+                                    + dp,
+                                    1,
+                                )
+                            ]
+                        )[0][0]
+                        wj = lds_ld(misc, BASE_SPLITS)
+                        a0, a1 = bf2_f32(last)
                         o0 = o0 + a0 * wj
                         o1 = o1 + a1 * wj
                     lds_st(red, (hf * (KV_LORA // 2) + dp) * 2, o0)
@@ -2927,6 +2989,8 @@ def build_flash_kernel(key: FlashBuild):
                                 red,
                                 (w * 64 + f * ROUTER_TILE + 16 * (m // 4)) * 4 + m % 4,
                             )
+                    # SGLang rounds the router GEMM's logits to bf16
+                    logit = bf16_round(logit)
                     put(
                         mb("scores"),
                         router_sample * N_EXPERTS + t * ROUTER_TILE + r,

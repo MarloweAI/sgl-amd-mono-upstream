@@ -4,7 +4,9 @@ test/kernels/glm53_flash/check_layer.py --kind dsa --rows 4``. Every rank must
 finish with no error word set and the same output (the TP sums run in rank order);
 ``--writes``: the launch changes exactly its valid rows' state or cache rows;
 ``--compare-shuffled``: a sparse-attention launch on AITER-shuffled FP8 projections
-equals the row-major one bitwise."""
+equals the row-major one bitwise; ``--check-routing``: the top-8 equals SGLang's on
+keys that tie in bf16; ``--check-keys``: rows past 2048 tokens attend to the selected
+pools and then their tail, as SGLang's kpool top-k selects."""
 
 import argparse
 import os
@@ -368,6 +370,255 @@ def compare_shuffled(args, rank, tp, group, device) -> bool:
     return same_out and same_cache and wrote
 
 
+# router weights and biases whose keys tie after bf16 rounding (see tie_router)
+TIE_GROUPS, TIE_MEMBERS = 24, 12
+TIE_DELTA = 2.0**-12
+
+
+def tie_router(ffn, device):
+    """``ffn`` with router weights and biases whose keys tie after bf16 rounding: 24
+    groups of 12 experts at random ids. Group g reads column j_g with weight 1 and has
+    bias b_g (bf16); its odd members add +-TIE_DELTA x column j2_g, and every member's
+    f32 bias is b_g plus less than a quarter bf16 ulp. The logits are exact in f32 (two
+    nonzero products), so the keys tie exactly in bf16 and differ in f32. Returns the
+    weights and the plain router [288, HIDDEN] bf16."""
+    from msgspec.structs import replace
+
+    from sgl_amd_mono.glm53_flash.gfx950.packing import pack_bf16
+
+    g = _gen(11, device)
+    assert TIE_GROUPS * TIE_MEMBERS == N_EXPERTS
+    ids = torch.randperm(N_EXPERTS, generator=g, device=device).view(
+        TIE_GROUPS, TIE_MEMBERS
+    )
+    cols = torch.randperm(HIDDEN, generator=g, device=device)[: 2 * TIE_GROUPS]
+    cols = cols.view(2, TIE_GROUPS)
+    b = ((torch.rand(TIE_GROUPS, generator=g, device=device) - 0.5) * 0.4).bfloat16()
+    b = b.float()
+    ulp = torch.exp2(torch.floor(torch.log2(b.abs())) - 7)
+    w = torch.zeros(N_EXPERTS, HIDDEN, device=device)
+    bias = torch.zeros(N_EXPERTS, device=device)
+    for grp in range(TIE_GROUPS):
+        for m in range(TIE_MEMBERS):
+            e = int(ids[grp, m])
+            w[e, cols[0, grp]] = 1.0
+            if m % 2:
+                w[e, cols[1, grp]] = TIE_DELTA if m % 4 == 1 else -TIE_DELTA
+            eps = (torch.rand((), generator=g, device=device) - 0.5) * 0.5 * ulp[grp]
+            bias[e] = b[grp] + eps
+    w = w.bfloat16()
+    return replace(ffn, w_r=pack_bf16(w), bias=bias), w
+
+
+def ffn_input(rt, rows: int) -> torch.Tensor:
+    """The launch's own RMSNorm'd FFN input rows (bf16), from its scratch."""
+    a = rt.scratch[rt.sc["a"] :].view(torch.int32)[: rows * HIDDEN : 2]
+    return a.contiguous().view(torch.bfloat16).view(rows, HIDDEN)
+
+
+def routed(rt, rows: int) -> torch.Tensor:
+    """The launch's 8 routed experts a row, best first (slot 0 is the shared expert)."""
+    from sgl_amd_mono.glm53_flash.gfx950.config import MOE_SLOTS
+
+    sel = rt.scratch[rt.sc["sel"] :].view(torch.int32)[: 2 * rows * MOE_SLOTS : 2]
+    return sel.view(rows, MOE_SLOTS)[:, 1:].clone()
+
+
+def stock_topk(x, w_r, bias) -> torch.Tensor:
+    """SGLang's top-8 for GLM-5.3-Flash with AITER: bf16 logits and bias into AITER's
+    ``biased_grouped_topk`` (one group, renormalized, scale 2.5), best first."""
+    from aiter import biased_grouped_topk
+
+    from sgl_amd_mono.glm53_flash.gfx950.config import ROUTE_SCALE, TOP_K
+
+    logits = (x.float() @ w_r.float().T).bfloat16()
+    weights = torch.empty(x.shape[0], TOP_K, dtype=torch.float32, device=x.device)
+    ids = torch.empty(x.shape[0], TOP_K, dtype=torch.int32, device=x.device)
+    biased_grouped_topk(logits, bias.bfloat16(), weights, ids, 1, 1, True, ROUTE_SCALE)
+    return ids
+
+
+def key_order(x, w_r, bias, rounded: bool, tie: str) -> torch.Tensor:
+    """Top-8 ids of sigmoid(logits) + bias, best first: logits and bias in bf16
+    (``rounded``) or f32; equal keys in AITER's lane order (``tie="aiter"``) or by
+    lower id (``tie="id"``)."""
+    from sgl_amd_mono.glm53_flash.gfx950.config import TOP_K
+    from sgl_amd_mono.glm53_flash.gfx950.kernel import tie_rank
+
+    logits, b = x.float() @ w_r.float().T, bias.float()
+    if rounded:
+        logits, b = logits.bfloat16().float(), b.bfloat16().float()
+    keys = torch.sigmoid(logits) + b
+    ids = torch.arange(N_EXPERTS, device=x.device)
+    if tie == "aiter":
+        rank = torch.tensor([tie_rank(e) for e in range(N_EXPERTS)], device=x.device)
+    else:
+        rank = ids
+    by_rank = torch.argsort(rank)
+    order = torch.argsort(-keys[:, by_rank], dim=-1, stable=True)
+    return by_rank[order][:, :TOP_K].int()
+
+
+def check_routing(args, rank, tp, group, device) -> bool:
+    """FFN launches on router keys that tie in bf16: the launch's top-8 (order
+    included) equals SGLang's (AITER's ``biased_grouped_topk`` on bf16 logits and bias)
+    on the launch's own FFN input, every draw; and the inputs tell that apart from
+    lower-id ties and from f32 keys (negative controls)."""
+    from sgl_amd_mono.glm53_flash.gfx950.kernel import FlashBuild
+    from sgl_amd_mono.glm53_flash.gfx950.runner import FlashLayerOp, FlashRuntime
+
+    key = FlashBuild(
+        rows=args.rows, tp=tp, launches_per_step=1, inter=GLOBAL_INTER // tp, stop=False
+    )
+    ffn, w_r = tie_router(ffn_weights(rank, tp, device), device)
+    rt = FlashRuntime(key, rank, group, device)
+    rt.set_deadline(args.deadline)
+    op = FlashLayerOp(rt, ffn, 0)
+    ok, by_id, by_f32, rows = True, 0, 0, 0
+    for draw in range(3):
+        g = _gen(20 + draw, device)
+        x = torch.randn(args.rows, HIDDEN, generator=g, device=device).bfloat16()
+        _, res, post, comb = layer_inputs(args.rows, device)
+        op.launch(x / tp, res, post, comb)
+        rt.advance_step()
+        torch.cuda.synchronize()
+        a, got = ffn_input(rt, args.rows), routed(rt, args.rows)
+        same = torch.equal(got, stock_topk(a, w_r, ffn.bias))
+        own = torch.equal(got, key_order(a, w_r, ffn.bias, True, "aiter"))
+        print(
+            f"rank {rank} draw {draw}: top-8 == AITER biased_grouped_topk {same}, "
+            f"== bf16 keys in AITER's tie order {own}",
+            flush=True,
+        )
+        ok = ok and same and own
+        by_id += int((got != key_order(a, w_r, ffn.bias, True, "id")).any(-1).sum())
+        by_f32 += int(
+            (got != key_order(a, w_r, ffn.bias, False, "aiter")).any(-1).sum()
+        )
+        rows += args.rows
+    print(
+        f"rank {rank}: lower-id ties would differ in {by_id}/{rows} rows, f32 keys "
+        f"in {by_f32}/{rows}",
+        flush=True,
+    )
+    rt.close()
+    return ok and by_id > 0 and by_f32 > 0
+
+
+# row lengths for the key check: scored rows with tails of 2, 3 and 1 tokens, and a
+# row of 2051 tokens (2048 + a tail of 3), which attends to every token
+KEY_LENS = (4102, 5003, 7001, 2051)
+
+
+def kv_slot(pt: torch.Tensor, row: int, token: int) -> int:
+    """MLA cache row of ``token`` of request ``row`` through the 64-token page table."""
+    return int(pt[row, token // 64]) * 64 + token % 64
+
+
+def check_keys(args, rank, tp, group, device) -> bool:
+    """Sparse-attention launches on rows past 2048 tokens. A scored row (more than 512
+    complete pools) attends to the selected pools' 2048 tokens and then its tail (up to
+    2051 keys), as SGLang's kpool top-k appends it: its selection holds 512 whole
+    distinct complete pools, then the tail tokens in order. Perturbing the MLA rows of
+    the tokens a 2048-key selection gives up for the tail (its last selected pool's last
+    positions) changes the row's output (negative control: a 2048-key selection never
+    reads them); perturbing an unselected pool changes nothing. A row of 2051 tokens
+    attends to every token: perturbing its first token changes its output."""
+    from msgspec.structs import replace
+
+    from sgl_amd_mono.glm53_flash.gfx950.config import KPOOL, TOPK_POOLS, TOPK_TOKENS
+    from sgl_amd_mono.glm53_flash.gfx950.kernel import FlashBuild
+    from sgl_amd_mono.glm53_flash.gfx950.layout import SEL_STRIDE
+    from sgl_amd_mono.glm53_flash.gfx950.runner import FlashLayerOp, FlashRuntime
+
+    rows = len(KEY_LENS)
+    key = FlashBuild(
+        rows=rows,
+        tp=tp,
+        launches_per_step=1,
+        inter=GLOBAL_INTER // tp,
+        dsa=True,
+        max_pools=args.max_pools,
+        stop=False,
+    )
+    rt = FlashRuntime(key, rank, group, device)
+    rt.set_deadline(args.deadline)
+    op = FlashLayerOp(
+        rt, ffn_weights(rank, tp, device), 0, dsa=dsa_weights(rank, tp, device)
+    )
+    x, res, post, comb = layer_inputs(rows, device)
+    caches, table, pt = dsa_caches(rows, device, list(KEY_LENS))
+
+    def run(kv):
+        c = replace(
+            caches,
+            kv_cache=kv,
+            idx_cache=caches.idx_cache.clone(),
+            tail_k=caches.tail_k.clone(),
+            tail_g=caches.tail_g.clone(),
+        )
+        out = op.launch(x, res, post, comb, caches=c, rows=table, page_table=pt)
+        rt.advance_step()
+        torch.cuda.synchronize()
+        sel = rt.scratch[rt.sc["tok_sel"] :].view(torch.int32)[: rows * SEL_STRIDE]
+        return out[1].clone(), sel.view(rows, SEL_STRIDE).clone()
+
+    base, sel = run(caches.kv_cache.clone())
+    g = _gen(30, device)
+    ok = True
+    for r, n in enumerate(KEY_LENS):
+        bound, tail = n // KPOOL, n % KPOOL
+        if bound <= TOPK_POOLS:
+            victims, spare = [0], None
+        else:
+            picked = sel[r, :TOPK_TOKENS].long()
+            pools = picked.view(TOPK_POOLS, KPOOL)
+            whole = bool(
+                (pools == pools[:, :1] + torch.arange(KPOOL, device=device)).all()
+            )
+            whole = whole and bool((pools[:, 0] % KPOOL == 0).all())
+            ids = pools[:, 0] // KPOOL
+            distinct = ids.unique().numel() == TOPK_POOLS and int(ids.max()) < bound
+            tail_ok = sel[r, TOPK_TOKENS : TOPK_TOKENS + tail].tolist() == [
+                bound * KPOOL + i for i in range(tail)
+            ]
+            print(
+                f"rank {rank} row {r} ({n} tokens): 512 whole distinct pools "
+                f"{whole and distinct}, tail {tail_ok}",
+                flush=True,
+            )
+            ok = ok and whole and distinct and tail_ok
+            victims = picked[TOPK_TOKENS - tail : TOPK_TOKENS].tolist()
+            unpicked = sorted(set(range(bound)) - set(ids.tolist()))
+            spare = unpicked[0] * KPOOL
+        kv = caches.kv_cache.clone()
+        for t in victims:
+            kv[kv_slot(pt, r, t)] = (
+                30 * torch.randn(kv.shape[1], generator=g, device=device).bfloat16()
+            )
+        moved = not torch.equal(run(kv)[0][r], base[r])
+        print(
+            f"rank {rank} row {r}: perturbing tokens {victims} changes the row {moved}",
+            flush=True,
+        )
+        ok = ok and moved
+        if spare is not None:
+            kv = caches.kv_cache.clone()
+            for t in range(spare, spare + KPOOL):
+                kv[kv_slot(pt, r, t)] = (
+                    30 * torch.randn(kv.shape[1], generator=g, device=device).bfloat16()
+                )
+            still = torch.equal(run(kv)[0][r], base[r])
+            print(
+                f"rank {rank} row {r}: perturbing unselected pool {spare // KPOOL} "
+                f"leaves the row unchanged {still}",
+                flush=True,
+            )
+            ok = ok and still
+    rt.close()
+    return ok
+
+
 def _changed_rows(before: torch.Tensor, after: torch.Tensor) -> set:
     d = (before != after).reshape(before.shape[0], -1).any(1)
     return set(d.nonzero().flatten().tolist())
@@ -430,6 +681,8 @@ def main() -> int:
     ap.add_argument("--max-pools", type=int, default=MAX_LEN // 4)
     ap.add_argument("--lens", type=str, default="", help="comma-separated row lengths")
     ap.add_argument("--compare-shuffled", action="store_true")
+    ap.add_argument("--check-routing", action="store_true")
+    ap.add_argument("--check-keys", action="store_true")
     ap.add_argument("--pad-rows", type=int, default=0, help="trailing pad rows")
     ap.add_argument(
         "--writes", action="store_true", help="check the rows a launch writes"
@@ -442,6 +695,10 @@ def main() -> int:
     group = dist.new_group(backend="gloo")
     if args.compare_shuffled:
         return 0 if compare_shuffled(args, rank, tp, group, device) else 1
+    if args.check_routing:
+        return 0 if check_routing(args, rank, tp, group, device) else 1
+    if args.check_keys:
+        return 0 if check_keys(args, rank, tp, group, device) else 1
     kda, dsa = args.kind == "kda", args.kind == "dsa"
     key = FlashBuild(
         rows=args.rows,

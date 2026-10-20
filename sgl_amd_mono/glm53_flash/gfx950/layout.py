@@ -13,6 +13,7 @@ from .config import (
     HIDDEN,
     INDEX_DIM,
     INDEX_HEADS,
+    KPOOL,
     KV_LORA,
     MOE_SLOTS,
     N_EXPERTS,
@@ -44,9 +45,17 @@ QB_TILE = 32
 UK_TILE = 128
 UV_TILE = 64
 POOLS_PER_TASK = 256
-# split attention: one task 64 selected keys x 8 heads (one head a wave)
+# a scored row attends to its 2048 selected pool tokens plus the tail past its last
+# complete pool (up to KPOOL - 1 tokens), as SGLang's kpool top-k appends it; a row of
+# at most MAX_KEYS tokens attends to every token
+MAX_KEYS = TOPK_TOKENS + KPOOL - 1
+# split attention: one task 64 selected keys x 8 heads (one head a wave); the merge
+# sums the first BASE_SPLITS partials in two halves, then the tail's split
 SPLIT_KEYS = 64
-N_SPLIT = TOPK_TOKENS // SPLIT_KEYS
+BASE_SPLITS = TOPK_TOKENS // SPLIT_KEYS
+N_SPLIT = (MAX_KEYS + SPLIT_KEYS - 1) // SPLIT_KEYS
+SEL_STRIDE = N_SPLIT * SPLIT_KEYS
+assert N_SPLIT == BASE_SPLITS + 1
 # per-step row table of a sparse-attention launch (int32 [S, ROW_WORDS])
 ROW_POS, ROW_SLOT, ROW_POOL_SLOT, ROW_TAIL_SLOT, ROW_BT = range(5)
 ROW_WORDS = 8
@@ -161,7 +170,7 @@ def layout(
             ("q_lat", samples * H * KV_LORA // 2 * pair_bytes),
             ("kv_ready", samples * pair_bytes),
             ("iscores", samples * max(max_pools, 1) * pair_bytes),
-            ("tok_sel", samples * TOPK_TOKENS * 4),
+            ("tok_sel", samples * SEL_STRIDE * 4),
             ("tok_ready", samples * pair_bytes),
             ("sp_acc", samples * N_SPLIT * H * KV_LORA // 2 * pair_bytes),
             ("sp_m", samples * N_SPLIT * H * pair_bytes),

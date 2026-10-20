@@ -3,7 +3,8 @@
 each launch kind finishes on every rank with no error word and the same output,
 and writes exactly its valid rows' state or cache rows (none of a pad row's); a
 sparse-attention launch on AITER-shuffled FP8 projections equals the row-major one
-bitwise."""
+bitwise; the router's top-8 equals SGLang's on keys that tie in bf16; and rows past
+2048 tokens attend to their selected pools and then their tail, as SGLang selects."""
 
 import subprocess
 import sys
@@ -48,6 +49,12 @@ class TestMonoGlm53FlashKernels(CustomTestCase):
 
     def test_shuffled_fp8_projections_match_row_major(self):
         self._check("--kind", "dsa", "--rows", "4", "--compare-shuffled")
+
+    def test_routing_matches_sglang_on_ties(self):
+        self._check("--kind", "ffn", "--rows", "4", "--check-routing")
+
+    def test_long_rows_attend_their_tail(self):
+        self._check("--kind", "dsa", "--check-keys")
 
 
 if __name__ == "__main__":
