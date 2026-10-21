@@ -35,7 +35,18 @@ SGLANG_READS = {
 }
 
 PAGE_SIZE = 256  # tokens an index-cache page covers
-INDEX_VALUE_BYTES = 64 * 128  # an index page's FP8 values; its f32 scales follow
+INDEX_POOLS = 64  # kpool pools an index-cache page holds
+INDEX_VALUE_BYTES = INDEX_POOLS * 128  # their FP8 values; one f32 scale a pool follows
+
+
+def _index_keys(page: torch.Tensor) -> torch.Tensor:
+    """An index-cache page's keys as the indexer reads them: each pool's FP8 values
+    (AITER's 16-pool x 16-byte tiles) times the pool's power-of-two scale."""
+    j = torch.arange(INDEX_VALUE_BYTES, device=page.device)
+    pool = (j // 2048) * 16 + (j % 256) // 16
+    values = page[:, :INDEX_VALUE_BYTES].contiguous().view(torch.float8_e4m3fn)
+    scales = page[:, INDEX_VALUE_BYTES:].contiguous().view(torch.float32)
+    return values.float() * scales[:, pool]
 
 
 def _metrics(a: torch.Tensor, b: torch.Tensor) -> dict[str, float]:
@@ -52,18 +63,9 @@ def _metrics(a: torch.Tensor, b: torch.Tensor) -> dict[str, float]:
 def _outputs(name: str, a: torch.Tensor, b: torch.Tensor) -> dict[str, dict]:
     if name != "index":
         return {name: _metrics(a, b)}
-    # both pages in one layout: compare the decoded FP8 values and the f32 scales
-    fp8 = torch.float8_e4m3fn
-    return {
-        "index": _metrics(
-            a[:, :INDEX_VALUE_BYTES].contiguous().view(fp8),
-            b[:, :INDEX_VALUE_BYTES].contiguous().view(fp8),
-        ),
-        "index_scale": _metrics(
-            a[:, INDEX_VALUE_BYTES:].contiguous().view(torch.float32),
-            b[:, INDEX_VALUE_BYTES:].contiguous().view(torch.float32),
-        ),
-    }
+    # the dequantized keys: a pool whose amax sits at a power of two may take the
+    # next scale with its values requantized, the same keys to FP8 precision
+    return {"index": _metrics(_index_keys(a), _index_keys(b))}
 
 
 def _regions(L, forward_batch, S: int, state_idx) -> dict:

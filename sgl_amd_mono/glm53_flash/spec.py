@@ -181,8 +181,8 @@ NUMERICS = Numerics(
         "kda.state.cosine": 0.9999,
         "dsa.streams.cosine": 0.95,
         "dsa.kv.cosine": 0.995,
+        # the completed index pools' keys, dequantized (FP8 value x pool scale)
         "dsa.index.cosine": 0.999,
-        "dsa.index_scale.rel": 0.01,
         "dsa.tail_k.cosine": 0.9999,
         "dsa.tail_g.cosine": 0.9999,
     },
