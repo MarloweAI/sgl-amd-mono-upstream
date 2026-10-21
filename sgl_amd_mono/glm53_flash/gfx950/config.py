@@ -7,6 +7,8 @@
 import msgspec
 
 HIDDEN = 4096
+# the vocabulary (the vocab-parallel embedding and LM head hold VOCAB / TP rows a rank)
+VOCAB = 154880
 N_EXPERTS = 288
 TOP_K = 8
 # the fused shared expert is the last expert slot of the routed tensor
@@ -15,6 +17,9 @@ MOE_SLOTS = TOP_K + 1
 # router candidates per lane: experts lane + 64 i, i < ROUTER_CANDIDATES
 ROUTER_CANDIDATES = (N_EXPERTS + 63) // 64
 GLOBAL_INTER = 2048
+# the dense MLP of layers 0-2 (FP8 with 128 x 128 block scales)
+DENSE_INTER = 12288
+FP8_BLOCK = 128
 ROUTE_SCALE = 2.5
 SWIGLU_LIMIT = 10.0
 EPS = 1e-5
@@ -66,6 +71,14 @@ class FlashShard(msgspec.Struct, frozen=True):
     @property
     def inter(self) -> int:
         return GLOBAL_INTER // self.tp
+
+    @property
+    def dense_inter(self) -> int:
+        return DENSE_INTER // self.tp
+
+    @property
+    def vocab(self) -> int:
+        return VOCAB // self.tp
 
     @property
     def kda_heads(self) -> int:
