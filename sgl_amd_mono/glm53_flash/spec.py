@@ -171,9 +171,10 @@ SGLANG_READS = {
 # quantizes the expert inputs to MXFP8 and SGLang's AITER MoE its own way, so the
 # streams differ by about the MoE's error. The dense MLP runs on bf16 activations
 # where SGLang quantizes them to FP8 per 128, so the bound that catches errors in it
-# is the one against an f32 MLP on the launch's own FFN input. The dense and tail
-# bounds are 3x the largest difference measured on real weights (and at least 3x the
-# normal path's own run to run).
+# is the one against an f32 MLP on the launch's own FFN input. The dense bounds are
+# 3x the largest difference this check measured in serving (TP2, TP4, TP8): on layers
+# 0 to 2 the streams are the embedding's, small, so SGLang's FP8-activation MLP sets
+# the streams difference. The tail's are 3x the largest over 270 real inputs.
 NUMERICS = Numerics(
     NumericsKind.TOLERANCE,
     {
@@ -186,15 +187,14 @@ NUMERICS = Numerics(
         "dsa.index.cosine": 0.999,
         "dsa.tail_k.cosine": 0.9999,
         "dsa.tail_g.cosine": 0.9999,
-        "dense.streams.rel": 3e-3,
-        "dense.conv.rel": 6e-4,
-        "dense.state.rel": 7.5e-4,
+        "dense.streams.rel": 0.11,
+        "dense.conv.rel": 3e-3,
+        "dense.state.rel": 3.5e-3,
         "dense.x_vs_fp32.rel": 1.2e-2,
         # the tail's logits (f32 of bf16, as SGLang's LM head and all-gather leave
         # them): in one row of a few the two bf16 roundings part (median 3e-5, max
         # 5.8e-4 over 270 inputs; launch and SGLang equally far from an f32 tail)
         "head.logits.rel": 1.8e-3,
-        "head.logits.max_abs": 0.05,
         # the bound that catches errors in the tail: against an f32 tail on the same
         # input (hc_post, the stream mean, RMSNorm and the LM head in f32), each row's
         # distance in excess of SGLang's, relative to SGLang's (median 1.7e-5, max

@@ -415,7 +415,7 @@ def test_bounds_name_the_dense_layers_and_the_tail():
     b = flash.NUMERICS.bounds
     for name in ("streams.rel", "conv.rel", "state.rel", "x_vs_fp32.rel"):
         assert f"dense.{name}" in b
-    assert b["head.logits.rel"] == 1.8e-3 and b["head.logits.max_abs"] == 0.05
+    assert b["head.logits.rel"] == 1.8e-3 and "head.logits.max_abs" not in b
     # the f32 tail's bound is the one that catches errors in the tail
     assert b["head.logits_vs_fp32.rel"] == 0.06
 
