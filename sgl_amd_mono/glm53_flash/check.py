@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""SGLANG_AMD_MONO_CHECK=1 (eager only): each covered layer also runs the normal
-layer on its input, on the caches as they were, and checks the kernel's outputs
-against it: the written streams, and the state or cache rows the layer writes, each
-against its ``spec.NUMERICS`` bound. Every check is logged; a miss is logged as a
-violation."""
+"""SGLANG_AMD_MONO_CHECK=1 (eager only): each layer's launch also runs the normal
+layer on its input (layer 0: SGLang's embedding of the step's tokens), on the caches
+as they were, and checks the kernel's outputs against it: the written streams (the
+last layer's contracted), and the state or cache rows the layer writes; a dense
+layer's MLP output also against an f32 MLP on the launch's own FFN input. The tail's
+logits are checked against SGLang's final norm and logits, and against an f32 tail.
+Each value against its ``spec.NUMERICS`` bound. Every check is logged; a miss is
+logged as a violation."""
 
 from __future__ import annotations
 
@@ -16,7 +19,16 @@ logger = logging.getLogger(__name__)
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
-    "srt/layers/layer_boundary/residual/batch.py": ("take_output", "set_written"),
+    "kernels/ops/layernorm/mhc.py": ("hc_contract",),
+    "srt/distributed/parallel_state.py": ("device_group",),
+    "srt/layers/layer_boundary/residual/batch.py": (
+        "start",
+        "take_output",
+        "set_written",
+    ),
+    "srt/layers/logits_processor.py": ("LogitsMetadata", "from_forward_batch"),
+    "srt/layers/layernorm.py": ("variance_epsilon",),
+    "srt/models/glm5_next.py": ("model", "layers", "hc_post", "norm", "lm_head"),
     "srt/mem_cache/memory_pool.py": (
         "mamba2_layer_cache",
         "conv",
@@ -30,7 +42,12 @@ SGLANG_READS = {
         "get_req_to_token_pool",
         "get_token_to_kv_pool",
     ),
-    "srt/runtime_context.py": ("get_parallel", '"tp_rank"'),
+    "srt/runtime_context.py": (
+        "get_parallel",
+        '"tp_rank"',
+        '"tp_size"',
+        '"tp_group"',
+    ),
     "srt/utils/common.py": ("BumpAllocator",),
 }
 
@@ -95,15 +112,24 @@ def _regions(L, forward_batch, S: int, state_idx) -> dict:
     }
 
 
-def reference(L, positions, streams_in, forward_batch, S: int, state_idx) -> dict:
-    """The normal layer's outputs on ``streams_in``; the caches are restored after."""
-    from sglang.srt.layers.layer_boundary.residual.batch import set_written, take_output
+def reference(L, positions, hidden_in, forward_batch, S: int, state_idx) -> dict:
+    """The normal layer's outputs on ``hidden_in`` (the written streams, or layer 0's
+    embedded tokens); the caches are restored after."""
+    from sglang.srt.layers.layer_boundary.residual.batch import (
+        set_written,
+        start,
+        take_output,
+    )
     from sglang.srt.utils.common import BumpAllocator
 
     regions = _regions(L, forward_batch, S, state_idx)
     saved = {name: t[idx].clone() for name, (t, idx) in regions.items()}
-    hidden = set_written(streams_in, forward_batch)
-    zero = BumpAllocator(buffer_size=4, dtype=torch.float32, device=streams_in.device)
+    if L.i == 0:
+        start(forward_batch)
+        hidden = hidden_in
+    else:
+        hidden = set_written(hidden_in, forward_batch)
+    zero = BumpAllocator(buffer_size=4, dtype=torch.float32, device=hidden_in.device)
     out, _ = L.module(
         positions, hidden, forward_batch, zero, None, prev_topk_indices=None
     )
@@ -114,32 +140,60 @@ def reference(L, positions, streams_in, forward_batch, S: int, state_idx) -> dic
     return ref
 
 
-def compare(
-    L, ref: dict, streams: torch.Tensor, positions, forward_batch, S: int, state_idx
-) -> None:
+def contract(streams: torch.Tensor) -> torch.Tensor:
+    """The mean of the four streams, as the last layer's FFN exit hands it on."""
+    from sglang.kernels.ops.layernorm.mhc import hc_contract
+
+    from sgl_amd_mono.glm53_flash.gfx950.config import HC_MULT
+
+    return hc_contract(streams, HC_MULT)
+
+
+def _all_reduce(t: torch.Tensor) -> torch.Tensor:
     from sglang.srt.runtime_context import get_parallel
 
+    torch.distributed.all_reduce(t, group=get_parallel().tp_group.device_group)
+    return t
+
+
+def _dequant(w: torch.Tensor, s: torch.Tensor, shuffled: bool) -> torch.Tensor:
+    """A block-FP8 weight (row-major or AITER (16, 16)-shuffled) in f32."""
+    n, k = w.shape
+    if shuffled:
+        w = w.view(torch.uint8).reshape(n // 16, k // 32, 2, 16, 16)
+        w = w.permute(0, 3, 1, 2, 4).reshape(n, k).view(torch.float8_e4m3fn)
+    scale = s.repeat_interleave(128, 0).repeat_interleave(128, 1)
+    return w.float() * scale
+
+
+def dense_mlp_fp32(L, W: int, S: int) -> torch.Tensor:
+    """The dense MLP in f32 on dequantized weights, on the launch's own FFN input
+    (its scratch), summed over the ranks (collective)."""
+    from sgl_amd_mono.glm53_flash.gfx950.config import HIDDEN, SWIGLU_LIMIT
+
+    op = L.ops[W]
+    rt, w = op.rt, op.w
+    a = rt.scratch[rt.sc["a"] :].view(torch.int32)[: S * HIDDEN : 2]
+    a = a.contiguous().view(torch.bfloat16).view(S, HIDDEN).float()
+    tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        gu = a @ _dequant(w.w_ug, w.s_ug, w.shuffled).T
+        gate, up = gu.chunk(2, dim=-1)
+        gate = gate.clamp(max=SWIGLU_LIMIT)
+        up = up.clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
+        x = (F.silu(gate) * up) @ _dequant(w.w_dn, w.s_dn, w.shuffled).T
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = tf32
+    return _all_reduce(x)
+
+
+def _report(what: str, values: dict) -> None:
     from sgl_amd_mono.glm53_flash.spec import NUMERICS
 
-    if get_parallel().tp_rank != 0:
-        return
-    kind = "kda" if L.kda else "dsa"
-    outputs = _outputs("streams", streams, ref["streams"])
-    for name, (t, idx) in _regions(L, forward_batch, S, state_idx).items():
-        outputs.update(_outputs(name, t[idx], ref[name]))
-    values = {
-        f"{kind}.{out}.{metric}": v
-        for out, ms in outputs.items()
-        for metric, v in ms.items()
-    }
-    pos = positions[:S]
     logger.info(
-        "monokernel check layer %d (%s, %d rows, positions %d..%d): %s",
-        L.i,
-        kind,
-        S,
-        pos.min().item(),
-        pos.max().item(),
+        "monokernel check %s: %s",
+        what,
         " ".join(f"{k}={v:.6g}" for k, v in values.items()),
     )
     for name, bound in NUMERICS.bounds.items():
@@ -149,9 +203,98 @@ def compare(
         ok = v >= bound if name.endswith(".cosine") else v <= bound
         if not ok:
             logger.error(
-                "monokernel check violation: layer %d %s = %.6g, bound %g",
-                L.i,
+                "monokernel check violation: %s %s = %.6g, bound %g",
+                what.split(" (")[0],
                 name,
                 v,
                 bound,
             )
+
+
+def compare(
+    L,
+    ref: dict,
+    streams: torch.Tensor,
+    out,
+    positions,
+    forward_batch,
+    S: int,
+    state_idx,
+) -> None:
+    from sglang.srt.runtime_context import get_parallel
+
+    x32 = dense_mlp_fp32(L, out[0].shape[0], S) if L.kind == "dense" else None
+    if get_parallel().tp_rank != 0:
+        return
+    outputs = _outputs("streams", streams, ref["streams"])
+    for name, (t, idx) in _regions(L, forward_batch, S, state_idx).items():
+        outputs.update(_outputs(name, t[idx], ref[name]))
+    if x32 is not None:
+        outputs["x_vs_fp32"] = _metrics(out[0][:S], x32)
+    values = {
+        f"{L.kind}.{out}.{metric}": v
+        for out, ms in outputs.items()
+        for metric, v in ms.items()
+    }
+    pos = positions[:S]
+    _report(
+        f"layer {L.i} ({L.kind}, {S} rows, positions {pos.min().item()}.."
+        f"{pos.max().item()})",
+        values,
+    )
+
+
+def tail_fp32(owed, g_norm, eps: float, w_head) -> torch.Tensor:
+    """The tail in f32 on the last layer's owed (x, residual, post, comb): the four
+    streams (post_j x + sum_i comb_ij R_i), their mean, RMSNorm and the logits of
+    this rank's LM-head rows."""
+    s = owed.x.shape[0]
+    x, r, post, comb = (
+        t.float() for t in (owed.x, owed.residual, owed.post, owed.comb)
+    )
+    streams = post.reshape(s, -1, 1) * x[:, None] + torch.einsum(
+        "sij,sih->sjh", comb, r
+    )
+    h = streams.mean(1)
+    h = h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + eps) * g_norm.float()
+    tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        return h @ w_head.float().T
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = tf32
+
+
+def tail(lm, own_get_logits, owed, logits, forward_batch, S: int) -> None:
+    """The tail's logits against SGLang's final norm and logits on the last layer's
+    contracted output, and against an f32 tail: per row, the launch's distance to it
+    in excess of SGLang's, relative to SGLang's (collective)."""
+    from sglang.srt.layers.logits_processor import LogitsMetadata
+    from sglang.srt.runtime_context import get_parallel
+
+    p = get_parallel()
+    owed = type(owed)(*(t[:S] for t in (owed.x, owed.residual, owed.post, owed.comb)))
+    layer = lm.model.layers[-1]
+    streams = layer.hc_post(
+        owed.x, owed.residual.reshape(S, -1), owed.comb, owed.post.reshape(S, -1)
+    )
+    normed = lm.model.norm(contract(streams))
+    meta = LogitsMetadata.from_forward_batch(forward_batch)
+    ref = own_get_logits(normed, lm.lm_head, meta).float()
+    norm = lm.model.norm
+    shard = tail_fp32(owed, norm.weight, norm.variance_epsilon, lm.lm_head.weight)
+    parts = [torch.empty_like(shard) for _ in range(p.tp_size)]
+    torch.distributed.all_gather(parts, shard, group=p.tp_group.device_group)
+    f32 = torch.cat(parts, -1)
+    if p.tp_rank != 0:
+        return
+    got = logits[:S].float()
+    values = {f"head.logits.{k}": v for k, v in _metrics(got, ref).items()}
+    nf = f32.norm(dim=-1)
+    eg, es = (got - f32).norm(dim=-1) / nf, (ref - f32).norm(dim=-1) / nf
+    ratio = eg / es.clamp_min(torch.finfo(torch.float32).tiny)
+    finite = bool(torch.isfinite(got).all())
+    values["head.logits_vs_fp32.rel"] = (
+        ratio.max().item() - 1 if finite else float("inf")
+    )
+    _report(f"tail ({S} rows)", values)

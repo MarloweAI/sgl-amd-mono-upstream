@@ -2,9 +2,10 @@
 switch points: decode steps of 1 to 8 rows run the kernels, wider ones the normal
 path, and requests join and leave a running batch that steps past 8 rows and back
 (a short GSM8K run, for gross failures); the tokens of covered steps scored again by
-the normal prefill path (KL consistency); each covered layer against SGLang's own
-under SGLANG_AMD_MONO_CHECK; and a fault on one rank that stops the server before
-any token of the failed step is sent."""
+the normal prefill path (KL consistency); each layer's launch against SGLang's own
+layer, and the tail's logits against SGLang's, under SGLANG_AMD_MONO_CHECK; and a
+fault on one rank that stops the server before any token of the failed step is
+sent."""
 
 import os
 import re
@@ -98,9 +99,10 @@ class TestMonokernelDecode(CustomTestCase):
 
 class TestMonokernelCheck(CustomTestCase):
     def test_each_covered_layer_within_its_numerics(self):
-        # SGLANG_AMD_MONO_CHECK (eager) runs the normal layer next to each covered layer; 1, 3
-        # and 8 rows run at widths 2, 4 and 8 (pad rows on the first two), and the
-        # long prompt's positions pass 2048, where the sparse attention selects keys
+        # SGLANG_AMD_MONO_CHECK (eager) runs the normal layer next to each layer's
+        # launch, and SGLang's final norm and logits next to the tail; 1, 3 and 8
+        # rows run at widths 2, 4 and 8 (pad rows on the first two), and the long
+        # prompt's positions pass 2048, where the sparse attention selects keys
         para = "The river valley archive lists the flood height of every year. "
         with (
             tempfile.NamedTemporaryFile("w+", suffix=".out") as out,
@@ -130,7 +132,7 @@ class TestMonokernelCheck(CustomTestCase):
             out.seek(0)
             log = err.read() + out.read()
         checks = re.findall(
-            r"monokernel check layer \d+ \((kda|dsa), (\d+) rows, positions "
+            r"monokernel check layer \d+ \((kda|dsa|dense), (\d+) rows, positions "
             r"\d+\.\.(\d+)\): (.*)",
             log,
         )
@@ -141,8 +143,10 @@ class TestMonokernelCheck(CustomTestCase):
         for name, vs in sorted(values.items()):
             print(f"{name}: min {min(vs):.6g} max {max(vs):.6g} ({len(vs)} checks)")
         seen = {(kind, int(rows)) for kind, rows, _, _ in checks}
-        want = {(kind, rows) for kind in ("kda", "dsa") for rows in (1, 3, 8)}
+        want = {(kind, rows) for kind in ("kda", "dsa", "dense") for rows in (1, 3, 8)}
         self.assertTrue(want <= seen, seen)
+        tails = re.findall(r"monokernel check tail \((\d+) rows\): (.*)", log)
+        self.assertEqual({int(rows) for rows, _ in tails} & {1, 3, 8}, {1, 3, 8})
         self.assertTrue(any(k == "dsa" and int(hi) >= 2048 for k, _, hi, _ in checks))
         violations = re.findall(r"monokernel check violation: .*", log)
         self.assertEqual(violations, [], "\n".join(violations[:20]))

@@ -2,9 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from vllm-project/vllm at ca328e297b (Apache-2.0):
 # vllm/models/glm5next/amd/mono/weights.py
-"""One GLM-5.3-Flash MoE layer's tensors as the launch reads them: views of
-SGLang's loaded parameters, except the copies each function names (each records
-them in ``copies``, so attach logs their sizes)."""
+"""One GLM-5.3-Flash layer's tensors as the launch reads them, and the embedding
+and LM head the first and the tail launches read: views of SGLang's loaded
+parameters, except the copies each function names (each records them in
+``copies``, so attach logs their sizes)."""
 
 from __future__ import annotations
 
@@ -24,6 +25,7 @@ from .config import (
     NOPE_DIM,
     Q_LORA,
     V_DIM,
+    VOCAB,
     FlashShard,
 )
 
@@ -51,6 +53,10 @@ SGLANG_READS = {
         "input_layernorm",
         "post_attention_layernorm",
         "o_proj",
+        "model",
+        "embed_tokens",
+        "norm",
+        "lm_head",
     ),
     "srt/models/deepseek_v2.py": (
         "fused_qkv_a_proj_with_mqa",
@@ -65,6 +71,21 @@ SGLANG_READS = {
         "experts",
         "e_score_correction_bias",
         "indexer",
+        "swiglu_limit",
+    ),
+    "srt/layers/vocab_parallel_embedding.py": (
+        "enable_tp",
+        "use_attn_tp_group",
+        "tp_size",
+        "shard_indices",
+        "org_vocab_start_index",
+        "org_vocab_end_index",
+        "added_vocab_start_index",
+        "added_vocab_end_index",
+        "num_org_vocab_padding",
+        "output_dtype",
+        "quant_method",
+        "UnquantizedEmbeddingMethod",
     ),
     "srt/layers/attention/dsa/dsa_indexer.py": ("wk", "wq_b", "weights_proj"),
     "srt/layers/attention/dsa/dsa_indexer_kpool.py": (
@@ -376,4 +397,106 @@ def kda_weights(layer, i: int, tp: int, copies: dict):
         dt_bias=_need("dt_bias", attn.dt_bias, (P,), f32),
         w_on=w_on,
         w_o=_need("o_proj.weight", attn.o_proj.weight, (HIDDEN, P), bf16),
+    )
+
+
+def dense_weights(layer, i: int, tp: int, copies: dict):
+    """A dense layer's FFN side: its MLP's gate | up and down as SGLang keeps them,
+    block FP8 (row-major or AITER-shuffled, the same for both), and the FFN mHC."""
+    from .runner import FlashDenseWeights
+
+    mlp = layer.mlp
+    inter = FlashShard(tp=tp).dense_inter
+    if getattr(mlp, "swiglu_limit", None) != 10.0:
+        raise ValueError(
+            f"needs the dense MLP's SwiGLU limit 10, got {getattr(mlp, 'swiglu_limit', None)}"
+        )
+    w_ug, s_ug, ug_sh = _proj("mlp.gate_up_proj", mlp.gate_up_proj, 2 * inter, HIDDEN)
+    w_dn, s_dn, dn_sh = _proj("mlp.down_proj", mlp.down_proj, HIDDEN, inter)
+    if s_ug is None or s_dn is None:
+        raise ValueError("needs the dense MLP as block FP8, got bf16")
+    if ug_sh != dn_sh:
+        raise ValueError("needs the dense MLP's gate | up and down in one FP8 layout")
+    return FlashDenseWeights(
+        w_ug=w_ug,
+        s_ug=s_ug,
+        w_dn=w_dn,
+        s_dn=s_dn,
+        hc_fn=_need(
+            "hc_ffn_fn", layer.hc_ffn_fn, (N_MIX, HC_MULT * HIDDEN), (torch.float32,)
+        ),
+        hc_scale=_need("hc_ffn_scale", layer.hc_ffn_scale, (3,), (torch.float32,)),
+        hc_base=_need("hc_ffn_base", layer.hc_ffn_base, (N_MIX,), (torch.float32,)),
+        g_norm=_need(
+            "post_attention_layernorm.weight",
+            layer.post_attention_layernorm.weight,
+            (HIDDEN,),
+            (torch.bfloat16,),
+        ),
+        shuffled=ug_sh,
+    )
+
+
+def _unquantized(name: str, module) -> None:
+    method = type(getattr(module, "quant_method", None)).__name__
+    if method != "UnquantizedEmbeddingMethod":
+        raise ValueError(f"needs an unquantized {name}, got {method}")
+
+
+def _vocab_shard(name: str, module, tp: int) -> None:
+    """A plain vocab-parallel shard over the TP group: VOCAB / TP rows a rank, no
+    added or padded rows."""
+    if (
+        not getattr(module, "enable_tp", False)
+        or getattr(module, "use_attn_tp_group", False)
+        or getattr(module, "tp_size", 1) != tp
+    ):
+        raise ValueError(f"needs the {name} sharded over the TP group")
+    si = module.shard_indices
+    rows = VOCAB // tp
+    if (
+        si.num_org_vocab_padding
+        or si.added_vocab_end_index != si.added_vocab_start_index
+        or si.org_vocab_end_index - si.org_vocab_start_index != rows
+    ):
+        raise ValueError(
+            f"needs the {name} as {rows} vocabulary rows a rank, no added or padded rows"
+        )
+
+
+def head_weights(model, tp: int):
+    """The tail: the final RMSNorm weight and this rank's rows of the vocab-parallel
+    LM head, both views."""
+    from .runner import FlashHeadWeights
+
+    head = model.lm_head
+    _unquantized("LM head", head)
+    _vocab_shard("LM head", head, tp)
+    return FlashHeadWeights(
+        g_norm=_need(
+            "model.norm.weight", model.model.norm.weight, (HIDDEN,), (torch.bfloat16,)
+        ),
+        w_head=_need(
+            "lm_head.weight", head.weight, (VOCAB // tp, HIDDEN), (torch.bfloat16,)
+        ),
+    )
+
+
+def embed_weights(model, tp: int):
+    """The input embedding as the step's first launch reads it: this rank's rows of
+    the vocab-parallel table (a view) and the vocabulary ids they hold."""
+    from .runner import FlashEmbedding
+
+    emb = model.model.embed_tokens
+    _unquantized("input embedding", emb)
+    if getattr(emb, "output_dtype", None) is not None:
+        raise ValueError("needs the input embedding in its weight's dtype")
+    _vocab_shard("input embedding", emb, tp)
+    si = emb.shard_indices
+    return FlashEmbedding(
+        weight=_need(
+            "embed_tokens.weight", emb.weight, (VOCAB // tp, HIDDEN), (torch.bfloat16,)
+        ),
+        start=int(si.org_vocab_start_index),
+        end=int(si.org_vocab_end_index),
     )
