@@ -203,9 +203,6 @@ def layout(
         ("midq", samples * MOE_SLOTS * inter // 4 * pair_bytes),
         ("midqs", samples * MOE_SLOTS * (inter // 32) * pair_bytes),
     ]
-    if dsa:
-        # where the launch's code ends (its last launch recorded it)
-        items += [("code_end", pair_bytes)]
     assert len({name for name, _ in items}) == len(items), "mailbox names"
     offset, scratch = 0, {}
     for name, size in items:

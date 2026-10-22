@@ -38,11 +38,10 @@ import flydsl.expr as fx
 import msgspec
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from aiter.ops.flydsl.kernels.dpp_utils import update_dpp_i32
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu
 from flydsl.expr import math as fmath
 from flydsl.expr import range_constexpr, rocdl
-from flydsl.expr.typing import Int32, Int64, T, as_ir_value
+from flydsl.expr.typing import Int32, Int64, T
 
 from sgl_amd_mono.common import guard
 from sgl_amd_mono.common.epoch import kernel_symbol, spin_until
@@ -197,27 +196,6 @@ ID_BITS = 9
 assert N_EXPERTS < 1 << ID_BITS and ROUTER_CANDIDATES == 5
 
 
-def pc_now():
-    """The program counter (wave-uniform)."""
-    return fx.Int64(
-        llvm.InlineAsmOp(
-            T.i64, [], "s_getpc_b64 $0", "=s", has_side_effects=True
-        ).result
-    )
-
-
-def keep(values):
-    """Consume ``values`` with no effect: their loads are kept, and the wave waits for
-    them here."""
-    llvm.InlineAsmOp(
-        None,
-        [as_ir_value(fx.Int32(v)) for v in values],
-        "",
-        ",".join("v" * len(values)),
-        has_side_effects=True,
-    )
-
-
 def tie_rank(expert):
     """AITER's ``legacy_topk_tie_rank``: the lane order in which its one-wave grouped
     top-k (vec4 per lane, lane + 64 r) keeps one of two equal scores."""
@@ -323,9 +301,6 @@ def build_flash_kernel(key: FlashBuild):
     # first stage
     PRO = whole
     EARLY = PRO and S <= 4
-    WARM_LINE = 64
-    # at most this much code is warmed (the launch's code is smaller)
-    CODE_MAX = 1 << 20
     expert_inter = key.inter
     SHARED = SHARED_EXPERT
     G = BLOCKS
@@ -3368,63 +3343,6 @@ def build_flash_kernel(key: FlashBuild):
                 min(4, O8_CPW),
             )
 
-        # The mailboxes a sparse-attention launch hands its attention through are cold
-        # in the caches when other launches ran in between: the CTAs with no attention
-        # seam tile and no gate row read one dword of every line of them while the gate
-        # is pending, and one of every line of the code that follows.
-        assert WARM_LINE * (G - N_ROW_TILES - S) * THREADS >= CODE_MAX
-        WARM_RANGES = (
-            [(0, SC["iscores"]), (SC["tok_sel"], SC["_bytes"] - SC["tok_sel"])]
-            if dsa
-            else []
-        )
-        WARM_LINES = sum(-(-n // WARM_LINE) for _, n in WARM_RANGES)
-        WARM_CTAS = G - N_ROW_TILES - S
-        WARM_LOADS = -(-WARM_LINES // (WARM_CTAS * THREADS))
-
-        def warm_mailboxes():
-            if bid >= N_ROW_TILES + S:
-                q0 = (bid - N_ROW_TILES - S) * THREADS + tid
-                vals = []
-                for k in range_constexpr(WARM_LOADS):
-                    q = q0 + k * (WARM_CTAS * THREADS)
-                    off, first = fx.Int32(0), 0
-                    for b, n in WARM_RANGES:
-                        lines = -(-n // WARM_LINE)
-                        off = ((q >= first) & (q < first + lines)).select(
-                            (q - first) * WARM_LINE + b, off
-                        )
-                        first += lines
-                    rs = bo.create_buffer_resource_from_addr(
-                        scratch,
-                        num_records_bytes=(q < WARM_LINES).select(
-                            fx.Int32(SC["_bytes"]), fx.Int32(0)
-                        ),
-                    )
-                    vals.append(
-                        fx.Int32(bo.buffer_load(rs, off // 4, vec_width=1, dtype=T.i32))
-                    )
-                # the code from here to the launch's end, as the previous launch recorded it
-                here = pc_now() & fx.Int64(-WARM_LINE)
-                ce = fx.Vector(
-                    bo.buffer_load(_rsrc(mb("code_end")), 0, vec_width=2, dtype=T.i32)
-                )
-                end = (fx.Int64(_uniform(ce[1])) << 32) | fx.Int64(
-                    fx.Uint32(_uniform(ce[0]))
-                )
-                span = fx.Int32(
-                    fx.min(fx.max(end - here, fx.Int64(0)), fx.Int64(CODE_MAX))
-                )
-                rc = bo.create_buffer_resource_from_addr(here, num_records_bytes=span)
-                vals.append(
-                    fx.Int32(
-                        bo.buffer_load(
-                            rc, q0 * (WARM_LINE // 4), vec_width=1, dtype=T.i32
-                        )
-                    )
-                )
-                keep(vals)
-
         def run_dsa():
             # the layer's argument table (entry i in lane i): pointers, then int32 geometry
             t32 = {
@@ -3438,7 +3356,6 @@ def build_flash_kernel(key: FlashBuild):
             }
             run_seam("aseam", "attn", early_seam)
             run_gate("agate", "attn", early_gate)
-            warm_mailboxes()
             # the step's row table -> LDS, read from the cache stage on (which
             # begins with a barrier)
             if tid < S * ROW_WORDS:
@@ -3953,18 +3870,6 @@ def build_flash_kernel(key: FlashBuild):
 
             peer_reduce("ffn", t, store_x, DN_TILE)
             gpu.barrier()
-        if const_expr(dsa):
-            # where this launch's code ends, for the next launch's warming
-            if (bid == 0) & (tid == 0):
-                end = pc_now()
-                bo.buffer_store(
-                    fx.Vector.from_elements(
-                        [fx.Int32(end & fx.Int64(0xFFFFFFFF)), fx.Int32(end >> 32)],
-                        fx.Int32,
-                    ),
-                    _rsrc(mb("code_end")),
-                    0,
-                )
 
     @flyc.jit
     def launch(
