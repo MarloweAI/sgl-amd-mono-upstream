@@ -242,11 +242,11 @@ class _Guard(guard.Guard):
         return (fx.Int64(hi) << 32) | (fx.Int64(lo) & fx.Int64(0xFFFFFFFF))
 
     def stopped(self):
-        own = (
-            self._word(guard.ERR_DEADLINE)
-            | self._word(guard.ERR_PEER)
-            | self._word(guard.ERR_FAULT)
-        )
+        """``Guard.stopped`` over ``guard.ERROR_WORDS``, read wave-uniform."""
+        words = [self._word(i) for i in guard.ERROR_WORDS]
+        own = words[0]
+        for w in words[1:]:
+            own = own | w
         return _uniform(own | self.flags()) != 0
 
 
