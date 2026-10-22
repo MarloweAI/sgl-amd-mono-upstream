@@ -384,8 +384,8 @@ def build_flash_kernel(key: FlashBuild):
 
     order = stage_tasks(S, expert_inter, W, kda, dsa)
     base, acc = {}, 0
-    for name, n in order:
-        base[name] = acc % G
+    for stage, n in order:
+        base[stage] = acc % G
         acc += n
 
     @fx.struct
