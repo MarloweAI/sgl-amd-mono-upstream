@@ -463,7 +463,8 @@ def check_routing(args, rank, tp, group, device) -> bool:
     """FFN launches on router keys that tie in bf16: the launch's top-8 (order
     included) equals SGLang's (AITER's ``biased_grouped_topk`` on bf16 logits and bias)
     on the launch's own FFN input, every draw; and the inputs tell that apart from
-    lower-id ties and from f32 keys (negative controls)."""
+    lower-id ties and from f32 keys (negative controls). The host-side key order is
+    printed as a diagnostic only: it restates the kernel's ``tie_rank``."""
     from sgl_amd_mono.glm53_flash.gfx950.kernel import FlashBuild
     from sgl_amd_mono.glm53_flash.gfx950.runner import FlashLayerOp, FlashRuntime
 
@@ -486,11 +487,11 @@ def check_routing(args, rank, tp, group, device) -> bool:
         same = torch.equal(got, stock_topk(a, w_r, ffn.bias))
         own = torch.equal(got, key_order(a, w_r, ffn.bias, True, "aiter"))
         print(
-            f"rank {rank} draw {draw}: top-8 == AITER biased_grouped_topk {same}, "
-            f"== bf16 keys in AITER's tie order {own}",
+            f"rank {rank} draw {draw}: top-8 == AITER biased_grouped_topk {same} "
+            f"(diagnostic: == bf16 keys in tie_rank order {own})",
             flush=True,
         )
-        ok = ok and same and own
+        ok = ok and same
         by_id += int((got != key_order(a, w_r, ffn.bias, True, "id")).any(-1).sum())
         by_f32 += int(
             (got != key_order(a, w_r, ffn.bias, False, "aiter")).any(-1).sum()
