@@ -77,6 +77,24 @@ def test_a_step_runs_at_the_next_width_and_tp2_takes_four_rows():
     assert torch.equal(built.eye_comb[1], torch.eye(4)) and not built.zero_x.any()
 
 
+def test_the_spec_needs_aiters_grouped_topk(monkeypatch):
+    # the kernel's router ties follow AITER's grouped top-k; SGLang's JIT grouped
+    # top-k (a Triton gate) keeps the lower expert id, so the spec requires it off.
+    # SGLang refuses a spec whose required env value differs from envs' value.
+    from sglang.srt.environ import envs
+
+    def unmet():
+        req = flash.SPEC.requires.env
+        return [name for name, want in req.items() if getattr(envs, name).get() != want]
+
+    name = "SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK"
+    assert flash.SPEC.requires.env[name] is False
+    monkeypatch.delenv(name, raising=False)
+    assert unmet() == []
+    monkeypatch.setenv(name, "1")
+    assert unmet() == [name]
+
+
 def _cfg(**kw):
     return SimpleNamespace(**{"page_size": 256, **kw})
 
