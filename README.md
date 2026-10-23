@@ -137,6 +137,8 @@ pytest test/e2e -k "glm53 and not glm53_flash"                  # GLM_53_MODEL_P
 pytest test/kernels test/e2e -k minimax_m3                      # 4 x MI350X or MI355X, MINIMAX_M3_MODEL_PATH and MINIMAX_M3_EAGLE3_PATH set
 ```
 
+Kernel-only time of the GLM-5.3-Flash launches (no model needed): `torchrun --nproc-per-node 4 test/kernels/glm53_flash/time_layers.py --kind model --rows 2,4,8`.
+
 ## Contributing
 
 Format code with [pre-commit](https://pre-commit.com/) (`pre-commit install`). Every module that reads SGLang internals declares them in `SGLANG_READS`. `test/unit/test_contract.py` checks each declared name against the installed SGLang, so an incompatible SGLang change fails on CPU.

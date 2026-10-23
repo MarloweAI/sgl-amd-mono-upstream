@@ -19,6 +19,7 @@ from .config import (
     N_EXPERTS,
     NOPE_DIM,
     Q_LORA,
+    TOP_K,
     TOPK_TOKENS,
     V_DIM,
     FlashShard,
@@ -27,7 +28,6 @@ from .tiles import (
     BLOCKS,
     ROUTER_TILE,
     ROW_TILE,
-    UG_TILE,
     WAVES,
 )
 
@@ -45,12 +45,14 @@ QB_TILE = 32
 UK_TILE = 128
 UV_TILE = 64
 POOLS_PER_TASK = 256
-# a scored row attends to its 2048 selected pool tokens plus the tail past its last
-# complete pool (up to KPOOL - 1 tokens), as SGLang's kpool top-k appends it; a row of
-# at most MAX_KEYS tokens attends to every token
+# a row attends to its 2048 selected pool tokens plus the tail past its last complete
+# pool (up to KPOOL - 1 tokens), as SGLang's top-k appends it; a row of at most
+# MAX_KEYS tokens attends to every token
 MAX_KEYS = TOPK_TOKENS + KPOOL - 1
-# split attention: one task 64 selected keys x 8 heads (one head a wave); the merge
-# sums the first BASE_SPLITS partials in two halves, then the tail's split
+# split attention: one task 64 selected keys x up to 16 heads (the 16 columns of
+# its MFMAs); the merge sums the first BASE_SPLITS partials in two halves, then the
+# tail's split. The tail splits (split BASE_SPLITS of each row and head group) are
+# tasks 0 .., then the regular splits
 SPLIT_KEYS = 64
 BASE_SPLITS = TOPK_TOKENS // SPLIT_KEYS
 N_SPLIT = (MAX_KEYS + SPLIT_KEYS - 1) // SPLIT_KEYS
@@ -95,29 +97,33 @@ N_ROW_TILES = HIDDEN // ROW_TILE
 N_MIX = HC_MULT * (2 + HC_MULT)
 PMIX = N_MIX + 1
 N_ROUTER = N_EXPERTS // ROUTER_TILE
-XQ_BLOCKS = HIDDEN // 128
 XQ_GROUPS = HIDDEN // 32
-XQ_WAVES = (XQ_BLOCKS + N_ROUTER - 1) // N_ROUTER
-assert N_EXPERTS % ROUTER_TILE == 0 and XQ_WAVES * 4 <= WAVES
+assert N_EXPERTS % ROUTER_TILE == 0
 
 
 def dn_tile(samples: int) -> int:
     """Rows per expert-down / FFN-reduce task."""
-    return 32 if samples == 1 or samples > 4 else HIDDEN // BLOCKS
+    return 32 if samples == 1 or samples > 8 else HIDDEN // BLOCKS
 
 
 def sample_wave_batches(samples: int) -> int:
     return (samples + WAVES - 1) // WAVES
 
 
-def ug_task_rounds(inter: int) -> int:
-    return (inter + BLOCKS - 1) // BLOCKS
+def ug_tasks(inter: int) -> int:
+    """Routed up/gate tasks: 32 intermediate values of one routed slot for half of the
+    rows."""
+    return TOP_K * (inter // 32) * 2
 
 
 def down_prefetch_batch(samples: int) -> int:
-    if samples <= 4:
-        return 9
-    return 4 if samples <= 6 else 3
+    return 9 if samples <= 8 else 3
+
+
+def uv_tiles(samples: int) -> int:
+    """V tiles of one (row, head) a uv task covers: two at 8 rows, so a CTA merges
+    the head's split partials once."""
+    return 2 if samples > 4 else 1
 
 
 def down_x_words(samples: int, inter: int) -> int:
@@ -147,6 +153,7 @@ def layout(
             ("rnew_a", samples * HC_MULT * HIDDEN // 2 * pair_bytes),
             ("pmix_a", samples * N_ROW_TILES * PMIX * pair_bytes),
             ("a_in", samples * HIDDEN // 2 * pair_bytes),
+            ("a_in_rdy", samples * pair_bytes),
             ("mix_a", samples * HC_MULT * (1 + HC_MULT) * pair_bytes),
         ]
     if kda:
@@ -165,6 +172,7 @@ def layout(
             ("ig", samples * INDEX_DIM * pair_bytes),
             ("q_an", samples * Q_LORA // 2 * pair_bytes),
             ("q_nope", samples * H * NOPE_DIM // 2 * pair_bytes),
+            ("iq", samples * INDEX_HEADS * INDEX_DIM // 2 * pair_bytes),
             ("iq8", samples * INDEX_HEADS * INDEX_DIM // 4 * pair_bytes),
             ("iqw", samples * INDEX_HEADS * pair_bytes),
             ("q_lat", samples * H * KV_LORA // 2 * pair_bytes),
@@ -181,12 +189,19 @@ def layout(
         ("rnew", samples * HC_MULT * HIDDEN // 2 * pair_bytes),
         ("pmix", samples * N_ROW_TILES * PMIX * pair_bytes),
         ("a", samples * HIDDEN // 2 * pair_bytes),
+        ("a_rdy", samples * pair_bytes),
+    ]
+    items += [
         ("scores", samples * N_EXPERTS * pair_bytes),
         ("xq", samples * HIDDEN // 4 * pair_bytes),
         ("xqs", samples * XQ_GROUPS * pair_bytes),
         ("sel", samples * MOE_SLOTS * pair_bytes),
         ("prob", samples * MOE_SLOTS * pair_bytes),
-        ("mid", samples * MOE_SLOTS * inter * pair_bytes),
+        # the shared expert's mid (f32); the routed slots' mid as MXFP8 (4 values a
+        # word) and its E8M0 block exponents, indexed (row, slot) like the shared one's
+        ("mid", samples * inter * pair_bytes),
+        ("midq", samples * MOE_SLOTS * inter // 4 * pair_bytes),
+        ("midqs", samples * MOE_SLOTS * (inter // 32) * pair_bytes),
     ]
     assert len({name for name, _ in items}) == len(items), "mailbox names"
     offset, scratch = 0, {}
@@ -211,8 +226,11 @@ def layout(
 def stage_tasks(
     samples: int, inter: int, npes: int = 1, kda: bool = False, dsa: bool = False
 ):
-    """``(stage name, task count)`` pairs in execution order. ``iscore`` is sized
-    per row at run time; its count here only places the next stage."""
+    """``(stage name, CTA slots)`` pairs in execution order: a stage's first task runs
+    on the CTA after the previous stages' slots. ``iscore`` is sized per row at run
+    time; its count here only places the next stage. The tail splits run ahead of
+    the regular splits on their CTAs and take no slots, and the split keeps the slots
+    of 8-head tasks (tasks of 16 heads use the first half)."""
     shard = FlashShard(npes)
     attention = []
     if dsa:
@@ -224,19 +242,21 @@ def stage_tasks(
             ("qnorm", samples),
             ("cache", samples),
             ("q_b", H * NOPE_DIM // QB_TILE),
-            ("index_q", INDEX_HEADS),
+            ("index_q", BLOCKS),
+            ("iq_quant", INDEX_HEADS),
             ("uk", H * KV_LORA // UK_TILE),
             ("iscore", samples * 8),
             ("iselect", samples),
-            ("split", samples * (H // WAVES) * N_SPLIT),
-            ("uv", samples * H * (V_DIM // UV_TILE)),
+            ("split", samples * (H // WAVES) * BASE_SPLITS),
+            ("uv", samples * H * (V_DIM // UV_TILE) // uv_tiles(samples)),
             ("oproj", HIDDEN // O_TILE),
         ]
     if kda:
         attention = [
             ("aseam", N_ROW_TILES),
             ("agate", samples),
-            ("inproj", (shard.kda_in_rows + IN_TILE - 1) // IN_TILE),
+            # the attention gate's CTAs run none of its tasks
+            ("inproj", (shard.kda_in_rows + IN_TILE - 1) // IN_TILE + samples),
             ("fgb", 2 * shard.kda_proj // FGB_TILE),
             ("kda", samples * shard.kda_heads),
             ("oproj", HIDDEN // O_TILE),
@@ -245,15 +265,6 @@ def stage_tasks(
         ("seam", N_ROW_TILES),
         ("gate", samples),
         ("router", samples * N_ROUTER),
-        (
-            "ug",
-            BLOCKS
-            if samples == 1
-            else samples
-            * max(
-                BLOCKS,
-                ((MOE_SLOTS * inter // UG_TILE + BLOCKS - 1) // BLOCKS) * BLOCKS,
-            ),
-        ),
+        ("ug", (ug_tasks(inter) + BLOCKS - 1) // BLOCKS * BLOCKS),
         ("down", HIDDEN // dn_tile(samples)),
     ]

@@ -4,7 +4,9 @@ each launch kind finishes on every rank with no error word and the same output,
 and writes exactly its valid rows' state or cache rows (none of a pad row's); a
 sparse-attention launch on AITER-shuffled FP8 projections equals the row-major one
 bitwise; the router's top-8 equals SGLang's on keys that tie in bf16; and rows past
-2048 tokens attend to their selected pools and then their tail, as SGLang selects."""
+2048 tokens attend to their selected pools and then their tail, as SGLang selects; and
+a graph of several launches of each kind replays the eager step bitwise at every width
+the TP size builds."""
 
 import subprocess
 import sys
@@ -28,19 +30,27 @@ CHECK = Path(__file__).with_name("glm53_flash") / "check_layer.py"
 
 @unittest.skipIf(_gfx950_gpus() < 8, "needs 8 gfx950 GPUs")
 class TestMonoGlm53FlashKernels(CustomTestCase):
-    def _check(self, *args: str) -> None:
+    def _check(self, *args: str, widths=None) -> None:
         for tp in (2, 4, 8):
-            cmd = [
-                sys.executable,
-                "-m",
-                "torch.distributed.run",
-                f"--nproc-per-node={tp}",
-                f"--master-port={29610 + tp}",
-                str(CHECK),
-                *args,
-            ]
-            result = subprocess.run(cmd, timeout=1800)
-            self.assertEqual(result.returncode, 0, f"{' '.join(args)} at TP{tp}")
+            if widths is not None:
+                # TP2 builds no launch wider than 4 rows
+                for w in (w for w in widths if tp > 2 or w <= 4):
+                    self._run(tp, *args, "--rows", str(w))
+                continue
+            self._run(tp, *args)
+
+    def _run(self, tp: int, *args: str) -> None:
+        cmd = [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            f"--nproc-per-node={tp}",
+            f"--master-port={29610 + tp}",
+            str(CHECK),
+            *args,
+        ]
+        result = subprocess.run(cmd, timeout=1800)
+        self.assertEqual(result.returncode, 0, f"{' '.join(args)} at TP{tp}")
 
     def test_each_launch_kind(self):
         # 4 rows (TP2 builds no wider launch), the last a pad row
@@ -55,6 +65,12 @@ class TestMonoGlm53FlashKernels(CustomTestCase):
 
     def test_long_rows_attend_their_tail(self):
         self._check("--kind", "dsa", "--check-keys")
+
+    def test_graph_replays_equal_the_eager_step(self):
+        for kind in ("kda", "dsa"):
+            self._check(
+                "--kind", kind, "--layers", "4", "--replays", "20", widths=(2, 4, 8)
+            )
 
 
 if __name__ == "__main__":
