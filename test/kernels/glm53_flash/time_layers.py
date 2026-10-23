@@ -8,8 +8,11 @@ live. Each layer has its own random weights (``check_layer.py``'s, seeded by lay
 so they stream from HBM as in a served step), its own state or caches, and every
 sparse-attention row sits at position ``--pos``. ``--kind model`` is the served
 step: layers 3 to 43 in model order (30 KDA, 11 sparse attention) on one runtime a
-kind, as the spec builds them; ``kda`` and ``dsa`` run ``--layers`` launches of one
-kind. FP8 projections are read in place (AITER's (16, 16) layout), or row-major with
+kind; ``--kind full`` the whole served step as the spec builds it: layer 0 from the
+step's tokens, the dense layers 1 and 2, layers 3 to 44, then the tail. ``kda``,
+``dsa``, ``dense``, ``embed`` (layer 0 from the tokens) and ``head`` (the tail) run
+``--layers`` launches of one kind; each ``embed`` and ``head`` launch takes the step's
+input, the others the previous launch's output. FP8 projections are read in place (AITER's (16, 16) layout), or row-major with
 ``--row-major``. After an eager step and 20 warm-up replays, each of ``--trials``
 trials replays the graph ``--reps`` times; rank 0 prints per-launch microseconds
 (trial time / (reps x launches)): the median, minimum and maximum over trials, the
@@ -38,6 +41,9 @@ def _seed_layer(layer: int) -> None:
 def _kinds(args) -> list:
     if args.kind == "model":
         return ["dsa" if i % 4 == 3 else "kda" for i in range(3, 44)]
+    if args.kind == "full":
+        layers = ["dsa" if i % 4 == 3 else "kda" for i in range(3, 45)]
+        return ["embed", "dense", "dense", *layers, "head"]
     return [args.kind] * args.layers
 
 
@@ -45,43 +51,71 @@ def _build(args, kinds: list, rows: int, rank: int, tp: int, group, device):
     """The runtimes (one a kind), each layer's op and launch arguments."""
     from sgl_amd_mono.glm53_flash.gfx950.config import GLOBAL_INTER
     from sgl_amd_mono.glm53_flash.gfx950.kernel import FlashBuild
-    from sgl_amd_mono.glm53_flash.gfx950.runner import FlashLayerOp, FlashRuntime
+    from sgl_amd_mono.glm53_flash.gfx950.runner import (
+        FlashHeadOp,
+        FlashLayerOp,
+        FlashRuntime,
+    )
 
     shuffled = not args.row_major
     runtimes = {}
     for kind in sorted(set(kinds)):
-        dsa = kind == "dsa"
+        dsa, head = kind == "dsa", kind == "head"
+        dense = kind in ("dense", "embed")
         key = FlashBuild(
             rows=rows,
             tp=tp,
             launches_per_step=kinds.count(kind),
             inter=GLOBAL_INTER // tp,
-            kda=not dsa,
+            kda=not (dsa or head),
             dsa=dsa,
             max_pools=args.max_pools if dsa else 0,
             qkv_shuffled=shuffled and dsa,
             qb_shuffled=shuffled and dsa,
             o_shuffled=shuffled and dsa,
+            dense=dense,
+            dense_shuffled=shuffled and dense,
+            tokens=kind == "embed",
+            head=head,
         )
         runtimes[kind] = FlashRuntime(key, rank, group, device)
         runtimes[kind].set_deadline(60.0)
     ops, extra, ordinal = [], [], {kind: 0 for kind in runtimes}
     for layer, kind in enumerate(kinds):
         _seed_layer(layer)
+        n = ordinal[kind]
+        ordinal[kind] += 1
+        if kind == "head":
+            ops.append(
+                FlashHeadOp(runtimes[kind], cl.head_weights(rank, tp, device), n)
+            )
+            extra.append({})
+            continue
+        if kind in ("dense", "embed"):
+            ffn = cl.dense_weights(rank, tp, device, shuffled)
+            attn = cl.kda_weights(rank, tp, device)
+            state, idx = cl.kda_state(rows, tp, device)
+            embedding = cl.embedding(rank, tp, device)[0] if kind == "embed" else None
+            op = FlashLayerOp(runtimes[kind], ffn, n, kda=attn, embedding=embedding)
+            ops.append(op)
+            kw = dict(state=state, state_idx=idx)
+            if embedding is not None:
+                kw["step"] = cl.step_inputs(rows, rows, tp, device)
+            extra.append(kw)
+            continue
         ffn = cl.ffn_weights(rank, tp, device)
         if kind == "kda":
             attn = cl.kda_weights(rank, tp, device)
             state, idx = cl.kda_state(rows, tp, device)
-            ops.append(FlashLayerOp(runtimes[kind], ffn, ordinal[kind], kda=attn))
+            ops.append(FlashLayerOp(runtimes[kind], ffn, n, kda=attn))
             extra.append(dict(state=state, state_idx=idx))
         else:
             attn = cl.dsa_weights(rank, tp, device)
             if shuffled:
                 attn = cl.shuffled_copy(attn)
             caches, table, pt = cl.dsa_caches(rows, device, [args.pos + 1] * rows)
-            ops.append(FlashLayerOp(runtimes[kind], ffn, ordinal[kind], dsa=attn))
+            ops.append(FlashLayerOp(runtimes[kind], ffn, n, dsa=attn))
             extra.append(dict(caches=caches, rows=table, page_table=pt))
-        ordinal[kind] += 1
     cl._gen = _GEN
     return runtimes, ops, extra
 
@@ -92,11 +126,23 @@ def _time(args, rows: int, rank: int, tp: int, group, device) -> None:
     kinds = _kinds(args)
     runtimes, ops, extra = _build(args, kinds, rows, rank, tp, group, device)
     x, res, post, comb = cl.layer_inputs(rows, device)
+    # layer 0's input besides its tokens: every stream a copy of the embedding row
+    entry = (
+        torch.zeros_like(x),
+        torch.zeros_like(res),
+        torch.ones_like(post),
+        torch.zeros_like(comb),
+    )
 
     def step():
         h = (x, res, post, comb)
-        for op, kw in zip(ops, extra):
-            h = op.launch(*h, **kw)
+        for op, kw, kind in zip(ops, extra, kinds):
+            if kind == "embed":
+                h = op.launch(*entry, **kw)
+            elif kind == "head":
+                op.launch(*(h if args.kind == "full" else (x, res, post, comb)))
+            else:
+                h = op.launch(*h, **kw)
         for rt in runtimes.values():
             rt.advance_step()
 
@@ -151,14 +197,18 @@ def _time(args, rows: int, rank: int, tp: int, group, device) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--kind", choices=("kda", "dsa", "model"), default="model")
+    ap.add_argument(
+        "--kind",
+        choices=("kda", "dsa", "dense", "embed", "head", "model", "full"),
+        default="model",
+    )
     ap.add_argument("--rows", default="2,4,8", help="comma-separated widths")
-    ap.add_argument("--layers", type=int, default=12, help="launches (kda, dsa)")
+    ap.add_argument("--layers", type=int, default=12, help="launches of one kind")
     ap.add_argument("--reps", type=int, default=200, help="graph replays a trial")
     ap.add_argument("--trials", type=int, default=7)
     ap.add_argument("--pos", type=int, default=2047, help="sparse-attention position")
     ap.add_argument("--max-pools", type=int, default=262144, help="1M-token context")
-    ap.add_argument("--row-major", action="store_true", help="row-major FP8 copies")
+    ap.add_argument("--row-major", action="store_true", help="row-major FP8 weights")
     args = ap.parse_args()
     rank, tp = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))

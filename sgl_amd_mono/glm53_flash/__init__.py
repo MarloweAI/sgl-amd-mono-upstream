@@ -13,6 +13,8 @@ origin.
 HF_CONFIG = dict(
     model_type="glm5_next_text",
     hidden_size=4096,
+    vocab_size=154880,
+    intermediate_size=12288,
     n_routed_experts=288,
     num_experts_per_tok=8,
     n_shared_experts=1,

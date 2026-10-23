@@ -22,6 +22,7 @@ from .config import (
     TOP_K,
     TOPK_TOKENS,
     V_DIM,
+    VOCAB,
     FlashShard,
 )
 from .tiles import (
@@ -35,6 +36,10 @@ from .tiles import (
 IN_TILE = 16
 FGB_TILE = 16 * WAVES
 O_TILE = 16
+# a dense up/gate task: 16 gate rows and the same 16 up rows, the whole K
+DUG_TILE = 16
+# an LM-head tile: 16 vocabulary rows, the whole K
+HEAD_TILE = 16
 
 # sparse attention: q_a | kv_a (FP8) then wk | weights_proj | kpool gate (bf16)
 QKV_TILE = 16
@@ -91,6 +96,30 @@ DSA_TAB = (
     "idx_block_pools",
     "tail_block_elems",
 )
+# entries of the int64 step-input table of a launch from the step's tokens: the token
+# ids (int32 words an id), this rank's embedding rows and the vocabulary range they
+# hold, the step's positions, MLA slots and request rows (words an entry), its row
+# count, and the KDA slot and row tables the step's later launches read
+STEP_TAB = (
+    "ids",
+    "ids_words",
+    "emb",
+    "vocab_lo",
+    "vocab_hi",
+    "positions",
+    "positions_words",
+    "out_cache_loc",
+    "loc_words",
+    "req_pool_indices",
+    "rpi_words",
+    "n_rows",
+    "slots",
+    "rows",
+)
+# the step-input table's int32 entries (the rest are pointers)
+STEP_COUNTS = frozenset(
+    name for name in STEP_TAB if name.endswith(("_words", "_lo", "_hi", "_rows"))
+)
 
 N_ROW_TILES = HIDDEN // ROW_TILE
 # mix projection outputs (pre, post, comb) plus one sum of squares a tile
@@ -141,12 +170,39 @@ def layout(
     kda: bool = False,
     dsa: bool = False,
     max_pools: int = 0,
+    dense: bool = False,
+    head: bool = False,
+    x_in: bool = False,
 ):
-    """Byte offsets of the per-rank scratch and the symmetric peer buffer."""
+    """Byte offsets of the per-rank scratch and the symmetric peer buffer (with
+    ``x_in`` a region for the ranks' partials of the layer input)."""
     from sgl_amd_mono.common.guard import FLAG_BYTES
 
     pair_bytes = 8
     shard = FlashShard(npes)
+    if head:
+        # the contracted rows (bf16 pairs) and their tiles' sums of squares; every
+        # rank's logits (bf16 pairs, [S, VOCAB]) in the symmetric buffer, in two slots
+        # by launch parity: a peer's next tail never writes the slot a slow rank
+        # still gathers
+        scratch, offset = {}, 0
+        for name, size in (
+            ("hc", samples * HIDDEN // 2 * pair_bytes),
+            ("hss", samples * N_ROW_TILES * pair_bytes),
+        ):
+            scratch[name] = offset
+            offset += _align(size)
+        scratch["_bytes"] = offset
+        logits = _align(samples * VOCAB // 2 * pair_bytes)
+        return scratch, {
+            "logits": 0,
+            "_logits_stride": logits,
+            "attn": 0,
+            "ffn": 0,
+            "_part_stride": 0,
+            "flags": 2 * logits,
+            "_bytes": 2 * logits + FLAG_BYTES,
+        }
     items = []
     if kda or dsa:
         items = [
@@ -191,18 +247,23 @@ def layout(
         ("a", samples * HIDDEN // 2 * pair_bytes),
         ("a_rdy", samples * pair_bytes),
     ]
-    items += [
-        ("scores", samples * N_EXPERTS * pair_bytes),
-        ("xq", samples * HIDDEN // 4 * pair_bytes),
-        ("xqs", samples * XQ_GROUPS * pair_bytes),
-        ("sel", samples * MOE_SLOTS * pair_bytes),
-        ("prob", samples * MOE_SLOTS * pair_bytes),
-        # the shared expert's mid (f32); the routed slots' mid as MXFP8 (4 values a
-        # word) and its E8M0 block exponents, indexed (row, slot) like the shared one's
-        ("mid", samples * inter * pair_bytes),
-        ("midq", samples * MOE_SLOTS * inter // 4 * pair_bytes),
-        ("midqs", samples * MOE_SLOTS * (inter // 32) * pair_bytes),
-    ]
+    if dense:
+        # the dense MLP's mid (bf16 pairs)
+        items += [("dmid", samples * shard.dense_inter // 2 * pair_bytes)]
+    else:
+        items += [
+            ("scores", samples * N_EXPERTS * pair_bytes),
+            ("xq", samples * HIDDEN // 4 * pair_bytes),
+            ("xqs", samples * XQ_GROUPS * pair_bytes),
+            ("sel", samples * MOE_SLOTS * pair_bytes),
+            ("prob", samples * MOE_SLOTS * pair_bytes),
+            # the shared expert's mid (f32); the routed slots' mid as MXFP8 (4 values
+            # a word) and its E8M0 block exponents, indexed (row, slot) like the
+            # shared one's
+            ("mid", samples * inter * pair_bytes),
+            ("midq", samples * MOE_SLOTS * inter // 4 * pair_bytes),
+            ("midqs", samples * MOE_SLOTS * (inter // 32) * pair_bytes),
+        ]
     assert len({name for name, _ in items}) == len(items), "mailbox names"
     offset, scratch = 0, {}
     for name, size in items:
@@ -212,19 +273,31 @@ def layout(
 
     part = npes * samples * HIDDEN * pair_bytes
     region = 2 * part
-    symmetric = {
-        "attn": 0,
-        "ffn": region,
-        "_part_stride": part,
-        # the guard's error flags: rank r writes word r of every rank's flags
-        "flags": 2 * region,
-        "_bytes": 2 * region + FLAG_BYTES,
-    }
+    # the attention partials, the FFN (MoE or MLP) partials and, with ``x_in``, the
+    # layer input's partials: a region each, so no two exchanges of one launch share
+    # a word
+    names = ("attn", "ffn", "xin") if x_in else ("attn", "ffn")
+    symmetric = {name: k * region for k, name in enumerate(names)}
+    end = len(names) * region
+    symmetric.update(
+        {
+            "_part_stride": part,
+            # the guard's error flags: rank r writes word r of every rank's flags
+            "flags": end,
+            "_bytes": end + FLAG_BYTES,
+        }
+    )
     return scratch, symmetric
 
 
 def stage_tasks(
-    samples: int, inter: int, npes: int = 1, kda: bool = False, dsa: bool = False
+    samples: int,
+    inter: int,
+    npes: int = 1,
+    kda: bool = False,
+    dsa: bool = False,
+    dense: bool = False,
+    head: bool = False,
 ):
     """``(stage name, CTA slots)`` pairs in execution order: a stage's first task runs
     on the CTA after the previous stages' slots. ``iscore`` is sized per row at run
@@ -232,6 +305,8 @@ def stage_tasks(
     the regular splits on their CTAs and take no slots, and the split keeps the slots
     of 8-head tasks (tasks of 16 heads use the first half)."""
     shard = FlashShard(npes)
+    if head:
+        return [("hpost", N_ROW_TILES), ("lmhead", BLOCKS), ("gather", BLOCKS)]
     attention = []
     if dsa:
         H = shard.mla_heads
@@ -260,6 +335,13 @@ def stage_tasks(
             ("fgb", 2 * shard.kda_proj // FGB_TILE),
             ("kda", samples * shard.kda_heads),
             ("oproj", HIDDEN // O_TILE),
+        ]
+    if dense:
+        return attention + [
+            ("seam", N_ROW_TILES),
+            ("gate", samples),
+            ("dug", shard.dense_inter // DUG_TILE),
+            ("down", HIDDEN // dn_tile(samples)),
         ]
     return attention + [
         ("seam", N_ROW_TILES),
