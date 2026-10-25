@@ -709,10 +709,13 @@ def check_keys(args, rank, tp, group, device) -> bool:
         out = op.launch(x, res, post, comb, caches=c, rows=table, page_table=pt)
         rt.advance_step()
         torch.cuda.synchronize()
-        sel = rt.scratch[rt.sc["tok_sel"] :].view(torch.int32)[: rows * SEL_STRIDE]
-        return out[1].clone(), sel.view(rows, SEL_STRIDE).clone()
+        sel = rt.scratch[rt.sc["tok_sel"] :].view(torch.int32)[: 2 * rows * SEL_STRIDE]
+        return out[1].clone(), sel.view(rows, SEL_STRIDE, 2).clone()
 
     base, sel = run(caches.kv_cache.clone())
+    # (token, launch tag) pairs; kv_ready holds this launch's tag
+    tags = rt.scratch[rt.sc["kv_ready"] :].view(torch.int32)[1 : 2 * rows : 2].clone()
+    sel, sel_tags = sel[..., 0], sel[..., 1]
     g = _gen(30, device)
     ok = True
     for r, n in enumerate(KEY_LENS):
@@ -731,12 +734,13 @@ def check_keys(args, rank, tp, group, device) -> bool:
             tail_ok = sel[r, TOPK_TOKENS : TOPK_TOKENS + tail].tolist() == [
                 bound * KPOOL + i for i in range(tail)
             ]
+            tagged = bool((sel_tags[r, : TOPK_TOKENS + tail] == tags[r]).all())
             print(
                 f"rank {rank} row {r} ({n} tokens): 512 whole distinct pools "
-                f"{whole and distinct}, tail {tail_ok}",
+                f"{whole and distinct}, tail {tail_ok}, tagged {tagged}",
                 flush=True,
             )
-            ok = ok and whole and distinct and tail_ok
+            ok = ok and whole and distinct and tail_ok and tagged
             victims = picked[TOPK_TOKENS - tail : TOPK_TOKENS].tolist()
             unpicked = sorted(set(range(bound)) - set(ids.tolist()))
             spare = unpicked[0] * KPOOL

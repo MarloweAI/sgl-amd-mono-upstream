@@ -2686,7 +2686,6 @@ def build_flash_kernel(key: FlashBuild):
         def dsa_iselect(tv, t32):
             hist = fx.recast_iter(fx.Int32, xs)
             r_scores = _rsrc(mb("iscores"))
-            r_sel = _rsrc(mb("tok_sel"))
 
             def radix_key(bits):
                 return (bits >= 0).select(bits ^ fx.Int32(-(2**31)), ~bits)
@@ -2870,23 +2869,21 @@ def build_flash_kernel(key: FlashBuild):
                                 )
 
                     def publish_all():
-                        """red[0 .. 512) holds the pools; write the row's tokens."""
+                        """red[0 .. 512) holds the pools; write the row's tokens, tagged."""
                         gpu.barrier()
                         for b in range_constexpr(TOPK_TOKENS // THREADS):
                             j = tid + b * THREADS
                             pool = lds_ld(red, j // KPOOL).bitcast(fx.Int32)
-                            bo.buffer_store(
-                                pool * KPOOL + j % KPOOL,
-                                r_sel,
+                            put(
+                                mb("tok_sel"),
                                 s * SEL_STRIDE + j,
-                                cache_modifier=CM_DEV,
+                                pool * KPOOL + j % KPOOL,
                             )
                         if tid < (pos + 1) - bound * KPOOL:
-                            bo.buffer_store(
-                                bound * KPOOL + tid,
-                                r_sel,
+                            put(
+                                mb("tok_sel"),
                                 s * SEL_STRIDE + TOPK_TOKENS + tid,
-                                cache_modifier=CM_DEV,
+                                bound * KPOOL + tid,
                             )
 
                     def candidates(level, prefix, remain, n_cand):
@@ -3113,12 +3110,6 @@ def build_flash_kernel(key: FlashBuild):
                             candidates(8, p24, r24, c24)
                         if c24 > SEL_CAP:
                             full_radix()
-                    # the tokens are device-scope stores: their completion releases
-                    # them
-                    rocdl.s_waitcnt(vmcnt=0)
-                    gpu.barrier()
-                    if tid == 0:
-                        put(mb("tok_ready"), s, fx.Int32(1))
 
         # ================= sparse MLA split: 64 selected keys x HT heads a task
         # Scored rows attend to the tokens the index selected plus their tail, other
@@ -3172,29 +3163,22 @@ def build_flash_kernel(key: FlashBuild):
                         )
 
                     kidx = t * SPLIT_KEYS + lane
-                    # A task that reads the selection waits for it: one lane polls the
-                    # selection's and the cache's flags; its divergent poll reconverges
-                    # before wave 0's acquire, and the barrier below orders the other
-                    # waves' loads after it. Any other task knows its tokens and
-                    # gathers them at once; of those only the row's own token (its
-                    # last key) is written by this launch's cache task, and it is read
-                    # again once kv_ready is in.
+                    # A task that reads the selection waits for it: wave 0 polls its 64
+                    # tagged tokens and the cache's flag together, then acquires; the
+                    # barrier below orders the other waves' loads after it. Any other task
+                    # knows its tokens and gathers them at once; of those only the row's
+                    # own token (its last key) is written by this launch's cache task, and
+                    # it is read again once kv_ready is in.
                     if picked_keys:
                         if wave == 0:
-                            if lane == 0:
-                                poll([(mb("tok_ready"), s, 1), (mb("kv_ready"), s, 1)])
+                            picked = poll(
+                                [
+                                    (mb("tok_sel"), s * SEL_STRIDE + kidx, 1),
+                                    (mb("kv_ready"), s, 1),
+                                ]
+                            )[0][0]
                             fx.memory_fence(
                                 ordering=fx.AtomicOrdering.Acquire, syncscope="agent"
-                            )
-                        if wave == 0:
-                            picked = fx.Int32(
-                                bo.buffer_load(
-                                    _rsrc(mb("tok_sel")),
-                                    s * SEL_STRIDE + kidx,
-                                    vec_width=1,
-                                    dtype=T.i32,
-                                    cache_modifier=CM_DEV,
-                                )
                             )
                             resolve((kidx < nk).select(picked, fx.Int32(0)))
                     else:
