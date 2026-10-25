@@ -1854,10 +1854,14 @@ def build_flash_kernel(key: FlashBuild):
         # One task a (row, head). A row whose state index is not positive (padding)
         # writes no state and outputs zeros.
         QO, KO, VO, G1O, G2O, OO, DO = 0, KD, 2 * KD, 3 * KD, 4 * KD, 5 * KD, 6 * KD
-        # at 8 rows the new states are stored after the output, the conv inputs
-        # kept in LDS words XO .. until then
-        STATES_LAST = S > 4
-        XO = 7 * KD
+        # at 2 rows (TP4 and TP8: slower at TP2) a kda CTA runs its o_proj task right
+        # after the head's output, then stores the new states; at 8 rows the states also
+        # follow the output. The conv inputs wait in LDS words XO .. (with o_proj, past
+        # its staged rows)
+        OPROJ_IN_KDA = S <= 2 and W > 2
+        STATES_LAST = OPROJ_IN_KDA or S > 4
+        XO = X_WORDS - 3 * KD if OPROJ_IN_KDA else 7 * KD
+        assert not OPROJ_IN_KDA or XO >= max(7 * KD, S * P // 2)
 
         def conv_at(ch, j):
             """Element of channel ``ch``, tap ``j`` in a conv state slot, laid out
@@ -1866,7 +1870,9 @@ def build_flash_kernel(key: FlashBuild):
                 return ch * (CONV_TAPS - 1) + j
             return j * (3 * P) + ch
 
-        def run_kda():
+        def run_kda(then):
+            """``then``: the CTA's o_proj task, run between the head's output and its
+            state write-back with ``OPROJ_IN_KDA``."""
             r_cw = _rsrc(conv_w)
             r_alog = _rsrc(a_log)
             r_dtb = _rsrc(dt_bias)
@@ -2007,6 +2013,8 @@ def build_flash_kernel(key: FlashBuild):
                     # the head's word in every o_proj CTA's box, after its stores
                     signal("box_o_in", t)
                 gpu.barrier()
+                if const_expr(OPROJ_IN_KDA):
+                    then()
                 if const_expr(STATES_LAST):
                     if valid:
                         store_rec()
@@ -2024,11 +2032,15 @@ def build_flash_kernel(key: FlashBuild):
         # One task a 16-row tile of the row-major [HIDDEN, K] weight; the FFN seam
         # sums the TP partials as it does vLLM's. ``unit_of(row0, chunk)`` issues
         # one K chunk (``cpw`` a wave, prefetched ``ahead`` at a time) of the weight.
-        def run_oproj(unit_of, K, cpw, ahead):
+        def run_oproj(unit_of, K, cpw, ahead, done=None):
+            """``done``: the CTA ran its task already (inside its kda task)."""
             attn_base = fx.Int64(SY["attn"]) + fx.Int64(peer_slot) * fx.Int64(
                 SY["_part_stride"]
             )
-            for t in range(start("oproj"), HIDDEN // O_TILE, G):
+            t0 = start("oproj")
+            if const_expr(done is not None):
+                t0 = done.select(fx.Int32(HIDDEN // O_TILE), t0)
+            for t in range(t0, HIDDEN // O_TILE, G):
                 t = fx.Int32(t)
                 row0 = t * O_TILE
 
@@ -3783,15 +3795,22 @@ def build_flash_kernel(key: FlashBuild):
             run_gate("agate", "attn", early_gate)
             run_inproj()
             run_fgb()
-            run_kda()
-            run_oproj(
-                lambda row0, kc: unit_rm(
-                    r_wo_kda, row0, kc, P, HIDDEN, n_sel() * (P // 2) + kc * 32
-                ),
-                P,
-                O_CPW,
-                min(4, O_CPW),
-            )
+
+            def kda_oproj(done=None):
+                run_oproj(
+                    lambda row0, kc: unit_rm(
+                        r_wo_kda, row0, kc, P, HIDDEN, n_sel() * (P // 2) + kc * 32
+                    ),
+                    P,
+                    O_CPW,
+                    min(4, O_CPW),
+                    done,
+                )
+
+            # a CTA with a kda task (at most one) runs its o_proj task inside it
+            assert S * H <= G
+            run_kda(kda_oproj)
+            kda_oproj(start("kda") < S * H if OPROJ_IN_KDA else None)
             run_seam("seam", "ffn_own")
         elif const_expr(dsa):
             run_dsa()
