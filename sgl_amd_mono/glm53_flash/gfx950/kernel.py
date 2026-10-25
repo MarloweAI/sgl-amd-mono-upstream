@@ -1564,15 +1564,26 @@ def build_flash_kernel(key: FlashBuild):
                 li, rstd, gam, rinv = gate_row(
                     stage, "aseam" if attn else "seam", s, attn, misc, early
                 )
-                for q in range_constexpr(CPT // 2):
-                    put(
-                        a_out,
-                        (s * HIDDEN + tid * CPT + 2 * q) // 2,
-                        bf16_pair(
-                            li[2 * q] * rstd * gam[2 * q],
-                            li[2 * q + 1] * rstd * gam[2 * q + 1],
-                        ),
+                pairs = [
+                    bf16_pair(
+                        li[2 * q] * rstd * gam[2 * q],
+                        li[2 * q + 1] * rstd * gam[2 * q + 1],
                     )
+                    for q in range(CPT // 2)
+                ]
+                if const_expr(attn):
+                    # plain words, released by their drain before the box word
+                    bo.buffer_store(
+                        fx.Vector.from_elements(
+                            [p.bitcast(fx.Int32) for p in pairs], fx.Int32
+                        ),
+                        _rsrc(a_out),
+                        (s * HIDDEN + tid * CPT) // 2,
+                        cache_modifier=CM_DEV,
+                    )
+                else:
+                    for q in range_constexpr(CPT // 2):
+                        put(a_out, (s * HIDDEN + tid * CPT + 2 * q) // 2, pairs[q])
                 if const_expr(not attn and not dense):
                     # the row's MXFP8 blocks for the experts: a 32-value block is 4
                     # threads' values (as rounded to bf16 in the row)
@@ -1593,6 +1604,8 @@ def build_flash_kernel(key: FlashBuild):
                     if tid % (32 // CPT) == 0:
                         put(mb("xqs"), s * XQ_GROUPS + tid // (32 // CPT), exponent)
                 # the row's word in every CTA's box, after every thread's stores of it
+                if const_expr(attn):
+                    rocdl.s_waitcnt(vmcnt=0)
                 gpu.barrier()
                 if _uniform(wave) == 0:
                     signal("box_a_in" if attn else "box_a", s)
@@ -1700,6 +1713,31 @@ def build_flash_kernel(key: FlashBuild):
                     for j in range_constexpr(2):
                         lds_st(xs, q * 2 + j, v[j].bitcast(fx.Float32))
 
+        def stage_plain(base, K):
+            """``stage_rows`` for a mailbox of plain words (packed bf16 pairs) its box
+            releases: one read, 16 bytes a load."""
+            nl = S * K // 8 // THREADS
+            assert nl * THREADS * 8 == S * K
+            r = _rsrc(base)
+            for g0 in range_constexpr(0, nl, STAGE_GROUP):
+                group = range(g0, min(g0 + STAGE_GROUP, nl))
+                got = [
+                    fx.Vector(
+                        bo.buffer_load(
+                            r,
+                            (tid + i * THREADS) * 4,
+                            vec_width=4,
+                            dtype=T.i32,
+                            cache_modifier=CM_DEV,
+                        )
+                    )
+                    for i in group
+                ]
+                for k, i in enumerate(group):
+                    fx.ptr_store(
+                        got[k].bitcast(fx.Float32), xs + (tid + i * THREADS) * 4
+                    )
+
         def wait_ready(box, row=None):
             """Wave 0 waits for every row's word (or row ``row``'s) in this CTA's
             line of ``box`` (a broadcast row's word is set after its stores), so the
@@ -1751,7 +1789,7 @@ def build_flash_kernel(key: FlashBuild):
                 # the CTA's first task stages every row; a later task reuses them
                 if const_expr(k == 0):
                     wait_ready("box_a_in")
-                    stage_rows(mb("a_in"), HIDDEN)
+                    stage_plain(mb("a_in"), HIDDEN)
                     gpu.barrier()
                 acc = run_units(lambda c: unit_of(row0, c), IN_CPW, IN_AHEAD, pre)
                 nxt = (
@@ -2199,7 +2237,7 @@ def build_flash_kernel(key: FlashBuild):
 
                 pre = [u8(c) for c in range(4)]
                 wait_ready("box_a_in")
-                stage_rows(mb("a_in"), HIDDEN)
+                stage_plain(mb("a_in"), HIDDEN)
                 gpu.barrier()
                 acc = run_units(u8, QKV_CPW, 4, pre)
 
@@ -2234,7 +2272,7 @@ def build_flash_kernel(key: FlashBuild):
 
                 pre = [ub(c) for c in range(4)]
                 wait_ready("box_a_in")
-                stage_rows(mb("a_in"), HIDDEN)
+                stage_plain(mb("a_in"), HIDDEN)
                 gpu.barrier()
                 acc = run_units(ub, IDX_CPW, 4, pre)
 
