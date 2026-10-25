@@ -202,7 +202,10 @@ class FlashRuntime:
         self.launch, self.sc, self.sy = build_flash_kernel(key)
         self.peer = PeerBuffer(self.sy["_bytes"], group, rank, key.tp, device)
         self.peer.bytes.zero_()
-        self.scratch = torch.zeros(self.sc["_bytes"], dtype=torch.uint8, device=device)
+        # the hand-off mailboxes, uncached as the peer buffer is: a line is read at its
+        # home memory, not through the producer's L2
+        self._scratch = PeerBuffer(self.sc["_bytes"], group, rank, 1, device)
+        self.scratch = self._scratch.bytes
         self.epoch = torch.zeros(guard.GUARD_WORDS, dtype=torch.int32, device=device)
         # the tail's gathered logits; a layer's two output sets, by layer parity: a
         # layer never writes what it reads
@@ -244,6 +247,8 @@ class FlashRuntime:
         self.epoch[:1].add_(1)
 
     def close(self) -> None:
+        self.scratch = None
+        self._scratch.close()
         self.peer.close()
 
 
