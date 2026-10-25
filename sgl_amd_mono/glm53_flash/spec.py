@@ -76,6 +76,7 @@ SGLANG_READS = {
         "enable_linear_replayssm",
         "enable_hisparse",
         "expert_distribution_recorder_mode",
+        "watchdog_timeout",
     ),
     "srt/configs/glm5_next.py": (
         "num_hidden_layers",
@@ -165,6 +166,7 @@ SGLANG_READS = {
         "copies",
     ),
     "srt/runtime_context.py": (
+        "get_device",
         "get_parallel",
         "process_model_config",
         '"tp_rank"',
@@ -634,6 +636,15 @@ class _Built:
         )
 
 
+def _deadline(key, deadline_s: float, longest_s: int) -> float:
+    """A step's first launch waits up to half the watchdog, at most ``longest_s``."""
+    from sglang.srt.runtime_context import get_device
+
+    if not key.tokens:
+        return deadline_s
+    return min(max(deadline_s, 0.5 * get_device().watchdog_timeout), longest_s)
+
+
 def _build(model, hf_config, ctx) -> _Built:
     from sglang.srt.runtime_context import get_parallel, process_model_config
 
@@ -725,7 +736,10 @@ def _build(model, hf_config, ctx) -> _Built:
 
     def runtime(key):
         rt = FlashRuntime(key, rank, p.tp_group.cpu_group, device)
-        rt.set_deadline(ctx.deadline_s)
+        # at most the guard's longest deadline, in whole seconds
+        rt.set_deadline(
+            _deadline(key, ctx.deadline_s, guard.MAX_DEADLINE_TICKS // guard.CLOCK_HZ)
+        )
         return rt
 
     # each runtime's peer handshake is collective: every rank builds them in one order

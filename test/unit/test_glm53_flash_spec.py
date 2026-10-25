@@ -4,6 +4,7 @@ cap, the tail's logits in place of the logits processor's, its registry entry, i
 config and model refusal reasons, and the dense, embedding and LM-head views. SGLang
 checks its declared requirements, the same way for every spec."""
 
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -432,6 +433,36 @@ def test_the_check_rejects_an_output_it_does_not_list():
 
     with pytest.raises(ValueError, match="dense.mlp_out.rel"):
         check._report("layer 1", {"dense.mlp_out.rel": 0.0})
+
+
+def test_a_step_s_first_launch_waits_up_to_half_the_watchdog(monkeypatch):
+    import sglang.srt.runtime_context as runtime_context
+
+    try:
+        from sglang.srt.kernel_plugins.amd.binding import deadline_s
+    except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
+        from sglang.srt.monokernels.guards import deadline_s
+
+    first, other = SimpleNamespace(tokens=True), SimpleNamespace(tokens=False)
+    longest = 5497  # the guard's longest deadline, in whole seconds
+    # SGLang's default watchdog, the serving test's and the fault test's; a watchdog
+    # past twice the longest deadline, and none
+    cases = (
+        (300, 150.0),
+        (600, 300.0),
+        (20, 10.0),
+        (11100, longest),
+        (math.inf, longest),
+    )
+    for watchdog, entry in cases:
+        monkeypatch.setattr(
+            runtime_context,
+            "get_device",
+            lambda w=watchdog: SimpleNamespace(watchdog_timeout=w),
+        )
+        deadline = deadline_s(watchdog)
+        assert flash._deadline(first, deadline, longest) == entry
+        assert flash._deadline(other, deadline, longest) == deadline
 
 
 class _Op:
