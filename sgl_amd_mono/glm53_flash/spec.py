@@ -76,6 +76,7 @@ SGLANG_READS = {
         "enable_linear_replayssm",
         "enable_hisparse",
         "expert_distribution_recorder_mode",
+        "watchdog_timeout",
     ),
     "srt/configs/glm5_next.py": (
         "num_hidden_layers",
@@ -165,6 +166,7 @@ SGLANG_READS = {
         "copies",
     ),
     "srt/runtime_context.py": (
+        "get_device",
         "get_parallel",
         "process_model_config",
         '"tp_rank"',
@@ -634,6 +636,18 @@ class _Built:
         )
 
 
+def _deadline(key, deadline_s: float) -> float:
+    """The wait deadline of the launch ``key``. The ranks meet in a step's first
+    launch (layer 0, from the tokens) after their hosts' work between steps, which can
+    take long (a first-use JIT build behind a file lock): there it is half the
+    watchdog timeout, the framework's deadline without its 60 s cap."""
+    from sglang.srt.runtime_context import get_device
+
+    if not key.tokens:
+        return deadline_s
+    return max(deadline_s, 0.5 * get_device().watchdog_timeout)
+
+
 def _build(model, hf_config, ctx) -> _Built:
     from sglang.srt.runtime_context import get_parallel, process_model_config
 
@@ -725,7 +739,7 @@ def _build(model, hf_config, ctx) -> _Built:
 
     def runtime(key):
         rt = FlashRuntime(key, rank, p.tp_group.cpu_group, device)
-        rt.set_deadline(ctx.deadline_s)
+        rt.set_deadline(_deadline(key, ctx.deadline_s))
         return rt
 
     # each runtime's peer handshake is collective: every rank builds them in one order

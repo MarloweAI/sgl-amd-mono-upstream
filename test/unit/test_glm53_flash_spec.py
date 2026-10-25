@@ -434,6 +434,27 @@ def test_the_check_rejects_an_output_it_does_not_list():
         check._report("layer 1", {"dense.mlp_out.rel": 0.0})
 
 
+def test_a_step_s_first_launch_waits_up_to_half_the_watchdog(monkeypatch):
+    import sglang.srt.runtime_context as runtime_context
+
+    try:
+        from sglang.srt.kernel_plugins.amd.binding import deadline_s
+    except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
+        from sglang.srt.monokernels.guards import deadline_s
+
+    first, other = SimpleNamespace(tokens=True), SimpleNamespace(tokens=False)
+    # SGLang's default watchdog, the serving test's and the fault test's
+    for watchdog, entry in ((300, 150.0), (600, 300.0), (20, 10.0)):
+        monkeypatch.setattr(
+            runtime_context,
+            "get_device",
+            lambda w=watchdog: SimpleNamespace(watchdog_timeout=w),
+        )
+        deadline = deadline_s(watchdog)
+        assert flash._deadline(first, deadline) == entry
+        assert flash._deadline(other, deadline) == deadline
+
+
 class _Op:
     """A layer's launch: records its call, returns its four outputs (x is the input's
     plus one)."""
