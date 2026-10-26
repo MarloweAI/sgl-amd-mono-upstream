@@ -528,6 +528,12 @@ def build_flash_kernel(key: FlashBuild):
                 fx.BFloat16(bo.buffer_load(r, i, vec_width=1, dtype=T.bf16))
             )
 
+        def ld_bf16s(r, elem, n):
+            """bf16 elements elem .. elem + n - 1 (n of 4 or 8, elem a multiple of n)
+            of a plain tensor -> n f32, in one load."""
+            w = fx.Vector(bo.buffer_load(r, elem // 2, vec_width=n // 2, dtype=T.i32))
+            return [v for e in range(n // 2) for v in bf2_f32(w[e])]
+
         def ld_pair(r, elem):
             """bf16 elements elem, elem + 1 (elem even) of a plain tensor -> 2 f32."""
             return bf2_f32(
@@ -1373,11 +1379,15 @@ def build_flash_kernel(key: FlashBuild):
         # misc words of the mix scales (3) and biases (N_MIX), past the mix sums
         SCW = 32
         HBW = SCW + 4
+        # a row's mix partials (every tile's), staged in LDS words 0 .. PM_WORDS
+        PM_WORDS = N_ROW_TILES * PMIX
+        PM_LOADS = PM_WORDS // 2
+        assert PM_WORDS % 2 == 0 and PM_WORDS + HBW + N_MIX <= X_WORDS
 
         def gate_early():
             """The attention gate's constants, loaded at launch start: this thread's norm
             weights, a mix scale and a mix bias (clamped thread indices)."""
-            gam = [ld_bf16(_rsrc(g_in), tid * CPT + q) for q in range(CPT)]
+            gam = ld_bf16s(_rsrc(g_in), tid * CPT, CPT)
             sc = ld_f32(_rsrc(hc_a_scale), fx.min(tid, 2))
             bs = ld_f32(_rsrc(hc_a_base), fx.min(tid, N_MIX - 1))
             return gam, sc, bs
@@ -1399,7 +1409,7 @@ def build_flash_kernel(key: FlashBuild):
                 if tid < N_MIX:
                     lds_st(sums, HBW + tid, bs)
             else:
-                gam = [ld_bf16(r_g, tid * CPT + q) for q in range(CPT)]
+                gam = ld_bf16s(r_g, tid * CPT, CPT)
                 if tid < 3:
                     lds_st(sums, SCW + tid, ld_f32(r_scale, tid))
                 if tid < N_MIX:
@@ -1417,18 +1427,22 @@ def build_flash_kernel(key: FlashBuild):
                     for q in range(CPT // 4)
                 ]
             )
+            # every tile's mix partials of the row -> LDS words 0 .., two pairs a load
+            pm = [
+                fx.min(tid + i * THREADS, PM_LOADS - 1)
+                for i in range(-(-PM_LOADS // THREADS))
+            ]
+            got_pm = poll([(pmix, s * N_ROW_TILES * PMIX + 2 * q, 2) for q in pm])
+            for i, q in enumerate(pm):
+                for e in range_constexpr(2):
+                    lds_st(xs, 2 * q + e, got_pm[i][e].bitcast(fx.Float32))
+            gpu.barrier()
             if tid < PMIX * NP:
                 k = tid // NP
                 part = tid % NP
-                vals = getf_many(
-                    [
-                        (pmix, (s * N_ROW_TILES + part * TPP + q) * PMIX + k)
-                        for q in range(TPP)
-                    ]
-                )
-                tot = vals[0]
+                tot = lds_ld(xs, part * TPP * PMIX + k)
                 for q in range_constexpr(1, TPP):
-                    tot = tot + vals[q]
+                    tot = tot + lds_ld(xs, (part * TPP + q) * PMIX + k)
                 lds_st(red, k * NP + part, tot)
             gpu.barrier()
             if tid < PMIX:
@@ -2173,7 +2187,7 @@ def build_flash_kernel(key: FlashBuild):
                 s = fx.Int32(t)
                 live = tid < NQ4
                 e0 = fx.min(tid, NQ4 - 1) * 4
-                gam = [ld_bf16(r_gqa, e0 + j) for j in range(4)]
+                gam = ld_bf16s(r_gqa, e0, 4)
                 v2 = get2_many(
                     [(mb("qa"), s * Q_LORA + e0), (mb("qa"), s * Q_LORA + e0 + 2)]
                 )
@@ -3597,7 +3611,7 @@ def build_flash_kernel(key: FlashBuild):
                         tile_task(k + 1, tile + G, nxt)
 
             pre = ahead(t0)
-            gam = [ld_bf16(r_g, tid * CPT + q) for q in range(CPT)]
+            gam = ld_bf16s(r_g, tid * CPT, CPT)
             # the rows' rstd: wave s sums row s's tile sums (lanes l, l + 64), then the
             # wave in a fixed order
             if wave < S:
@@ -3823,7 +3837,7 @@ def build_flash_kernel(key: FlashBuild):
             # the gate's
             if const_expr(ROUTER_OWN_ROW):
                 li, rstd, gam, _ = gate_row(
-                    "router", "seam", router_sample, False, xs + HIDDEN // 2
+                    "router", "seam", router_sample, False, xs + PM_WORDS
                 )
                 for q in range_constexpr(CPT // 2):
                     lds_st(
