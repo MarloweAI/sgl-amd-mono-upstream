@@ -2241,10 +2241,17 @@ def build_glm5_monokernel(
         if const_expr(with_indexer):
             # The 128 CTAs without q_b work produce the other 128 index-query
             # tiles concurrently.  They reload q_a, but remove one full GEMV
-            # from the q_b CTAs' serialized critical path.
+            # from the q_b CTAs' serialized critical path.  The tile that would land
+            # on the cache task's CTA runs second on the CTA of the first extra tile
+            # instead: behind the cache task it would end last.
             N_INDEX_Q_EXTRA = INDEX_Q_ROWS // INDEX_TILE - N_QB
-            for tt in range(start("index_q"), N_INDEX_Q_EXTRA, G):
-                tt = fx.Int32(tt)
+            IQ_CACHE = (base["cache"] - base["index_q"]) % G
+            IQ_HOST = 0
+            # at TP4 the q_b CTAs run every index-query tile: there is no extra one
+            MOVED = IQ_CACHE < N_INDEX_Q_EXTRA
+            assert IQ_HOST != IQ_CACHE or not MOVED
+
+            def index_q_extra(tt):
                 iq_t = N_QB + tt
                 stamp("index_q", iq_t, 0)
 
@@ -2283,6 +2290,14 @@ def build_glm5_monokernel(
                         [lds_ld(outs, s * INDEX_TILE + r + j) for j in range(4)],
                     )
                 stamp("index_q", iq_t, 4)
+
+            for tt in range(start("index_q"), N_INDEX_Q_EXTRA, G):
+                tt = fx.Int32(tt)
+                if tt != IQ_CACHE:
+                    index_q_extra(tt)
+            if const_expr(MOVED):
+                if start("index_q") == IQ_HOST:
+                    index_q_extra(fx.Int32(IQ_CACHE))
 
         # ==================================== 4. absorbed query: q_lat = W_UK^T q_nope
         # 8 row groups (128 latent rows of one head) x 3 chunks: one row group per wave
