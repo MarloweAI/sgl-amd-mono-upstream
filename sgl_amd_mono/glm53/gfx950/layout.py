@@ -202,8 +202,7 @@ def layout(
             ("index_w", samples * INDEX_HEADS * pair_bytes),
             ("index_q", samples * INDEX_Q_ROWS // 2 * pair_bytes),
             ("index_scores", samples * index_max_seq * pair_bytes),
-            ("indices", samples * sparse_attention_topk * 4),
-            ("indices_ready", samples * pair_bytes),
+            ("indices", samples * sparse_attention_topk * pair_bytes),
             # parallel top-k: per slice a 4096-bin histogram and its ready pair, per
             # row the threshold (bin prefix, keys still needed, keys in the bin), per
             # slice its winners' positions, its (key, position) candidates and their

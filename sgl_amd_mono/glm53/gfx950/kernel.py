@@ -2585,7 +2585,6 @@ def build_glm5_monokernel(
                     prefix_mask |= 255 << shift
 
                 threshold = prefix
-                r_index_out = _rsrc(mb("indices"))
                 items = index_max_seq // THREADS
                 item_indices = [tid * items + j for j in range_constexpr(items)]
                 item_keys = [
@@ -2637,12 +2636,7 @@ def build_glm5_monokernel(
                 gpu.barrier()
                 for j in range_constexpr(items):
                     if gt[j]:
-                        bo.buffer_store(
-                            fx.Int32(item_indices[j]),
-                            r_index_out,
-                            s * topk + gt_offsets[j],
-                            cache_modifier=CM_DEV,
-                        )
+                        put(mb("indices"), s * topk + gt_offsets[j], item_indices[j])
                     if eq[j] & (eq_offsets[j] < topk):
                         lds_st(red, eq_offsets[j], item_indices[j].bitcast(fx.Float32))
                 gpu.barrier()
@@ -2650,31 +2644,17 @@ def build_glm5_monokernel(
                 for batch in range_constexpr((topk + THREADS - 1) // THREADS):
                     j = tid + batch * THREADS
                     if j >= bound:
-                        bo.buffer_store(
-                            fx.Int32(0),
-                            r_index_out,
-                            s * topk + j,
-                            cache_modifier=CM_DEV,
-                        )
+                        put(mb("indices"), s * topk + j, fx.Int32(0))
                     if j < need_eq:
                         i = lds_ld(red, j).bitcast(fx.Int32)
-                        bo.buffer_store(
-                            i, r_index_out, s * topk + out_gt + j, cache_modifier=CM_DEV
-                        )
-                # Every lane contributed compact indices.  Make all of those
-                # device-memory stores visible before lane 0 publishes the one
-                # readiness tag consumed by the attention CTAs.
-                fx.memory_fence(ordering=fx.AtomicOrdering.Release, syncscope="agent")
+                        put(mb("indices"), s * topk + out_gt + j, i)
                 gpu.barrier()
-                if tid == 0:
-                    put(mb("indices_ready"), s, fx.Int32(1))
                 stamp("index_select", s, 4)
 
         if const_expr(index_paged):
             r_index_cache = _rsrc(indices)
             r_out_indices = _rsrc(out_indices)
             r_index_scores = _rsrc(mb("index_scores"))
-            r_index_out = _rsrc(mb("indices"))
             hist = fx.recast_iter(fx.Int32, xs)
             N_PAGED_SPLIT = index_max_seq // INDEX_KEYS_PER_TASK
 
@@ -3330,9 +3310,7 @@ def build_glm5_monokernel(
 
                 def publish(p, i):
                     slot = index_block(req, i) * index_block_size + i % index_block_size
-                    bo.buffer_store(
-                        slot, r_index_out, s * topk + p, cache_modifier=CM_DEV
-                    )
+                    put(mb("indices"), s * topk + p, slot)
                     bo.buffer_store(
                         slot, r_out_indices, out_begin + p, cache_modifier=CM_DEV
                     )
@@ -3624,10 +3602,7 @@ def build_glm5_monokernel(
                         candidates(20, p12, r12, c12, collect=False)
                     if c12 > SEL_CAP:
                         overflow(p12, r12, polled=False)
-                fx.memory_fence(ordering=fx.AtomicOrdering.Release, syncscope="agent")
                 gpu.barrier()
-                if tid == 0:
-                    put(mb("indices_ready"), s, fx.Int32(1))
                 stamp("index_select", s, 4)
 
         # ================================== 5. sparse MLA split: 32 keys x 8 heads
@@ -3647,32 +3622,15 @@ def build_glm5_monokernel(
                 kv_len = pos0 + s + 1
                 sparse = kv_len > topk
                 nkeys = sparse.select(fx.Int32(topk), kv_len)
-            if const_expr(with_indexer):
-                if sparse:
-                    if wave == 0:
-                        if lane == 0:
-                            get(mb("indices_ready"), s)
-                        # Only wave 0 consumes the compact index payload; its
-                        # divergent ready poll reconverges before this acquire.
-                        fx.memory_fence(
-                            ordering=fx.AtomicOrdering.Acquire, syncscope="agent"
-                        )
             if wave == 0:
                 if lane < SPLIT_KEYS:
                     k_pos = t * SPLIT_KEYS + lane
                     k_cl = (k_pos < nkeys).select(k_pos, 0)
                     if const_expr(with_indexer):
+                        # the selected tokens are tagged pairs: each lane polls its own
                         idx = k_cl
                         if sparse:
-                            idx = fx.Int32(
-                                bo.buffer_load(
-                                    _rsrc(mb("indices")),
-                                    s * topk + k_cl,
-                                    vec_width=1,
-                                    dtype=T.i32,
-                                    cache_modifier=CM_DEV,
-                                )
-                            )
+                            idx = get(mb("indices"), s * topk + k_cl)
                         lds_st(attn_keys, lane, idx)
                     elif const_expr(use_atom_kv_cache):
                         idx = fx.Int32(0)

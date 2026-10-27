@@ -3,7 +3,9 @@
 spec builds at that TP size: each launch kind finishes on every rank with no error
 word and the same output, on the bf16 and the E4M3 MLA cache, and writes exactly its
 live rows' cache rows (none of a pad row's); a graph of the model order's first
-launches replays the eager step bitwise, for one request a row and for verify rows."""
+launches replays the eager step bitwise, for one request a row and for verify rows;
+and every selected token of a row past 2048 keys is a pair tagged with its indexer
+launch's tag that holds the slot the launch publishes."""
 
 import subprocess
 import sys
@@ -63,6 +65,9 @@ class TestMonoGlm53Kernels(CustomTestCase):
             "--rowsets",
             "p0,v4",
         )
+
+    def test_selected_tokens_carry_the_launch_tag(self):
+        self._check("--kind", "index", "--check-tags", "--rowsets", "p0,v4")
 
 
 if __name__ == "__main__":

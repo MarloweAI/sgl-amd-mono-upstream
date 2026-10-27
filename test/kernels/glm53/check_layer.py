@@ -397,6 +397,48 @@ def check_replays(model: Model, replays: int) -> bool:
     return ok
 
 
+def check_tags(model: Model) -> bool:
+    """Every selected token of a scored row (one past 2048 keys) is a pair tagged
+    with its launch's tag and holds the slot the launch publishes in the top-k; a
+    pair whose tag is cleared fails the check (negative control)."""
+    st = model.step_tables
+    scored = [
+        s for s, p in enumerate(st.positions.tolist()) if st.slots[s] >= 0 and p >= TOPK
+    ]
+    seen = []
+
+    def after(i, _):
+        rt = model.ops[i].rt
+        if model.kinds[i] == "index":
+            at, n = rt.sc["indices"], rt.width * TOPK * 8
+            pairs = rt.scratch[at : at + n].view(torch.int32).view(rt.width, TOPK, 2)
+            tag = int(rt.epoch[0]) * rt.key.launches_per_step + model.ops[i].layer + 1
+            seen.append((i, pairs.clone(), st.topk.clone(), tag))
+
+    model.step(after=after)
+    torch.cuda.synchronize()
+
+    def ok(pairs, topk, tag) -> bool:
+        for s in scored:
+            begin = int(st.indptr[s])
+            if not (pairs[s, :, 1] == tag).all():
+                return False
+            if not torch.equal(pairs[s, :, 0], topk[begin : begin + TOPK]):
+                return False
+        return True
+
+    good = True
+    for i, pairs, topk, tag in seen:
+        if not ok(pairs, topk, tag):
+            print(f"launch {i}: a selected token is not the launch's pair", flush=True)
+            good = False
+        pairs[scored[0], TOPK - 1, 1] = 0
+        if ok(pairs, topk, tag):
+            print(f"launch {i}: a cleared tag passed the check", flush=True)
+            good = False
+    return good and bool(seen) and bool(scored)
+
+
 def dump(model: Model, name: str, steps: int, perturb: bool, out: dict) -> str:
     """The digests of ``steps`` steps of ``model`` into ``out``; returns the last
     output's."""
@@ -468,6 +510,7 @@ def main() -> int:
     ap.add_argument("--deadline", type=float, default=10.0)
     ap.add_argument("--writes", action="store_true")
     ap.add_argument("--replays", type=int, default=0, help="graph replays of a step")
+    ap.add_argument("--check-tags", action="store_true")
     ap.add_argument("--dump", default="", help="write the digests into DIR")
     ap.add_argument("--perturb", action="store_true", help="negate one input value")
     ap.add_argument("--compare", nargs=2, metavar=("A_DIR", "B_DIR"))
@@ -500,6 +543,8 @@ def main() -> int:
             ok &= writes_only_its_rows(model)
         if args.replays:
             ok &= check_replays(model, args.replays)
+        if args.check_tags:
+            ok &= check_tags(model)
         torch.cuda.synchronize()
         if model.errors():
             print(f"rank {rank} {name}: error words set", flush=True)
