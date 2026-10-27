@@ -290,11 +290,13 @@ def build_glm5_monokernel(
     PS = PE_DIM // 2 + 4
     KT_OFF = H * QS
     PT_OFF = KT_OFF + SPLIT_KEYS * KS
-    # The input projection is processed four samples at a time.  Besides keeping
-    # the MFMA N dimension dense, this caps its normalized activation tile at
-    # 48 KiB for S=8.  Later stages either consume a smaller tensor or use the
+    # The input projection stages up to eight samples' normalized activations in LDS
+    # (96 KiB at S=8, inside the arena the split tiles already need) and runs its
+    # MFMAs once for all of them; the RMSNorm takes NORM_ROWS samples at a time to
+    # bound its registers.  Later stages either consume a smaller tensor or use the
     # FP8 representation and therefore fit all samples at once.
-    SAMPLE_TILE = min(S, 4)
+    SAMPLE_TILE = min(S, 8)
+    NORM_ROWS = 4
     DN_TILE = dn_tile(S, expert_mxfp4)
     N_DN_TILES = HIDDEN // DN_TILE
     RED_WORDS = WAVES * 64 * 4
@@ -1229,8 +1231,9 @@ def build_glm5_monokernel(
 
             return f
 
-        def stage_x_rmsnorm_ptpc(ld4s, n, gamma, loaded=None, count=S):
-            """RMSNorm followed by production per-token FP8 quantization."""
+        def stage_x_rmsnorm_ptpc(ld4s, n, gamma, loaded=None, count=S, first=0):
+            """RMSNorm followed by production per-token FP8 quantization, into LDS
+            sample rows first ... first + count - 1."""
             per = n // (4 * THREADS)
             ks = [(tid + i * THREADS) * 4 for i in range(per)]
             gs, vals = (
@@ -1276,7 +1279,7 @@ def build_glm5_monokernel(
                     ]
                     lds_st(
                         xs,
-                        (s * n + ks[i]) // 4,
+                        ((first + s) * n + ks[i]) // 4,
                         fp8_pack4(values[0], values[1], values[2], values[3]).bitcast(
                             fx.Float32
                         ),
@@ -1337,10 +1340,10 @@ def build_glm5_monokernel(
                             )
             return scales
 
-        def stage_x_rmsnorm(ld4s, n, gamma, mark=None, loaded=None, count=S):
-            """LDS bf16 X[s][0:n] = bf16(rmsnorm(x_s) * gamma) for every sample s, where
-            ld4s([(s, k)]) -> [(x_s[k], .., x_s[k+3])] (one batched load); returns the rstds.
-            ``loaded``: the (gamma, x) loads already issued by load_x_rmsnorm."""
+        def stage_x_rmsnorm(ld4s, n, gamma, mark=None, loaded=None, count=S, first=0):
+            """LDS bf16 X[first + s][0:n] = bf16(rmsnorm(x_s) * gamma) for every sample s,
+            where ld4s([(s, k)]) -> [(x_s[k], .., x_s[k+3])] (one batched load); returns the
+            rstds. ``loaded``: the (gamma, x) loads already issued by load_x_rmsnorm."""
             per = n // (4 * THREADS)
             ks = [(tid + i * THREADS) * 4 for i in range(per)]
             gs, vals = (
@@ -1364,7 +1367,7 @@ def build_glm5_monokernel(
                     for j in range_constexpr(2):
                         lds_st(
                             xs,
-                            (s * n + ks[i]) // 2 + j,
+                            ((first + s) * n + ks[i]) // 2 + j,
                             bf16_pair(
                                 a[2 * j] * rstds[s] * gs[i][2 * j],
                                 a[2 * j + 1] * rstds[s] * gs[i][2 * j + 1],
@@ -1723,34 +1726,35 @@ def build_glm5_monokernel(
             return fx.min(lane % 16, count - 1)
 
         # ================================================= 1. q_a / kv_a GEMV
-        # 1 row group x 96 chunks: 8 waves split K, 12 chunks each (all prefetched)
+        # 1 row group x 96 chunks: 8 waves split K, 12 chunks each (all prefetched).
+        # With the indexer, the index K and weights projections are further 16-row tiles
+        # of this stage, each on its own CTA: tasks N_QKV_A .. + N_INDEX_K are W_k's
+        # tiles, the last N_INDEX_W the weights projection's.
         r_wqa, r_sqa = _rsrc(w_qkv_a), _rsrc(s_qkv_a)
         QA_NKC = HIDDEN // 64
         QA_UNITS = QA_NKC // (attention_k_chunks_per_unit * WAVES)
+        IW_CPW = QA_NKC // WAVES
+        N_INDEX_K = INDEX_DIM // QKV_A_TILE if const_expr(with_indexer) else 0
+        N_INDEX_W = INDEX_HEADS // QKV_A_TILE if const_expr(with_indexer) else 0
         if const_expr(with_indexer):
             r_wik, r_sik = _rsrc(index_arg(0)), _rsrc(index_arg(1))
             r_wiw = _rsrc(index_arg(2))
-        for t in range(start("qkv_a"), N_QKV_A, G):
-            t = fx.Int32(t)
-            stamp("qkv_a", t, 0)
-            for sample_base in range_constexpr(0, S, SAMPLE_TILE):
-                group_count = min(SAMPLE_TILE, S - sample_base)
 
-                def u_qa(c):
-                    kc = (wave * QA_UNITS + c) * attention_k_chunks_per_unit
-                    return unit_attention(
-                        r_wqa,
-                        r_sqa,
-                        t,
-                        kc,
-                        QA_NKC,
-                        HIDDEN,
-                        128,
-                        attention_b_word(n_sel(group_count) * HIDDEN + kc * 64),
-                        shuffled=fp8_shuffled,
-                    )
+        def front_tile(t, make_unit, n_units, publish, ptpc=False, ahead=None):
+            """One 16-row tile of a projection of the RMS-normalized input rows: the
+            first NORM_ROWS samples' input loads, the weight units (issued once and kept
+            in registers for every group of SAMPLE_TILE samples), then per group the
+            RMSNorm into LDS (NORM_ROWS samples at a time), the MFMAs, the row reduction
+            and ``publish(sample_base, group_count, acc, scales)``. A later group with
+            fewer samples reuses the first group's units: their extra MFMA columns read
+            stale LDS and are not emitted. ``ahead``: only the first ``ahead`` units go
+            out before the staging, the rest after it (one group only); the sum keeps
+            the units' order."""
+            ahead = n_units if ahead is None else ahead
+            assert ahead == n_units or S <= SAMPLE_TILE
 
-                def ld_h(sks):
+            def ld_h(sample_base):
+                def f(sks):
                     res = []
                     for s, k in sks:
                         w = fx.Vector(
@@ -1765,38 +1769,65 @@ def build_glm5_monokernel(
                         res.append([v[j] for j in range(4)])
                     return res
 
-                if const_expr(S <= SAMPLE_TILE):
-                    h_ld = load_x_rmsnorm(ld_h, HIDDEN, g_in, group_count)
-                    pre = [u_qa(c) for c in range(QA_UNITS)]
-                    if const_expr(attention_ptpc):
-                        qa_scales = stage_x_rmsnorm_ptpc(
-                            ld_h, HIDDEN, g_in, loaded=h_ld, count=group_count
-                        )
-                    else:
-                        stage_x_rmsnorm(
-                            ld_h, HIDDEN, g_in, loaded=h_ld, count=group_count
-                        )
-                else:
-                    if const_expr(attention_ptpc):
-                        qa_scales = stage_x_rmsnorm_ptpc(
-                            ld_h, HIDDEN, g_in, count=group_count
-                        )
-                    else:
-                        stage_x_rmsnorm(ld_h, HIDDEN, g_in, count=group_count)
-                    pre = [u_qa(c) for c in range(QA_UNITS)]
+                return f
+
+            def stage(sample_base, count, loaded, first):
+                ld = ld_h(sample_base)
+                if const_expr(ptpc):
+                    return stage_x_rmsnorm_ptpc(
+                        ld, HIDDEN, g_in, loaded=loaded, count=count, first=first
+                    )
+                stage_x_rmsnorm(
+                    ld, HIDDEN, g_in, loaded=loaded, count=count, first=first
+                )
+                return []
+
+            pre = None
+            for sample_base in range_constexpr(0, S, SAMPLE_TILE):
+                group_count = min(SAMPLE_TILE, S - sample_base)
+                scales = []
+                for first in range_constexpr(0, group_count, NORM_ROWS):
+                    count = min(NORM_ROWS, group_count - first)
+                    h_ld = load_x_rmsnorm(
+                        ld_h(sample_base + first), HIDDEN, g_in, count
+                    )
+                    if const_expr(pre is None):
+                        pre = [make_unit(c, group_count) for c in range(ahead)]
+                    scales += stage(sample_base + first, count, h_ld, first)
                 gpu.barrier()
                 stamp("qkv_a", t, 2)
-                acc = run_units(u_qa, QA_UNITS, QA_UNITS, pre)
+                if const_expr(ahead == n_units):
+                    acc = mma_units([fx.Float32(0.0) for _ in range(4)], pre)
+                else:
+                    acc = run_units(
+                        lambda c, g=group_count: make_unit(c, g), n_units, ahead, pre
+                    )
+                publish(sample_base, group_count, acc, scales)
+
+        for t in range(start("qkv_a"), N_QKV_A + N_INDEX_K + N_INDEX_W, G):
+            t = fx.Int32(t)
+            stamp("qkv_a", t, 0)
+
+            def u_qa(c, group_count):
+                kc = (wave * QA_UNITS + c) * attention_k_chunks_per_unit
+                return unit_attention(
+                    r_wqa,
+                    r_sqa,
+                    t,
+                    kc,
+                    QA_NKC,
+                    HIDDEN,
+                    128,
+                    attention_b_word(n_sel(group_count) * HIDDEN + kc * 64),
+                    shuffled=fp8_shuffled,
+                )
+
+            def put_qa(sample_base, group_count, acc, qa_scales):
                 if const_expr(attention_ptpc):
                     reduce_rows(
                         1,
                         acc,
-                        emit_ptpc(
-                            QKV_A_TILE,
-                            t * QKV_A_TILE,
-                            r_sqa,
-                            qa_scales,
-                        ),
+                        emit_ptpc(QKV_A_TILE, t * QKV_A_TILE, r_sqa, qa_scales),
                         group_count,
                     )
                 else:
@@ -1812,69 +1843,77 @@ def build_glm5_monokernel(
                     else:
                         put(mb("kv_a"), s * (KV_LORA + PE_DIM) + row - Q_LORA, v)
 
-                if const_expr(with_indexer):
-                    IW_CPW = QA_NKC // WAVES
+            if const_expr(not with_indexer):
+                front_tile(t, u_qa, QA_UNITS, put_qa, ptpc=attention_ptpc)
+            else:
+                tk = t - N_QKV_A
+                tw = tk - N_INDEX_K
 
-                    def u_index_w(c):
+                def put_index(name, rows, tile):
+                    def f(sample_base, group_count, acc, _):
+                        reduce_rows(1, acc, emit_out(INDEX_TILE), group_count)
+                        stamp("qkv_a", t, 3)
+                        gpu.barrier()
+                        if tid < group_count * INDEX_TILE:
+                            s = sample_base + tid // INDEX_TILE
+                            row = tile * INDEX_TILE + tid % INDEX_TILE
+                            put(mb(name), s * rows + row, lds_ld(outs, tid))
+
+                    return f
+
+                def u_index_k(c, group_count):
+                    if const_expr(index_k_bf16):
                         kc = wave * IW_CPW + c
                         return unit_bf16(
-                            r_wiw,
-                            t,
+                            r_wik,
+                            tk,
                             kc,
                             QA_NKC,
                             (n_sel(group_count) * HIDDEN + kc * 64) // 2,
                         )
+                    kc = (wave * QA_UNITS + c) * 2
+                    return unit_fp8x2(
+                        r_wik,
+                        r_sik,
+                        tk,
+                        kc,
+                        QA_NKC,
+                        HIDDEN,
+                        (n_sel(group_count) * HIDDEN + kc * 64) // 2,
+                        shuffled=fp8_shuffled,
+                    )
 
-                    if t < INDEX_DIM // QKV_A_TILE:
-                        if const_expr(index_k_bf16):
+                def u_index_w(c, group_count):
+                    kc = wave * IW_CPW + c
+                    return unit_bf16(
+                        r_wiw,
+                        tw,
+                        kc,
+                        QA_NKC,
+                        (n_sel(group_count) * HIDDEN + kc * 64) // 2,
+                    )
 
-                            def u_index_k(c):
-                                kc = wave * IW_CPW + c
-                                return unit_bf16(
-                                    r_wik,
-                                    t,
-                                    kc,
-                                    QA_NKC,
-                                    (n_sel(group_count) * HIDDEN + kc * 64) // 2,
-                                )
-
-                            ik_acc = run_units(u_index_k, IW_CPW, IW_CPW)
-                        else:
-
-                            def u_index_k(c):
-                                kc = (wave * QA_UNITS + c) * 2
-                                return unit_fp8x2(
-                                    r_wik,
-                                    r_sik,
-                                    t,
-                                    kc,
-                                    QA_NKC,
-                                    HIDDEN,
-                                    (n_sel(group_count) * HIDDEN + kc * 64) // 2,
-                                    shuffled=fp8_shuffled,
-                                )
-
-                            ik_acc = run_units(u_index_k, QA_UNITS, QA_UNITS)
-                        iw_acc = [fx.Float32(0.0) for _ in range(4)]
-                        if t < INDEX_HEADS // QKV_A_TILE:
-                            iw_acc = run_units(u_index_w, IW_CPW, IW_CPW)
-                        reduce_rows(1, ik_acc, emit_out(INDEX_TILE), group_count)
-                        gpu.barrier()
-                        if tid < group_count * INDEX_TILE:
-                            s = sample_base + tid // INDEX_TILE
-                            row = t * INDEX_TILE + tid % INDEX_TILE
-                            put(mb("index_k"), s * INDEX_DIM + row, lds_ld(outs, tid))
-                        if t < INDEX_HEADS // QKV_A_TILE:
-                            reduce_rows(1, iw_acc, emit_out(INDEX_TILE), group_count)
-                            gpu.barrier()
-                            if tid < group_count * INDEX_TILE:
-                                s = sample_base + tid // INDEX_TILE
-                                row = t * INDEX_TILE + tid % INDEX_TILE
-                                put(
-                                    mb("index_w"),
-                                    s * INDEX_HEADS + row,
-                                    lds_ld(outs, tid),
-                                )
+                # the index tiles: above 4 rows half the weights wait for the rows'
+                # staging, so they and the 8 rows' inputs fit in registers
+                if t < N_QKV_A:
+                    front_tile(t, u_qa, QA_UNITS, put_qa, ptpc=attention_ptpc)
+                elif tk < N_INDEX_K:
+                    n_k = IW_CPW if const_expr(index_k_bf16) else QA_UNITS
+                    front_tile(
+                        t,
+                        u_index_k,
+                        n_k,
+                        put_index("index_k", INDEX_DIM, tk),
+                        ahead=n_k // 2 if const_expr(S > 4) else n_k,
+                    )
+                else:
+                    front_tile(
+                        t,
+                        u_index_w,
+                        IW_CPW,
+                        put_index("index_w", INDEX_HEADS, tw),
+                        ahead=IW_CPW // 2 if const_expr(S > 4) else IW_CPW,
+                    )
             stamp("qkv_a", t, 4)
 
         def ld_qa(sks):

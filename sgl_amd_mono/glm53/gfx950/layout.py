@@ -253,7 +253,11 @@ def stage_tasks(
     """Return ``(stage name, task count)`` pairs in execution order."""
 
     tasks = [
-        ("qkv_a", N_QKV_A),
+        # with the indexer, the index K and weights projections' 16-row tiles follow
+        (
+            "qkv_a",
+            N_QKV_A + ((INDEX_DIM + INDEX_HEADS) // QKV_A_TILE if with_indexer else 0),
+        ),
         ("q_norm", samples),
         ("cache", samples),
         ("q_b", heads * (NOPE_DIM + PE_DIM) // Q_B_TILE),
