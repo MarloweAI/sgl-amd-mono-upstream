@@ -4172,6 +4172,10 @@ def build_glm5_monokernel(
         # One sample per CTA: 1 row group x 96 chunks (bf16), 8 waves split K.
         # S > 1 gets S times as many independent router CTAs instead of serializing
         # every sample's normalization and output columns inside one CTA.
+        # at 8 rows the MoE stages' wave index, and so their per-wave address terms,
+        # are scalars: the 8-row build then fits in VGPRs
+        if const_expr(S > 4):
+            wave = _uniform(tid // 64)
         r_wr = _rsrc(w_r)
         R_NKC = HIDDEN // 64
         for tt in range(start("router"), S * N_ROUTER, G):
