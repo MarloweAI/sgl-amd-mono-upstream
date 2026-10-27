@@ -188,7 +188,10 @@ class Glm53Runtime:
         )
         self.peer = PeerBuffer(self.sy["_bytes"], group, rank, key.tp, device)
         self.peer.bytes.zero_()
-        self.scratch = torch.zeros(self.sc["_bytes"], dtype=torch.uint8, device=device)
+        # the hand-off mailboxes, uncached as the peer buffer is: a line is read at its
+        # home memory, not through the producer's L2
+        self._scratch = PeerBuffer(self.sc["_bytes"], group, rank, 1, device)
+        self.scratch = self._scratch.bytes
         self.epoch = torch.zeros(guard.GUARD_WORDS, dtype=torch.int32, device=device)
         # two outputs, by layer parity: a layer never writes what it reads
         self.outs = [
@@ -212,6 +215,8 @@ class Glm53Runtime:
         self.epoch[:1].add_(1)
 
     def close(self) -> None:
+        self.scratch = None
+        self._scratch.close()
         self.peer.close()
 
 
