@@ -593,16 +593,12 @@ def build_glm5_monokernel(
             )
 
         def put2(base_addr, i, v0, v1, cm=CM_DEV):
-            """Pairs i, i+1 (i even) in one 16-byte store."""
-            vec = fx.Vector.from_elements(
-                [
-                    fx.Float32(v0).bitcast(fx.Int32),
-                    tag,
-                    fx.Float32(v1).bitcast(fx.Int32),
-                    tag,
-                ],
-                fx.Int32,
-            )
+            """Pairs i, i+1 (i even) in one 16-byte store; f32 values, or int32 bits."""
+
+            def bits(v):
+                return v if isinstance(v, fx.Int32) else fx.Float32(v).bitcast(fx.Int32)
+
+            vec = fx.Vector.from_elements([bits(v0), tag, bits(v1), tag], fx.Int32)
             bo.buffer_store(vec, _rsrc(base_addr), i * 2, cache_modifier=cm)
 
         def put_bf(base_addr, i, vs, cm=CM_DEV):
@@ -1452,6 +1448,35 @@ def build_glm5_monokernel(
             (sample list, or one runtime sample) into LDS, slot 0 for one runtime sample."""
             nxw = HIDDEN // 4 // THREADS
             nscale = XQ_GROUPS if native_fp4_mfma else XQ_BLOCKS
+            if const_expr(list(samples) == list(range(S)) and S % 2 == 0):
+                # every row: two tagged words (16 bytes) a load, all scales in one
+                # spec, so the whole activation is one poll
+                n2 = S * HIDDEN // 8 // THREADS
+                nsc = (S * nscale + THREADS - 1) // THREADS
+                got = poll(
+                    [(mb("xq"), (tid + i * THREADS) * 2, 2) for i in range(n2)]
+                    + [
+                        (mb("xqs"), fx.min(tid + i * THREADS, S * nscale - 1), 1)
+                        for i in range(nsc)
+                    ],
+                    batch=n2 + nsc,
+                )
+                for i in range_constexpr(n2):
+                    for e in range_constexpr(2):
+                        w = (tid + i * THREADS) * 2 + e
+                        lds_st(
+                            xs,
+                            w if const_expr(native_fp4_mfma) else f8_word(w * 4),
+                            got[i][e].bitcast(fx.Float32),
+                        )
+                for i in range_constexpr(nsc):
+                    if tid + i * THREADS < S * nscale:
+                        lds_st(
+                            misc,
+                            8 + tid + i * THREADS,
+                            got[n2 + i][0].bitcast(fx.Float32),
+                        )
+                return
             got = poll(
                 [
                     (mb("xq"), sx * (HIDDEN // 4) + tid + i * THREADS, 1)
@@ -4219,9 +4244,10 @@ def build_glm5_monokernel(
                     fx.Int32(rocdl.cvt_pk_fp8_f32(T.i32, q0, q1, fx.Int32(0), False))
                     & 0xFFFF
                 )
-                w8n = _xshfl(w8, 1)
-                if lane % 2 == 0:  # FP8 bytes k .. k + 3 in one tagged word
-                    put(mb("xq"), (x_s * HIDDEN + xk) // 4, w8 | (w8n << 16))
+                word = w8 | (_xshfl(w8, 1) << 16)  # even lanes: FP8 bytes k .. k + 3
+                word_n = _xshfl(word, 2)  # bytes k + 4 .. k + 7
+                if lane % 4 == 0:  # two tagged words in one 16-byte store
+                    put2(mb("xq"), (x_s * HIDDEN + xk) // 4, word, word_n)
                 d0, d1 = _fp8_roundtrip(q0, q1)
                 qscale = (
                     (qs << 23).bitcast(fx.Float32)
@@ -4676,30 +4702,54 @@ def build_glm5_monokernel(
             # round 0 holds every shared-expert tile (inter / 8 <= G of them). At 8 rows
             # every CTA runs a router task before it, and the weights issued after the
             # activations' poll measured faster than ahead of it
+            assert expert_inter >= G
             tile0 = ug8_tile(fx.Int32(u0))
             has_sh = fx.Int32(u0) < expert_inter // UG8
+            bs = load_bias()
             if const_expr(S <= 4):
                 shared_pre = ug8_units(tile0, fx.Int32(SHARED), None, has_sh)
-            stage_xq(list(range(S)))
-            gpu.barrier()
-            if const_expr(S > 4):
-                shared_pre = ug8_units(tile0, fx.Int32(SHARED), None, has_sh)
-            if has_sh:
-                reduce_rows(
-                    1,
-                    mma_units([fx.Float32(0.0) for _ in range(4)], shared_pre),
-                    emit_out(16),
-                )
+
+            def stage_and_shared():
+                """The activations, then the shared expert's tile on its CTAs."""
+                stage_xq(list(range(S)))
                 gpu.barrier()
-                ug8_emit(tile0, 0, True)
-            dn_route(load_bias())
+                if const_expr(S > 4):
+                    sh_pre = ug8_units(tile0, fx.Int32(SHARED), None, has_sh)
+                else:
+                    sh_pre = shared_pre
+                if has_sh:
+                    reduce_rows(
+                        1,
+                        mma_units([fx.Float32(0.0) for _ in range(4)], sh_pre),
+                        emit_out(16),
+                    )
+                    gpu.barrier()
+                    ug8_emit(tile0, 0, True)
+
+            # A CTA that ran a router task reaches this point after the activations
+            # are out: it routes first, issues its first routed weights, and stages
+            # the activations behind them. The others stage them while the scores
+            # are still being computed.
+            if const_expr(S * N_ROUTER < G):
+                if start("router") >= S * N_ROUTER:
+                    stage_and_shared()
+            dn_route(bs)
             gpu.barrier()
+            cur0 = ug8_units(tile0, _uniform(lds_ld(keys, tile0[1])), 0)
+            if const_expr(S * N_ROUTER < G):
+                if start("router") < S * N_ROUTER:
+                    stage_and_shared()
+            else:
+                stage_and_shared()
             for task_round in range_constexpr(ug_task_rounds(expert_inter)):
                 u = fx.Int32(u0 + task_round * G)
                 if u < expert_inter:
                     tile = tile0 if const_expr(task_round == 0) else ug8_tile(u)
                     slot = tile[1]
-                    cur = ug8_units(tile, _uniform(lds_ld(keys, slot)), 0)
+                    if const_expr(task_round == 0):
+                        cur = cur0
+                    else:
+                        cur = ug8_units(tile, _uniform(lds_ld(keys, slot)), 0)
                     for sample in range_constexpr(S):
                         stamp("ug", sample * G + u, 0)
                         pre = cur
