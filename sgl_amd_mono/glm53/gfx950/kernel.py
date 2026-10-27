@@ -49,10 +49,12 @@ order, so all ranks produce bit-identical hidden states (and routing).
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu
 from flydsl.expr import math as fmath
 from flydsl.expr import range_constexpr, rocdl
-from flydsl.expr.typing import Int32, Int64, T
+from flydsl.expr.typing import Int32, Int64, T, as_ir_value
 
 from sgl_amd_mono.common import guard
 from sgl_amd_mono.common.epoch import spin_until
@@ -464,6 +466,16 @@ def build_glm5_monokernel(
         def ld_f32(r, i):
             return fx.Float32(bo.buffer_load(r, i, vec_width=1, dtype=T.f32))
 
+        def sld_f32(addr):
+            """The f32 at a wave-uniform byte address, as a scalar load issued here
+            (volatile: not sunk to its use)."""
+            ptr = llvm.IntToPtrOp(
+                ir.Type.parse("!llvm.ptr<4>"), as_ir_value(fx.Int64(addr))
+            ).result
+            return fx.Float32(
+                llvm.LoadOp(T.f32, ptr, alignment=4, volatile_=True).result
+            )
+
         def ld_bf16(r, i):
             return fx.Float32(
                 fx.BFloat16(bo.buffer_load(r, i, vec_width=1, dtype=T.bf16))
@@ -833,17 +845,33 @@ def build_glm5_monokernel(
             return ("fp8x2", wv, s, b_word + (lane // 16) * 4)
 
         def unit_f8f8(
-            w_rsrc, s_rsrc, rg, kc, NKC, K, b_word, coef, ln=None, shuffled=False
+            w_rsrc,
+            s_rsrc,
+            rg,
+            kc,
+            NKC,
+            K,
+            b_word,
+            coef,
+            ln=None,
+            shuffled=False,
+            s_addr=None,
         ):
             """Issue one 128-k chunk (packed 64-k chunks kc, kc + 1; kc even) of row group
             ``rg`` against the FP8 activation of LDS words ``b_word`` + [0, 32) (``f8_word``
             order); ``coef()`` = activation block scale (times route weight).  ``ln``
-            = the lane whose weights are loaded (default: own lane)."""
+            = the lane whose weights are loaded (default: own lane). With ``s_addr``
+            (the byte address of the expert's scales; ``rg`` and ``kc`` wave-uniform)
+            the scale is a scalar load."""
             ln = lane if ln is None else ln
             wv = [
                 ld_fp8_chunk(w_rsrc, rg, kc + h, NKC, K, ln, shuffled) for h in range(2)
             ]
-            s = ld_f32(s_rsrc, (rg * 16 // SCALE_BM) * (K // 128) + kc // 2)
+            si = (rg * 16 // SCALE_BM) * (K // 128) + kc // 2
+            if const_expr(s_addr is None):
+                s = ld_f32(s_rsrc, si)
+            else:
+                s = sld_f32(s_addr + fx.Int64(si) * 4)
             return ("f8f8", wv, lambda: s * coef(), b_word + (lane // 16) * 4)
 
         def unit_ptpc(w_rsrc, rg, kc, NKC, b_word, coef=None, ln=None):
@@ -4657,13 +4685,21 @@ def build_glm5_monokernel(
                         )
                         for j in range(2)
                     ]
-                    sc = ld_f32(rs, (s_rg * 16 // SCALE_BM) * (HIDDEN // 128) + kc // 2)
+                    # the scales of this tile's gate rows (lanes < 32) and up rows
+                    s_at = s_ug + fx.Int64(e) * fx.Int64(UG_S_BYTES)
+                    si = (tile[0] // 2 * 16 // SCALE_BM) * (HIDDEN // 128) + kc // 2
+                    sg = sld_f32(s_at + fx.Int64(si) * 4)
+                    su = sld_f32(
+                        s_at
+                        + fx.Int64(si + expert_inter // SCALE_BM * (HIDDEN // 128)) * 4
+                    )
                     units.append(
                         (
                             "f8f8",
                             wv,
-                            lambda sc=sc, kc=kc, sn=sn: (
-                                sc * lds_ld(misc, 8 + sn * XQ_BLOCKS + kc // 2)
+                            lambda sg=sg, su=su, kc=kc, sn=sn: (
+                                (lane < 32).select(sg, su)
+                                * lds_ld(misc, 8 + sn * XQ_BLOCKS + kc // 2)
                             ),
                             sn * XW + kc * 16 + (lane // 16) * 4,
                         )
@@ -5068,6 +5104,7 @@ def build_glm5_monokernel(
                     coef,
                     dn_ln,
                     shuffled=fp8_shuffled,
+                    s_addr=s_dn + fx.Int64(e) * fx.Int64(DN_S_BYTES),
                 )
 
             if const_expr(S <= 4):
