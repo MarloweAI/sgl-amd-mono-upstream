@@ -2055,18 +2055,41 @@ def build_glm5_monokernel(
                 # gfx950 indexer applies to the keys it caches and to its queries.
                 r_gik, r_bik = _rsrc(index_arg(5)), _rsrc(index_arg(6))
                 r_index_cache = _rsrc(indices)
-                for s in range_constexpr(S):
-                    ik = getf(mb("index_k"), s * INDEX_DIM + fx.min(tid, INDEX_DIM - 1))
-                    live = tid < INDEX_DIM
-                    iv = live.select(ik, fx.Float32(0.0))
-                    mean = block_sum(iv) * (1.0 / INDEX_DIM)
-                    centered = live.select(ik - mean, fx.Float32(0.0))
-                    rstd = _rsq(
-                        block_sum(centered * centered) * (1.0 / INDEX_DIM) + 1.0e-6
+                # every row's key in one poll and its LayerNorm sums in two block
+                # reductions, each in the order of one row's
+                live = tid < INDEX_DIM
+                ik_one = fx.min(tid, INDEX_DIM - 1)
+                ik_two = fx.min(tid, INDEX_DIM // 2 - 1) * 2
+                got = poll(
+                    [(mb("index_k"), s * INDEX_DIM + ik_one, 1) for s in range(S)]
+                    + [(mb("index_k"), s * INDEX_DIM + ik_two, 2) for s in range(S)]
+                )
+                iks = [got[s][0].bitcast(fx.Float32) for s in range(S)]
+                kps = [
+                    (
+                        got[S + s][0].bitcast(fx.Float32),
+                        got[S + s][1].bitcast(fx.Float32),
                     )
+                    for s in range(S)
+                ]
+                means = [
+                    m * (1.0 / INDEX_DIM)
+                    for m in block_sums(
+                        [live.select(ik, fx.Float32(0.0)) for ik in iks]
+                    )
+                ]
+                centered = [
+                    live.select(ik - m, fx.Float32(0.0)) for ik, m in zip(iks, means)
+                ]
+                rstds = [
+                    _rsq(v * (1.0 / INDEX_DIM) + 1.0e-6)
+                    for v in block_sums([c * c for c in centered])
+                ]
+                for s in range_constexpr(S):
+                    mean, rstd = means[s], rstds[s]
                     if tid < INDEX_DIM // 2:
                         i0 = tid * 2
-                        k0, k1 = get2(mb("index_k"), s * INDEX_DIM + i0)
+                        k0, k1 = kps[s]
                         v0 = (k0 - mean) * rstd * ld_f32(r_gik, i0) + ld_f32(r_bik, i0)
                         v1 = (k1 - mean) * rstd * ld_f32(r_gik, i0 + 1) + ld_f32(
                             r_bik, i0 + 1
