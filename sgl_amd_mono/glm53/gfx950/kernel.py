@@ -3588,39 +3588,45 @@ def build_glm5_monokernel(
                         lds_st(attn_keys, lane, sparse.select(idx, k_cl))
             return nkeys, sparse
 
-        def gather_old_kv():
-            """Each wave copies its 8 keys' KV latent (1 KB) + k_pe (128 B) cache rows
-            into the LDS tiles (rows of this launch are patched in by patch_new_kv)."""
+        # a row this launch appends, staged by split as bf16 pairs: latent then k_pe
+        NEW_ROW_WORDS = (KV_LORA + PE_DIM) // 2
+        assert S * NEW_ROW_WORDS <= KT_OFF, "new rows are staged in split's q region"
+
+        def new_rows():
+            """(writes cache, slot) of every row of this launch, for gather_kv."""
+            if const_expr(use_atom_kv_cache):
+                return [(row_writes_cache(s), row_slot(s)) for s in range(S)]
+            return None
+
+        def gather_kv(rows):
+            """Each wave copies its 8 keys' KV latent (1 KB) + k_pe (128 B) rows into
+            the LDS tiles: the cache rows of all 8 keys are loaded at once, then, if any
+            key is a row this launch appends, the CTA polls those rows from the cache
+            tasks' kvnew / penew pairs (their loads issued behind the cache rows'),
+            then the rest is stored."""
             krows = [lds_ld(attn_keys, wave * KPW + jj) for jj in range(KPW)]
+            kv_row_words = (
+                QK_DIM // 2 if const_expr(use_atom_kv_cache) else KV_LORA // 2
+            )
+            pe_lanes = PE_DIM // 8 if const_expr(cache_fp8) else PE_DIM // 2
+            pe_lane = fx.min(lane, pe_lanes - 1)
+            raws = []
             for jj in range_constexpr(KPW):
-                j = wave * KPW + jj
                 if const_expr(cache_fp8):
                     row = krows[jj] * (QK_DIM // 4)
-                    raw = fx.Vector(
+                    kv = fx.Vector(
                         bo.buffer_load(r_kv, row + lane * 2, vec_width=2, dtype=T.i32)
                     )
-                    fx.ptr_store(
-                        _fp8_to_bf16x8(raw[0], raw[1]).bitcast(fx.Float32),
-                        ktile + (j * KS + lane * 4),
+                    pe = fx.Vector(
+                        bo.buffer_load(
+                            r_pe,
+                            row + KV_LORA // 4 + pe_lane * 2,
+                            vec_width=2,
+                            dtype=T.i32,
+                        )
                     )
-                    if lane < PE_DIM // 8:
-                        pe_raw = fx.Vector(
-                            bo.buffer_load(
-                                r_pe,
-                                row + KV_LORA // 4 + lane * 2,
-                                vec_width=2,
-                                dtype=T.i32,
-                            )
-                        )
-                        fx.ptr_store(
-                            _fp8_to_bf16x8(pe_raw[0], pe_raw[1]).bitcast(fx.Float32),
-                            petile + (j * PS + lane * 4),
-                        )
                 else:
-                    kv_row_words = (
-                        QK_DIM // 2 if const_expr(use_atom_kv_cache) else KV_LORA // 2
-                    )
-                    kv8 = fx.Vector(
+                    kv = fx.Vector(
                         bo.buffer_load(
                             r_kv,
                             krows[jj] * kv_row_words + lane * 4,
@@ -3628,47 +3634,95 @@ def build_glm5_monokernel(
                             dtype=T.i32,
                         )
                     )
-                    fx.ptr_store(kv8.bitcast(fx.Float32), ktile + (j * KS + lane * 4))
-                    if lane < PE_DIM // 2:
-                        pe_row = (
-                            krows[jj] * (QK_DIM // 2) + KV_LORA // 2 + lane
-                            if const_expr(use_atom_kv_cache)
-                            else krows[jj] * (PE_DIM // 2) + lane
-                        )
-                        lds_st(petile, j * PS + lane, ld_f32(r_pe, pe_row))
-
-        def patch_new_kv():
-            """Rows appended by this launch come from the cache task's kvnew / penew pairs."""
+                    pe_row = (
+                        krows[jj] * (QK_DIM // 2) + KV_LORA // 2 + pe_lane
+                        if const_expr(use_atom_kv_cache)
+                        else krows[jj] * (PE_DIM // 2) + pe_lane
+                    )
+                    pe = ld_f32(r_pe, pe_row)
+                raws.append((kv, pe))
+            news = []
             if const_expr(use_atom_kv_cache):
-                new_active = [row_writes_cache(new_s) for new_s in range(S)]
-                new_slots = [row_slot(new_s) for new_s in range(S)]
-            for jj in range_constexpr(KPW):
-                j = wave * KPW + jj
-                kr = lds_ld(attn_keys, j)
-                if const_expr(use_atom_kv_cache):
+                for jj in range_constexpr(KPW):
                     sn = fx.Int32(-1)
                     for new_s in range_constexpr(S):
-                        match = new_active[new_s] & (kr == new_slots[new_s])
-                        sn = match.select(fx.Int32(new_s), sn)
-                    is_new = sn >= 0
-                else:
-                    is_new = kr >= pos0
-                    sn = kr - pos0
-                if is_new:
-                    kvp = get2_many(
-                        [
-                            (mb("kvnew"), sn * KV_LORA + lane * 8 + m * 2)
-                            for m in range(4)
-                        ]
-                    )
-                    w = [bf16_pair(a0, a1) for a0, a1 in kvp]
-                    fx.ptr_store(
-                        fx.Vector.from_elements(w, fx.Float32),
-                        ktile + (j * KS + lane * 4),
-                    )
-                    if lane < PE_DIM // 2:
-                        a0, a1 = get2(mb("penew"), sn * PE_DIM + lane * 2)
-                        lds_st(petile, j * PS + lane, bf16_pair(a0, a1))
+                        active, slot = rows[new_s]
+                        sn = (active & (krows[jj] == slot)).select(fx.Int32(new_s), sn)
+                    news.append(sn)
+            else:
+                news = [
+                    (krows[jj] >= pos0).select(krows[jj] - pos0, fx.Int32(-1))
+                    for jj in range(KPW)
+                ]
+            # every row this launch appends, if a key of this task is one: polled once
+            # by the whole CTA into the (still unused) q region as bf16 pairs, then
+            # copied to the keys' tile rows
+            any_new = news[0] >= 0
+            for jj in range_constexpr(1, KPW):
+                any_new = any_new | (news[jj] >= 0)
+            if lane == 0:
+                lds_st(misc, wave, any_new.select(fx.Float32(1.0), fx.Float32(0.0)))
+            gpu.barrier()
+            block_new = lds_ld(misc, 0)
+            for w in range_constexpr(1, WAVES):
+                block_new = block_new + lds_ld(misc, w)
+            if block_new > 0.0:
+                pe_word = fx.min(tid - KV_LORA // 2, PE_DIM // 2 - 1)
+                is_kv = tid < KV_LORA // 2
+                got = poll(
+                    [
+                        (
+                            is_kv.select(fx.Int64(SC["kvnew"]), fx.Int64(SC["penew"]))
+                            + scratch,
+                            is_kv.select(
+                                r * KV_LORA + tid * 2, r * PE_DIM + pe_word * 2
+                            ),
+                            2,
+                        )
+                        for r in range(S)
+                    ]
+                )
+                if tid < NEW_ROW_WORDS:
+                    for r in range_constexpr(S):
+                        a0 = got[r][0].bitcast(fx.Float32)
+                        a1 = got[r][1].bitcast(fx.Float32)
+                        lds_st(xs, r * NEW_ROW_WORDS + tid, bf16_pair(a0, a1))
+                gpu.barrier()
+                for jj in range_constexpr(KPW):
+                    j = wave * KPW + jj
+                    sn = news[jj]
+                    if sn >= 0:
+                        row = xs + (sn * NEW_ROW_WORDS + lane * 4)
+                        fx.ptr_store(
+                            fx.ptr_load(row, result_type=v4f),
+                            ktile + (j * KS + lane * 4),
+                        )
+                        if lane < PE_DIM // 2:
+                            lds_st(
+                                petile,
+                                j * PS + lane,
+                                lds_ld(xs, sn * NEW_ROW_WORDS + KV_LORA // 2 + lane),
+                            )
+            for jj in range_constexpr(KPW):
+                j = wave * KPW + jj
+                kv, pe = raws[jj]
+                if news[jj] < 0:
+                    if const_expr(cache_fp8):
+                        fx.ptr_store(
+                            _fp8_to_bf16x8(kv[0], kv[1]).bitcast(fx.Float32),
+                            ktile + (j * KS + lane * 4),
+                        )
+                        if lane < PE_DIM // 8:
+                            fx.ptr_store(
+                                _fp8_to_bf16x8(pe[0], pe[1]).bitcast(fx.Float32),
+                                petile + (j * PS + lane * 4),
+                            )
+                    else:
+                        fx.ptr_store(
+                            kv.bitcast(fx.Float32), ktile + (j * KS + lane * 4)
+                        )
+                        if lane < PE_DIM // 2:
+                            lds_st(petile, j * PS + lane, pe)
 
         N_HEAD_GROUPS = H // WAVES
         for tt in range(start("split"), S * N_HEAD_GROUPS * N_SPLIT, G):
@@ -3678,9 +3732,10 @@ def build_glm5_monokernel(
             head_group = (tt // N_SPLIT) % N_HEAD_GROUPS
             t = tt % N_SPLIT
             h = head_group * WAVES + wave
+            rows = new_rows()
             nkeys, sparse = split_keys(t, s)
             gpu.barrier()
-            gather_old_kv()  # before waiting for q: these rows are from earlier launches
+            gather_kv(rows)  # before waiting for q: the cache tasks end before uk
             if const_expr(True):
                 N_PE_T = PE_DIM // Q_B_TILE
                 hint_wait(
@@ -3729,7 +3784,6 @@ def build_glm5_monokernel(
                 qw = hh * QS + KV_LORA // 2 + (tid % (PE_DIM // 4)) * 2
                 lds_st(xs, qw, qv[NQ][0].bitcast(fx.Float32))
                 lds_st(xs, qw + 1, qv[NQ][1].bitcast(fx.Float32))
-            patch_new_kv()
             if const_expr(True):
                 stamp("split", tt, 2)
             gpu.barrier()
