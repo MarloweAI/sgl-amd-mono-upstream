@@ -255,7 +255,7 @@ def stage_tasks(
     tasks = [
         ("qkv_a", N_QKV_A),
         ("q_norm", samples),
-        ("cache", 1),
+        ("cache", samples),
         ("q_b", heads * (NOPE_DIM + PE_DIM) // Q_B_TILE),
     ]
     if with_indexer:
@@ -298,3 +298,65 @@ def stage_tasks(
         ("down", HIDDEN // dn_tile(samples, expert_mxfp4)),
     ]
     return tasks
+
+
+def stage_bases(
+    samples: int,
+    heads: int,
+    sparse_attention_topk: int,
+    with_indexer: bool = False,
+    index_max_seq: int = 4096,
+    expert_mxfp4: bool = False,
+    inter: int = INTER,
+):
+    """Return ``{stage name: base CTA}``: task ``t`` of a stage runs on CTA
+    ``(base + t) % BLOCKS``."""
+
+    tasks = dict(
+        stage_tasks(
+            samples,
+            heads,
+            sparse_attention_topk,
+            with_indexer,
+            index_max_seq,
+            expert_mxfp4,
+            inter=inter,
+        )
+    )
+    base, acc = {}, 0
+    # q_norm (with each row's cache task) on the first CTAs past qkv_a's, so it polls
+    # from the launch start; q_b after it. split from the CTA past q_b's, so its tiles
+    # land on CTAs freed by qkv_a, the last few on the q_norm CTAs; the cache keeps one
+    # CTA of the sequence after split, so uk (on the q_b CTAs it waits on anyway) and
+    # the later stages keep their CTAs.
+    for name in (
+        "qkv_a",
+        "q_norm",
+        "q_b",
+        "split",
+        "cache",
+        "uk",
+        "uv",
+        "o",
+        "router",
+        "ug",
+        "down",
+    ):
+        base[name] = acc % BLOCKS
+        acc += 1 if name == "cache" else tasks[name]
+    base["cache"] = base["q_norm"]
+    # o from split's first CTA: its tasks fill the split CTAs, free once the
+    # attention ends
+    base["o"] = base["split"]
+    if with_indexer:
+        # q_b occupies exactly half the grid.  Put the second half of index-Q on
+        # the complementary CTAs while q_b CTAs reuse their normalized q_lora
+        # tile for the first half, instead of serializing two index-Q tiles on
+        # every q_b CTA.
+        base["index_q"] = (base["q_b"] + tasks["q_b"]) % BLOCKS
+        base["index_score"] = 101
+        base["index_select"] = 100
+        base["index_thresh"] = 100
+        base["index_hist"] = BLOCKS // 2
+        base["index_gather"] = BLOCKS // 2
+    return base
