@@ -147,6 +147,7 @@ from .layout import (
     sparse_keys_per_task,
     split_acc_head,
     split_score_column,
+    stage_bases,
     stage_tasks,
     ug_split,
     ug_task_rounds,
@@ -346,46 +347,15 @@ def build_glm5_monokernel(
     WORK_WORDS = OUT_OFF + OUT_WORDS
     assert WORK_WORDS <= 32768, "keep static LDS below the MI355X per-workgroup budget"
 
-    base, first, acc = {}, {}, 0
+    first, acc = {}, 0
     for name, n in stage_tasks(
         S, H, topk, with_indexer, index_max_seq, expert_mxfp4, inter=expert_inter
     ):
         first[name] = acc
         acc += n
-    # CTA placement: split before uk, so every split tile lands on a CTA freed by
-    # qkv_a (uk shares the q_b CTAs it waits on anyway)
-    tasks = dict(
-        stage_tasks(
-            S, H, topk, with_indexer, index_max_seq, expert_mxfp4, inter=expert_inter
-        )
+    base = stage_bases(
+        S, H, topk, with_indexer, index_max_seq, expert_mxfp4, inter=expert_inter
     )
-    acc = 0
-    for name in (
-        "qkv_a",
-        "q_norm",
-        "cache",
-        "q_b",
-        "split",
-        "uk",
-        "uv",
-        "o",
-        "router",
-        "ug",
-        "down",
-    ):
-        base[name] = acc % G
-        acc += tasks[name]
-    if with_indexer:
-        # q_b occupies exactly half the grid.  Put the second half of index-Q on
-        # the complementary CTAs while q_b CTAs reuse their normalized q_lora
-        # tile for the first half, instead of serializing two index-Q tiles on
-        # every q_b CTA.
-        base["index_q"] = (base["q_b"] + N_QB) % G
-        base["index_score"] = 101
-        base["index_select"] = 100
-        base["index_thresh"] = 100
-        base["index_hist"] = G // 2
-        base["index_gather"] = G // 2
 
     @fx.struct
     class Smem:
@@ -1941,113 +1911,102 @@ def build_glm5_monokernel(
             stamp("q_norm", s_norm, 4)
 
         # ================ 3. KV RMSNorm + k_pe RoPE -> cache (+ this launch's rows)
-        for t in range(start("cache"), 1, G):
-            stamp("cache", t, 0)
+        # one task a row
+        for s in range(start("cache"), S, G):
+            s = fx.Int32(s)
+            stamp("cache", s, 0)
             r_kv = _rsrc(kv_cache)
             r_pe = _rsrc(pe_cache)
             # gamma and the RoPE factors are issued ahead of the wait
             g = ld_bf16(_rsrc(g_kv), tid)
             tpe = tid % (PE_DIM // 2)
-            cs = [
-                ld_bf16(_rsrc(rope_cos), row_position(s) * (PE_DIM // 2) + tpe)
-                for s in range(S)
-            ]
-            sns = [
-                ld_bf16(_rsrc(rope_sin), row_position(s) * (PE_DIM // 2) + tpe)
-                for s in range(S)
-            ]
+            c = ld_bf16(_rsrc(rope_cos), row_position(s) * (PE_DIM // 2) + tpe)
+            sn = ld_bf16(_rsrc(rope_sin), row_position(s) * (PE_DIM // 2) + tpe)
             hint_wait(
                 (KV_LORA + PE_DIM) // QKV_A_TILE,
                 lambda k: (
                     mb("kv_a"),
-                    (S - 1) * (KV_LORA + PE_DIM) + k * QKV_A_TILE + QKV_A_TILE - 1,
+                    s * (KV_LORA + PE_DIM) + k * QKV_A_TILE + QKV_A_TILE - 1,
                 ),
-                mark=("cache", t),
+                mark=("cache", s),
             )
-            # every sample's kv latent and k_pe pair in one poll, one block reduction
-            vs = getf_many(
-                [(mb("kv_a"), s * (KV_LORA + PE_DIM) + tid) for s in range(S)]
-            )
-            pes = get2_many(
+            # the row's kv latent and k_pe pair in one poll
+            got = poll(
                 [
+                    (mb("kv_a"), s * (KV_LORA + PE_DIM) + tid, 1),
                     (
                         mb("kv_a"),
                         s * (KV_LORA + PE_DIM) + KV_LORA + (tid % (PE_DIM // 2)) * 2,
-                    )
-                    for s in range(S)
+                        2,
+                    ),
                 ]
             )
-            stamp("cache", t, 2)
-            ssq = block_sums([v * v for v in vs])
-            for s in range_constexpr(S):
-                pos = row_position(s)
-                slot = row_slot(s)
-                active = row_writes_cache(s)
-                value = vs[s] * _rsq(ssq[s] * (1.0 / KV_LORA) + EPS) * g
+            v = got[0][0].bitcast(fx.Float32)
+            x0, x1 = got[1][0].bitcast(fx.Float32), got[1][1].bitcast(fx.Float32)
+            stamp("cache", s, 2)
+            ssq = block_sums([v * v])[0]
+            pos = row_position(s)
+            slot = row_slot(s)
+            active = row_writes_cache(s)
+            value = v * _rsq(ssq * (1.0 / KV_LORA) + EPS) * g
+            if const_expr(cache_fp8):
+                value = bf16_round(value)
+                kvn, _ = _fp8_roundtrip(value, value)
+            else:
+                kvn = bf16_round(value)
+            if const_expr(use_atom_kv_cache):
+                if active:
+                    if const_expr(cache_fp8):
+                        pair = fx.Int32(
+                            rocdl.cvt_pk_fp8_f32(
+                                T.i32, kvn, _xshfl(kvn, 1), fx.Int32(0), False
+                            )
+                        ) & fx.Int32(0xFFFF)
+                        upper_pair = bpermute_i32(
+                            fp8_kv_upper_pair_lane(lane) * 4, pair
+                        )
+                        if lane % 4 == 0:
+                            bo.buffer_store(
+                                pair | (upper_pair << 16),
+                                r_kv,
+                                slot * (QK_DIM // 4) + tid // 4,
+                            )
+                    else:
+                        bo.buffer_store(kvn.to(fx.BFloat16), r_kv, slot * QK_DIM + tid)
+            else:
+                bo.buffer_store(kvn.to(fx.BFloat16), r_kv, pos * KV_LORA + tid)
+            put(mb("kvnew"), s * KV_LORA + tid, kvn)
+            if tid < PE_DIM // 2:
+                p0, p1 = x0 * c - x1 * sn, x0 * sn + x1 * c
                 if const_expr(cache_fp8):
-                    value = bf16_round(value)
-                    kvn, _ = _fp8_roundtrip(value, value)
+                    p0, p1 = bf16_round(p0), bf16_round(p1)
+                    p0, p1 = _fp8_roundtrip(p0, p1)
                 else:
-                    kvn = bf16_round(value)
+                    p0, p1 = bf16_round(p0), bf16_round(p1)
                 if const_expr(use_atom_kv_cache):
                     if active:
                         if const_expr(cache_fp8):
                             pair = fx.Int32(
-                                rocdl.cvt_pk_fp8_f32(
-                                    T.i32, kvn, _xshfl(kvn, 1), fx.Int32(0), False
-                                )
+                                rocdl.cvt_pk_fp8_f32(T.i32, p0, p1, fx.Int32(0), False)
                             ) & fx.Int32(0xFFFF)
                             upper_pair = bpermute_i32(
-                                fp8_kv_upper_pair_lane(lane) * 4, pair
+                                fp8_pe_upper_pair_lane(lane) * 4, pair
                             )
-                            if lane % 4 == 0:
+                            if lane % 2 == 0:
                                 bo.buffer_store(
                                     pair | (upper_pair << 16),
-                                    r_kv,
-                                    slot * (QK_DIM // 4) + tid // 4,
+                                    r_pe,
+                                    slot * (QK_DIM // 4) + KV_LORA // 4 + tid // 2,
                                 )
                         else:
-                            bo.buffer_store(
-                                kvn.to(fx.BFloat16), r_kv, slot * QK_DIM + tid
-                            )
+                            pe_offset = slot * QK_DIM + KV_LORA + tid * 2
+                            bo.buffer_store(p0.to(fx.BFloat16), r_pe, pe_offset)
+                            bo.buffer_store(p1.to(fx.BFloat16), r_pe, pe_offset + 1)
                 else:
-                    bo.buffer_store(kvn.to(fx.BFloat16), r_kv, pos * KV_LORA + tid)
-                put(mb("kvnew"), s * KV_LORA + tid, kvn)
-                if tid < PE_DIM // 2:
-                    x0, x1 = pes[s]
-                    c, sn = cs[s], sns[s]
-                    p0, p1 = x0 * c - x1 * sn, x0 * sn + x1 * c
-                    if const_expr(cache_fp8):
-                        p0, p1 = bf16_round(p0), bf16_round(p1)
-                        p0, p1 = _fp8_roundtrip(p0, p1)
-                    else:
-                        p0, p1 = bf16_round(p0), bf16_round(p1)
-                    if const_expr(use_atom_kv_cache):
-                        if active:
-                            if const_expr(cache_fp8):
-                                pair = fx.Int32(
-                                    rocdl.cvt_pk_fp8_f32(
-                                        T.i32, p0, p1, fx.Int32(0), False
-                                    )
-                                ) & fx.Int32(0xFFFF)
-                                upper_pair = bpermute_i32(
-                                    fp8_pe_upper_pair_lane(lane) * 4, pair
-                                )
-                                if lane % 2 == 0:
-                                    bo.buffer_store(
-                                        pair | (upper_pair << 16),
-                                        r_pe,
-                                        slot * (QK_DIM // 4) + KV_LORA // 4 + tid // 2,
-                                    )
-                            else:
-                                pe_offset = slot * QK_DIM + KV_LORA + tid * 2
-                                bo.buffer_store(p0.to(fx.BFloat16), r_pe, pe_offset)
-                                bo.buffer_store(p1.to(fx.BFloat16), r_pe, pe_offset + 1)
-                    else:
-                        pe_offset = pos * PE_DIM + tid * 2
-                        bo.buffer_store(p0.to(fx.BFloat16), r_pe, pe_offset)
-                        bo.buffer_store(p1.to(fx.BFloat16), r_pe, pe_offset + 1)
-                    put2(mb("penew"), s * PE_DIM + tid * 2, p0, p1)
+                    pe_offset = pos * PE_DIM + tid * 2
+                    bo.buffer_store(p0.to(fx.BFloat16), r_pe, pe_offset)
+                    bo.buffer_store(p1.to(fx.BFloat16), r_pe, pe_offset + 1)
+                put2(mb("penew"), s * PE_DIM + tid * 2, p0, p1)
 
             if const_expr(with_indexer):
                 # Index keys use LayerNorm (not RMSNorm), interleaved RoPE on the
@@ -2055,99 +2014,79 @@ def build_glm5_monokernel(
                 # gfx950 indexer applies to the keys it caches and to its queries.
                 r_gik, r_bik = _rsrc(index_arg(5)), _rsrc(index_arg(6))
                 r_index_cache = _rsrc(indices)
-                # every row's key in one poll and its LayerNorm sums in two block
-                # reductions, each in the order of one row's
+                # the row's key in one poll
                 live = tid < INDEX_DIM
                 ik_one = fx.min(tid, INDEX_DIM - 1)
                 ik_two = fx.min(tid, INDEX_DIM // 2 - 1) * 2
                 got = poll(
-                    [(mb("index_k"), s * INDEX_DIM + ik_one, 1) for s in range(S)]
-                    + [(mb("index_k"), s * INDEX_DIM + ik_two, 2) for s in range(S)]
+                    [
+                        (mb("index_k"), s * INDEX_DIM + ik_one, 1),
+                        (mb("index_k"), s * INDEX_DIM + ik_two, 2),
+                    ]
                 )
-                iks = [got[s][0].bitcast(fx.Float32) for s in range(S)]
-                kps = [
-                    (
-                        got[S + s][0].bitcast(fx.Float32),
-                        got[S + s][1].bitcast(fx.Float32),
+                ik = got[0][0].bitcast(fx.Float32)
+                k0, k1 = got[1][0].bitcast(fx.Float32), got[1][1].bitcast(fx.Float32)
+                mean = block_sums([live.select(ik, fx.Float32(0.0))])[0] * (
+                    1.0 / INDEX_DIM
+                )
+                centered = live.select(ik - mean, fx.Float32(0.0))
+                rstd = _rsq(
+                    block_sums([centered * centered])[0] * (1.0 / INDEX_DIM) + 1.0e-6
+                )
+                if tid < INDEX_DIM // 2:
+                    i0 = tid * 2
+                    v0 = (k0 - mean) * rstd * ld_f32(r_gik, i0) + ld_f32(r_bik, i0)
+                    v1 = (k1 - mean) * rstd * ld_f32(r_gik, i0 + 1) + ld_f32(
+                        r_bik, i0 + 1
                     )
-                    for s in range(S)
-                ]
-                means = [
-                    m * (1.0 / INDEX_DIM)
-                    for m in block_sums(
-                        [live.select(ik, fx.Float32(0.0)) for ik in iks]
-                    )
-                ]
-                centered = [
-                    live.select(ik - m, fx.Float32(0.0)) for ik, m in zip(iks, means)
-                ]
-                rstds = [
-                    _rsq(v * (1.0 / INDEX_DIM) + 1.0e-6)
-                    for v in block_sums([c * c for c in centered])
-                ]
-                for s in range_constexpr(S):
-                    mean, rstd = means[s], rstds[s]
-                    if tid < INDEX_DIM // 2:
-                        i0 = tid * 2
-                        k0, k1 = kps[s]
-                        v0 = (k0 - mean) * rstd * ld_f32(r_gik, i0) + ld_f32(r_bik, i0)
-                        v1 = (k1 - mean) * rstd * ld_f32(r_gik, i0 + 1) + ld_f32(
-                            r_bik, i0 + 1
+                    if tid < PE_DIM // 2:
+                        v0, v1 = v0 * c - v1 * sn, v0 * sn + v1 * c
+                    v0, v1 = fwht128(v0, v1)
+                    if const_expr(index_paged):
+                        # the index cache's ue8m0 quant: scale = 2^ceil(log2(max(amax, 1e-4) / 448))
+                        amax = wave_max(fx.max(fmath.absf(v0), fmath.absf(v1)))
+                        bits = div_rn(
+                            fx.max(amax, fx.Float32(1.0e-4)),
+                            fx.Float32(FP8_MAX),
+                            fx.Float32(1.0 / FP8_MAX),
+                        ).bitcast(fx.Int32)
+                        exponent = (bits >> 23) & fx.Int32(0xFF)
+                        exponent = exponent + ((bits & fx.Int32(0x7FFFFF)) != 0).select(
+                            fx.Int32(1), fx.Int32(0)
                         )
-                        if tid < PE_DIM // 2:
-                            c, sn = cs[s], sns[s]
-                            v0, v1 = v0 * c - v1 * sn, v0 * sn + v1 * c
-                        v0, v1 = fwht128(v0, v1)
-                        if const_expr(index_paged):
-                            # the index cache's ue8m0 quant: scale = 2^ceil(log2(max(amax, 1e-4) / 448))
-                            amax = wave_max(fx.max(fmath.absf(v0), fmath.absf(v1)))
-                            bits = div_rn(
-                                fx.max(amax, fx.Float32(1.0e-4)),
-                                fx.Float32(FP8_MAX),
-                                fx.Float32(1.0 / FP8_MAX),
-                            ).bitcast(fx.Int32)
-                            exponent = (bits >> 23) & fx.Int32(0xFF)
-                            exponent = exponent + (
-                                (bits & fx.Int32(0x7FFFFF)) != 0
-                            ).select(fx.Int32(1), fx.Int32(0))
-                            k_scale = (exponent << 23).bitcast(fx.Float32)
-                            k_inv = ((fx.Int32(254) - exponent) << 23).bitcast(
-                                fx.Float32
-                            )
-                            q0, q1 = v0 * k_inv, v1 * k_inv
-                            word = fp8_pack4(q0, q1, _xshfl(q0, 1), _xshfl(q1, 1))
-                            slot = row_slot(s)
-                            block = slot // index_block_size
-                            off = slot % index_block_size
-                            if row_writes_cache(s) & (tid % 2 == 0):
-                                bo.buffer_store(
-                                    word,
-                                    r_index_cache,
-                                    index_value_word(block, off, i0),
-                                )
-                            if row_writes_cache(s) & (tid == 0):
-                                bo.buffer_store(
-                                    k_scale, r_index_cache, index_scale_word(block, off)
-                                )
-                            d0, d1 = _fp8_roundtrip(q0, q1)
-                            put_bf(
-                                mb("index_k_new"),
-                                s * INDEX_DIM + i0,
-                                [d0 * k_scale, d1 * k_scale],
-                            )
-                        else:
+                        k_scale = (exponent << 23).bitcast(fx.Float32)
+                        k_inv = ((fx.Int32(254) - exponent) << 23).bitcast(fx.Float32)
+                        q0, q1 = v0 * k_inv, v1 * k_inv
+                        word = fp8_pack4(q0, q1, _xshfl(q0, 1), _xshfl(q1, 1))
+                        block = slot // index_block_size
+                        off = slot % index_block_size
+                        if active & (tid % 2 == 0):
                             bo.buffer_store(
-                                fx.Vector.from_elements([v0, v1], fx.Float32).to(
-                                    fx.BFloat16
-                                ),
-                                r_index_cache,
-                                (pos0 + s) * INDEX_DIM + i0,
+                                word, r_index_cache, index_value_word(block, off, i0)
                             )
-                            put_bf(mb("index_k_new"), s * INDEX_DIM + i0, [v0, v1])
-                    gpu.barrier()
-                    if tid == 0:
-                        put(mb("index_ready"), s, fx.Int32(1))
-            stamp("cache", t, 4)
+                        if active & (tid == 0):
+                            bo.buffer_store(
+                                k_scale, r_index_cache, index_scale_word(block, off)
+                            )
+                        d0, d1 = _fp8_roundtrip(q0, q1)
+                        put_bf(
+                            mb("index_k_new"),
+                            s * INDEX_DIM + i0,
+                            [d0 * k_scale, d1 * k_scale],
+                        )
+                    else:
+                        bo.buffer_store(
+                            fx.Vector.from_elements([v0, v1], fx.Float32).to(
+                                fx.BFloat16
+                            ),
+                            r_index_cache,
+                            (pos0 + s) * INDEX_DIM + i0,
+                        )
+                        put_bf(mb("index_k_new"), s * INDEX_DIM + i0, [v0, v1])
+                gpu.barrier()
+                if tid == 0:
+                    put(mb("index_ready"), s, fx.Int32(1))
+            stamp("cache", s, 4)
 
         # =============================================== 4. normalized q_a -> q_b (+RoPE)
         r_wqb, r_sqb = _rsrc(w_q_b), _rsrc(s_q_b)
@@ -2264,15 +2203,15 @@ def build_glm5_monokernel(
         if const_expr(with_indexer):
             # The 128 CTAs without q_b work produce the other 128 index-query
             # tiles concurrently.  They reload q_a, but remove one full GEMV
-            # from the q_b CTAs' serialized critical path.  The tile that would land
-            # on the cache task's CTA runs second on the CTA of the first extra tile
-            # instead: behind the cache task it would end last.
+            # from the q_b CTAs' serialized critical path.  S of them hold the q_norm
+            # and cache tasks: their tiles run second on the CTAs of the first S extra
+            # tiles instead (qkv_a tiles' CTAs), as behind the cache tasks they would
+            # end last.
             N_INDEX_Q_EXTRA = INDEX_Q_ROWS // INDEX_TILE - N_QB
-            IQ_CACHE = (base["cache"] - base["index_q"]) % G
-            IQ_HOST = 0
+            IQ_NORM = (base["q_norm"] - base["index_q"]) % G
+            assert base["cache"] == base["q_norm"]
             # at TP4 the q_b CTAs run every index-query tile: there is no extra one
-            MOVED = IQ_CACHE < N_INDEX_Q_EXTRA
-            assert IQ_HOST != IQ_CACHE or not MOVED
+            assert N_INDEX_Q_EXTRA == 0 or S <= IQ_NORM <= N_INDEX_Q_EXTRA - S
 
             def index_q_extra(tt):
                 iq_t = N_QB + tt
@@ -2316,11 +2255,10 @@ def build_glm5_monokernel(
 
             for tt in range(start("index_q"), N_INDEX_Q_EXTRA, G):
                 tt = fx.Int32(tt)
-                if tt != IQ_CACHE:
+                if (tt < IQ_NORM) | (tt >= IQ_NORM + S):
                     index_q_extra(tt)
-            if const_expr(MOVED):
-                if start("index_q") == IQ_HOST:
-                    index_q_extra(fx.Int32(IQ_CACHE))
+                if tt < S:
+                    index_q_extra(tt + IQ_NORM)
 
         # ==================================== 4. absorbed query: q_lat = W_UK^T q_nope
         # 8 row groups (128 latent rows of one head) x 3 chunks: one row group per wave
