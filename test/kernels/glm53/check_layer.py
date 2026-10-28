@@ -274,8 +274,9 @@ def make_step(positions: list, requests: list, pages: Pages, device):
         positions=torch.tensor([p or 0 for p in positions], dtype=i64, device=device),
         slots=torch.tensor(slots, dtype=i64, device=device),
         indptr=torch.tensor(indptr, dtype=i32, device=device),
-        req_ids=torch.tensor(requests, dtype=i32, device=device),
-        # SGLang's DSA backend gives each row its request's page-table row
+        # SGLang's DSA backend gives each row its request's page-table row, and the
+        # spec each row that row
+        req_ids=torch.arange(W, dtype=i32, device=device),
         page_table=pages.table[torch.tensor(requests, device=device)].contiguous(),
         topk=topk,
     )
