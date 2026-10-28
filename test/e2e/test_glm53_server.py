@@ -3,11 +3,12 @@ switch points: decode steps of 1 to 8 rows run the kernels, wider ones the norma
 path, and requests join and leave a running batch that steps past 8 rows and back
 (a short GSM8K run, for gross failures); the tokens of covered steps scored again by
 the normal prefill path (KL consistency); with MTP, verify steps of 1 and 2 requests
-(4 and 8 rows) on the kernels (GSM8K and the draft's accept length); each covered
-layer against the normal one, in decode and verify steps, and in verify steps on the
-E4M3 MLA cache, the dense layers' MLPs and the tail's logits included; the hidden
-states a covered step returns; and a fault on one rank that stops the server before
-any token of the failed step is sent."""
+(4 and 8 rows) on the kernels, and the NextN draft's extend of 1 and 2 requests on
+its launches (GSM8K and the draft's accept length); each covered layer against the
+normal one, in decode and verify steps, and in verify steps on the E4M3 MLA cache,
+the dense layers' MLPs, the tail's logits and each MTP draft step against SGLang's
+NextN included; the hidden states a covered step returns; and a fault on one rank
+that stops the server before any token of the failed step is sent."""
 
 import os
 import re
@@ -113,12 +114,18 @@ class TestMonokernelMtp(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.process = _launch(extra_args=[*MTP, "--watchdog-timeout", "1200"])
+        cls.out = tempfile.NamedTemporaryFile("w+", suffix=".out")
+        cls.err = tempfile.NamedTemporaryFile("w+", suffix=".err")
+        cls.process = _launch(
+            extra_args=[*MTP, "--watchdog-timeout", "1200"], log=(cls.out, cls.err)
+        )
 
     @classmethod
     def tearDownClass(cls):
         if cls.process is not None:
             terminate_and_kill_process_tree(cls.process)
+        cls.out.close()
+        cls.err.close()
 
     def test_gsm8k_and_accept_length_past_the_largest_width(self):
         # 12 requests at a time: verify steps of 1 and 2 requests run the kernels,
@@ -130,6 +137,16 @@ class TestMonokernelMtp(CustomTestCase):
         print(f"{metrics=} {accept=}")
         self.assertGreater(metrics["score"], GSM8K_BOUND)
         self.assertGreater(accept, MTP_ACCEPT_BOUND)
+        # the draft extends of 1 and 2 requests ran the NextN launches (these
+        # requests sample, so under rejection sampling the draft decode steps run
+        # SGLang's path; the check-mode test runs them greedy)
+        self.err.seek(0)
+        self.out.seek(0)
+        log = self.err.read() + self.out.read()
+        steps = re.findall(r"runs the MTP draft step \('(\w+)', (\d+), (\d+)\)", log)
+        self.assertLessEqual(
+            {("DRAFT_EXTEND_V2", "1", "4"), ("DRAFT_EXTEND_V2", "2", "8")}, set(steps)
+        )
 
 
 class TestMonokernelCheck(CustomTestCase):
@@ -236,6 +253,13 @@ class TestMonokernelCheck(CustomTestCase):
         self.assertTrue(
             any(k == "indexer" and int(hi) >= past for k, _, hi, _ in checks)
         )
+        if "--speculative-algorithm" in extra_args:
+            # each MTP draft step on the NextN launches, checked against SGLang's
+            drafts = re.findall(r"monokernel check draft (\d) \((index|shared),", log)
+            self.assertEqual(
+                {(int(n), kind) for n, kind in drafts},
+                {(1, "index"), (2, "shared"), (3, "shared")},
+            )
         violations = re.findall(r"monokernel check violation: .*", log)
         self.assertEqual(violations, [], "\n".join(violations[:20]))
 

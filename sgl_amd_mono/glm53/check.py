@@ -197,10 +197,22 @@ def _f32_routing(mlp):
     return mlp.register_forward_pre_hook(gate_in), mlp.topk.register_forward_hook(route)
 
 
-def reference(L, positions, h_in, forward_batch, S: int, prev_topk) -> dict:
-    """SGLang's layer on ``h_in`` [S, HIDDEN] (a copy), routed in f32: its output
-    stream, its top-k and the cache rows it writes. The KV cache is restored after;
-    the index keys keep SGLang's values with POISON_SCALE scales."""
+def reference(
+    L,
+    positions,
+    h_in,
+    forward_batch,
+    S: int,
+    prev_topk,
+    *,
+    f32_routing: bool = True,
+    restore_index: bool = False,
+) -> dict:
+    """SGLang's layer on ``h_in`` [S, HIDDEN] (a copy), routed in f32 (or, without
+    ``f32_routing``, as SGLang routes): its output stream, its top-k and the cache
+    rows it writes. The KV cache is restored after; the index keys keep SGLang's
+    values with POISON_SCALE scales, or, with ``restore_index`` (a reference after
+    the launch), are restored too."""
     from sglang.srt.layers.layer_boundary.residual.batch import (
         fold,
         set_written,
@@ -211,6 +223,10 @@ def reference(L, positions, h_in, forward_batch, S: int, prev_topk) -> dict:
     regions = _regions(L, forward_batch, S)
     kv, kv_slots = regions["kv"]
     saved = kv[kv_slots].clone()
+    saved_index = None
+    if restore_index and "index" in regions:
+        pages, page_ids = regions["index"]
+        saved_index = pages[page_ids].clone()
     hidden = set_written(h_in, forward_batch)
     zero = BumpAllocator(buffer_size=4, dtype=torch.float32, device=h_in.device)
     mlp_in, o_proj = [], []
@@ -224,7 +240,7 @@ def reference(L, positions, h_in, forward_batch, S: int, prev_topk) -> dict:
             ),
         )
     else:
-        hooks = _f32_routing(L.module.mlp)
+        hooks = _f32_routing(L.module.mlp) if f32_routing else ()
     try:
         out, topk = L.module(
             positions[:S],
@@ -247,7 +263,10 @@ def reference(L, positions, h_in, forward_batch, S: int, prev_topk) -> dict:
     for name, (t, idx) in regions.items():
         ref[name] = t[idx].clone()
     kv[kv_slots] = saved
-    if "index" in regions:
+    if saved_index is not None:
+        pages, page_ids = regions["index"]
+        pages[page_ids] = saved_index
+    elif "index" in regions:
         poison_new_index_scales(regions["index"][0], forward_batch.out_cache_loc[:S])
     return ref
 
@@ -262,7 +281,10 @@ def compare(
     *,
     step,
     scores: torch.Tensor | None,
+    check: str = "layer",
 ) -> None:
+    """The launch's outputs against ``reference``'s, as ``<check>.<output>.<metric>``
+    (the NextN layer's check: ``nextn``)."""
     from sglang.srt.runtime_context import get_parallel
 
     if get_parallel().tp_rank != 0:
@@ -277,13 +299,14 @@ def compare(
         slots = forward_batch.out_cache_loc[:S]
         outputs.update(_topk_outputs(ref["topk"], step, slots, S))
     values = {
-        f"layer.{out}.{metric}": v
+        f"{check}.{out}.{metric}": v
         for out, ms in outputs.items()
         for metric, v in ms.items()
     }
     pos = positions[:S]
     logger.info(
-        "monokernel check layer %d (%s, %d rows, positions %d..%d): %s",
+        "monokernel check %s %d (%s, %d rows, positions %d..%d): %s",
+        check,
         L.i,
         "dense" if L.w.dense else "indexer" if L.w.index is not None else "shared",
         S,
@@ -291,7 +314,7 @@ def compare(
         pos.max().item(),
         " ".join(f"{k}={v:.6g}" for k, v in values.items()),
     )
-    _bounds(f"layer {L.i}", values)
+    _bounds(f"{check} {L.i}", values)
 
 
 # the outputs each check reports (``<check>.<output>.<metric>``)
@@ -307,6 +330,25 @@ REPORTED = {
     ),
     "dense": ("attn", "mlp_in", "mid", "x", "x_vs_fp32", "stock_vs_fp32", "excess"),
     "head": ("logits", "logits_vs_fp32", "stock_vs_fp32", "normed", "top1"),
+    # the MTP draft's NextN layer (as ``layer``) and its entry, seed and tokens
+    "nextn": (
+        "streams",
+        "kv",
+        "index",
+        "index_scale",
+        "topk",
+        "topk_own",
+        "topk_exact",
+    ),
+    "draft": (
+        "eh",
+        "eh_vs_fp32",
+        "eh_stock_vs_fp32",
+        "topk_extra",
+        "seed",
+        "token",
+        "token_gap",
+    ),
 }
 METRICS = ("cosine", "rel", "max_abs", "agree")
 
@@ -496,21 +538,29 @@ def dense(L, op, ref: dict, out: torch.Tensor, S: int) -> None:
     _bounds(f"layer {L.i}", values)
 
 
-def tail(lm, x: torch.Tensor, logits: torch.Tensor, normed: torch.Tensor) -> None:
-    """The tail's logits (and normed rows) against SGLang's final norm, LM head and
-    all-gather on the same rows, and against an f32 tail."""
+def tail(
+    lm,
+    x: torch.Tensor,
+    logits: torch.Tensor,
+    normed: torch.Tensor,
+    norm=None,
+    where: str = "tail",
+) -> None:
+    """The tail's logits (and normed rows) against SGLang's final norm (or ``norm``),
+    LM head and all-gather on the same rows, and against an f32 tail."""
     from sglang.srt.distributed.communication_op import (
         tensor_model_parallel_all_gather,
     )
     from sglang.srt.runtime_context import get_parallel
 
+    norm = lm.model.norm if norm is None else norm
     w = lm.lm_head.weight
-    ref_normed = lm.model.norm(x.clone())
+    ref_normed = norm(x.clone())
     if isinstance(ref_normed, tuple):
         ref_normed = ref_normed[0]
     ref = tensor_model_parallel_all_gather((ref_normed @ w.t()).contiguous()).float()
     f32 = tensor_model_parallel_all_gather(
-        (_rms(x, lm.model.norm.weight) @ w.float().t()).contiguous()
+        (_rms(x, norm.weight) @ w.float().t()).contiguous()
     )
     vocab = logits.shape[-1]
     values = {
@@ -526,8 +576,147 @@ def tail(lm, x: torch.Tensor, logits: torch.Tensor, normed: torch.Tensor) -> Non
     if get_parallel().tp_rank != 0:
         return
     logger.info(
-        "monokernel check tail (%d rows): %s",
+        "monokernel check %s (%d rows): %s",
+        where,
         x.shape[0],
         " ".join(f"{k}={v:.6g}" for k, v in values.items()),
     )
-    _bounds("tail", values)
+    _bounds(where, values)
+
+
+def seed_mismatch(step, seed: torch.Tensor, S: int) -> int:
+    """The most entries of a seed row (SGLang's int32 [>= S, TOPK]) that differ from
+    its step row's keys (``step.topk`` at ``indptr``), then -1."""
+    bounds = step.indptr[: S + 1].tolist()
+    bad = 0
+    for s in range(S):
+        n = bounds[s + 1] - bounds[s]
+        row = seed[s]
+        bad = max(
+            bad,
+            int((row[:n] != step.topk[bounds[s] : bounds[s + 1]]).sum())
+            + int((row[n:] != -1).sum()),
+        )
+    return bad
+
+
+def topk_extra(step, seed: torch.Tensor, out_cache_loc, S: int) -> int:
+    """The most keys a draft decode row attends (``indptr``) past or short of the
+    seed row's valid entries; pad rows (slot 0) aside."""
+    want = (seed[:S] >= 0).sum(-1)
+    got = (step.indptr[1 : S + 1] - step.indptr[:S]).to(want.dtype)
+    live = out_cache_loc[:S] != 0
+    return int(((got - want).abs() * live).max().item())
+
+
+def entry_rows(runtime, rows: int) -> torch.Tensor:
+    """A NextN launch's layer input x (its entry's rows, as every rank gathered
+    them), bf16 [rows, HIDDEN]: the value words of the (packed bf16 pair, tag) pairs
+    of the launch's xin slot. Read after the launch and its epoch's advance."""
+    from sgl_amd_mono.glm53.gfx950.config import HIDDEN
+
+    slot = (int(runtime.epoch[0]) - 1) & 1
+    at = runtime.sy["xin"] + slot * runtime.sy["_xin_stride"]
+    pairs = runtime.peer.bytes[at : at + rows * HIDDEN * 4].view(torch.int32)
+    return pairs.view(-1, 2)[:, 0].contiguous().view(torch.bfloat16).view(rows, HIDDEN)
+
+
+def _gathered_logits(lm, rows: torch.Tensor, norm) -> torch.Tensor:
+    """SGLang's ``norm``, LM head and all-gather on ``rows``: f32 logits."""
+    from sglang.srt.distributed.communication_op import (
+        tensor_model_parallel_all_gather,
+    )
+
+    normed = norm(rows.clone())
+    if isinstance(normed, tuple):
+        normed = normed[0]
+    return tensor_model_parallel_all_gather(
+        (normed @ lm.lm_head.weight.t()).contiguous()
+    ).float()
+
+
+def entry_values(m, e: torch.Tensor, h: torch.Tensor, x: torch.Tensor):
+    """A NextN entry's rows ``x`` against SGLang's eh_proj on its enorm | hnorm of
+    the e and h rows, and against an f32 entry; and SGLang's rows."""
+    stock = m.eh_proj(torch.cat((m.enorm(e), m.hnorm(h)), -1))
+    f32 = torch.cat((_rms(e, m.enorm.weight), _rms(h, m.hnorm.weight)), -1)
+    f32 = f32 @ m.eh_proj.weight.float().t()
+    values = {
+        "draft.eh.rel": _rel(x, stock),
+        "draft.eh_vs_fp32.rel": _rel(x, f32),
+        "draft.eh_stock_vs_fp32.rel": _rel(stock, f32),
+    }
+    return values, stock
+
+
+def draft(
+    d, L, op, kind, position, positions, fb, S, step, e, h, x, logits, normed, seed_buf
+) -> None:
+    """A routed MTP draft step (``position`` 1: the draft extend, 2 and 3 the draft
+    decode steps) against SGLang's NextN on the same inputs and caches: the entry (x
+    against SGLang's eh_proj on its norms, and against f32: ``draft.eh``), the layer
+    on the launch's x (``nextn``; a draft decode row's keys against the seed's
+    valid entries: ``draft.topk_extra``), the tail, the seed SGLang gets against the
+    launch's top-k (``draft.seed``), and the draft tokens: the tail's top-1 against
+    SGLang's whole NextN (its eh_proj, layer as SGLang routes, shared_head.norm and
+    LM head), reported with SGLang's logit gap where they differ."""
+    import types
+
+    import msgspec
+    from sglang.srt.runtime_context import get_parallel
+
+    m = d.lm.model
+    rt = op.rt
+    mine = entry_rows(rt, S)
+    if kind == "shared":
+        # a draft decode step writes no index keys (nor does SGLang's)
+        L = types.SimpleNamespace(
+            i=L.i,
+            module=L.module,
+            caches=L.caches,
+            w=msgspec.structs.replace(L.w, index=None),
+        )
+    values, stock = entry_values(m, e[:S], h[:S], mine)
+    prev = fb.spec_info.dsa_topk_indices if kind == "shared" else None
+    ref = reference(L, positions, mine, fb, S, prev, restore_index=True)
+    scores = launch_scores(rt, S) if kind == "index" else None
+    compare(L, ref, x[:S], positions, fb, S, step=step, scores=scores, check="nextn")
+    if prev is not None:
+        values["draft.topk_extra.max_abs"] = float(
+            topk_extra(step, prev, fb.out_cache_loc, S)
+        )
+    if seed_buf is not None and kind == "index":
+        values["draft.seed.max_abs"] = float(seed_mismatch(step, seed_buf, S))
+    tail(
+        d.lm, x[:S], logits[:S], normed[:S], norm=m.shared_head.norm, where="draft tail"
+    )
+    # SGLang's whole NextN on the same inputs, as it routes
+    ref = reference(
+        L, positions, stock, fb, S, prev, f32_routing=False, restore_index=True
+    )
+    theirs = _gathered_logits(d.lm, ref["streams"], m.shared_head.norm)
+    theirs = theirs[:, : logits.shape[-1]]
+    live = fb.out_cache_loc[:S] != 0
+    ours, want = logits[:S].argmax(-1), theirs.argmax(-1)
+    same = (ours == want) | ~live
+    gaps = (theirs.gather(1, want[:, None]) - theirs.gather(1, ours[:, None])).squeeze(
+        1
+    )
+    values["draft.token.agree"] = (
+        same[live].float().mean().item() if live.any() else 1.0
+    )
+    values["draft.token_gap.max_abs"] = (
+        float(gaps[~same].max().item()) if (~same).any() else 0.0
+    )
+    if get_parallel().tp_rank != 0:
+        return
+    logger.info(
+        "monokernel check draft %d (%s, %d rows, positions %d..%d): %s",
+        position,
+        kind,
+        S,
+        positions[:S].min().item(),
+        positions[:S].max().item(),
+        " ".join(f"{k}={v:.6g}" for k, v in values.items()),
+    )
+    _bounds(f"draft {position}", values)
