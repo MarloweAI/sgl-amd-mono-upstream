@@ -112,6 +112,7 @@ from .config import (
 from .layout import (
     BLOCKS,
     DCP_SUMMARY_PAIRS,
+    HEAD_TILE,
     INDEX_CAND_STAGE_CAP,
     INDEX_DIM,
     INDEX_HEADS,
@@ -198,6 +199,9 @@ def build_glm5_monokernel(
     fault_site: int = 0,
     fault_after: int = 0,
     stop: bool = True,
+    tokens: bool = False,
+    vocab_rows: int = 0,
+    tail: bool = False,
 ):
     """Return the ``@flyc.jit`` launcher for one rank's whole layer.
 
@@ -219,7 +223,20 @@ def build_glm5_monokernel(
 
     ``dense_experts > 0`` runs a dense MLP instead of the MoE: its intermediate
     dimension is stored as that many expert-shaped slices, every row routes to all
-    of them with weight 1, and the router GEMV is skipped.
+    of them with weight 1, and the router GEMV is skipped. With FP8 experts the
+    slots past the slices load nothing.
+
+    ``tokens=True`` (a step's first layer) starts from the step's tokens: ``h_in``
+    holds their ids (int32 [S], -1 for a pad row) and ``w_r`` this rank's
+    ``vocab_rows`` rows of the vocab-parallel embedding (bf16 [vocab_rows, HIDDEN]).
+    The rank that holds a token's row pushes it to every rank (a pad row's zeros come
+    from rank 0), which equals the embedding's all-reduce: one rank holds each row.
+
+    ``tail=True`` builds the tail instead of a layer: the final RMSNorm of the rows
+    ``h_in`` (bf16 [S, HIDDEN]) with weight ``g_in``, written to ``w_o`` (bf16
+    [S, HIDDEN]); this rank's ``vocab_rows`` LM-head rows ``w_r`` (bf16, row-major) on
+    the normed rows, rounded to bf16 as SGLang's LM head leaves them; and their
+    all-gather over the TP ranks into ``x_out`` (f32 [S, vocab_rows * npes]).
     """
     keyed = key_tuple(locals(), SOURCES)
     assert uv_scale_rows in (64, 128)
@@ -251,8 +268,12 @@ def build_glm5_monokernel(
         and index_block_bytes % 4 == 0
         and (not index_shuffled or index_block_size % 16 == 0)
     )
+    assert not tokens or (vocab_rows > 0 and dense_experts and not attention_ptpc)
+    assert not tail or (vocab_rows % HEAD_TILE == 0 and not tokens)
     assert 0 <= dense_experts <= MOE_SLOTS
-    assert not dense_experts or (S > 1 and atom_experts)
+    assert not dense_experts or (S > 1 and (atom_experts or not expert_mxfp4))
+    # the slots past an FP8 dense MLP's slices: weight 0, no weight loads
+    dense_fp8 = dense_experts > 0 and not expert_mxfp4
     H = heads
     L = H if output_heads is None else output_heads
     W = npes
@@ -273,6 +294,8 @@ def build_glm5_monokernel(
         output_heads=L,
         dcp_size=D,
         native_fp4_mfma=native_fp4_mfma,
+        tokens=tokens,
+        head_vocab=vocab_rows * W if tail else 0,
     )
     N_SPLIT = topk // SPLIT_KEYS
     QB_ROWS = H * (NOPE_DIM + PE_DIM)
@@ -319,6 +342,8 @@ def build_glm5_monokernel(
         SPLIT_X_WORDS,
         0 if index_paged else index_max_seq,
         down_x_words(S, expert_inter, expert_mxfp4, native_fp4_mfma),
+        # the tail's normed rows, every row at once
+        S * HIDDEN // 2 if tail else 0,
     )
     # Paged top-k: a 4096-bin histogram, then (key, position) candidates of
     # the threshold bin, both in the X region of the selecting CTA.
@@ -353,13 +378,24 @@ def build_glm5_monokernel(
 
     first, acc = {}, 0
     for name, n in stage_tasks(
-        S, H, topk, with_indexer, index_max_seq, expert_mxfp4, inter=expert_inter
+        S,
+        H,
+        topk,
+        with_indexer,
+        index_max_seq,
+        expert_mxfp4,
+        inter=expert_inter,
+        tokens=tokens,
+        head_rows=vocab_rows if tail else 0,
     ):
         first[name] = acc
         acc += n
     base = stage_bases(
         S, H, topk, with_indexer, index_max_seq, expert_mxfp4, inter=expert_inter
     )
+    # the embedding push runs ahead of qkv_a on the CTAs from 0; the tail's stages
+    # start at CTA 0
+    base["embed"] = base["lmhead"] = base["gather"] = 0
 
     @fx.struct
     class Smem:
@@ -1778,6 +1814,180 @@ def build_glm5_monokernel(
             """This lane's local MFMA B column; inactive columns duplicate the last one."""
             return fx.min(lane % 16, count - 1)
 
+        # ======================================= the tail (a ``tail`` build)
+        def run_head():
+            """Every CTA normalizes all rows into LDS (CTA b also writes columns
+            HIDDEN / G * b .. of them to ``w_o``), runs 16-row tiles of this rank's
+            LM-head rows and pushes their bf16 logits to every rank (two slots by
+            launch parity), then turns its slice of the gathered logits into f32."""
+            VR = vocab_rows
+            VOCAB = VR * W
+            N_VT = VR // HEAD_TILE
+            HD_CPW = HIDDEN // 64 // WAVES
+            HD_AHEAD = HD_CPW if S <= 4 else HD_CPW // 2
+            HD_ROUNDS = (N_VT + G - 1) // G
+            G_PAIRS = S * VOCAB // 2
+            G_PER = (G_PAIRS + G - 1) // G
+            NC = HIDDEN // G
+            r_x, r_wh = _rsrc(h_in), _rsrc(w_r)
+            logits_base = fx.Int64(SY["logits"]) + fx.Int64(peer_slot) * fx.Int64(
+                SY["_logits_stride"]
+            )
+
+            def u_h(row0, c):
+                # rows past the end load the last row; the caller drops them
+                kc = wave * HD_CPW + c
+                r = fx.min(row0 + lane % 16, VR - 1)
+                wv = [
+                    fx.Vector(
+                        bo.buffer_load(
+                            r_wh,
+                            (r * HIDDEN + kc * 64 + sp * 32 + (lane // 16) * 8) // 2,
+                            vec_width=4,
+                            dtype=T.i32,
+                        )
+                    )
+                    for sp in range(2)
+                ]
+                b_word = n_sel() * (HIDDEN // 2) + kc * 32 + (lane // 16) * 4
+                return ("bf16", wv, None, b_word)
+
+            def ahead(tile):
+                row0 = (tile < N_VT).select(tile * HEAD_TILE, fx.Int32(VR))
+                return [u_h(row0, c) for c in range(HD_AHEAD)]
+
+            def tile_task(k, tile, pre):
+                stamp("lmhead", tile, 0)
+                acc = run_units(
+                    lambda c: u_h(tile * HEAD_TILE, c), HD_CPW, HD_AHEAD, pre
+                )
+                nxt = ahead(tile + G) if k + 1 < HD_ROUNDS else None
+                reduce_rows(1, acc, emit_out(HEAD_TILE))
+                gpu.barrier()
+                if wave < W:
+                    if lane < S * HEAD_TILE // 2:
+                        si = lane // (HEAD_TILE // 2)
+                        ri = (lane % (HEAD_TILE // 2)) * 2
+                        put_bf(
+                            peer_dst + logits_base,
+                            si * VOCAB + rank * VR + tile * HEAD_TILE + ri,
+                            [
+                                lds_ld(outs, si * HEAD_TILE + ri),
+                                lds_ld(outs, si * HEAD_TILE + ri + 1),
+                            ],
+                            CM_SYS,
+                        )
+                gpu.barrier()
+                stamp("lmhead", tile, 4)
+                if const_expr(k + 1 < HD_ROUNDS):
+                    if tile + G < N_VT:
+                        tile_task(k + 1, tile + G, nxt)
+
+            t0 = start("lmhead")
+            pre = ahead(t0)
+
+            def ld_x(sks):
+                res = []
+                for s, k in sks:
+                    w = fx.Vector(
+                        bo.buffer_load(
+                            r_x, (s * HIDDEN + k) // 2, vec_width=2, dtype=T.i32
+                        )
+                    )
+                    v = w.bitcast(fx.BFloat16).to(fx.Float32)
+                    res.append([v[j] for j in range(4)])
+                return res
+
+            stage_x_rmsnorm(ld_x, HIDDEN, g_in, count=S)
+            gpu.barrier()
+            if tid < S * NC // 4:
+                s = tid // (NC // 4)
+                word = (s * HIDDEN + bid * NC) // 2 + (tid % (NC // 4)) * 2
+                bo.buffer_store(
+                    fx.Vector.from_elements(
+                        [lds_ld(xs, word + j).bitcast(fx.Int32) for j in range(2)],
+                        fx.Int32,
+                    ),
+                    _rsrc(w_o),
+                    word,
+                )
+            tile_task(0, t0, pre)
+            stamp("gather", bid, 0)
+            own = sym + logits_base
+            r_out = _rsrc(x_out)
+            n_g = (G_PER + THREADS - 1) // THREADS
+            qs = [
+                fx.min(bid * G_PER + fx.min(tid + i * THREADS, G_PER - 1), G_PAIRS - 1)
+                for i in range(n_g)
+            ]
+            got = poll([(own, q, 1) for q in qs], "one-as")
+            for i in range_constexpr(n_g):
+                if tid + i * THREADS < G_PER:
+                    v0, v1 = bf2_f32(got[i][0])
+                    bo.buffer_store(
+                        fx.Vector.from_elements([v0, v1], fx.Float32), r_out, qs[i] * 2
+                    )
+            stamp("gather", bid, 4)
+
+        if const_expr(tail):
+            run_head()
+            guarded.__exit__(None, None, None)
+            return
+
+        # ============================== 0. the step's embedding rows (layer 0)
+        # The token's owner rank pushes its row's 32-column tile to every rank, one
+        # wave a destination, as tagged packed bf16 pairs; the layer reads them back
+        # from its own buffer where it would read x.
+        if const_expr(tokens):
+            xin = (
+                sym
+                + fx.Int64(SY["xin"])
+                + fx.Int64(peer_slot) * fx.Int64(SY["_xin_stride"])
+            )
+            xin_dst = (
+                peer_dst
+                + fx.Int64(SY["xin"])
+                + fx.Int64(peer_slot) * fx.Int64(SY["_xin_stride"])
+            )
+            e_ids, e_emb = _rsrc(h_in), _rsrc(w_r)
+            EMB_PAIRS = S * (ROW_TILE // 2)
+            for e_t in range(start("embed"), N_ROW_TILES, G):
+                e_t = fx.Int32(e_t)
+                stamp("embed", e_t, 0)
+                if wave < W:
+                    for e_b in range_constexpr((EMB_PAIRS + 63) // 64):
+                        e_pair = lane + e_b * 64
+                        if e_pair < EMB_PAIRS:
+                            e_s = e_pair // (ROW_TILE // 2)
+                            e_col = e_t * ROW_TILE + (e_pair % (ROW_TILE // 2)) * 2
+                            e_tok = fx.Int32(
+                                bo.buffer_load(e_ids, e_s, vec_width=1, dtype=T.i32)
+                            )
+                            e_live = e_tok >= 0
+                            e_own = e_live.select(e_tok // vocab_rows, fx.Int32(0))
+                            if e_own == rank:
+                                e_row = e_live.select(
+                                    e_tok - rank * vocab_rows, fx.Int32(0)
+                                )
+                                e_word = fx.Int32(
+                                    bo.buffer_load(
+                                        e_emb,
+                                        (e_row * HIDDEN + e_col) // 2,
+                                        vec_width=1,
+                                        dtype=T.i32,
+                                    )
+                                )
+                                bo.buffer_store(
+                                    fx.Vector.from_elements(
+                                        [e_live.select(e_word, fx.Int32(0)), tag],
+                                        fx.Int32,
+                                    ),
+                                    _rsrc(xin_dst),
+                                    e_s * HIDDEN + e_col,
+                                    cache_modifier=CM_SYS,
+                                )
+                stamp("embed", e_t, 4)
+
         # ================================================= 1. q_a / kv_a GEMV
         # 1 row group x 96 chunks: 8 waves split K, 12 chunks each (all prefetched).
         # With the indexer, the index K and weights projections are further 16-row tiles
@@ -1808,6 +2018,15 @@ def build_glm5_monokernel(
 
             def ld_h(sample_base):
                 def f(sks):
+                    if const_expr(tokens):  # the rows the tokens' owner ranks pushed
+                        got = poll(
+                            [
+                                (xin, ((sample_base + s) * HIDDEN + k) // 2, 2)
+                                for s, k in sks
+                            ],
+                            "one-as",
+                        )
+                        return [list(bf2_f32(w[0])) + list(bf2_f32(w[1])) for w in got]
                     res = []
                     for s, k in sks:
                         w = fx.Vector(
@@ -1841,12 +2060,17 @@ def build_glm5_monokernel(
                 scales = []
                 for first in range_constexpr(0, group_count, NORM_ROWS):
                     count = min(NORM_ROWS, group_count - first)
-                    h_ld = load_x_rmsnorm(
-                        ld_h(sample_base + first), HIDDEN, g_in, count
-                    )
-                    if const_expr(pre is None):
-                        pre = [make_unit(c, group_count) for c in range(ahead)]
-                    scales += stage(sample_base + first, count, h_ld, first)
+                    if const_expr(tokens):  # the weights go out before the rows' wait
+                        if const_expr(pre is None):
+                            pre = [make_unit(c, group_count) for c in range(ahead)]
+                        scales += stage(sample_base + first, count, None, first)
+                    else:
+                        h_ld = load_x_rmsnorm(
+                            ld_h(sample_base + first), HIDDEN, g_in, count
+                        )
+                        if const_expr(pre is None):
+                            pre = [make_unit(c, group_count) for c in range(ahead)]
+                        scales += stage(sample_base + first, count, h_ld, first)
                 gpu.barrier()
                 stamp("qkv_a", t, 2)
                 if const_expr(ahead == n_units):
@@ -4175,6 +4399,10 @@ def build_glm5_monokernel(
             gpu.barrier()
 
             def resid_h(s, row):
+                if const_expr(tokens):
+                    return bf2_f32(
+                        poll([(xin, (s * HIDDEN + row) // 2, 1)], "one-as")[0][0]
+                    )
                 w = fx.Vector.from_elements(
                     [
                         fx.Int32(
@@ -4600,6 +4828,87 @@ def build_glm5_monokernel(
                         put(mb("sel"), 0, fx.Int32(SHARED))
                         put(mb("prob"), 0, fx.Float32(1.0))
                 stamp("ug", u, 4)
+        elif const_expr(dense_fp8):
+            # A dense MLP: a slice is every row's, so one MFMA takes all rows as its B
+            # columns. Task u < slices * 32 computes intermediates (u % 32) * 8 of slice
+            # u // 32; the tasks of slice 0 also write the zeros of the slots past the
+            # slices, which down reads with weight 0.
+            UG8 = 8
+            UG8_UNITS = (HIDDEN // 128) // WAVES
+            XW = HIDDEN // 4
+            D_NT = expert_inter // UG8
+            dn_route(load_bias())
+            gpu.barrier()
+            stage_xq(list(range(S)))
+            gpu.barrier()
+            u0 = start("ug")
+            for task_round in range_constexpr((dense_experts * D_NT + G - 1) // G):
+                d_u = fx.Int32(u0 + task_round * G)
+                if d_u < dense_experts * D_NT:
+                    stamp("ug", d_u, 0)
+                    d_c, d_sl = d_u % D_NT, d_u // D_NT
+                    w_rg = ((lane % 16) // 8) * (expert_inter // 16) + d_c // 2
+                    w_ln = (lane & -16) | ((d_c % 2) * 8 + lane % 8)
+                    s_rg = (lane // 32) * (expert_inter // 16) + d_c // 2
+                    rw = _rsrc(w_ug + fx.Int64(d_sl) * fx.Int64(UG_W_BYTES))
+                    rs = _rsrc(s_ug + fx.Int64(d_sl) * fx.Int64(UG_S_BYTES))
+                    d_sn = n_sel()
+                    d_units = []
+                    for cc in range_constexpr(UG8_UNITS):
+                        d_kc = (wave * UG8_UNITS + cc) * 2
+                        d_wv = [
+                            ld_fp8_chunk(
+                                rw, w_rg, d_kc + j, UG_NKC, HIDDEN, w_ln, fp8_shuffled
+                            )
+                            for j in range(2)
+                        ]
+                        d_sc = ld_f32(
+                            rs, (s_rg * 16 // SCALE_BM) * (HIDDEN // 128) + d_kc // 2
+                        )
+                        d_units.append(
+                            (
+                                "f8f8",
+                                d_wv,
+                                lambda d_sc=d_sc, d_kc=d_kc: (
+                                    d_sc
+                                    * lds_ld(misc, 8 + d_sn * XQ_BLOCKS + d_kc // 2)
+                                ),
+                                d_sn * XW + d_kc * 16 + (lane // 16) * 4,
+                            )
+                        )
+                    reduce_rows(
+                        1,
+                        mma_units([fx.Float32(0.0) for _ in range(4)], d_units),
+                        emit_out(16),
+                    )
+                    gpu.barrier()
+                    if tid < S * UG8 // 2:
+                        d_n = tid // (UG8 // 2)
+                        d_r = (tid % (UG8 // 2)) * 2
+                        d_g0 = lds_ld(outs, d_n * 16 + d_r)
+                        d_g1 = lds_ld(outs, d_n * 16 + d_r + 1)
+                        d_v0 = lds_ld(outs, d_n * 16 + UG8 + d_r)
+                        d_v1 = lds_ld(outs, d_n * 16 + UG8 + d_r + 1)
+                        put2(
+                            mb("mid"),
+                            (d_n * MOE_SLOTS + d_sl) * expert_inter + d_c * UG8 + d_r,
+                            d_g0 * _rcp(1.0 + _exp(-d_g0)) * d_v0,
+                            d_g1 * _rcp(1.0 + _exp(-d_g1)) * d_v1,
+                        )
+                        if d_sl == 0:
+                            for d_z in range_constexpr(dense_experts, MOE_SLOTS):
+                                put2(
+                                    mb("mid"),
+                                    (d_n * MOE_SLOTS + d_z) * expert_inter
+                                    + d_c * UG8
+                                    + d_r,
+                                    fx.Float32(0.0),
+                                    fx.Float32(0.0),
+                                )
+                    stamp("ug", d_u, 4)
+                if const_expr(task_round + 1 < (dense_experts * D_NT + G - 1) // G):
+                    gpu.barrier()
+
         elif const_expr(S > 1):
             # One eight-intermediate tile per CTA and task round. Shared-expert weights
             # feed all sample columns of one MFMA, while routed-expert weights are
@@ -5028,11 +5337,51 @@ def build_glm5_monokernel(
             dn_lr = gu * 16 + lane % 16 - dn_off
             dn_ln = ((dn_lr >= 0) & (dn_lr < DN_TILE)).select(lane, lane ^ 8)
 
-            DN_NU = S * MOE_SLOTS * DN_NKC // 2
+            DN_NU = (dense_experts if dense_fp8 else S * MOE_SLOTS) * DN_NKC // 2
             DN_UPW = (DN_NU + DN_WPR - 1) // DN_WPR
             DN_BLK = S * MOE_SLOTS * expert_inter // 128
 
+            def u_dn_dense(cc):
+                """A dense MLP's 128-k chunk cc of this wave: one slice's weights for
+                every row, each lane's column scaled by its row's mid block scale."""
+                qu = (wave % DN_WPR) * DN_UPW + cc
+                live = qu < DN_NU
+                q = fx.min(qu, DN_NU - 1) * 2  # 64-k chunk over (slice, kc)
+                d_sl, kc = q // DN_NKC, q % DN_NKC
+                nr = None if DN_NU % DN_WPR == 0 else live
+                wb = bo.create_buffer_resource_from_addr(
+                    w_dn + fx.Int64(d_sl) * fx.Int64(DN_W_BYTES),
+                    num_records_bytes=(
+                        None
+                        if nr is None
+                        else nr.select(fx.Int32(DN_W_BYTES), fx.Int32(0))
+                    ),
+                )
+                sb = bo.create_buffer_resource_from_addr(
+                    s_dn + fx.Int64(d_sl) * fx.Int64(DN_S_BYTES),
+                    num_records_bytes=(
+                        None
+                        if nr is None
+                        else nr.select(fx.Int32(DN_S_BYTES), fx.Int32(0))
+                    ),
+                )
+                qn = (n_sel() * MOE_SLOTS + d_sl) * DN_NKC + kc
+                return unit_f8f8(
+                    wb,
+                    sb,
+                    dn_rg + gu,
+                    kc,
+                    DN_NKC,
+                    expert_inter,
+                    qn * 16,
+                    lambda: lds_ld(misc, qn // 2),
+                    dn_ln,
+                    shuffled=fp8_shuffled,
+                )
+
             def u_dn(cc):  # cc: 128-k chunk of this wave
+                if const_expr(dense_fp8):
+                    return u_dn_dense(cc)
                 qu = (wave % DN_WPR) * DN_UPW + cc
                 live = qu < DN_NU
                 unit = fx.min(qu, DN_NU - 1)
