@@ -196,6 +196,28 @@ NUMERICS = Numerics(
         # SGLang's own distance alike); 3x those. The final norm x1.01 gives 9.2e-3.
         "head.logits.rel": 1.7e-3,
         "head.logits_vs_fp32.rel": 7.5e-3,
+        # The MTP draft (draft.py, check.draft). Its NextN entry x against SGLang's
+        # eh_proj on its own enorm | hnorm rows, and against an f32 entry: 3x the
+        # serving check's maxima (TP8, FP8 KV, 1-2 requests, 1K-64K: 4.7e-4, 2.9e-3,
+        # SGLang's own 2.9e-3); the enorm and hnorm weights swapped give 0.58. A draft
+        # decode row attends exactly the seed's valid entries, and the seed SGLang
+        # gets is the draft extend's top-k; a count from the row's position or every
+        # seed row row 0's gives 1-2 and 4-936.
+        "draft.eh.rel": 1.4e-3,
+        "draft.eh_vs_fp32.rel": 8.8e-3,
+        "draft.topk_extra.max_abs": 0.0,
+        "draft.seed.max_abs": 0.0,
+        # The NextN layer on the launch's x, as a target layer's (its kernel checks:
+        # equal to the plain launch fed the same x, bitwise). Its stream is x plus one
+        # layer's attention and MLP, not a residual of 78 layers, so it carries the
+        # distance of SGLang's NextN attention in full: the serving check's minimum
+        # cosine 0.963 (TP8, FP8 KV, 1-2 requests, 1K-8K), 3x the distance gives 0.89.
+        # The NextN layer rotated 4096 positions off fails it and nextn.kv.
+        "nextn.streams.cosine": 0.89,
+        "nextn.kv.cosine": 0.995,
+        "nextn.index.cosine": 0.999,
+        "nextn.topk_own.max_abs": 0.0,
+        "nextn.topk_exact.max_abs": 0.0,
     },
 )
 
@@ -348,11 +370,14 @@ class _Built:
         tp: int,
         device,
         context_len,
+        epochs=None,
     ):
         from sgl_amd_mono.glm53.gfx950.runner import Glm53Step
 
         self.lm, self.model = lm, lm.model
         self._layers, self.runtimes, self.heads = layers, runtimes, heads
+        # per width, the guard blocks of its runtimes: a step advances them at once
+        self.epochs = epochs
         self.max_rows = TP_MAX_ROWS.get(tp, max(WIDTHS))
         self.max_position = context_len - 1
         self.check_layers = os.environ.get("SGLANG_AMD_MONO_CHECK") == "1"
@@ -435,9 +460,7 @@ class _Built:
             from sgl_amd_mono.glm53 import check
 
             check.tail(self.lm, h[:S], logits[:S], normed[:S])
-        for (w, _), rt in self.runtimes.items():
-            if w == W:
-                rt.advance_step()
+        self.epochs[W].advance()
         clear(forward_batch)
         return normed[:S], logits
 
@@ -505,32 +528,27 @@ class _Built:
 
     def _step(self, plan, input_ids, positions, forward_batch, S: int, W: int):
         """The step's rows for every launch (``Glm53Step``) and layer 0's token ids:
-        built once a step, in the graph when captured."""
+        built once a step (one launch, ``tables.step_rows``), in the graph when
+        captured. A row sees keys 0 ..= its position (in TARGET_VERIFY seq_lens holds
+        each request's prefix, not each row's keys); verify rows past the context are
+        lookahead the scheduler discards, and the rotary table and the indexer's
+        score rows end at the context."""
         if "step" not in plan.state:
             from sglang.srt.model_executor.forward_context import get_attn_backend
 
+            from sgl_amd_mono.glm53 import tables
+
             st = self.steps[W]
-            ids = self.ids[W]
-            ids[:S] = input_ids[:S]
-            ids[S:] = -1
-            loc = forward_batch.out_cache_loc[:S].to(torch.int64)
-            valid = loc != 0
-            st.slots[:S] = torch.where(valid, loc, -1)
-            st.slots[S:] = -1
-            # verify rows past the context are lookahead the scheduler discards; the
-            # rotary table and the indexer's score rows end at the context
-            pos = positions[:S].to(torch.int64).clamp(max=self.max_position)
-            st.positions[:S] = pos
-            st.positions[S:] = 0
-            # a row sees keys 0 ..= its position (in TARGET_VERIFY seq_lens holds
-            # each request's prefix, not each row's keys)
-            count = torch.where(valid, (pos + 1).clamp(max=TOPK), 0)
-            # indptr[0] stays 0 from its allocation
-            st.indptr[1 : S + 1] = torch.cumsum(count, 0, dtype=torch.int32)
-            st.indptr[S + 1 :] = st.indptr[S]
+            tables.step_rows(
+                st,
+                forward_batch.out_cache_loc,
+                positions,
+                S,
+                self.max_position,
+                ids_in=input_ids,
+                ids=self.ids[W],
+            )
             # the DSA backend repeats a verify request's page-table row for each row
-            st.req_ids[:S] = torch.arange(S, dtype=torch.int32, device=loc.device)
-            st.req_ids[S:] = 0
             md = get_attn_backend().forward_metadata
             plan.state["step"] = msgspec.structs.replace(
                 st, page_table=md.real_page_table[:S]
@@ -545,6 +563,7 @@ def _build(model, hf_config, ctx) -> _Built:
     from sgl_amd_mono.glm53.gfx950.layout import INDEX_KEYS_PER_TASK
     from sgl_amd_mono.glm53.gfx950.runner import (
         Glm53Build,
+        Glm53Epochs,
         Glm53HeadOp,
         Glm53LayerOp,
         Glm53Runtime,
@@ -622,9 +641,10 @@ def _build(model, hf_config, ctx) -> _Built:
             f"this server's decode graphs route {sorted(ctx.widths)}"
         )
     runtimes, heads = {}, {}
+    epochs = {w: Glm53Epochs(len(kinds) + 1, device) for w in widths}
 
     def runtime(key):
-        rt = Glm53Runtime(key, rank, p.tp_group.cpu_group, device)
+        rt = Glm53Runtime(key, rank, p.tp_group.cpu_group, device, epochs[key.rows])
         # at most the guard's longest deadline, in whole seconds
         rt.set_deadline(
             _deadline(key, ctx.deadline_s, guard.MAX_DEADLINE_TICKS // guard.CLOCK_HZ)
@@ -678,7 +698,16 @@ def _build(model, hf_config, ctx) -> _Built:
             if rw == w:
                 rt.precompile()
     return _Built(
-        model, layers, runtimes, heads, cos, sin, tp, device, context_len=context_len
+        model,
+        layers,
+        runtimes,
+        heads,
+        cos,
+        sin,
+        tp,
+        device,
+        context_len=context_len,
+        epochs=epochs,
     )
 
 
