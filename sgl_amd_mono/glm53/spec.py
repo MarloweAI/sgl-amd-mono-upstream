@@ -18,6 +18,8 @@ tail's logits (``_get_logits``) and stores the final norm's rows.
 The forward is ``DeepseekV2ForCausalLM.forward`` for a routed decode or MTP verify
 step (a verify step's rows are its requests' draft chains). A pad row (SGLang's
 padding slot 0, or a width's row past the step) writes no cache and attends no key.
+The waits of a step's first launch (layer 0's, where the ranks' hosts meet) have half
+the watchdog timeout as their deadline; every other wait keeps the framework's.
 
 The kernels read SGLang's weights in place, except the copies logged at startup:
 W_UK and W_UV packed from SGLang's per-tensor FP8 w_kc and w_vc, the router and the
@@ -83,6 +85,7 @@ SGLANG_READS = {
         "speculative_eagle_topk",
         "speculative_num_steps",
         "speculative_num_draft_tokens",
+        "watchdog_timeout",
     ),
     "srt/distributed/parallel_state.py": ("cpu_group",),
     "srt/environ.py": (
@@ -148,6 +151,7 @@ SGLANG_READS = {
         "copies",
     ),
     "srt/runtime_context.py": (
+        "get_device",
         "get_model",
         "get_parallel",
         "process_model_config",
@@ -194,6 +198,15 @@ NUMERICS = Numerics(
 def _covered_layers(config) -> list[int]:
     """Every layer: the dense ones below ``first_k_dense_replace``, then the MoE ones."""
     return list(range(config.num_hidden_layers))
+
+
+def _deadline(key, deadline_s: float, longest_s: int) -> float:
+    """A step's first launch waits up to half the watchdog, at most ``longest_s``."""
+    from sglang.srt.runtime_context import get_device
+
+    if not key.tokens:
+        return deadline_s
+    return min(max(deadline_s, 0.5 * get_device().watchdog_timeout), longest_s)
 
 
 def _config_disable_reasons(cfg, hf_config) -> list[str]:
@@ -607,7 +620,10 @@ def _build(model, hf_config, ctx) -> _Built:
 
     def runtime(key):
         rt = Glm53Runtime(key, rank, p.tp_group.cpu_group, device)
-        rt.set_deadline(ctx.deadline_s)
+        # at most the guard's longest deadline, in whole seconds
+        rt.set_deadline(
+            _deadline(key, ctx.deadline_s, guard.MAX_DEADLINE_TICKS // guard.CLOCK_HZ)
+        )
         return rt
 
     # each runtime's peer handshake is collective: every rank builds them in one order

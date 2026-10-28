@@ -2,11 +2,13 @@
 covers on the GLM-5.3 layer structure, its row routing and TP4 row cap, the keys
 each row of a decode or MTP verify step attends, the MLA cache layout an FP8 launch
 binds, its registry entry, its config and model refusal reasons, a routed step's
-launches and what it hands the logits processor, the dense MLP's expert slices and the embedding and LM-head shards, and the layer
+launches and what it hands the logits processor, the first launch's wait deadline,
+the dense MLP's expert slices and the embedding and LM-head shards, and the layer
 check's top-k metric, cache poisoning, tail check and reported outputs.
 SGLang checks its declared requirements, the same way for every spec."""
 
 import logging
+import math
 import sys
 from types import SimpleNamespace
 from unittest import mock
@@ -653,6 +655,36 @@ def test_the_tail_check_catches_a_wrong_final_norm(monkeypatch, caplog):
     assert violations(w_norm) == []
     bad = violations((w_norm.float() * 1.01).bfloat16())
     assert any("head.logits.rel" in v for v in bad), bad
+
+
+def test_a_step_s_first_launch_waits_up_to_half_the_watchdog(monkeypatch):
+    import sglang.srt.runtime_context as runtime_context
+
+    try:
+        from sglang.srt.kernel_plugins.amd.binding import deadline_s
+    except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
+        from sglang.srt.monokernels.guards import deadline_s
+
+    first, other = SimpleNamespace(tokens=True), SimpleNamespace(tokens=False)
+    longest = 5497  # the guard's longest deadline, in whole seconds
+    # SGLang's default watchdog, the serving test's and the fault test's; a watchdog
+    # past twice the longest deadline, and none
+    cases = (
+        (300, 150.0),
+        (1200, 600.0),
+        (20, 10.0),
+        (11100, longest),
+        (math.inf, longest),
+    )
+    for watchdog, entry in cases:
+        monkeypatch.setattr(
+            runtime_context,
+            "get_device",
+            lambda w=watchdog: SimpleNamespace(watchdog_timeout=w),
+        )
+        deadline = deadline_s(watchdog)
+        assert glm53._deadline(first, deadline, longest) == entry
+        assert glm53._deadline(other, deadline, longest) == deadline
 
 
 class _Op:
