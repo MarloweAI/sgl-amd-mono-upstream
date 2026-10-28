@@ -217,6 +217,9 @@ def layout(
         ("sel", samples * MOE_SLOTS * pair_bytes),
         ("prob", samples * MOE_SLOTS * pair_bytes),
         ("mid", samples * MOE_SLOTS * inter * pair_bytes),
+        # mid's FP8 blocks (four values a pair) and their scales
+        ("midq", samples * MOE_SLOTS * inter // 4 * pair_bytes),
+        ("midqs", samples * MOE_SLOTS * inter // 128 * pair_bytes),
         ("ugp", BLOCKS * samples * 2 * UG_TILE * pair_bytes),
         ("xqd", samples * HIDDEN * 4),
     ]
