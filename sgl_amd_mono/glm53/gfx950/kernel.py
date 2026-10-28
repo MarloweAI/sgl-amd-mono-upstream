@@ -4750,11 +4750,33 @@ def build_glm5_monokernel(
                 xa.append(bf2_f32(v[-1][0]))
                 return [list(bf2_f32(w[0])) + list(bf2_f32(w[1])) for w in v[:-1]]
 
-            rstds = stage_x_rmsnorm(ld_a, HIDDEN, g_post, mark=("router", tt), count=1)
+            # the row times gamma into LDS, not normalized: its sum of squares goes
+            # through the same barrier, and the row's rstd scales the activation
+            # blocks and the logits
+            gs, vals = load_x_rmsnorm(ld_a, HIDDEN, g_post, count=1)
+            ss = fx.Float32(0.0)
+            for v in vals:
+                for a in v:
+                    ss = ss + a * a
+            ss = wave_sum(ss)
+            if lane == 0:
+                lds_st(xs, HIDDEN // 2 + wave, ss)
+            for i in range_constexpr(len(vals)):
+                a, g = vals[i], gs[i]
+                for j in range_constexpr(2):
+                    lds_st(
+                        xs,
+                        ((tid + i * THREADS) * 4) // 2 + j,
+                        bf16_pair(a[2 * j] * g[2 * j], a[2 * j + 1] * g[2 * j + 1]),
+                    )
+            gpu.barrier()
+            tot = lds_ld(xs, HIDDEN // 2)
+            for w in range_constexpr(1, WAVES):
+                tot = tot + lds_ld(xs, HIDDEN // 2 + w)
+            x_rstd = _rsq(tot * (1.0 / HIDDEN) + EPS)
             stamp("router", tt, 2)
             # this task's FP8 activation blocks go out ahead of the gate GEMV
             if x_ok:
-                x_rstd = rstds[0]
                 a0, a1 = xa[0]
                 if const_expr(native_fp4_mfma):
                     q0, q1, qs = quant_mxfp8(a0 * x_rstd * xg[0], a1 * x_rstd * xg[1])
@@ -4789,7 +4811,6 @@ def build_glm5_monokernel(
                 else:
                     if lane == 0:
                         put(mb("xqs"), x_s * XQ_BLOCKS + x_blk, qs)
-            gpu.barrier()
             if const_expr(not dense_experts):
                 acc = run_units(u_r, R_CPW, R_CPW, pre)
                 fx.ptr_store(
@@ -4813,7 +4834,7 @@ def build_glm5_monokernel(
                     put(
                         mb("scores"),
                         router_sample * N_EXPERTS + t * ROUTER_TILE + r,
-                        _rcp(1.0 + _exp(-logit)),
+                        _rcp(1.0 + _exp(-(logit * x_rstd))),
                     )
             stamp("router", tt, 4)
 
