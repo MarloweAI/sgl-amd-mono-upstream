@@ -6640,6 +6640,7 @@ def build_glm5_monokernel(
                     lds_st(outs, n * DN_TILE + rl - dn_off, v)
 
             if const_expr(DEDUP):
+                dd_units = DN_KU * _uniform(lds_ld(jobs, 0))  # live units a row group
                 cur = pre
                 for b0 in range_constexpr(0, DD_UPW, DN_BATCH):
                     now = cur
@@ -6650,7 +6651,9 @@ def build_glm5_monokernel(
                                 b0 + DN_BATCH, min(b0 + 2 * DN_BATCH, DD_UPW)
                             )
                         ]
-                    dd_products(now)
+                    # a batch past the step's expert groups has no products
+                    if (wave % DN_WPR) + b0 * DN_WPR < dd_units:
+                        dd_products(now)
                 gpu.barrier()
                 # a column's units are a wave's in the one-row-a-wave form when the
                 # wave segment (DN_UPW units) covers a whole row, else halves of it
