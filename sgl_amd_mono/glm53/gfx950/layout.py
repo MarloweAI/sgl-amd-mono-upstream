@@ -37,23 +37,25 @@ HEAD_TILE = 16
 INDEX_Q_ROWS = INDEX_HEADS * INDEX_DIM
 INDEX_TILE = 16
 INDEX_KEYS_PER_TASK = 64
-# a long row's paged top-k runs on up to this many slices (CTAs) per row, each with
-# staging room for this many threshold-bin candidates
-INDEX_SEL_SLICES = 16
+# a row's top-k runs on up to this many slices (CTAs), with staging room for this many
+# candidates of the threshold's prefix
+INDEX_SEL_SLICES = 64
 INDEX_CAND_STAGE_CAP = 16384
-# keys a select chunk (a CTA's 512 threads x 8), and the chunks past which a row selects
-# on up to INDEX_SEL_SLICES CTAs: up to 8 chunks the hand-offs cost what the slices save
-INDEX_SEL_CHUNK = 4096
-INDEX_SEL_PAR_CHUNKS = 8
+# radix digits of the sliced top-k; a row has a slice per this many keys (rounded up),
+# at most INDEX_SEL_SLICES
+INDEX_SEL_DIGITS = 6
+INDEX_SEL_SLICE_KEYS = 1024
 
 
-def select_slices(bound):
-    """(slices, chunks a slice) of a row of ``bound`` > 0 keys whose top-k runs on
-    several CTAs: runs of whole chunks in position order, at most INDEX_SEL_SLICES, none
-    empty. The kernel calls it on traced Int32 and the CPU test on ints."""
-    chunks = (bound + INDEX_SEL_CHUNK - 1) // INDEX_SEL_CHUNK
-    per = (chunks + INDEX_SEL_SLICES - 1) // INDEX_SEL_SLICES
-    return (chunks + per - 1) // per, per
+def select_slices(bound, minimum=min, maximum=max):
+    """(slices, keys a slice) of a row of ``bound`` keys: runs of the row's keys in
+    position order, none empty (one for an empty row). The kernel calls it on traced
+    Int32 with ``fx.min`` and ``fx.max``, the CPU test on ints."""
+    n = minimum(
+        (bound + INDEX_SEL_SLICE_KEYS - 1) // INDEX_SEL_SLICE_KEYS, INDEX_SEL_SLICES
+    )
+    n = maximum(n, 1)
+    return n, (bound + n - 1) // n
 
 
 DCP_SUMMARY_PAIRS = KV_LORA // 2 + 2
@@ -220,16 +222,13 @@ def layout(
             ("index_qh", samples * INDEX_Q_ROWS // 2 * pair_bytes),
             ("index_scores", samples * index_max_seq * pair_bytes),
             ("indices", samples * sparse_attention_topk * pair_bytes),
-            # parallel top-k: per slice a 4096-bin histogram and its ready pair, per
-            # row the threshold (bin prefix, keys still needed, keys in the bin), per
-            # slice its winners' positions, its (key, position) candidates and their
-            # counts
-            ("index_part_hist", samples * INDEX_SEL_SLICES * 4096 * 4),
-            ("index_part_ready", samples * INDEX_SEL_SLICES * pair_bytes),
-            ("index_thresh", samples * 4 * pair_bytes),
-            ("index_win_stage", samples * INDEX_SEL_SLICES * sparse_attention_topk * 4),
-            ("index_cand_stage", samples * INDEX_SEL_SLICES * INDEX_CAND_STAGE_CAP * 8),
-            ("index_gather_count", samples * INDEX_SEL_SLICES * pair_bytes),
+            # sliced top-k: per row, digit and slice the slice's 64 counts (two a
+            # pair); per row the candidates (key, cache slot) under the threshold's prefix
+            (
+                "sel_hist",
+                samples * INDEX_SEL_DIGITS * INDEX_SEL_SLICES * 32 * pair_bytes,
+            ),
+            ("sel_cand", samples * INDEX_CAND_STAGE_CAP * 2 * pair_bytes),
         ]
 
     offset, scratch = 0, {}
@@ -305,10 +304,7 @@ def stage_tasks(
         tasks += [
             # one task a CTA: its runs of the requests' keys
             ("index_score", BLOCKS),
-            ("index_hist", samples * INDEX_SEL_SLICES),
-            ("index_thresh", samples),
-            ("index_gather", samples * INDEX_SEL_SLICES),
-            ("index_select", samples),
+            ("index_slice", samples * INDEX_SEL_SLICES),
         ]
     tasks += [
         (
@@ -397,8 +393,6 @@ def stage_bases(
         base["index_key"] = base["q_norm"]
         # one scoring task a CTA, numbered by its CTA
         base["index_score"] = 0
-        base["index_select"] = 100
-        base["index_thresh"] = 100
-        base["index_hist"] = BLOCKS // 2
-        base["index_gather"] = BLOCKS // 2
+        # the selection's slices past uk's CTAs
+        base["index_slice"] = (base["uk"] + tasks["uk"]) % BLOCKS
     return base
