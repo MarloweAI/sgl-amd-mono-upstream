@@ -355,7 +355,9 @@ class _Runtime:
         self.precompiled = True
 
 
-@pytest.mark.parametrize("tp, extend, decode", [(8, [4, 8], [2, 4]), (4, [4], [2, 4])])
+@pytest.mark.parametrize(
+    "tp, extend, decode", [(8, [4, 8], [2, 4]), (4, [4, 8], [2, 4])]
+)
 def test_the_build_runs_the_nextn_launches_and_installs_the_wrapper(
     tp, extend, decode, caplog
 ):

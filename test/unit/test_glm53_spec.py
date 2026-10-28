@@ -1,5 +1,5 @@
 """The GLM-5.3 gfx950 monokernel spec on CPU (RFC #43949): the layers its forward
-covers on the GLM-5.3 layer structure, its row routing and TP4 row cap, the keys
+covers on the GLM-5.3 layer structure, its row routing, the keys
 each row of a decode or MTP verify step attends, the MLA cache layout an FP8 launch
 binds, its registry entry, its config and model refusal reasons, a routed step's
 launches and what it hands the logits processor, the first launch's wait deadline,
@@ -93,7 +93,7 @@ class _Lm:
         return "the model's forward"
 
 
-def _built(lm, layers, runtimes, tp=8, context_len=202752, heads=None, epochs=None):
+def _built(lm, layers, runtimes, context_len=202752, heads=None, epochs=None):
     return glm53._Built(
         lm,
         layers,
@@ -101,7 +101,6 @@ def _built(lm, layers, runtimes, tp=8, context_len=202752, heads=None, epochs=No
         heads or {},
         None,
         None,
-        tp,
         "cpu",
         context_len=context_len,
         epochs=epochs,
@@ -111,19 +110,9 @@ def _built(lm, layers, runtimes, tp=8, context_len=202752, heads=None, epochs=No
 KINDS = ("embed", "dense", "index", "shared", "head")
 
 
-def test_a_step_runs_at_the_next_width_and_tp4_takes_four_rows():
+def test_a_step_runs_at_the_next_width():
     # a one-row launch never completes on gfx950: one row runs at width 2
     assert [glm53._width(r) for r in glm53.ROWS] == [2, 2, 4, 4, 8, 8, 8, 8]
-    # TP4 builds no 8-row launch: a wider step runs the model's own forward
-    runtimes = {(w, k): None for w in (2, 4) for k in KINDS}
-    layers = {i: SimpleNamespace(i=i) for i in range(78)}
-    lm = _Lm()
-    built = _built(lm, layers, runtimes, tp=4)
-    key = registry.ShapeKey(forward_mode="decode", batch_size=5, tokens_per_request=1)
-    out = built.forward(registry.Plan(key=key), "ids", "positions", "batch")
-    assert out == "the model's forward"
-    assert lm.ran == [("ids", "positions", "batch", None, None)]
-    assert _built(lm, layers, runtimes, tp=8).max_rows == 8
 
 
 def test_a_step_from_embeddings_runs_the_model_s_forward():
