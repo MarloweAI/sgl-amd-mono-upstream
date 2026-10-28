@@ -287,6 +287,10 @@ def stage_tasks(
         ),
         ("q_norm", samples),
         ("cache", samples),
+    ]
+    if with_indexer:
+        tasks += [("index_key", samples)]
+    tasks += [
         ("q_b", heads * (NOPE_DIM + PE_DIM) // Q_B_TILE),
     ]
     if with_indexer:
@@ -385,6 +389,8 @@ def stage_bases(
         # tile for the first half, instead of serializing two index-Q tiles on
         # every q_b CTA.
         base["index_q"] = (base["q_b"] + tasks["q_b"]) % BLOCKS
+        # each row's index key on its q_norm CTA, after the CTA's index-query tile
+        base["index_key"] = base["q_norm"]
         base["index_score"] = 101
         base["index_select"] = 100
         base["index_thresh"] = 100
