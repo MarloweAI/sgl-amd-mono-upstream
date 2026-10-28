@@ -509,15 +509,14 @@ def embedding(model, tp: int, rank: int) -> torch.Tensor:
     return emb.weight
 
 
-def head_weights(model, tp: int, rank: int):
-    """The tail's tensors (``Glm53HeadWeights``): the final norm and this rank's
-    LM-head rows, in place."""
+def head_weights(model, tp: int, rank: int, norm=None):
+    """The tail's tensors (``Glm53HeadWeights``): the final norm (or ``norm``) and
+    this rank's LM-head rows, in place."""
     from .runner import Glm53HeadWeights
 
+    norm = model.model.norm if norm is None else norm
     _vocab_shard("LM head", model.lm_head, tp, rank)
     return Glm53HeadWeights(
-        g_norm=_need(
-            "model.norm", model.model.norm.weight, (HIDDEN,), (torch.bfloat16,)
-        ),
+        g_norm=_need("final norm", norm.weight, (HIDDEN,), (torch.bfloat16,)),
         w_head=model.lm_head.weight,
     )
