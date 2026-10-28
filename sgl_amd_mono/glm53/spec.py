@@ -62,9 +62,6 @@ from sgl_amd_mono.glm53 import HF_CONFIG
 WIDTHS = (2, 4, 8)
 ROWS = tuple(range(1, max(WIDTHS) + 1))
 TP_SIZES = (4, 8)
-# the rows a step runs on the kernels at most at this TP size: on MI355X an 8-row
-# launch at TP4 is slower than the model's forward, so wider steps run that
-TP_MAX_ROWS = {4: 4}
 # SGLang's DSA cache on ROCm: 64-token pages
 PAGE_SIZE = 64
 TOPK = 2048
@@ -367,7 +364,6 @@ class _Built:
         heads: dict,
         cos,
         sin,
-        tp: int,
         device,
         context_len,
         epochs=None,
@@ -378,7 +374,6 @@ class _Built:
         self._layers, self.runtimes, self.heads = layers, runtimes, heads
         # per width, the guard blocks of its runtimes: a step advances them at once
         self.epochs = epochs
-        self.max_rows = TP_MAX_ROWS.get(tp, max(WIDTHS))
         self.max_position = context_len - 1
         self.check_layers = os.environ.get("SGLANG_AMD_MONO_CHECK") == "1"
         self.cos, self.sin = cos, sin
@@ -422,7 +417,7 @@ class _Built:
     ):
         """``DeepseekV2ForCausalLM.forward`` for a routed decode or verify step."""
         lm = self.lm
-        if plan.key.rows > self.max_rows or input_embeds is not None:
+        if input_embeds is not None:
             return type(lm).forward(
                 lm, input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
             )
@@ -633,13 +628,7 @@ def _build(model, hf_config, ctx) -> _Built:
     # the keys an indexer row scores at most: the served context's, in whole tasks
     tasks = -(-context_len // INDEX_KEYS_PER_TASK)
     max_seq = tasks * INDEX_KEYS_PER_TASK
-    cap = TP_MAX_ROWS.get(tp, max(WIDTHS))
-    widths = sorted({_width(r) for r in ctx.widths if r <= cap})
-    if not widths:
-        raise ValueError(
-            f"GLM-5.3 monokernel: TP{tp} runs at most {cap} rows on the kernels, and "
-            f"this server's decode graphs route {sorted(ctx.widths)}"
-        )
+    widths = sorted({_width(r) for r in ctx.widths})
     runtimes, heads = {}, {}
     epochs = {w: Glm53Epochs(len(kinds) + 1, device) for w in widths}
 
@@ -704,7 +693,6 @@ def _build(model, hf_config, ctx) -> _Built:
         heads,
         cos,
         sin,
-        tp,
         device,
         context_len=context_len,
         epochs=epochs,
