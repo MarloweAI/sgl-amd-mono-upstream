@@ -213,10 +213,11 @@ def layout(
     if with_indexer:
         items += [
             ("index_k", samples * INDEX_DIM * pair_bytes),
-            ("index_k_new", samples * INDEX_DIM // 2 * pair_bytes),
-            ("index_ready", samples * pair_bytes),
+            # each row's new key as cached: its FP8 value words, then its scale
+            ("index_k8", samples * (INDEX_DIM // 4 + 1) * pair_bytes),
             ("index_w", samples * INDEX_HEADS * pair_bytes),
             ("index_q", samples * INDEX_Q_ROWS // 2 * pair_bytes),
+            ("index_qh", samples * INDEX_Q_ROWS // 2 * pair_bytes),
             ("index_scores", samples * index_max_seq * pair_bytes),
             ("indices", samples * sparse_attention_topk * pair_bytes),
             # parallel top-k: per slice a 4096-bin histogram and its ready pair, per
@@ -294,15 +295,16 @@ def stage_tasks(
         ("q_b", heads * (NOPE_DIM + PE_DIM) // Q_B_TILE),
     ]
     if with_indexer:
-        tasks += [("index_q", INDEX_Q_ROWS // INDEX_TILE)]
+        # index_qh: each row's query, rotated and Hadamard-transformed, 8 heads a task
+        tasks += [
+            ("index_q", INDEX_Q_ROWS // INDEX_TILE),
+            ("index_qh", samples * INDEX_HEADS // 8),
+        ]
     tasks += [("uk", heads * KV_LORA // UK_TILE)]
     if with_indexer:
         tasks += [
-            (
-                "index_score",
-                samples
-                * ((index_max_seq + INDEX_KEYS_PER_TASK - 1) // INDEX_KEYS_PER_TASK),
-            ),
+            # one task a CTA: its runs of the requests' keys
+            ("index_score", BLOCKS),
             ("index_hist", samples * INDEX_SEL_SLICES),
             ("index_thresh", samples),
             ("index_gather", samples * INDEX_SEL_SLICES),
@@ -389,9 +391,12 @@ def stage_bases(
         # tile for the first half, instead of serializing two index-Q tiles on
         # every q_b CTA.
         base["index_q"] = (base["q_b"] + tasks["q_b"]) % BLOCKS
+        # on the first CTAs of index_q's own tiles, after their tile
+        base["index_qh"] = base["index_q"]
         # each row's index key on its q_norm CTA, after the CTA's index-query tile
         base["index_key"] = base["q_norm"]
-        base["index_score"] = 101
+        # one scoring task a CTA, numbered by its CTA
+        base["index_score"] = 0
         base["index_select"] = 100
         base["index_thresh"] = 100
         base["index_hist"] = BLOCKS // 2
