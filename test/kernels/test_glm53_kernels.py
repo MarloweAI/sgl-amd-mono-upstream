@@ -3,9 +3,13 @@
 spec builds at that TP size: each launch kind finishes on every rank with no error
 word and the same output, on the bf16 and the E4M3 MLA cache, and writes exactly its
 live rows' cache rows (none of a pad row's); a graph of the model order's first
-launches replays the eager step bitwise, for one request a row and for verify rows;
-and every selected token of a row past 2048 keys is a pair tagged with its indexer
-launch's tag that holds the slot the launch publishes."""
+launches, and of layer 0, the dense layers, the first MoE layers and the tail,
+replays the eager step bitwise, for one request a row and for verify rows; every
+selected token of a row past 2048 keys is a pair tagged with its indexer launch's
+tag that holds the slot the launch publishes; a dense layer's MLP and the tail's
+logits are within the spec's bounds against f32 references, and fail them with a
+scale or the final norm off; and layer 0 from the token ids equals the dense launch
+fed the gathered embedding rows."""
 
 import subprocess
 import sys
@@ -49,7 +53,7 @@ class TestMonoGlm53Kernels(CustomTestCase):
 
     def test_each_launch_kind_writes_its_rows(self):
         # the last row a pad row
-        for kind in ("shared", "index"):
+        for kind in ("shared", "index", "dense", "embed"):
             for kv in ("bf16", "fp8"):
                 self._check("--kind", kind, "--kv", kv, "--rowsets", "p1", "--writes")
 
@@ -65,6 +69,27 @@ class TestMonoGlm53Kernels(CustomTestCase):
             "--rowsets",
             "p0,v4",
         )
+
+    def test_graph_replays_with_the_dense_layers_and_the_tail(self):
+        # layer 0 from the tokens, 2 dense launches, 3 shared, an indexer launch and
+        # the tail
+        self._check(
+            "--kind", "full", "--launches", "7", "--replays", "20", "--rowsets", "p1,v4"
+        )
+
+    def test_dense_mlp_within_its_bounds(self):
+        for kv in ("bf16", "fp8"):
+            self._check(
+                "--kind", "dense", "--kv", kv, "--rowsets", "p0,p1", "--check-dense"
+            )
+
+    def test_layer_0_from_the_tokens_equals_the_dense_launch(self):
+        self._check(
+            "--kind", "embed", "--launches", "1", "--rowsets", "p0,p1", "--check-embed"
+        )
+
+    def test_tail_logits_within_their_bounds(self):
+        self._check("--kind", "head", "--launches", "0", "--check-head")
 
     def test_selected_tokens_carry_the_launch_tag(self):
         self._check("--kind", "index", "--check-tags", "--rowsets", "p0,v4")

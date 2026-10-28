@@ -5,9 +5,11 @@
 
 One HIP graph holds a step of launches, inputs chained layer to layer. Each layer has
 its own random weights and caches (``check_layer.py``'s, seeded by layer, so they
-stream from HBM as in a served step). ``--kind model`` is the served step: layers 3
-to 77 in model order (18 indexer and 57 shared launches); ``shared`` and ``index``
-run ``--layers`` launches of one kind. The rows are those of the served decode
+stream from HBM as in a served step). ``--kind full`` is the served step: layer 0
+from the step's tokens, the dense layers 1 and 2, layers 3 to 77 in model order and
+the tail (79 launches); ``model`` its MoE layers 3 to 77 (18 indexer and 57 shared
+launches); ``embed`` layer 0 alone and ``head`` the tail alone; ``shared``, ``index``
+and ``dense`` run ``--layers`` launches of one kind. The rows are those of the served decode
 points at ``--pos``: one request and a pad row at 2 rows (one request without MTP),
 one request's 4 verify rows at 4 (MTP, one request), two requests' at 8 (MTP, two
 requests). After an eager step and 20 warm-up replays, each of ``--trials`` trials
@@ -35,13 +37,18 @@ def serving_rows(width: int, pos: int):
     return [pos + s % 4 for s in range(width)], [s // 4 for s in range(width)]
 
 
+LAUNCHES = {"model": 75, "full": 78, "embed": 1, "head": 0}
+
+
 def _time(args, rows: int, rank: int, tp: int, group, device) -> None:
-    kinds = cl.model_kinds(75) if args.kind == "model" else [args.kind] * args.layers
+    kinds = cl.kinds_of(args.kind, LAUNCHES.get(args.kind, args.layers))
     positions, requests = serving_rows(rows, args.pos)
     # the spec's builds: a failed wait stops the launch
+    head = args.kind in ("full", "head")
     model = cl.Model(
-        kinds, positions, requests, rank, tp, group, device, args, stop=True
+        kinds, positions, requests, rank, tp, group, device, args, stop=True, head=head
     )
+    launches = len(kinds) + head
     model.step()  # eager first: each launch loads its code outside the capture
     torch.cuda.synchronize()
     dist.barrier(group=group)
@@ -61,14 +68,14 @@ def _time(args, rows: int, rank: int, tp: int, group, device) -> None:
             graph.replay()
         end.record()
         torch.cuda.synchronize()
-        per_launch.append(begin.elapsed_time(end) * 1e3 / (args.reps * len(kinds)))
+        per_launch.append(begin.elapsed_time(end) * 1e3 / (args.reps * launches))
     clean = model.errors() == 0
     median = statistics.median(per_launch)
     medians = [None] * tp
     dist.all_gather_object(medians, (median, clean), group=group)
     if rank == 0:
         print(
-            f"TIME kind={args.kind} rows={rows} tp={tp} launches={len(kinds)} "
+            f"TIME kind={args.kind} rows={rows} tp={tp} launches={launches} "
             f"pos={args.pos} kv={args.kv} us_per_launch median={median:.2f} "
             f"min={min(per_launch):.2f} max={max(per_launch):.2f} "
             f"slowest_rank_median={max(m for m, _ in medians):.2f} "
@@ -87,7 +94,11 @@ def _time(args, rows: int, rank: int, tp: int, group, device) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--kind", choices=("model", "shared", "index"), default="model")
+    ap.add_argument(
+        "--kind",
+        choices=("model", "full", "shared", "index", "dense", "embed", "head"),
+        default="model",
+    )
     ap.add_argument("--rows", default="2,4,8", help="comma-separated widths")
     ap.add_argument("--layers", type=int, default=12, help="launches of one kind")
     ap.add_argument("--pos", type=int, default=8447, help="the first row's position")
