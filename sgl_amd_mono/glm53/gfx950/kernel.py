@@ -71,6 +71,7 @@ from sgl_amd_mono.common.ops import (
 )
 from sgl_amd_mono.common.ops import fp8_roundtrip as _fp8_roundtrip
 from sgl_amd_mono.common.ops import fp8_to_bf16x8 as _fp8_to_bf16x8
+from sgl_amd_mono.common.ops import fresh as _fresh
 from sgl_amd_mono.common.ops import hw_exp as _exp
 from sgl_amd_mono.common.ops import hw_rcp as _rcp
 from sgl_amd_mono.common.ops import hw_rsq as _rsq
@@ -2011,6 +2012,25 @@ def build_glm5_monokernel(
                         ),
                         now,
                     )
+
+        def warm_code(nbytes):
+            """The next ``nbytes`` of this kernel's code into this XCD's L2 (a word of
+            each 64-byte line), ahead of code that runs once a launch."""
+            pc = fx.Int64(llvm.call_intrinsic(T.i64, "llvm.amdgcn.s.getpc", [], [], []))
+            r_code = bo.create_buffer_resource_from_addr(
+                pc, num_records_bytes=fx.Int64(nbytes)
+            )
+            words = fx.Int32(0)
+            for i in range_constexpr(nbytes // 64 // THREADS):
+                words = words | fx.Int32(
+                    bo.buffer_load(
+                        r_code,
+                        (fx.Int32(tid) + i * THREADS) * 16,
+                        vec_width=1,
+                        dtype=T.i32,
+                    )
+                )
+            _fresh(words)
 
         def n_sel(count=S):
             """This lane's local MFMA B column; inactive columns duplicate the last one."""
@@ -4198,6 +4218,11 @@ def build_glm5_monokernel(
                 t = s * SEL_SLICES + c
                 if (bound > 0) & (c < n_sl):
                     stamp("index_slice", t, 0)
+                    # the selection's and split's code, while the scores are pending
+                    # (not in TP8 dense launches above 4 rows: there it costs more than
+                    # it saves)
+                    if const_expr(S <= 4 or not dense_experts or W != 8):
+                        warm_code(65536)
                     req = _uniform(index_request(s))
                     count = fx.min(fx.Int32(topk), bound)
                     out_begin, _ = row_index_bounds(s)
@@ -4356,19 +4381,14 @@ def build_glm5_monokernel(
         r_idx = _rsrc(indices)
 
         def split_keys(t, s):
-            """(nkeys, sparse) of sample s; wave 0 writes this split's cache rows to LDS."""
+            """(nkeys, sparse) of sample s; wave 0 writes this split's cache rows to LDS
+            (without the indexer)."""
             index_base, nkeys, sparse = split_bounds(s)
             if wave == 0:
                 if lane < SPLIT_KEYS:
                     k_pos = t * SPLIT_KEYS + lane
                     k_cl = (k_pos < nkeys).select(k_pos, 0)
-                    if const_expr(with_indexer):
-                        # the selected tokens are tagged pairs: each lane polls its own
-                        idx = k_cl
-                        if sparse:
-                            idx = get(mb("indices"), s * topk + k_cl)
-                        lds_st(attn_keys, lane, idx)
-                    elif const_expr(use_atom_kv_cache):
+                    if const_expr(use_atom_kv_cache):
                         idx = fx.Int32(0)
                         if sparse:
                             idx = fx.Int32(
@@ -4386,9 +4406,56 @@ def build_glm5_monokernel(
                         lds_st(attn_keys, lane, sparse.select(idx, k_cl))
             return nkeys, sparse
 
-        # a row this launch appends, staged by split as bf16 pairs: latent then k_pe
+        # a row this launch appends, staged by split as bf16 pairs: latent then k_pe;
+        # with the indexer, before the selection's wait, in the reduction and output
+        # regions (q is staged by then), else in the (still unused) q region
         NEW_ROW_WORDS = (KV_LORA + PE_DIM) // 2
         assert S * NEW_ROW_WORDS <= KT_OFF, "new rows are staged in split's q region"
+        NEW_ROWS_OFF = (RED_OFF + 3) // 4 * 4
+        assert not with_indexer or (
+            NEW_ROWS_OFF + S * NEW_ROW_WORDS <= OUT_OFF + OUT_WORDS
+        ), "new rows are staged in split's reduction region"
+
+        def stage_new_rows(base):
+            """Every row this launch appends, from the cache tasks' kvnew / penew pairs,
+            as bf16 pairs at LDS ``base``."""
+            pe_word = fx.min(tid - KV_LORA // 2, PE_DIM // 2 - 1)
+            is_kv = tid < KV_LORA // 2
+            got = poll(
+                [
+                    (
+                        is_kv.select(fx.Int64(SC["kvnew"]), fx.Int64(SC["penew"]))
+                        + scratch,
+                        is_kv.select(r * KV_LORA + tid * 2, r * PE_DIM + pe_word * 2),
+                        2,
+                    )
+                    for r in range(S)
+                ]
+            )
+            if tid < NEW_ROW_WORDS:
+                for r in range_constexpr(S):
+                    a0 = got[r][0].bitcast(fx.Float32)
+                    a1 = got[r][1].bitcast(fx.Float32)
+                    lds_st(base, r * NEW_ROW_WORDS + tid, bf16_pair(a0, a1))
+
+        def copy_new_rows(base, news):
+            """This wave's keys that are rows this launch appends: their staged rows
+            (at LDS ``base``) to the keys' tile rows."""
+            for jj in range_constexpr(KPW):
+                j = wave * KPW + jj
+                sn = news[jj]
+                if sn >= 0:
+                    row = base + (sn * NEW_ROW_WORDS + lane * 4)
+                    fx.ptr_store(
+                        fx.ptr_load(row, result_type=v4f),
+                        ktile + (j * KS + lane * 4),
+                    )
+                    if lane < PE_DIM // 2:
+                        lds_st(
+                            petile,
+                            j * PS + lane,
+                            lds_ld(base, sn * NEW_ROW_WORDS + KV_LORA // 2 + lane),
+                        )
 
         def new_rows():
             """(writes cache, slot) of every row of this launch, for gather_kv."""
@@ -4396,13 +4463,13 @@ def build_glm5_monokernel(
                 return [(row_writes_cache(s), row_slot(s)) for s in range(S)]
             return None
 
-        def gather_kv(rows, early=None):
+        def gather_kv(rows, early=None, staged=None):
             """Each wave copies its 8 keys' KV latent (1 KB) + k_pe (128 B) rows into
             the LDS tiles: the cache rows of all 8 keys are loaded at once (or were,
             ``early``: (the keys a lane, their rows)), then, if any key is a row this
             launch appends, the CTA polls those rows from the cache tasks' kvnew /
-            penew pairs (their loads issued behind the cache rows'), then the rest is
-            stored."""
+            penew pairs (their loads issued behind the cache rows'; or they were,
+            ``staged``: their LDS base), then the rest is stored."""
             if const_expr(early is None):
                 krows = [lds_ld(attn_keys, wave * KPW + jj) for jj in range(KPW)]
                 raws = split_kv_loads(krows, r_kv, r_pe)
@@ -4422,55 +4489,25 @@ def build_glm5_monokernel(
                     (krows[jj] >= pos0).select(krows[jj] - pos0, fx.Int32(-1))
                     for jj in range(KPW)
                 ]
-            # every row this launch appends, if a key of this task is one: polled once
-            # by the whole CTA into the (still unused) q region as bf16 pairs, then
-            # copied to the keys' tile rows
-            any_new = news[0] >= 0
-            for jj in range_constexpr(1, KPW):
-                any_new = any_new | (news[jj] >= 0)
-            if lane == 0:
-                lds_st(misc, wave, any_new.select(fx.Float32(1.0), fx.Float32(0.0)))
-            gpu.barrier()
-            block_new = lds_ld(misc, 0)
-            for w in range_constexpr(1, WAVES):
-                block_new = block_new + lds_ld(misc, w)
-            if block_new > 0.0:
-                pe_word = fx.min(tid - KV_LORA // 2, PE_DIM // 2 - 1)
-                is_kv = tid < KV_LORA // 2
-                got = poll(
-                    [
-                        (
-                            is_kv.select(fx.Int64(SC["kvnew"]), fx.Int64(SC["penew"]))
-                            + scratch,
-                            is_kv.select(
-                                r * KV_LORA + tid * 2, r * PE_DIM + pe_word * 2
-                            ),
-                            2,
-                        )
-                        for r in range(S)
-                    ]
-                )
-                if tid < NEW_ROW_WORDS:
-                    for r in range_constexpr(S):
-                        a0 = got[r][0].bitcast(fx.Float32)
-                        a1 = got[r][1].bitcast(fx.Float32)
-                        lds_st(xs, r * NEW_ROW_WORDS + tid, bf16_pair(a0, a1))
+            if const_expr(staged is not None):
+                copy_new_rows(staged, news)
+            else:
+                # every row this launch appends, if a key of this task is one: polled
+                # once by the whole CTA into the (still unused) q region, then copied
+                # to the keys' tile rows
+                any_new = news[0] >= 0
+                for jj in range_constexpr(1, KPW):
+                    any_new = any_new | (news[jj] >= 0)
+                if lane == 0:
+                    lds_st(misc, wave, any_new.select(fx.Float32(1.0), fx.Float32(0.0)))
                 gpu.barrier()
-                for jj in range_constexpr(KPW):
-                    j = wave * KPW + jj
-                    sn = news[jj]
-                    if sn >= 0:
-                        row = xs + (sn * NEW_ROW_WORDS + lane * 4)
-                        fx.ptr_store(
-                            fx.ptr_load(row, result_type=v4f),
-                            ktile + (j * KS + lane * 4),
-                        )
-                        if lane < PE_DIM // 2:
-                            lds_st(
-                                petile,
-                                j * PS + lane,
-                                lds_ld(xs, sn * NEW_ROW_WORDS + KV_LORA // 2 + lane),
-                            )
+                block_new = lds_ld(misc, 0)
+                for w in range_constexpr(1, WAVES):
+                    block_new = block_new + lds_ld(misc, w)
+                if block_new > 0.0:
+                    stage_new_rows(xs)
+                    gpu.barrier()
+                    copy_new_rows(xs, news)
             for jj in range_constexpr(KPW):
                 j = wave * KPW + jj
                 kv, pe = raws[jj]
@@ -4493,50 +4530,38 @@ def build_glm5_monokernel(
                             lds_st(petile, j * PS + lane, pe)
 
         N_HEAD_GROUPS = H // WAVES
-        for tt in range(start("split"), S * N_HEAD_GROUPS * N_SPLIT, G):
-            tt = fx.Int32(tt)
-            stamp("split", tt, 0)
-            s = tt // (N_HEAD_GROUPS * N_SPLIT)
-            head_group = (tt // N_SPLIT) % N_HEAD_GROUPS
-            t = tt % N_SPLIT
-            h = head_group * WAVES + wave
-            rows = new_rows()
-            if const_expr(SPLIT_EARLY):  # the tile's rows are already loaded
-                _, nkeys, sparse = split_bounds(s)
-            else:
-                nkeys, sparse = split_keys(t, s)
-            gpu.barrier()
-            # before waiting for q: the cache tasks end before uk
-            gather_kv(rows, split_early if const_expr(SPLIT_EARLY) else None)
-            if const_expr(True):
-                N_PE_T = PE_DIM // Q_B_TILE
-                hint_wait(
-                    N_UK + H * N_PE_T + 1,
-                    lambda k: (
-                        (k < N_UK).select(
-                            fx.Int64(SC["q_lat"]),
-                            (k < N_UK + H * N_PE_T).select(
-                                fx.Int64(SC["q_pe"]), fx.Int64(SC["penew"])
-                            ),
-                        )
-                        + scratch,
-                        (k < N_UK).select(
-                            (s * H + k // UK_PER_HEAD) * KV_LORA
-                            + (k % UK_PER_HEAD) * UK_TILE
-                            + UK_TILE
+
+        def wait_q(tt, s):
+            N_PE_T = PE_DIM // Q_B_TILE
+            hint_wait(
+                N_UK + H * N_PE_T + 1,
+                lambda k: (
+                    (k < N_UK).select(
+                        fx.Int64(SC["q_lat"]),
+                        (k < N_UK + H * N_PE_T).select(
+                            fx.Int64(SC["q_pe"]), fx.Int64(SC["penew"])
+                        ),
+                    )
+                    + scratch,
+                    (k < N_UK).select(
+                        (s * H + k // UK_PER_HEAD) * KV_LORA
+                        + (k % UK_PER_HEAD) * UK_TILE
+                        + UK_TILE
+                        - 1,
+                        (k < N_UK + H * N_PE_T).select(
+                            (s * H + (k - N_UK) // N_PE_T) * PE_DIM
+                            + ((k - N_UK) % N_PE_T) * Q_B_TILE
+                            + Q_B_TILE
                             - 1,
-                            (k < N_UK + H * N_PE_T).select(
-                                (s * H + (k - N_UK) // N_PE_T) * PE_DIM
-                                + ((k - N_UK) % N_PE_T) * Q_B_TILE
-                                + Q_B_TILE
-                                - 1,
-                                s * PE_DIM + PE_DIM - 1,
-                            ),
+                            s * PE_DIM + PE_DIM - 1,
                         ),
                     ),
-                    mark=("split", tt),
-                )
-            # q of all heads -> bf16 Q[h][576] (words h * 288 + d / 2): latent 512 then pe 64
+                ),
+                mark=("split", tt),
+            )
+
+        def stage_q(s):
+            """q of all heads -> bf16 Q[h][576] (words h * 288 + d / 2): latent 512 then pe 64."""
             NQ = H * KV_LORA // 4 // THREADS
             tpe = fx.min(tid, H * PE_DIM // 4 - 1)
             qv = poll(
@@ -4556,7 +4581,58 @@ def build_glm5_monokernel(
                 qw = hh * QS + KV_LORA // 2 + (tid % (PE_DIM // 4)) * 2
                 lds_st(xs, qw, qv[NQ][0].bitcast(fx.Float32))
                 lds_st(xs, qw + 1, qv[NQ][1].bitcast(fx.Float32))
-            if const_expr(True):
+
+        def split_wave_keys(t, s):
+            """(nkeys, sparse, this wave's keys: lane j < KPW key j) of sample s's
+            selection; each wave polls its own keys."""
+            index_base, index_end = row_index_bounds(s)
+            nkeys = index_end - index_base
+            sparse = index_end > index_base
+            k_pos = t * SPLIT_KEYS + wave * KPW + fx.min(lane, KPW - 1)
+            idx = (k_pos < nkeys).select(k_pos, 0)
+            if sparse:
+                idx = get(mb("indices"), s * topk + idx)
+            return nkeys, sparse, idx
+
+        for tt in range(start("split"), S * N_HEAD_GROUPS * N_SPLIT, G):
+            tt = fx.Int32(tt)
+            stamp("split", tt, 0)
+            s = tt // (N_HEAD_GROUPS * N_SPLIT)
+            head_group = (tt // N_SPLIT) % N_HEAD_GROUPS
+            t = tt % N_SPLIT
+            h = head_group * WAVES + wave
+            rows = new_rows()
+            if const_expr(with_indexer):
+                # q and this launch's rows are staged before the selection's wait;
+                # once a wave's keys land it issues their cache rows
+                wait_q(tt, s)
+                stage_q(s)
+                stage_new_rows(xs + NEW_ROWS_OFF)
+                stamp("split", tt, 2)
+                gpu.barrier()
+                nkeys, sparse, wave_keys = split_wave_keys(t, s)
+                gather_kv(
+                    rows,
+                    (
+                        wave_keys,
+                        split_kv_loads(
+                            [read_lane_i32(wave_keys, jj) for jj in range(KPW)],
+                            r_kv,
+                            r_pe,
+                        ),
+                    ),
+                    staged=xs + NEW_ROWS_OFF,
+                )
+            else:
+                if const_expr(SPLIT_EARLY):  # the tile's rows are already loaded
+                    _, nkeys, sparse = split_bounds(s)
+                else:
+                    nkeys, sparse = split_keys(t, s)
+                gpu.barrier()
+                # before waiting for q: the cache tasks end before uk
+                gather_kv(rows, split_early if const_expr(SPLIT_EARLY) else None)
+                wait_q(tt, s)
+                stage_q(s)
                 stamp("split", tt, 2)
             gpu.barrier()
             stamp("split", tt, 5)
