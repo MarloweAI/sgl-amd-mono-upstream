@@ -2372,8 +2372,8 @@ def build_glm5_monokernel(
         # ================================================= 1. q_a / kv_a GEMV
         # 1 row group x 96 chunks: 8 waves split K, 12 chunks each (all prefetched).
         # With the indexer, the index K and weights projections are further 16-row tiles
-        # of this stage, each on its own CTA: tasks N_QKV_A .. + N_INDEX_K are W_k's
-        # tiles, the last N_INDEX_W the weights projection's.
+        # of this stage, each alone on one of the grid's last CTAs: the first N_INDEX_K
+        # W_k's tiles, the last N_INDEX_W the weights projection's.
         assert attention_weight is AttentionWeight.FP8_BLOCK128, (
             "the K-split front reads FP8 block-128 q_a / kv_a weights"
         )
@@ -2556,8 +2556,21 @@ def build_glm5_monokernel(
                         else:
                             put(mb(boxes[1]), s * (KV_LORA + PE_DIM) + row - Q_LORA, v)
 
-        # index tiles on the CTAs of the K rests of single tiles
-        N_FRONT_PAIRS = N_QKV_A - FRONT_SMALL_CTAS
+        # with the indexer, the index tiles on the last CTAs, alone, and the K rests two
+        # a CTA on the CTAs before them
+        N_REST_CTAS = FRONT_SMALL_CTAS - N_INDEX_K - N_INDEX_W
+        assert 2 * N_REST_CTAS >= N_QKV_A
+
+        def rests(t, j, n_rest_ctas):
+            second = j + n_rest_ctas
+            front_part(
+                t,
+                [(j, True), (fx.min(second, N_QKV_A - 1), second < N_QKV_A)],
+                FRONT_K_BIG,
+                HIDDEN - FRONT_K_BIG,
+                ("q_a2", "kv_a2"),
+            )
+
         for t in range(start("qkv_a"), G, G):
             t = fx.Int32(t)
             stamp("qkv_a", t, 0)
@@ -2565,16 +2578,13 @@ def build_glm5_monokernel(
             if t < N_QKV_A:
                 front_part(t, [(t, True)], 0, FRONT_K_BIG, ("q_a", "kv_a"))
             else:
-                second = j + FRONT_SMALL_CTAS
-                front_part(
-                    t,
-                    [(j, True), (fx.min(second, N_QKV_A - 1), second < N_QKV_A)],
-                    FRONT_K_BIG,
-                    HIDDEN - FRONT_K_BIG,
-                    ("q_a2", "kv_a2"),
-                )
+                if const_expr(with_indexer):
+                    if j < N_REST_CTAS:
+                        rests(t, j, N_REST_CTAS)
+                else:
+                    rests(t, j, FRONT_SMALL_CTAS)
             if const_expr(with_indexer):
-                tk = j - N_FRONT_PAIRS
+                tk = j - N_REST_CTAS
                 tw = tk - N_INDEX_K
 
                 def put_index(name, rows, tile):
@@ -3328,8 +3338,12 @@ def build_glm5_monokernel(
             BATCH_LOADS = (BATCH_WORDS + 4 * THREADS - 1) // (4 * THREADS)
             # a CTA scores at least SCORE_PAGES pages of a request, or all of them
             SCORE_PAGES = 2
+            # runs go to CTAs S .. G - 1: the q_norm CTAs (with the rows' index-key and
+            # cache tasks) score nothing
+            SCORE_CTAS = G - S
             MAX_RUN_PAGES = max(
-                SCORE_PAGES, (index_max_seq // index_block_size + G - 1) // G
+                SCORE_PAGES,
+                (index_max_seq // index_block_size + SCORE_CTAS - 1) // SCORE_CTAS,
             )
             BT_OFF = BATCH_WORDS  # the run's block ids, after the batch
             K8 = INDEX_DIM // 4 + 1  # a new key's pairs: its value words, its scale
@@ -3519,18 +3533,21 @@ def build_glm5_monokernel(
                     bound_g = fx.max(bound_g, bounds[r])
                 bound_g = _uniform(bound_g)
                 n_pages = (bound_g + index_block_size - 1) // index_block_size
-                runs = fx.min(fx.Int32(G), (n_pages + SCORE_PAGES - 1) // SCORE_PAGES)
+                runs = fx.min(
+                    fx.Int32(SCORE_CTAS), (n_pages + SCORE_PAGES - 1) // SCORE_PAGES
+                )
                 per = (n_pages + runs - 1) // runs
-                first_cta = (SCORE_BASE + s0 * (G // S)) % G
-                run = (fx.Int32(bid) + (G - first_cta)) % G
+                first_run = (SCORE_BASE - S + s0 * (G // S)) % SCORE_CTAS
+                run = (fx.Int32(bid) - S + (SCORE_CTAS - first_run)) % SCORE_CTAS
                 p_lo = run * per
                 p_hi = fx.min(p_lo + per, n_pages)
-                # above 4 rows, when every CTA has a run, runs differ by at most a page
+                # above 4 rows, when every scoring CTA has a run, runs differ by at
+                # most a page
                 if const_expr(PAIRED):
-                    even = runs == G
+                    even = runs == SCORE_CTAS
                     p_lo = even.select(run * n_pages // runs, p_lo)
                     p_hi = even.select((run + 1) * n_pages // runs, p_hi)
-                if (run < runs) & (p_lo < p_hi):
+                if (fx.Int32(bid) >= S) & (run < runs) & (p_lo < p_hi):
                     stamp("index_score", bid, 0)
                     # the run's block ids: loaded with the query's poll, stored after it
                     bt_word = index_block(
