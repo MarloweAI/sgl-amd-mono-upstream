@@ -76,6 +76,7 @@ from sgl_amd_mono.common.ops import hw_rcp as _rcp
 from sgl_amd_mono.common.ops import hw_rsq as _rsq
 from sgl_amd_mono.common.ops import mxfp4_to_bf16x8 as _mxfp4_to_bf16x8
 from sgl_amd_mono.common.ops import (
+    popcount,
     read_lane_i32,
 )
 from sgl_amd_mono.common.ops import rsrc as _rsrc
@@ -1723,9 +1724,14 @@ def build_glm5_monokernel(
             mv = fx.Int32(0)  # lane k: the expert ID of pick k
             for k in range_constexpr(TOP_K):
                 m = wave_umax(ks[0])
-                winner = wave_umax((ks[0] == m).select(255 - ids[0], fx.Int32(0)))
-                expert = 255 - winner
-                hit = (ks[0] == m) & (ids[0] == expert)
+                top = ks[0] == m
+                tied = ballot(top)
+                # one lane holds the maximum: its head; equal keys: the smallest ID
+                low = tied & (fx.Int64(0) - tied)
+                expert = read_lane_i32(ids[0], popcount(low - 1))
+                if popcount(tied) > 1:
+                    expert = 255 - wave_umax(top.select(255 - ids[0], fx.Int32(0)))
+                hit = top & (ids[0] == expert)
                 ks = [hit.select(ks[i + 1], ks[i]) for i in range(4)] + [ks[4]]
                 ids = [hit.select(ids[i + 1], ids[i]) for i in range(4)] + [ids[4]]
                 mv = write_lane_i32(expert, k, mv)
