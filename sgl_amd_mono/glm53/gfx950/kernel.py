@@ -2649,6 +2649,99 @@ def build_glm5_monokernel(
                 put2(mb("penew"), s * PE_DIM + tid * 2, p0, p1)
             stamp("cache", s, 4)
 
+        # ================ split's KV cache rows (section 5). Above 4 rows, in launches
+        # without the indexer (the selection is the previous launch's), most split
+        # tiles share a CTA with a q_norm, q_b or uk task: every tile's rows go out
+        # here, after the CTA's q_norm and cache tasks and ahead of its q_b or uk task
+        KPW = SPLIT_KEYS // WAVES
+        N_SPLIT_TILES = S * (H // WAVES) * N_SPLIT
+        SPLIT_EARLY = S > 4 and not with_indexer and N_SPLIT_TILES <= G
+
+        def split_bounds(s, indptr=None):
+            """(first index, keys, sparse) of sample s's selection."""
+            if const_expr(use_atom_kv_cache):
+                rs = _rsrc(sparse_kv_indptr) if indptr is None else indptr
+                begin = fx.Int32(bo.buffer_load(rs, s, vec_width=1, dtype=T.i32))
+                end = fx.Int32(bo.buffer_load(rs, s + 1, vec_width=1, dtype=T.i32))
+                return begin, end - begin, end > begin
+            kv_len = pos0 + s + 1
+            sparse = kv_len > topk
+            return s * topk, sparse.select(fx.Int32(topk), kv_len), sparse
+
+        def split_kv_loads(krows, kv_rs, pe_rs):
+            """Issue the KV latent and k_pe cache rows of this wave's keys."""
+            kv_row_words = (
+                QK_DIM // 2 if const_expr(use_atom_kv_cache) else KV_LORA // 2
+            )
+            pe_lanes = PE_DIM // 8 if const_expr(cache_fp8) else PE_DIM // 2
+            pe_lane = fx.min(lane, pe_lanes - 1)
+            raws = []
+            for jj in range_constexpr(KPW):
+                if const_expr(cache_fp8):
+                    row = krows[jj] * (QK_DIM // 4)
+                    kv = fx.Vector(
+                        bo.buffer_load(kv_rs, row + lane * 2, vec_width=2, dtype=T.i32)
+                    )
+                    pe = fx.Vector(
+                        bo.buffer_load(
+                            pe_rs,
+                            row + KV_LORA // 4 + pe_lane * 2,
+                            vec_width=2,
+                            dtype=T.i32,
+                        )
+                    )
+                else:
+                    kv = fx.Vector(
+                        bo.buffer_load(
+                            kv_rs,
+                            krows[jj] * kv_row_words + lane * 4,
+                            vec_width=4,
+                            dtype=T.i32,
+                        )
+                    )
+                    pe_row = (
+                        krows[jj] * (QK_DIM // 2) + KV_LORA // 2 + pe_lane
+                        if const_expr(use_atom_kv_cache)
+                        else krows[jj] * (PE_DIM // 2) + pe_lane
+                    )
+                    pe = ld_f32(pe_rs, pe_row)
+                raws.append((kv, pe))
+            return raws
+
+        if const_expr(SPLIT_EARLY):
+            e_tt = fx.Int32(start("split"))
+            e_has = e_tt < N_SPLIT_TILES
+            e_tt = fx.min(e_tt, N_SPLIT_TILES - 1)
+
+            def e_rsrc(addr):
+                """A CTA without a split tile loads nothing (no round trip to wait)."""
+                return bo.create_buffer_resource_from_addr(
+                    addr,
+                    num_records_bytes=e_has.select(fx.Int64(0xFFFFFFFF), fx.Int64(0)),
+                )
+
+            # lane j < KPW: key j of this wave
+            e_base, e_keys, e_sparse = split_bounds(
+                e_tt // ((H // WAVES) * N_SPLIT), e_rsrc(sparse_kv_indptr)
+            )
+            e_pos = (e_tt % N_SPLIT) * SPLIT_KEYS + wave * KPW + fx.min(lane, KPW - 1)
+            e_cl = (e_pos < e_keys).select(e_pos, 0)
+            e_key = fx.Int32(
+                bo.buffer_load(e_rsrc(indices), e_base + e_cl, vec_width=1, dtype=T.i32)
+            )
+            if const_expr(use_atom_kv_cache):
+                e_key = e_sparse.select(e_key, fx.Int32(0))
+            else:
+                e_key = e_sparse.select(e_key, e_cl)
+            split_early = (
+                e_key,
+                split_kv_loads(
+                    [read_lane_i32(e_key, jj) for jj in range(KPW)],
+                    e_rsrc(kv_cache),
+                    e_rsrc(pe_cache),
+                ),
+            )
+
         # =============================================== 4. normalized q_a -> q_b (+RoPE)
         r_wqb, r_sqb = _rsrc(w_q_b), _rsrc(s_q_b)
         QB_NKC = Q_LORA // 64
@@ -3723,19 +3816,10 @@ def build_glm5_monokernel(
         r_kv = _rsrc(kv_cache)
         r_pe = _rsrc(pe_cache)
         r_idx = _rsrc(indices)
-        KPW = SPLIT_KEYS // WAVES
 
         def split_keys(t, s):
             """(nkeys, sparse) of sample s; wave 0 writes this split's cache rows to LDS."""
-            if const_expr(use_atom_kv_cache):
-                index_base, index_end = row_index_bounds(s)
-                nkeys = index_end - index_base
-                sparse = index_end > index_base
-            else:
-                index_base = s * topk
-                kv_len = pos0 + s + 1
-                sparse = kv_len > topk
-                nkeys = sparse.select(fx.Int32(topk), kv_len)
+            index_base, nkeys, sparse = split_bounds(s)
             if wave == 0:
                 if lane < SPLIT_KEYS:
                     k_pos = t * SPLIT_KEYS + lane
@@ -3774,49 +3858,19 @@ def build_glm5_monokernel(
                 return [(row_writes_cache(s), row_slot(s)) for s in range(S)]
             return None
 
-        def gather_kv(rows):
+        def gather_kv(rows, early=None):
             """Each wave copies its 8 keys' KV latent (1 KB) + k_pe (128 B) rows into
-            the LDS tiles: the cache rows of all 8 keys are loaded at once, then, if any
-            key is a row this launch appends, the CTA polls those rows from the cache
-            tasks' kvnew / penew pairs (their loads issued behind the cache rows'),
-            then the rest is stored."""
-            krows = [lds_ld(attn_keys, wave * KPW + jj) for jj in range(KPW)]
-            kv_row_words = (
-                QK_DIM // 2 if const_expr(use_atom_kv_cache) else KV_LORA // 2
-            )
-            pe_lanes = PE_DIM // 8 if const_expr(cache_fp8) else PE_DIM // 2
-            pe_lane = fx.min(lane, pe_lanes - 1)
-            raws = []
-            for jj in range_constexpr(KPW):
-                if const_expr(cache_fp8):
-                    row = krows[jj] * (QK_DIM // 4)
-                    kv = fx.Vector(
-                        bo.buffer_load(r_kv, row + lane * 2, vec_width=2, dtype=T.i32)
-                    )
-                    pe = fx.Vector(
-                        bo.buffer_load(
-                            r_pe,
-                            row + KV_LORA // 4 + pe_lane * 2,
-                            vec_width=2,
-                            dtype=T.i32,
-                        )
-                    )
-                else:
-                    kv = fx.Vector(
-                        bo.buffer_load(
-                            r_kv,
-                            krows[jj] * kv_row_words + lane * 4,
-                            vec_width=4,
-                            dtype=T.i32,
-                        )
-                    )
-                    pe_row = (
-                        krows[jj] * (QK_DIM // 2) + KV_LORA // 2 + pe_lane
-                        if const_expr(use_atom_kv_cache)
-                        else krows[jj] * (PE_DIM // 2) + pe_lane
-                    )
-                    pe = ld_f32(r_pe, pe_row)
-                raws.append((kv, pe))
+            the LDS tiles: the cache rows of all 8 keys are loaded at once (or were,
+            ``early``: (the keys a lane, their rows)), then, if any key is a row this
+            launch appends, the CTA polls those rows from the cache tasks' kvnew /
+            penew pairs (their loads issued behind the cache rows'), then the rest is
+            stored."""
+            if const_expr(early is None):
+                krows = [lds_ld(attn_keys, wave * KPW + jj) for jj in range(KPW)]
+                raws = split_kv_loads(krows, r_kv, r_pe)
+            else:
+                krows = [read_lane_i32(early[0], jj) for jj in range(KPW)]
+                raws = early[1]
             news = []
             if const_expr(use_atom_kv_cache):
                 for jj in range_constexpr(KPW):
@@ -3909,9 +3963,13 @@ def build_glm5_monokernel(
             t = tt % N_SPLIT
             h = head_group * WAVES + wave
             rows = new_rows()
-            nkeys, sparse = split_keys(t, s)
+            if const_expr(SPLIT_EARLY):  # the tile's rows are already loaded
+                _, nkeys, sparse = split_bounds(s)
+            else:
+                nkeys, sparse = split_keys(t, s)
             gpu.barrier()
-            gather_kv(rows)  # before waiting for q: the cache tasks end before uk
+            # before waiting for q: the cache tasks end before uk
+            gather_kv(rows, split_early if const_expr(SPLIT_EARLY) else None)
             if const_expr(True):
                 N_PE_T = PE_DIM // Q_B_TILE
                 hint_wait(
