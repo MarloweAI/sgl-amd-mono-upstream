@@ -23,6 +23,9 @@ from flydsl.expr import math as fmath
 from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import T, as_ir_value
 
+# every kernel module imports this one: this package's FlyDSL compiles then run
+# their binary pass on a fresh copy of the module
+from sgl_amd_mono.common import binary_pass  # noqa: F401
 from sgl_amd_mono.common.plan import THREADS, WAVES
 
 # gfx95x cache policy bits: SC1 = device scope, SC0 | SC1 = system scope (peers over XGMI)
