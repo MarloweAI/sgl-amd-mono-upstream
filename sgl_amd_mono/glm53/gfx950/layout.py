@@ -47,11 +47,10 @@ def eh_parts(eh_tiles: int) -> int:
 
 def eh_base(eh_tiles: int, with_indexer: bool) -> int:
     """The NextN entry's first CTA. With the indexer, the CTA past the front's index
-    projection tiles (the entry wraps around the grid): those tiles' weights go out at
-    the launch start, not behind an entry task. Else the last CTAs."""
+    projection tiles, which are the grid's last CTAs, so CTA 0: those tiles' weights go
+    out at the launch start, not behind an entry task. Else the last CTAs."""
     if with_indexer:
-        index_tiles = (INDEX_DIM + INDEX_HEADS) // QKV_A_TILE
-        return (2 * N_QKV_A - FRONT_SMALL_CTAS + index_tiles) % BLOCKS
+        return 0
     return max(BLOCKS - eh_parts(eh_tiles) * eh_tiles, 0)
 
 
@@ -328,8 +327,8 @@ def stage_tasks(
     tasks = [("embed", N_ROW_TILES)] if tokens else []
     tasks += [("eh", eh_parts(eh_tiles) * eh_tiles)] if eh_tiles else []
     tasks += [
-        # every CTA: a tile's K head, or two tiles' K rests (and an index K or weights
-        # projection tile on some, with the indexer)
+        # every CTA: a tile's K head, two tiles' K rests or, with the indexer, an index
+        # K or weights projection tile
         ("qkv_a", BLOCKS),
         ("q_norm", samples),
         ("cache", samples),
