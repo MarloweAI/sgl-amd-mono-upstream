@@ -1,8 +1,12 @@
 """Run the GLM-5.3 layer launch on random weights in SGLang's layouts under torchrun
 (TP 4 or 8): ``torchrun --nproc-per-node 8 test/kernels/glm53/check_layer.py --kind
 index --rows 2,4,8``. Kinds: ``shared`` (a layer that reuses the previous top-k),
-``index`` (a layer that runs the indexer) and ``model`` (the model order's first
-``--launches`` layers: 3 shared, then an indexer layer every fourth). Each width runs
+``index`` (a layer that runs the indexer), ``model`` (the model order's first
+``--launches`` layers: 3 shared, then an indexer layer every fourth), ``dense`` (a
+dense layer: the indexer layer with its MLP as expert-shaped slices), ``embed``
+(layer 0 from the step's token ids, then dense layers), ``full`` (layer 0, the dense
+layers 1 and 2, then the model order, and the tail) and ``head`` (the tail alone:
+the final norm, the LM head and the logits' all-gather). Each width runs
 ``--steps`` steps of ``--launches`` launches, inputs chained, on the rows of each of
 ``--rowsets`` (one request a row, the same with a pad row, or MTP's verify rows; the
 live rows at positions below and past the 2048-key top-k), with the MLA cache in
@@ -11,7 +15,13 @@ output (the TP sums run in rank order). ``--writes``: each launch changes exactl
 its live rows' MLA and index cache rows, and a shared launch leaves the top-k alone;
 ``--replays N``: a graph of the step replays the eager step bitwise;
 ``--check-tags``: every selected token of a scored row is a pair carrying its
-indexer launch's tag and the slot the launch publishes, and a cleared tag fails.
+indexer launch's tag and the slot the launch publishes, and a cleared tag fails;
+``--check-dense``: the last dense launch's MLP against f32 references on its own
+inputs, within the spec's bounds, and one rank's down or gate | up scales x2 fail
+them; ``--check-embed``: layer 0 from the token ids equals the dense launch fed the
+gathered embedding rows (outputs, cache rows, top-k), and a changed token id differs;
+``--check-head``: the tail's logits against a torch and an f32 tail, within the
+spec's bounds, and the final norm x1.01 fails them.
 
 ``--dump DIR`` writes, per run and rank, the SHA-256 of every launch's output rows,
 of the cache rows and top-k entries it writes, and after each width of every cache
@@ -41,6 +51,9 @@ from sgl_amd_mono.glm53.gfx950.layout import INDEX_DIM, INDEX_HEADS
 
 N_EXPERTS = 256
 QKV_A = Q_LORA + KV_LORA + PE_DIM
+# GLM-5.3's vocabulary and dense MLP intermediates (over all ranks)
+VOCAB = 154880
+DENSE_INTER = 12288
 # the served context (GLM-5.3's 1M positions): the keys an indexer row scores at most
 MAX_SEQ = 1 << 20
 # the live rows' positions, in order: past and below the 2048-key top-k
@@ -69,19 +82,55 @@ def _norm(g, n: int, device, dtype=torch.bfloat16) -> torch.Tensor:
 
 
 def model_kinds(n: int) -> list:
-    """The kinds of the first n covered layers (from layer 3): SGLang runs the
-    indexer on layer i unless max(i - 2, 0) % 4."""
+    """The kinds of the first n MoE layers (from layer 3): SGLang runs the indexer on
+    layer i unless max(i - 2, 0) % 4."""
     return ["index" if (i - 2) % 4 == 0 else "shared" for i in range(3, 3 + n)]
 
 
-def layer_weights(layer: int, rank: int, tp: int, device, index: bool):
+def kinds_of(kind: str, n: int) -> list:
+    """The layer kinds of ``n`` launches of ``--kind`` (``head``: none)."""
+    if kind == "model":
+        return model_kinds(n)
+    if kind == "full":
+        return ["embed", "dense", "dense"] + model_kinds(n - 3)
+    if kind == "embed":
+        return ["embed"] + ["dense"] * (n - 1)
+    return [] if kind == "head" else [kind] * n
+
+
+def has_index(kind: str) -> bool:
+    return kind in ("index", "dense", "embed")
+
+
+def embedding(rank: int, tp: int, device) -> torch.Tensor:
+    """This rank's rows of a random vocab-parallel embedding."""
+    g = _gen(70000 + rank, device)
+    rows = VOCAB // tp
+    return (0.02 * torch.randn(rows, HIDDEN, generator=g, device=device)).bfloat16()
+
+
+def head_weights(rank: int, tp: int, device):
+    """The tail's random tensors: the final norm (every rank alike) and this rank's
+    LM-head rows."""
+    from sgl_amd_mono.glm53.gfx950.runner import Glm53HeadWeights
+
+    g = _gen(90000 + rank, device)
+    w = torch.randn(VOCAB // tp, HIDDEN, generator=g, device=device) * HIDDEN**-0.5
+    g_norm = _norm(_gen(90000, device), HIDDEN, device)
+    return Glm53HeadWeights(g_norm=g_norm, w_head=w.bfloat16())
+
+
+def layer_weights(layer: int, rank: int, tp: int, device, kind: str):
     """Layer ``layer``'s random tensors as this rank's shard (every rank draws the
     same): block-FP8 projections and experts read in place, W_UK / W_UV, the router
-    and the indexer's weights_proj packed; the shared expert is slot 256."""
+    and the indexer's weights_proj packed; the shared expert is slot 256. A dense
+    layer's MLP: its intermediates as expert-shaped slices, no router read; layer 0
+    (``embed``) reads this rank's embedding rows in the router's place."""
     from sgl_amd_mono.glm53.gfx950.packing import pack_bf16, pack_fp8
     from sgl_amd_mono.glm53.gfx950.runner import Glm53Weights
 
     g = _gen(1000 * layer + 7, device)
+    index = has_index(kind)
     heads, inter = GLM5_GLOBAL_HEADS // tp, GLM5_GLOBAL_INTER // tp
     E = N_EXPERTS + 1
     qb_rows = heads * (NOPE_DIM + PE_DIM)
@@ -115,6 +164,15 @@ def layer_weights(layer: int, rank: int, tp: int, device, index: bool):
         keep = (w_k, s_k, pack_bf16(w_w.bfloat16()), w_q, s_q, g_k, b_k)
         ptrs = [t.data_ptr() for t in keep] + [0]
         table = torch.tensor(ptrs, dtype=torch.int64, device=device)
+    w_r, dense = pack_bf16(router.bfloat16().contiguous()), 0
+    if kind in ("dense", "embed"):
+        dense = DENSE_INTER // tp // inter
+        w_ug = _fp8(g, (dense, 2 * inter, HIDDEN), device)
+        s_ug = _scales(g, (dense, 2 * inter // 128, HIDDEN // 128), HIDDEN, device)
+        w_dn = _fp8(g, (dense, HIDDEN, inter), device)
+        s_dn = _scales(g, (dense, HIDDEN // 128, inter // 128), DENSE_INTER, device)
+    if kind == "embed":
+        w_r = embedding(rank, tp, device)
     return Glm53Weights(
         g_in=_norm(g, HIDDEN, device),
         g_q=_norm(g, Q_LORA, device),
@@ -134,7 +192,7 @@ def layer_weights(layer: int, rank: int, tp: int, device, index: bool):
         ),
         w_o=w_o,
         s_o=s_o,
-        w_r=pack_bf16(router.bfloat16().contiguous()),
+        w_r=w_r,
         bias=bias,
         w_ug=w_ug,
         s_ug=s_ug,
@@ -143,6 +201,7 @@ def layer_weights(layer: int, rank: int, tp: int, device, index: bool):
         shuffled=True,
         index=table,
         keep=keep,
+        dense=dense,
     )
 
 
@@ -231,60 +290,111 @@ def rope(max_pos: int, device):
     return ang.cos().bfloat16().contiguous(), ang.sin().bfloat16().contiguous()
 
 
+def token_ids(positions: list, device) -> torch.Tensor:
+    """Random token ids of the live rows, over every rank's shard; -1 a pad row."""
+    g = torch.Generator().manual_seed(4)
+    ids = torch.randint(0, VOCAB, (len(positions),), generator=g, dtype=torch.int32)
+    ids[[p is None for p in positions]] = -1
+    return ids.to(device)
+
+
 class Model:
-    """Random layers of ``kinds`` (layer ids from 3), their caches and one runtime
-    a kind at one width; ``step()`` runs a step of launches, inputs chained.
-    ``stop=False``: a failed wait sets its error word and the launch runs on."""
+    """Random layers of ``kinds`` (layer ids from 3, or from 0 when the first is
+    ``embed``), their caches and one runtime a kind at one width, then with ``head``
+    the tail; ``step()`` runs a step of launches, inputs chained. ``stop=False``: a
+    failed wait sets its error word and the launch runs on."""
 
     def __init__(
-        self, kinds, positions, requests, rank, tp, group, device, args, stop=False
+        self,
+        kinds,
+        positions,
+        requests,
+        rank,
+        tp,
+        group,
+        device,
+        args,
+        stop=False,
+        head=False,
+        first=None,
     ):
         from sgl_amd_mono.glm53.gfx950.runner import (
             Glm53Build,
+            Glm53HeadOp,
             Glm53LayerOp,
             Glm53Runtime,
         )
 
         self.kinds, W = kinds, len(positions)
+        if first is None:
+            first = 0 if kinds[:1] == ["embed"] else 3
         live = [p for p in positions if p is not None]
         pages = Pages(max(requests) + 1, max(live) + W + 1, device)
         self.caches = [
-            layer_caches(3 + i, pages, k == "index", device, args.kv == "fp8")
+            layer_caches(first + i, pages, has_index(k), device, args.kv == "fp8")
             for i, k in enumerate(kinds)
         ]
         self.cos, self.sin = rope(max(live) + W + 1, device)
         self.step_tables, self.topk0 = make_step(positions, requests, pages, device)
+        self.weights = [
+            layer_weights(first + i, rank, tp, device, k) for i, k in enumerate(kinds)
+        ]
+        vocab_rows = VOCAB // tp
         self.runtimes = {}
         for kind in sorted(set(kinds)):
+            w = self.weights[kinds.index(kind)]
             key = Glm53Build(
                 rows=W,
                 tp=tp,
                 launches_per_step=kinds.count(kind),
-                with_indexer=kind == "index",
-                index_max_seq=MAX_SEQ if kind == "index" else 0,
+                with_indexer=has_index(kind),
+                index_max_seq=MAX_SEQ if has_index(kind) else 0,
                 fp8_shuffled=True,
                 kv_fp8=args.kv == "fp8",
                 stop=stop,
+                dense=w.dense,
+                tokens=kind == "embed",
+                vocab_rows=vocab_rows if kind == "embed" else 0,
             )
             self.runtimes[kind] = Glm53Runtime(key, rank, group, device)
             self.runtimes[kind].set_deadline(args.deadline)
         self.ops, ordinal = [], {k: 0 for k in self.runtimes}
-        for i, kind in enumerate(kinds):
-            w = layer_weights(3 + i, rank, tp, device, kind == "index")
+        for kind, w in zip(kinds, self.weights):
             self.ops.append(Glm53LayerOp(self.runtimes[kind], w, ordinal[kind]))
             ordinal[kind] += 1
+        self.head = None
+        if head:
+            key = Glm53Build(
+                rows=W,
+                tp=tp,
+                launches_per_step=1,
+                with_indexer=False,
+                index_max_seq=0,
+                fp8_shuffled=True,
+                stop=stop,
+                head=True,
+                vocab_rows=vocab_rows,
+            )
+            rt = self.runtimes["head"] = Glm53Runtime(key, rank, group, device)
+            rt.set_deadline(args.deadline)
+            self.head = Glm53HeadOp(rt, head_weights(rank, tp, device))
         g = _gen(3, device)
         self.h = torch.randn(W, HIDDEN, generator=g, device=device).bfloat16()
+        if kinds[:1] == ["embed"]:
+            self.h = token_ids(positions, device)
 
-    def step(self, after=None) -> torch.Tensor:
-        """One step (``after(i, out)`` after launch i); returns the last output."""
+    def step(self, after=None, h=None) -> torch.Tensor:
+        """One step from ``h`` (default ``self.h``; ``after(i, out)`` after launch i);
+        returns the last layer's output, or with the tail its gathered logits."""
         st = self.step_tables
         st.topk.copy_(self.topk0)
-        h = self.h
+        h = self.h if h is None else h
         for i, op in enumerate(self.ops):
             h = op.launch(h, self.caches[i], self.cos, self.sin, st)
             if after is not None:
                 after(i, h)
+        if self.head is not None:
+            h, _ = self.head.launch(h)
         for rt in self.runtimes.values():
             rt.advance_step()
         return h
@@ -439,6 +549,175 @@ def check_tags(model: Model) -> bool:
     return good and bool(seen) and bool(scored)
 
 
+def _rel(a: torch.Tensor, b: torch.Tensor) -> float:
+    a, b = a.float(), b.float()
+    return ((a - b).norm() / b.norm().clamp_min(1e-30)).item()
+
+
+def _sum_ranks(t: torch.Tensor, group) -> torch.Tensor:
+    c = t.float().cpu()
+    dist.all_reduce(c, group=group)
+    return c.to(t.device)
+
+
+def _gather_cols(t: torch.Tensor, group, tp: int) -> torch.Tensor:
+    parts = [torch.empty_like(t.float().cpu()) for _ in range(tp)]
+    dist.all_gather(parts, t.float().cpu().contiguous(), group=group)
+    return torch.cat(parts, -1).to(t.device)
+
+
+def _live(model: Model) -> int:
+    """The step's live rows: those before its pad rows."""
+    return int((model.step_tables.slots >= 0).sum())
+
+
+def dense_values(model: Model, out: torch.Tensor, group) -> dict:
+    """The last dense launch's MLP (its own mailboxes, ``check.dense_parts``) on the
+    live rows: its mid against an f32 gate | up on its own FP8 activations, its output
+    against the f32 down of its own per-128 FP8 mid, and its output and the same MLP
+    with SGLang's W8A8 rounding (bf16 normed rows, FP8 per 128, bf16 gate | up and
+    mid) against an f32 MLP on its FFN input; their distances' ratio less one is
+    ``excess``. Every rank's shard summed."""
+    from sgl_amd_mono.glm53 import check
+
+    op = model.ops[-1]
+    rt, w, S = op.rt, op.w, _live(model)
+    a = check.ffn_input(rt, rt.width)[:S]
+    parts = check.dense_parts(rt, w, rt.width)
+    x = check._rms(a, w.g_post)
+    wug = check.slices_f32(w.w_ug, w.s_ug, w.shuffled)
+    wdn = check.slices_f32(w.w_dn, w.s_dn, w.shuffled)
+    inter = wug.shape[1] // 2
+
+    def mlp(x, rounded):
+        gu = torch.einsum("sk,njk->snj", check._q128(x) if rounded else x, wug)
+        if rounded:
+            gu = gu.bfloat16().float()
+        mid = torch.nn.functional.silu(gu[..., :inter]) * gu[..., inter:]
+        if rounded:
+            mid = check._q128(mid.bfloat16())
+        return torch.einsum("sni,nhi->sh", mid, wdn)
+
+    f32 = _sum_ranks(mlp(x, False), group)
+    stock = _sum_ranks(mlp(x.bfloat16().float(), True), group)
+    down = _sum_ranks(parts["down"][:S], group)
+    mine = out[:S].float() - a.float()
+    v = {
+        "mid": _rel(parts["mid"][:S], parts["mid_ref"][:S]),
+        "x": _rel(mine, down),
+        "x_vs_fp32": _rel(mine, f32),
+        "stock_vs_fp32": _rel(stock, f32),
+    }
+    v["excess"] = v["x_vs_fp32"] / v["stock_vs_fp32"] - 1
+    return v
+
+
+def check_dense(model: Model, rank: int, group) -> bool:
+    """The last dense launch's MLP within the spec's dense bounds; rank 0's down scales
+    x2, or its gate | up scales x2, must fail one of them."""
+    from sgl_amd_mono.glm53.spec import NUMERICS
+
+    def within(v):
+        bounds = NUMERICS.bounds
+        return all(v[k] <= bounds[f"dense.{k}.rel"] for k in ("mid", "x", "excess"))
+
+    w = model.ops[-1].w
+    out = model.step()
+    torch.cuda.synchronize()
+    v = dense_values(model, out, group)
+    ok = within(v)
+    print(f"rank {rank} dense {v} within={ok}", flush=True)
+    for name, t in (("down", w.s_dn), ("gate_up", w.s_ug)):
+        saved = t.clone()
+        if rank == 0:
+            t.mul_(2)
+        out = model.step()
+        torch.cuda.synchronize()
+        t.copy_(saved)
+        bad = dense_values(model, out, group)
+        print(f"rank {rank} dense control {name} x2: {bad}", flush=True)
+        ok &= not within(bad)
+    return ok
+
+
+def _writes(model: Model, h=None):
+    """One step's output, the MLA and index cache rows of its live rows and its
+    top-k, the caches restored after."""
+    st = model.step_tables
+    saved = [(c.kv.clone(), c.idx.clone()) for c in model.caches]
+    out = model.step(h=h)
+    torch.cuda.synchronize()
+    slots = st.slots[st.slots >= 0]
+    c = model.caches[0]
+    got = [
+        out.clone(),
+        c.kv[slots].clone(),
+        _index_entries(c.idx, slots),
+        st.topk.clone(),
+    ]
+    for c, (kv, idx) in zip(model.caches, saved):
+        c.kv.copy_(kv)
+        c.idx.copy_(idx)
+    return got
+
+
+def check_embed(model: Model, dense: Model, rank: int, group) -> bool:
+    """Layer 0 from the token ids (``model``, one launch) equals the same layer as a
+    dense launch (``dense``) fed the gathered embedding rows: outputs, cache rows and
+    top-k bitwise. One live row's token id changed must change the output."""
+    ids, emb = model.h, model.ops[0].w.w_r
+    rows = emb.shape[0]
+    local = torch.zeros(ids.shape[0], HIDDEN, device=ids.device)
+    for s, t in enumerate(ids.tolist()):
+        if t >= 0 and t // rows == rank:
+            local[s] = emb[t - rank * rows].float()
+    x = _sum_ranks(local, group).bfloat16()
+    a, b = _writes(model), _writes(dense, h=x)
+    same = [torch.equal(p.view(torch.uint8), q.view(torch.uint8)) for p, q in zip(a, b)]
+    print(f"rank {rank} embed equal (out, kv, index, topk): {same}", flush=True)
+    saved = ids.clone()
+    ids[0] = (ids[0] + rows // 2) % VOCAB
+    changed = _writes(model)[0]
+    ids.copy_(saved)
+    differs = not torch.equal(changed.view(torch.uint8), a[0].view(torch.uint8))
+    print(f"rank {rank} embed control (a changed token id) differs: {differs}")
+    return all(same) and differs
+
+
+def check_head(model: Model, rank: int, tp: int, group) -> bool:
+    """The tail alone: its logits against a torch tail (bf16 normed rows, bf16 logits,
+    gathered) and an f32 tail within the spec's bounds, its normed rows against
+    torch's; the final norm's weight x1.01 must fail ``head.logits.rel``."""
+    from sgl_amd_mono.glm53 import check
+    from sgl_amd_mono.glm53.spec import NUMERICS
+
+    bounds, w, x = NUMERICS.bounds, model.head.w, model.h
+    logits = model.step().clone()
+    torch.cuda.synchronize()
+    normed = model.head.rt.outs[1].clone()
+    want = check._rms(x, w.g_norm).bfloat16()
+    ref = _gather_cols((want @ w.w_head.t()).float(), group, tp)
+    f32 = _gather_cols(check._rms(x, w.g_norm) @ w.w_head.float().t(), group, tp)
+    v = {
+        "logits": _rel(logits, ref),
+        "logits_vs_fp32": _rel(logits, f32),
+        "stock_vs_fp32": _rel(ref, f32),
+        "normed": _rel(normed, want),
+        "top1": (logits.argmax(-1) == ref.argmax(-1)).float().mean().item(),
+    }
+    ok = (
+        v["logits"] <= bounds["head.logits.rel"]
+        and v["logits_vs_fp32"] <= bounds["head.logits_vs_fp32.rel"]
+    )
+    saved = w.g_norm.clone()
+    w.g_norm.mul_(1.01)
+    bad = _rel(model.step(), ref)
+    torch.cuda.synchronize()
+    w.g_norm.copy_(saved)
+    print(f"rank {rank} head {v} within={ok}; final norm x1.01: {bad:.4g}", flush=True)
+    return ok and bad > bounds["head.logits.rel"]
+
+
 def dump(model: Model, name: str, steps: int, perturb: bool, out: dict) -> str:
     """The digests of ``steps`` steps of ``model`` into ``out``; returns the last
     output's."""
@@ -501,7 +780,11 @@ def compare(a_dir: str, b_dir: str) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--kind", choices=("shared", "index", "model"), default="shared")
+    ap.add_argument(
+        "--kind",
+        choices=("shared", "index", "model", "dense", "embed", "full", "head"),
+        default="shared",
+    )
     ap.add_argument("--rows", default="2,4,8", help="comma-separated widths")
     ap.add_argument("--rowsets", default="p0", help="comma-separated: p0, p1, v4")
     ap.add_argument("--launches", type=int, default=3, help="launches a step")
@@ -511,6 +794,9 @@ def main() -> int:
     ap.add_argument("--writes", action="store_true")
     ap.add_argument("--replays", type=int, default=0, help="graph replays of a step")
     ap.add_argument("--check-tags", action="store_true")
+    ap.add_argument("--check-dense", action="store_true")
+    ap.add_argument("--check-embed", action="store_true", help="with --launches 1")
+    ap.add_argument("--check-head", action="store_true")
     ap.add_argument("--dump", default="", help="write the digests into DIR")
     ap.add_argument("--perturb", action="store_true", help="negate one input value")
     ap.add_argument("--compare", nargs=2, metavar=("A_DIR", "B_DIR"))
@@ -522,17 +808,16 @@ def main() -> int:
     device = torch.device("cuda", torch.cuda.current_device())
     dist.init_process_group("gloo")
     group = dist.new_group(backend="gloo")
-    kinds = (
-        model_kinds(args.launches)
-        if args.kind == "model"
-        else [args.kind] * args.launches
-    )
+    kinds = kinds_of(args.kind, args.launches)
+    head = args.kind in ("full", "head")
     ok, digests, outs = True, {}, {}
     for W, rowset in [
         (W, r) for W in map(int, args.rows.split(",")) for r in args.rowsets.split(",")
     ]:
         positions, requests = rows_of(W, rowset)
-        model = Model(kinds, positions, requests, rank, tp, group, device, args)
+        model = Model(
+            kinds, positions, requests, rank, tp, group, device, args, head=head
+        )
         name = f"{args.kv}-{args.kind}/w{W}{rowset}"
         if args.dump:
             outs[name] = dump(model, name, args.steps, args.perturb, digests)
@@ -545,6 +830,17 @@ def main() -> int:
             ok &= check_replays(model, args.replays)
         if args.check_tags:
             ok &= check_tags(model)
+        if args.check_dense:
+            ok &= check_dense(model, rank, group)
+        if args.check_embed:
+            dense = Model(
+                ["dense"], positions, requests, rank, tp, group, device, args, first=0
+            )
+            ok &= check_embed(model, dense, rank, group)
+            dense.close()
+            del dense
+        if args.check_head:
+            ok &= check_head(model, rank, tp, group)
         torch.cuda.synchronize()
         if model.errors():
             print(f"rank {rank} {name}: error words set", flush=True)
