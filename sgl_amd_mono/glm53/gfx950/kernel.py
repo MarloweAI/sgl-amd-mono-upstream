@@ -144,6 +144,8 @@ from .layout import (
     dn_tile,
     down_prefetch_batch,
     down_x_words,
+    eh_base,
+    eh_parts,
     fp8_kv_upper_pair_lane,
     fp8_pe_upper_pair_lane,
     layout,
@@ -435,8 +437,7 @@ def build_glm5_monokernel(
     # the embedding push runs ahead of qkv_a on the CTAs from 0; the tail's stages
     # start at CTA 0
     base["embed"] = base["lmhead"] = base["gather"] = 0
-    # the NextN entry on the last CTAs, past qkv_a's where the grid allows
-    base["eh"] = max(G - 2 * EH_TILES, 0)
+    base["eh"] = eh_base(EH_TILES, with_indexer)
 
     @fx.struct
     class Smem:
@@ -2107,23 +2108,29 @@ def build_glm5_monokernel(
                 stamp("embed", e_t, 4)
 
         # ============================================ 0. the NextN entry (eh_entry)
-        # Task k < EH_TILES: x columns 16 k .. of this rank's rows of eh_proj over the
-        # e half (enorm(e)); task EH_TILES + k: over the h half (hnorm(h)), whose f32
-        # partial goes to task k's CTA. Task k adds it, rounds to bf16 and pushes the
-        # tile to every rank, one wave a destination, as tagged packed bf16 pairs.
+        # Task p * EH_TILES + k: x columns 16 k .. of this rank's rows of eh_proj over
+        # K part p of [enorm(e) | hnorm(h)] (EH_PARTS equal parts, the first half of
+        # them e's). Each part stages its whole half's normalized rows; every part but
+        # the first sends its f32 partial to task k's CTA, which adds them in part
+        # order, rounds to bf16 and pushes the tile to every rank, one wave a
+        # destination, as tagged packed bf16 pairs.
         if const_expr(eh_entry):
             EH_K = 2 * HIDDEN
-            EH_CPW = HIDDEN // 64 // WAVES
+            EH_PARTS = eh_parts(EH_TILES)
+            EH_CPW = EH_K // 64 // EH_PARTS // WAVES
             EH_AHEAD = EH_CPW if S <= 4 else EH_CPW // 2
             r_weh = _rsrc(index_arg(EH_ARGS[0]))
-            for et in range(start("eh"), 2 * EH_TILES, G):
+            for et in range(start("eh"), EH_PARTS * EH_TILES, G):
                 et = fx.Int32(et)
                 stamp("eh", et, 0)
-                e_half = et // EH_TILES
+                e_part = et // EH_TILES
+                e_half = e_part // (EH_PARTS // 2)
                 e_tile = et % EH_TILES
+                # the part's first 64-column chunk within its half
+                e_kc0 = (e_part % (EH_PARTS // 2)) * (EH_CPW * WAVES)
 
                 def u_eh(c):
-                    kc = wave * EH_CPW + c
+                    kc = e_kc0 + wave * EH_CPW + c
                     r = e_tile * HEAD_TILE + lane % 16
                     wv = [
                         fx.Vector(
@@ -2179,29 +2186,70 @@ def build_glm5_monokernel(
                         )
                     return res
 
-                if const_expr(tokens):
-                    if e_half == 0:
-                        stage_x_rmsnorm(ld_ein, HIDDEN, index_arg(EH_ARGS[1]), count=S)
+                # NORM_ROWS rows at a time
+                for e_first in range_constexpr(0, S, NORM_ROWS):
+                    e_count = min(NORM_ROWS, S - e_first)
+
+                    def rows_of(ld, e_first=e_first):
+                        return lambda sks: ld([(e_first + s, k) for s, k in sks])
+
+                    if const_expr(tokens):
+                        if e_half == 0:
+                            stage_x_rmsnorm(
+                                rows_of(ld_ein),
+                                HIDDEN,
+                                index_arg(EH_ARGS[1]),
+                                count=e_count,
+                                first=e_first,
+                            )
+                        else:
+                            stage_x_rmsnorm(
+                                rows_of(ld_eh),
+                                HIDDEN,
+                                index_arg(EH_ARGS[2]),
+                                count=e_count,
+                                first=e_first,
+                            )
                     else:
-                        stage_x_rmsnorm(ld_eh, HIDDEN, index_arg(EH_ARGS[2]), count=S)
-                else:
-                    e_gamma = (e_half == 0).select(
-                        index_arg(EH_ARGS[1]), index_arg(EH_ARGS[2])
-                    )
-                    stage_x_rmsnorm(ld_eh, HIDDEN, e_gamma, count=S)
+                        e_gamma = (e_half == 0).select(
+                            index_arg(EH_ARGS[1]), index_arg(EH_ARGS[2])
+                        )
+                        stage_x_rmsnorm(
+                            rows_of(ld_eh),
+                            HIDDEN,
+                            e_gamma,
+                            count=e_count,
+                            first=e_first,
+                        )
                 gpu.barrier()
                 stamp("eh", et, 2)
                 acc = run_units(u_eh, EH_CPW, EH_AHEAD, pre)
                 reduce_rows(1, acc, emit_out(HEAD_TILE))
                 stamp("eh", et, 3)
                 gpu.barrier()
-                if e_half == 1:
+                if e_part > 0:
                     if tid < S * HEAD_TILE:
-                        put(mb("ehp"), e_tile * S * HEAD_TILE + tid, lds_ld(outs, tid))
+                        put(
+                            mb("ehp"),
+                            (et - EH_TILES) * S * HEAD_TILE + tid,
+                            lds_ld(outs, tid),
+                        )
                 else:
                     if tid < S * HEAD_TILE:
-                        hp = poll([(mb("ehp"), e_tile * S * HEAD_TILE + tid, 1)])[0][0]
-                        lds_st(outs, tid, lds_ld(outs, tid) + hp.bitcast(fx.Float32))
+                        parts = poll(
+                            [
+                                (
+                                    mb("ehp"),
+                                    (p * EH_TILES + e_tile) * S * HEAD_TILE + tid,
+                                    1,
+                                )
+                                for p in range(EH_PARTS - 1)
+                            ]
+                        )
+                        v = lds_ld(outs, tid)
+                        for hp in parts:
+                            v = v + hp[0].bitcast(fx.Float32)
+                        lds_st(outs, tid, v)
                     gpu.barrier()
                     if wave < W:
                         if lane < S * HEAD_TILE // 2:
@@ -2292,8 +2340,11 @@ def build_glm5_monokernel(
             for sample_base in range_constexpr(0, S, SAMPLE_TILE):
                 group_count = min(SAMPLE_TILE, S - sample_base)
                 scales = []
-                for first in range_constexpr(0, group_count, NORM_ROWS):
-                    count = min(NORM_ROWS, group_count - first)
+                # a NextN layer polls the pushed rows two at a time: their tags then fit
+                # in registers next to the weights in flight
+                NR = 2 if const_expr(eh_entry and S <= 4) else NORM_ROWS
+                for first in range_constexpr(0, group_count, NR):
+                    count = min(NR, group_count - first)
                     if const_expr(x_pushed):  # the weights go out before the rows' wait
                         if const_expr(pre is None):
                             pre = [make_unit(c, group_count) for c in range(ahead)]
