@@ -371,6 +371,12 @@ def stage_tasks(
                     BLOCKS,
                     ((MOE_SLOTS * inter // UG_TILE + BLOCKS - 1) // BLOCKS) * BLOCKS,
                 )
+                if samples <= 4
+                # above 4 rows: rounds of 8-intermediate tiles of the shared expert
+                # and of up to every row's routed experts
+                else ((samples * TOP_K + 1) * (inter // 8) + BLOCKS - 1)
+                // BLOCKS
+                * BLOCKS
             ),
         ),
         ("down", HIDDEN // dn_tile(samples, expert_mxfp4)),
