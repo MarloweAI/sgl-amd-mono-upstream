@@ -49,6 +49,7 @@ order, so all ranks produce bit-identical hidden states (and routing).
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
+from aiter.ops.flydsl.kernels.dpp_utils import update_dpp_i32
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu
@@ -59,6 +60,7 @@ from flydsl.expr.typing import Int32, Int64, T, as_ir_value
 from sgl_amd_mono.common import guard
 from sgl_amd_mono.common.epoch import spin_until
 from sgl_amd_mono.common.ops import (
+    ballot,
     bpermute_i32,
 )
 from sgl_amd_mono.common.ops import clock as mem_realtime
@@ -379,6 +381,23 @@ def build_glm5_monokernel(
     # a row selects on up to SEL_SLICES CTAs, whole rows a round of the grid
     SEL_SLICES = INDEX_SEL_SLICES
     assert not index_paged or (SEL_CAP <= INDEX_CAND_STAGE_CAP and G % SEL_SLICES == 0)
+    # At 4 rows with one up/gate task round (TP8) a CTA's up/gate jobs are one row's
+    # and its first job goes out after that row's first picks (not in the NextN
+    # indexer launch: there its first job's weights next to the rest of the rounds
+    # add VGPR spills). Its routing scratch sits at the X region's end, past the
+    # rows' FP8 activations: a routing wave's picks and a word a lane, then the
+    # wave's round state (10 words a lane).
+    EARLY_ISSUE = (
+        S == 4
+        and expert_inter == G
+        and S * N_ROUTER < G
+        and not dense_experts
+        and not (eh_entry and with_indexer)
+    )
+    ROUTE_WORDS = TOP_K + 64
+    STASH_WORDS = 10 * 64
+    ROUTE_OFF = X_WORDS - (WAVES * ROUTE_WORDS + S * STASH_WORDS if EARLY_ISSUE else 0)
+    assert ROUTE_OFF >= S * HIDDEN // 4
     MISC_OFF = X_WORDS
     MISC_WORDS = max(
         8 + S * (XQ_GROUPS if native_fp4_mfma else XQ_BLOCKS),
@@ -496,6 +515,7 @@ def build_glm5_monokernel(
         keys = fx.recast_iter(fx.Int32, xs + KEYS_OFF)
         dnw = xs + DNW_OFF
         red = xs + RED_OFF
+        route_scr = fx.recast_iter(fx.Int32, xs + ROUTE_OFF)
         outs = xs + OUT_OFF
         pl = xs  # score Q is dead before split probabilities are written
         attn_keys = keys
@@ -1630,39 +1650,71 @@ def build_glm5_monokernel(
                 return None
             return [ld_f32(_rsrc(bias), lane + i * 64) for i in range(N_EXPERTS // 64)]
 
-        def route_top8(s, raws=None, bs=None):
-            """Top-8 of sample s (call from one whole wave, after the router scores landed).
+        def wave_max_all(v):
+            """Signed maximum of ``v`` over the wave, in every lane."""
+            for ctrl in (0xB1, 0x4E, 0x124, 0x128):  # quad xor 1, 2; row_ror 4, 8
+                v = fx.max(v, fx.Int32(update_dpp_i32(v, v, ctrl, 0xF, 0xF, True)))
+            for off in (16, 32):
+                v = _xred(v, off, fx.max)
+            return v
 
-            Preserve all FP32 bits of (sigmoid + bias). Each round reduces the score
-            first, then the expert ID only among exactly equal winners. Packing the
-            ID into the score's low byte can change GLM's top-k on real checkpoints.
-            Candidate i of this lane is expert lane + 64 i.
-            Returns (expert id, route weight = raw score / sum of
-            the 8 raw scores * ROUTE_SCALE) of pick ``lane`` in score order, valid in
-            lanes < TOP_K."""
-            if const_expr(bs is None):
-                bs = load_bias()
-            if const_expr(raws is None):
-                raws = getf_many(
-                    [
-                        (mb("scores"), s * N_EXPERTS + lane + i * 64)
-                        for i in range(N_EXPERTS // 64)
-                    ]
-                )
-                stamp("ug", bid, 7)
+        def route_scores(s):
+            """This lane's 4 router scores of sample s (candidate i: expert lane + 64 i)."""
+            raws = getf_many(
+                [
+                    (mb("scores"), s * N_EXPERTS + lane + i * 64)
+                    for i in range(N_EXPERTS // 64)
+                ]
+            )
+            stamp("ug", bid, 7)
+            return raws
+
+        def route_keys(raws, bs):
+            """This lane's 4 keys (all FP32 bits of sigmoid + bias, in unsigned order)
+            sorted descending, equal keys smaller ID first, and their IDs."""
             ks = []
             for i in range_constexpr(N_EXPERTS // 64):
                 kb = (raws[i] + bs[i]).bitcast(fx.Int32)
                 ok = (kb >= 0).select(kb ^ fx.Int32(-(2**31)), ~kb)
                 ks.append(fx.Uint32(ok))
             ids = [lane + i * 64 for i in range(N_EXPERTS // 64)]
-            # sort this lane's 4 keys descending; each round then takes the wave max of
-            # the lane heads and shifts the winning lane's list (0 is below every key)
             for a, b in ((0, 1), (2, 3), (0, 2), (1, 3), (1, 2)):
                 first = (ks[a] > ks[b]) | ((ks[a] == ks[b]) & (ids[a] < ids[b]))
                 ka, kb, ia, ib = ks[a], ks[b], ids[a], ids[b]
                 ks[a], ks[b] = first.select(ka, kb), first.select(kb, ka)
                 ids[a], ids[b] = first.select(ia, ib), first.select(ib, ia)
+            return ks, ids
+
+        def route_weights(e, raws):
+            """Route weight of pick ``lane`` (expert ``e``): its raw score / sum of the 8
+            raw scores * ROUTE_SCALE, valid in lanes < TOP_K."""
+            src = (e % 64) * 4
+            got = [bpermute_i32(src, r.bitcast(fx.Int32)) for r in raws]
+            raw = got[0]
+            for i in range_constexpr(1, N_EXPERTS // 64):
+                raw = (e // 64 == i).select(got[i], raw)
+            raw = (lane < TOP_K).select(raw.bitcast(fx.Float32), fx.Float32(0.0))
+            tot = raw
+            for off in (1, 2, 4):
+                tot = _xred(tot, off, lambda a, b: a + b)
+            return raw * (_rcp(tot) * ROUTE_SCALE)
+
+        def route_top8(s, raws=None, bs=None):
+            """Top-8 of sample s (call from one whole wave, after the router scores landed).
+
+            Preserve all FP32 bits of (sigmoid + bias). Each round reduces the score
+            first, then the expert ID only among exactly equal winners. Packing the
+            ID into the score's low byte can change GLM's top-k on real checkpoints.
+            Returns (expert id, route weight = raw score / sum of
+            the 8 raw scores * ROUTE_SCALE) of pick ``lane`` in score order, valid in
+            lanes < TOP_K."""
+            if const_expr(bs is None):
+                bs = load_bias()
+            if const_expr(raws is None):
+                raws = route_scores(s)
+            ks, ids = route_keys(raws, bs)
+            # each round takes the wave max of the lane heads and shifts the winning
+            # lane's list (0 is below every key)
             ks = [fx.Int32(k) for k in ks] + [fx.Int32(0)]
             ids = ids + [fx.Int32(N_EXPERTS)]
             mv = fx.Int32(0)  # lane k: the expert ID of pick k
@@ -1674,17 +1726,41 @@ def build_glm5_monokernel(
                 ks = [hit.select(ks[i + 1], ks[i]) for i in range(4)] + [ks[4]]
                 ids = [hit.select(ids[i + 1], ids[i]) for i in range(4)] + [ids[4]]
                 mv = write_lane_i32(expert, k, mv)
-            e = mv
-            src = (e % 64) * 4
-            got = [bpermute_i32(src, r.bitcast(fx.Int32)) for r in raws]
-            raw = got[0]
-            for i in range_constexpr(1, N_EXPERTS // 64):
-                raw = (e // 64 == i).select(got[i], raw)
-            raw = (lane < TOP_K).select(raw.bitcast(fx.Float32), fx.Float32(0.0))
-            tot = raw
-            for off in (1, 2, 4):
-                tot = _xred(tot, off, lambda a, b: a + b)
-            return e, raw * (_rcp(tot) * ROUTE_SCALE)
+            return mv, route_weights(mv, raws)
+
+        ROUTE_NEG = -(2**31)
+
+        def route_heads(ks, ids):
+            """State of the early-issue rounds: the lane's keys in signed order (the last
+            one below every key) and its IDs a byte each, the head in the low byte."""
+            hk = [fx.Int32(k) ^ fx.Int32(ROUTE_NEG) for k in ks]
+            hp = ids[0] | (ids[1] << 8) | (ids[2] << 16) | (ids[3] << 24)
+            return hk, hp
+
+        def route_rounds(scr, k0, k1, hk, hp):
+            """Picks k0 .. k1 - 1 of route_top8, a part of the rounds at a time: each round
+            takes the wave maximum of the lane heads into every lane, and the lane whose
+            head equals it records its ID at ``scr[k]`` and pops it. Exact while every
+            round's maximum is in one lane; returns the state and a nonzero word if a
+            round's maximum was in several lanes (then route_top8 decides)."""
+            tie = fx.Int64(0)
+            for k in range_constexpr(k0, k1):
+                m = wave_max_all(hk[0])
+                top = hk[0] == m
+                t = ballot(top)
+                tie = tie | (t & (t - 1))
+                lds_st(scr, top.select(fx.Int32(k), TOP_K + lane), hp)
+                hk = [top.select(hk[i + 1], hk[i]) for i in range(3)] + [
+                    top.select(fx.Int32(ROUTE_NEG), hk[3])
+                ]
+                hp = top.select(hp >> 8, hp)
+            return hk, hp, tie
+
+        def route_tied(s, scr, raws, bs):
+            """route_top8's picks of sample s into ``scr`` (after equal heads)."""
+            e, _ = route_top8(s, raws, bs)
+            if lane < TOP_K:
+                lds_st(scr, lane, e)
 
         def peer_reduce(region, t, residual, out_fn, tile=ROW_TILE):
             """Push BF16 partials to every peer, then sum them in rank order.
@@ -4976,22 +5052,28 @@ def build_glm5_monokernel(
             if const_expr(S <= 4):
                 shared_pre = ug8_units(tile0, fx.Int32(SHARED), None, has_sh)
 
-            def stage_and_shared():
-                """The activations, then the shared expert's tile on its CTAs."""
+            def stage():
                 stage_xq(list(range(S)))
                 gpu.barrier()
-                if const_expr(S > 4):
-                    sh_pre = ug8_units(tile0, fx.Int32(SHARED), None, has_sh)
-                else:
-                    sh_pre = shared_pre
+
+            def shared(units):
+                """The shared expert's tile on its CTAs (``units``: its issued weights)."""
                 if has_sh:
                     reduce_rows(
                         1,
-                        mma_units([fx.Float32(0.0) for _ in range(4)], sh_pre),
+                        mma_units([fx.Float32(0.0) for _ in range(4)], units),
                         emit_out(16),
                     )
                     gpu.barrier()
                     ug8_emit(tile0, 0, True)
+
+            def stage_and_shared():
+                """The activations, then the shared expert's tile on its CTAs."""
+                stage()
+                if const_expr(S > 4):
+                    shared(ug8_units(tile0, fx.Int32(SHARED), None, has_sh))
+                else:
+                    shared(shared_pre)
 
             # A CTA that ran a router task reaches this point after the activations
             # are out: it routes first, issues its first routed weights, and stages
@@ -5000,42 +5082,121 @@ def build_glm5_monokernel(
             if const_expr(S * N_ROUTER < G):
                 if start("router") >= S * N_ROUTER:
                     stage_and_shared()
-            dn_route(bs)
-            gpu.barrier()
-            cur0 = ug8_units(tile0, _uniform(lds_ld(keys, tile0[1])), 0)
-            if const_expr(S * N_ROUTER < G):
+            if const_expr(EARLY_ISSUE):
+                # A CTA's jobs are one row's tiles c of every SPAN-th slot from
+                # 1 + group / S (each (row, slot, c) tile once), so its first job needs
+                # the row's first SPAN picks only. Wave w < S routes row (row + w) % S,
+                # wave 0 this CTA's row; its first SPAN rounds go before the first
+                # job's weights, the rest after.
+                SPAN = TOP_K // S
+                assert G // (expert_inter // UG8) == S * SPAN
+                grp = fx.Int32(u0) // (expert_inter // UG8)
+                my_row = grp % S
+                slot0 = 1 + grp // S
+
+                def job_tile(j):
+                    return (tile0[0], slot0 + j * SPAN, tile0[2], tile0[3], tile0[4])
+
+                r_row = (my_row + wave) % S
+                scr = route_scr + wave * ROUTE_WORDS
+                # the round state waits in LDS while the first job's weights go out
+                stash = route_scr + WAVES * ROUTE_WORDS + wave * STASH_WORDS
+                if wave < S:
+                    raws1 = route_scores(r_row)
+                    ks1, ids1 = route_keys(raws1, bs)
+                    hk1, hp1 = route_heads(ks1, ids1)
+                    hk1, hp1, tie1 = route_rounds(scr, 0, SPAN, hk1, hp1)
+                    if tie1 != 0:
+                        route_tied(r_row, scr, raws1, bs)
+                    held = (
+                        hk1
+                        + [hp1, (tie1 != 0).select(fx.Int32(1), fx.Int32(0))]
+                        + [r.bitcast(fx.Int32) for r in raws1]
+                    )
+                    for i in range_constexpr(len(held)):
+                        lds_st(stash, i * 64 + lane, held[i])
+                gpu.barrier()
+                units = ug8_units(
+                    job_tile(0), _uniform(lds_ld(route_scr, slot0 - 1) & 0xFF), my_row
+                )
+                if wave < S:
+                    held = [lds_ld(stash, i * 64 + lane) for i in range(10)]
+                    raws2 = [r.bitcast(fx.Float32) for r in held[6:]]
+                    if held[5] == 0:
+                        _, _, tie2 = route_rounds(scr, SPAN, TOP_K, held[:4], held[4])
+                        if tie2 != 0:
+                            route_tied(r_row, scr, raws2, bs)
+                    e = lds_ld(scr, fx.min(lane, TOP_K - 1)) & 0xFF
+                    w = route_weights(e, raws2)
+                    if lane < MOE_SLOTS:  # slot 0: the shared expert, then pick lane
+                        q = r_row * MOE_SLOTS + (lane + 1) % MOE_SLOTS
+                        lds_st(keys, q, (lane == TOP_K).select(fx.Int32(SHARED), e))
+                        lds_st(dnw, q, (lane == TOP_K).select(fx.Float32(1.0), w))
+                gpu.barrier()
                 if start("router") < S * N_ROUTER:
-                    stage_and_shared()
-            else:
-                stage_and_shared()
-            for task_round in range_constexpr(ug_task_rounds(expert_inter)):
-                u = fx.Int32(u0 + task_round * G)
-                if u < expert_inter:
-                    tile = tile0 if const_expr(task_round == 0) else ug8_tile(u)
-                    slot = tile[1]
-                    if const_expr(task_round == 0):
-                        cur = cur0
-                    else:
-                        cur = ug8_units(tile, _uniform(lds_ld(keys, slot)), 0)
-                    for sample in range_constexpr(S):
-                        stamp("ug", sample * G + u, 0)
-                        pre = cur
-                        if const_expr(sample + 1 < S):
-                            cur = ug8_units(
-                                tile,
-                                _uniform(lds_ld(keys, (sample + 1) * MOE_SLOTS + slot)),
-                                sample + 1,
-                            )
-                        reduce_rows(
-                            1,
-                            mma_units([fx.Float32(0.0) for _ in range(4)], pre),
-                            emit_out(16),
+                    # its shared tile's weights (if any) issued only here
+                    stage()
+                    shared(ug8_units(tile0, fx.Int32(SHARED), None, has_sh))
+                for j in range_constexpr(S):
+                    pre = units
+                    if const_expr(j + 1 < S):
+                        units = ug8_units(
+                            job_tile(j + 1),
+                            _uniform(
+                                lds_ld(
+                                    keys, my_row * MOE_SLOTS + slot0 + (j + 1) * SPAN
+                                )
+                            ),
+                            my_row,
                         )
-                        gpu.barrier()
-                        ug8_emit(tile, sample, False)
-                        stamp("ug", sample * G + u, 4)
-                    if const_expr(task_round + 1 < ug_task_rounds(expert_inter)):
-                        gpu.barrier()
+                    stamp("ug", j * G + u0, 0)
+                    reduce_rows(
+                        1,
+                        mma_units([fx.Float32(0.0) for _ in range(4)], pre),
+                        emit_out(16),
+                    )
+                    gpu.barrier()
+                    ug8_emit(job_tile(j), my_row, False)
+                    stamp("ug", j * G + u0, 4)
+            else:
+                dn_route(bs)
+                gpu.barrier()
+                cur0 = ug8_units(tile0, _uniform(lds_ld(keys, tile0[1])), 0)
+                if const_expr(S * N_ROUTER < G):
+                    if start("router") < S * N_ROUTER:
+                        stage_and_shared()
+                else:
+                    stage_and_shared()
+                for task_round in range_constexpr(ug_task_rounds(expert_inter)):
+                    u = fx.Int32(u0 + task_round * G)
+                    if u < expert_inter:
+                        tile = tile0 if const_expr(task_round == 0) else ug8_tile(u)
+                        slot = tile[1]
+                        if const_expr(task_round == 0):
+                            cur = cur0
+                        else:
+                            cur = ug8_units(tile, _uniform(lds_ld(keys, slot)), 0)
+                        for sample in range_constexpr(S):
+                            stamp("ug", sample * G + u, 0)
+                            pre = cur
+                            if const_expr(sample + 1 < S):
+                                cur = ug8_units(
+                                    tile,
+                                    _uniform(
+                                        lds_ld(keys, (sample + 1) * MOE_SLOTS + slot)
+                                    ),
+                                    sample + 1,
+                                )
+                            reduce_rows(
+                                1,
+                                mma_units([fx.Float32(0.0) for _ in range(4)], pre),
+                                emit_out(16),
+                            )
+                            gpu.barrier()
+                            ug8_emit(tile, sample, False)
+                            stamp("ug", sample * G + u, 4)
+                        if const_expr(task_round + 1 < ug_task_rounds(expert_inter)):
+                            gpu.barrier()
 
         elif const_expr(ug_split(S, expert_inter) is not None):
             # S = 2, 4 (the router already quantized every sample's activation): job 0 is
