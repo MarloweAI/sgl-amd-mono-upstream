@@ -37,6 +37,24 @@ HEAD_TILE = 16
 # the NextN entry's pointer-table entries: this rank's eh_proj rows, the enorm and
 # hnorm weights, and (from the tokens) this rank's embedding rows
 EH_ARGS = (8, 9, 10, 11)
+
+
+def eh_parts(eh_tiles: int) -> int:
+    """The NextN entry's K parts a tile: four (two of each of the e and h_prev halves)
+    when their tasks fit one round of CTAs, else the two halves."""
+    return 4 if 4 * eh_tiles <= BLOCKS else 2
+
+
+def eh_base(eh_tiles: int, with_indexer: bool) -> int:
+    """The NextN entry's first CTA. With the indexer, the CTA past the front's index
+    projection tiles (the entry wraps around the grid): those tiles' weights go out at
+    the launch start, not behind an entry task. Else the last CTAs."""
+    if with_indexer:
+        index_tiles = (INDEX_DIM + INDEX_HEADS) // QKV_A_TILE
+        return (N_QKV_A + index_tiles) % BLOCKS
+    return max(BLOCKS - eh_parts(eh_tiles) * eh_tiles, 0)
+
+
 INDEX_Q_ROWS = INDEX_HEADS * INDEX_DIM
 INDEX_TILE = 16
 INDEX_KEYS_PER_TASK = 64
@@ -177,8 +195,8 @@ def layout(
     ``tokens``: also the layer input's rows, which the token's owner rank pushes
     (``xin``, two slots by launch parity). ``eh_tiles``: the NextN entry's rows of
     ``xin`` instead, which every rank pushes its ``eh_tiles`` 16-column tiles of, and
-    the h_prev halves' partial sums (``ehp``); with ``tokens`` the embedding rows go
-    to ``ein`` (as ``xin``). ``head_vocab``: the tail launch's
+    the partial sums of every K part but a tile's first (``ehp``); with ``tokens``
+    the embedding rows go to ``ein`` (as ``xin``). ``head_vocab``: the tail launch's
     buffers instead, the gathered bf16 logits of a ``head_vocab`` vocabulary (two
     slots)."""
     from sgl_amd_mono.common.guard import FLAG_BYTES
@@ -242,7 +260,12 @@ def layout(
             ("sel_cand", samples * INDEX_CAND_STAGE_CAP * 2 * pair_bytes),
         ]
     if eh_tiles:
-        items += [("ehp", eh_tiles * samples * HEAD_TILE * pair_bytes)]
+        items += [
+            (
+                "ehp",
+                (eh_parts(eh_tiles) - 1) * eh_tiles * samples * HEAD_TILE * pair_bytes,
+            )
+        ]
 
     offset, scratch = 0, {}
     for name, size in items:
@@ -291,13 +314,13 @@ def stage_tasks(
 ):
     """Return ``(stage name, task count)`` pairs in execution order; with ``tokens``
     led by the embedding rows' push, with ``eh_tiles`` by the NextN entry (each tile's
-    e and h_prev halves). With ``head_rows`` (this rank's LM-head rows) the tail's
+    K parts, ``eh_parts``). With ``head_rows`` (this rank's LM-head rows) the tail's
     instead."""
 
     if head_rows:
         return [("lmhead", head_rows // HEAD_TILE), ("gather", BLOCKS)]
     tasks = [("embed", N_ROW_TILES)] if tokens else []
-    tasks += [("eh", 2 * eh_tiles)] if eh_tiles else []
+    tasks += [("eh", eh_parts(eh_tiles) * eh_tiles)] if eh_tiles else []
     tasks += [
         # with the indexer, the index K and weights projections' 16-row tiles follow
         (
