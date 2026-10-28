@@ -115,6 +115,8 @@ from .layout import (
     BLOCKS,
     DCP_SUMMARY_PAIRS,
     EH_ARGS,
+    FRONT_K_BIG,
+    FRONT_SMALL_CTAS,
     HEAD_TILE,
     INDEX_CAND_STAGE_CAP,
     INDEX_DIM,
@@ -2363,6 +2365,9 @@ def build_glm5_monokernel(
         # With the indexer, the index K and weights projections are further 16-row tiles
         # of this stage, each on its own CTA: tasks N_QKV_A .. + N_INDEX_K are W_k's
         # tiles, the last N_INDEX_W the weights projection's.
+        assert attention_weight is AttentionWeight.FP8_BLOCK128, (
+            "the K-split front reads FP8 block-128 q_a / kv_a weights"
+        )
         if const_expr(eh_entry):
             reload_args()
         r_wqa, r_sqa = _rsrc(w_qkv_a), _rsrc(s_qkv_a)
@@ -2374,6 +2379,35 @@ def build_glm5_monokernel(
         if const_expr(with_indexer):
             r_wik, r_sik = _rsrc(index_arg(0)), _rsrc(index_arg(1))
             r_wiw = _rsrc(index_arg(2))
+
+        def ld_h(sample_base):
+            """Loader of input rows sample_base + s, elements k .. k + 3, for (s, k) pairs."""
+
+            def f(sks):
+                if const_expr(x_pushed):  # the rows pushed to every rank
+                    got = poll(
+                        [
+                            (xin, ((sample_base + s) * HIDDEN + k) // 2, 2)
+                            for s, k in sks
+                        ],
+                        "one-as",
+                    )
+                    return [list(bf2_f32(w[0])) + list(bf2_f32(w[1])) for w in got]
+                res = []
+                for s, k in sks:
+                    w = fx.Vector(
+                        bo.buffer_load(
+                            r_h,
+                            ((sample_base + s) * HIDDEN + k) // 2,
+                            vec_width=2,
+                            dtype=T.i32,
+                        )
+                    )
+                    v = w.bitcast(fx.BFloat16).to(fx.Float32)
+                    res.append([v[j] for j in range(4)])
+                return res
+
+            return f
 
         def front_tile(t, make_unit, n_units, publish, ptpc=False, ahead=None):
             """One 16-row tile of a projection of the RMS-normalized input rows: the
@@ -2387,33 +2421,6 @@ def build_glm5_monokernel(
             the units' order."""
             ahead = n_units if ahead is None else ahead
             assert ahead == n_units or S <= SAMPLE_TILE
-
-            def ld_h(sample_base):
-                def f(sks):
-                    if const_expr(x_pushed):  # the rows pushed to every rank
-                        got = poll(
-                            [
-                                (xin, ((sample_base + s) * HIDDEN + k) // 2, 2)
-                                for s, k in sks
-                            ],
-                            "one-as",
-                        )
-                        return [list(bf2_f32(w[0])) + list(bf2_f32(w[1])) for w in got]
-                    res = []
-                    for s, k in sks:
-                        w = fx.Vector(
-                            bo.buffer_load(
-                                r_h,
-                                ((sample_base + s) * HIDDEN + k) // 2,
-                                vec_width=2,
-                                dtype=T.i32,
-                            )
-                        )
-                        v = w.bitcast(fx.BFloat16).to(fx.Float32)
-                        res.append([v[j] for j in range(4)])
-                    return res
-
-                return f
 
             def stage(sample_base, count, loaded, first):
                 ld = ld_h(sample_base)
@@ -2456,49 +2463,109 @@ def build_glm5_monokernel(
                     )
                 publish(sample_base, group_count, acc, scales)
 
-        for t in range(start("qkv_a"), N_QKV_A + N_INDEX_K + N_INDEX_W, G):
-            t = fx.Int32(t)
-            stamp("qkv_a", t, 0)
+        def front_part(t, tiles, k0, kn, boxes):
+            """The K range [k0, k0 + kn) of q_a / kv_a tiles ``tiles`` against bf16(x *
+            gamma) of the input rows (not normalized: the consumers scale the summed
+            parts by the row's rstd): every tile's weight units issued after the first
+            NORM_ROWS samples' input loads, the scaled inputs into LDS, then per tile the
+            MFMAs, the row reduction and its rows' partial sums into ``boxes`` (the q_a
+            and kv_a mailboxes of this K range). ``tiles``: (tile, published) pairs."""
+            per = kn // (4 * THREADS)
+            units = kn // 128 // WAVES
 
-            def u_qa(c, group_count):
-                kc = (wave * QA_UNITS + c) * attention_k_chunks_per_unit
-                return unit_attention(
+            def load(sample_base, count):
+                ks = [k0 + (tid + i * THREADS) * 4 for i in range(per)]
+                gs = []
+                for k in ks:
+                    g = fx.Vector(
+                        bo.buffer_load(_rsrc(g_in), k // 2, vec_width=2, dtype=T.i32)
+                    )
+                    g = g.bitcast(fx.BFloat16).to(fx.Float32)
+                    gs.append([g[j] for j in range(4)])
+                vals = ld_h(sample_base)([(s, k) for s in range(count) for k in ks])
+                return ks, gs, vals
+
+            def unit(tile, c, group_count):
+                kc = k0 // 64 + (wave * units + c) * 2
+                return unit_fp8x2(
                     r_wqa,
                     r_sqa,
-                    t,
+                    tile,
                     kc,
                     QA_NKC,
                     HIDDEN,
-                    128,
-                    attention_b_word(n_sel(group_count) * HIDDEN + kc * 64),
+                    (n_sel(group_count) * kn + kc * 64 - k0) // 2,
                     shuffled=fp8_shuffled,
                 )
 
-            def put_qa(sample_base, group_count, acc, qa_scales):
-                if const_expr(attention_ptpc):
-                    reduce_rows(
-                        1,
-                        acc,
-                        emit_ptpc(QKV_A_TILE, t * QKV_A_TILE, r_sqa, qa_scales),
-                        group_count,
-                    )
-                else:
-                    reduce_rows(1, acc, emit_out(QKV_A_TILE), group_count)
-                stamp("qkv_a", t, 3)
+            pre = None
+            for sample_base in range_constexpr(0, S, SAMPLE_TILE):
+                group_count = min(SAMPLE_TILE, S - sample_base)
+                for first in range_constexpr(0, group_count, NORM_ROWS):
+                    count = min(NORM_ROWS, group_count - first)
+                    if const_expr(
+                        x_pushed and pre is None
+                    ):  # weights before the rows' wait
+                        pre = [
+                            [unit(tile, c, group_count) for c in range(units)]
+                            for tile, _ in tiles
+                        ]
+                    ks, gs, vals = load(sample_base + first, count)
+                    if const_expr(pre is None):
+                        pre = [
+                            [unit(tile, c, group_count) for c in range(units)]
+                            for tile, _ in tiles
+                        ]
+                    for s in range_constexpr(count):
+                        for i in range_constexpr(per):
+                            a = vals[s * per + i]
+                            for j in range_constexpr(2):
+                                lds_st(
+                                    xs,
+                                    ((first + s) * kn + ks[i] - k0) // 2 + j,
+                                    bf16_pair(
+                                        a[2 * j] * gs[i][2 * j],
+                                        a[2 * j + 1] * gs[i][2 * j + 1],
+                                    ),
+                                )
                 gpu.barrier()
-                if tid < group_count * QKV_A_TILE:
-                    s = sample_base + tid // QKV_A_TILE
-                    row = t * QKV_A_TILE + tid % QKV_A_TILE
-                    v = lds_ld(outs, tid)
-                    if row < Q_LORA:
-                        put(mb("q_a"), s * Q_LORA + row, v)
-                    else:
-                        put(mb("kv_a"), s * (KV_LORA + PE_DIM) + row - Q_LORA, v)
+                stamp("qkv_a", t, 2)
+                for (tile, published), tile_units in zip(tiles, pre):
+                    acc = mma_units([fx.Float32(0.0) for _ in range(4)], tile_units)
+                    reduce_rows(1, acc, emit_out(QKV_A_TILE), group_count)
+                    stamp("qkv_a", t, 3)
+                    gpu.barrier()
+                    live = tid < group_count * QKV_A_TILE
+                    if const_expr(published is not True):
+                        live = live & published
+                    if live:
+                        s = sample_base + tid // QKV_A_TILE
+                        row = tile * QKV_A_TILE + tid % QKV_A_TILE
+                        v = lds_ld(outs, tid)
+                        if row < Q_LORA:
+                            put(mb(boxes[0]), s * Q_LORA + row, v)
+                        else:
+                            put(mb(boxes[1]), s * (KV_LORA + PE_DIM) + row - Q_LORA, v)
 
-            if const_expr(not with_indexer):
-                front_tile(t, u_qa, QA_UNITS, put_qa, ptpc=attention_ptpc)
+        # index tiles on the CTAs of the K rests of single tiles
+        N_FRONT_PAIRS = N_QKV_A - FRONT_SMALL_CTAS
+        for t in range(start("qkv_a"), G, G):
+            t = fx.Int32(t)
+            stamp("qkv_a", t, 0)
+            j = t - N_QKV_A
+            if t < N_QKV_A:
+                front_part(t, [(t, True)], 0, FRONT_K_BIG, ("q_a", "kv_a"))
             else:
-                tk = t - N_QKV_A
+                second = j + FRONT_SMALL_CTAS
+                front_part(
+                    t,
+                    [(j, True), (fx.min(second, N_QKV_A - 1), second < N_QKV_A)],
+                    FRONT_K_BIG,
+                    HIDDEN - FRONT_K_BIG,
+                    ("q_a2", "kv_a2"),
+                )
+            if const_expr(with_indexer):
+                tk = j - N_FRONT_PAIRS
                 tw = tk - N_INDEX_K
 
                 def put_index(name, rows, tile):
@@ -2547,9 +2614,7 @@ def build_glm5_monokernel(
 
                 # the index tiles: above 4 rows half the weights wait for the rows'
                 # staging, so they and the 8 rows' inputs fit in registers
-                if t < N_QKV_A:
-                    front_tile(t, u_qa, QA_UNITS, put_qa, ptpc=attention_ptpc)
-                elif tk < N_INDEX_K:
+                if (tk >= 0) & (tk < N_INDEX_K):
                     n_k = IW_CPW if const_expr(index_k_bf16) else QA_UNITS
                     front_tile(
                         t,
@@ -2558,7 +2623,7 @@ def build_glm5_monokernel(
                         put_index("index_k", INDEX_DIM, tk),
                         ahead=n_k // 2 if const_expr(S > 4) else n_k,
                     )
-                else:
+                if (tw >= 0) & (tw < N_INDEX_W):
                     front_tile(
                         t,
                         u_index_w,
@@ -2568,11 +2633,32 @@ def build_glm5_monokernel(
                     )
             stamp("qkv_a", t, 4)
 
-        def ld_qa(sks):
+        def x_rstd(s):
+            """The rstd of input row s (sum of squares in stage_x_rmsnorm's order)."""
+            per = HIDDEN // (4 * THREADS)
+            vals = ld_h(s)([(0, (tid + i * THREADS) * 4) for i in range(per)])
+            ss = fx.Float32(0.0)
+            for v in vals:
+                for j in range_constexpr(4):
+                    ss = ss + v[j] * v[j]
+            return _rsq(block_sums([ss])[0] * (1.0 / HIDDEN) + EPS)
+
+        def ld_qa(sks, rstd):
+            """q_a elements k .. k + 3 of rows s: its K parts' sum times the row's rstd."""
             v = get2_many(
-                [(mb("q_a"), s * Q_LORA + k + j) for s, k in sks for j in (0, 2)]
+                [
+                    (mb(box), s * Q_LORA + k + j)
+                    for s, k in sks
+                    for box in ("q_a", "q_a2")
+                    for j in (0, 2)
+                ]
             )
-            return [list(v[2 * i]) + list(v[2 * i + 1]) for i in range(len(sks))]
+            out = []
+            for i in range_constexpr(len(sks)):
+                a = list(v[4 * i]) + list(v[4 * i + 1])
+                b = list(v[4 * i + 2]) + list(v[4 * i + 3])
+                out.append([(a[e] + b[e]) * rstd for e in range(4)])
+            return out
 
         # ===================== 2. one q_a RMSNorm CTA per sample, shared downstream
         if const_expr(eh_entry):
@@ -2580,6 +2666,7 @@ def build_glm5_monokernel(
         for s_norm in range(start("q_norm"), S, G):
             s_norm = fx.Int32(s_norm)
             stamp("q_norm", s_norm, 0)
+            rstd_x = x_rstd(s_norm)
             hint_wait(
                 Q_LORA // QKV_A_TILE,
                 lambda k: (
@@ -2590,7 +2677,7 @@ def build_glm5_monokernel(
             )
 
             def ld_qa_one(sks):
-                return ld_qa([(s_norm, k) for _, k in sks])
+                return ld_qa([(s_norm, k) for _, k in sks], rstd_x)
 
             stage_x_rmsnorm(ld_qa_one, Q_LORA, g_q, count=1)
             stamp("q_norm", s_norm, 2)
@@ -2785,6 +2872,7 @@ def build_glm5_monokernel(
             tpe = tid % (PE_DIM // 2)
             c = ld_bf16(_rsrc(rope_cos), row_position(s) * (PE_DIM // 2) + tpe)
             sn = ld_bf16(_rsrc(rope_sin), row_position(s) * (PE_DIM // 2) + tpe)
+            rstd_x = x_rstd(s)
             hint_wait(
                 (KV_LORA + PE_DIM) // QKV_A_TILE,
                 lambda k: (
@@ -2793,19 +2881,28 @@ def build_glm5_monokernel(
                 ),
                 mark=("cache", s),
             )
-            # the row's kv latent and k_pe pair in one poll
+            # the row's kv latent and k_pe pair, both K parts, in one poll
             got = poll(
                 [
-                    (mb("kv_a"), s * (KV_LORA + PE_DIM) + tid, 1),
+                    (mb(box), s * (KV_LORA + PE_DIM) + tid, 1)
+                    for box in ("kv_a", "kv_a2")
+                ]
+                + [
                     (
-                        mb("kv_a"),
+                        mb(box),
                         s * (KV_LORA + PE_DIM) + KV_LORA + (tid % (PE_DIM // 2)) * 2,
                         2,
-                    ),
+                    )
+                    for box in ("kv_a", "kv_a2")
                 ]
             )
-            v = got[0][0].bitcast(fx.Float32)
-            x0, x1 = got[1][0].bitcast(fx.Float32), got[1][1].bitcast(fx.Float32)
+            v = (got[0][0].bitcast(fx.Float32) + got[1][0].bitcast(fx.Float32)) * rstd_x
+            x0 = (
+                got[2][0].bitcast(fx.Float32) + got[3][0].bitcast(fx.Float32)
+            ) * rstd_x
+            x1 = (
+                got[2][1].bitcast(fx.Float32) + got[3][1].bitcast(fx.Float32)
+            ) * rstd_x
             stamp("cache", s, 2)
             ssq = block_sums([v * v])[0]
             pos = row_position(s)
