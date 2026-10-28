@@ -2,10 +2,11 @@
 # Copyright (c) 2025 FlyDSL Project Contributors
 # Adapted from ROCm/aiter#6173 at 56d6390def (Apache-2.0):
 # aiter/ops/flydsl/kernels/glm5_mono/glm/op.py
-"""Host side of the GLM-5.3 layer launch: one runtime per (width, kind), shared by
+"""Host side of the GLM-5.3 launches: one runtime per (width, kind), shared by
 every covered layer of that kind in a step, and one op per layer holding its
-weights. The kinds are the layers that run the indexer and those that reuse the
-previous top-k."""
+weights. The layer kinds are the MoE layers that run the indexer and those that
+reuse the previous top-k, and the dense layers (from the step's tokens for the
+first); the tail (final norm, LM head, logits) is one more runtime and op."""
 
 from __future__ import annotations
 
@@ -33,7 +34,10 @@ class Glm53Build(msgspec.Struct, frozen=True):
     """One compiled launch: the row width, TP size, the kind's layers per step,
     whether it runs the indexer (scoring up to ``index_max_seq`` keys a row),
     whether SGLang's FP8 weights are in AITER's (16, 16) layout, whether the MLA
-    cache holds E4M3 (``kv_fp8``), and the guard's test fault injection."""
+    cache holds E4M3 (``kv_fp8``), and the guard's test fault injection. ``dense``:
+    a dense MLP of that many expert-shaped slices instead of the MoE; ``tokens``:
+    the layer starts from the step's tokens and ``vocab_rows`` embedding rows a
+    rank; ``head``: the tail, on ``vocab_rows`` LM-head rows a rank."""
 
     rows: int
     tp: int
@@ -45,6 +49,10 @@ class Glm53Build(msgspec.Struct, frozen=True):
     fault_site: int = 0
     fault_after: int = 0
     stop: bool = True
+    dense: int = 0
+    tokens: bool = False
+    head: bool = False
+    vocab_rows: int = 0
 
     @property
     def heads(self) -> int:
@@ -60,7 +68,10 @@ class Glm53Weights(msgspec.Struct, frozen=True):
     block scales, 128 x 128 (W_UK's 128 x 64). q_a | kv_a, q_b, o_proj, the indexer's wq_b and wk and
     the experts are SGLang's tensors (``Glm53Build.fp8_shuffled``); W_UK, W_UV,
     the router and the indexer's weights_proj are packed copies, the k LayerNorm
-    weight and bias f32 copies. ``index``: an indexer layer's pointer table."""
+    weight and bias f32 copies. ``index``: an indexer layer's pointer table.
+    ``dense``: a dense layer's MLP as that many expert-shaped slices (copies) in the
+    expert tensors, its router tensors unread; a tokens layer's ``w_r`` is this
+    rank's embedding rows."""
 
     g_in: torch.Tensor
     g_q: torch.Tensor
@@ -85,6 +96,7 @@ class Glm53Weights(msgspec.Struct, frozen=True):
     shuffled: bool
     index: Optional[torch.Tensor] = None
     keep: tuple = ()
+    dense: int = 0
 
 
 class Glm53Caches(msgspec.Struct, frozen=True):
@@ -155,6 +167,8 @@ class Glm53Runtime:
             key.index_max_seq,
             inter=key.inter,
             output_heads=key.heads,
+            tokens=key.tokens,
+            head_vocab=key.vocab_rows * key.tp if key.head else 0,
         )
         self.launch = build_glm5_monokernel(
             key.rows,
@@ -179,20 +193,33 @@ class Glm53Runtime:
             fault_site=key.fault_site,
             fault_after=key.fault_after,
             stop=key.stop,
+            dense_experts=key.dense,
+            tokens=key.tokens,
+            vocab_rows=key.vocab_rows,
+            tail=key.head,
         )
         self.dispatch = partial(_run_compiled, self.launch)
         self.peer = PeerBuffer(self.sy["_bytes"], group, rank, key.tp, device)
         self.peer.bytes.zero_()
         # the hand-off mailboxes, uncached as the peer buffer is: a line is read at its
-        # home memory, not through the producer's L2
-        self._scratch = PeerBuffer(self.sc["_bytes"], group, rank, 1, device)
+        # home memory, not through the producer's L2. The tail has none, and its
+        # buffer still needs an address (an uncached allocation of 0 bytes has none)
+        self._scratch = PeerBuffer(max(self.sc["_bytes"], 256), group, rank, 1, device)
         self.scratch = self._scratch.bytes
         self.epoch = torch.zeros(guard.GUARD_WORDS, dtype=torch.int32, device=device)
-        # two outputs, by layer parity: a layer never writes what it reads
-        self.outs = [
-            torch.empty(key.rows, HIDDEN, dtype=torch.bfloat16, device=device)
-            for _ in range(2)
-        ]
+        # two outputs, by layer parity: a layer never writes what it reads; the
+        # tail's: the gathered f32 logits and the final norm's rows
+        if key.head:
+            vocab = key.vocab_rows * key.tp
+            self.outs = [
+                torch.empty(key.rows, vocab, dtype=torch.float32, device=device),
+                torch.empty(key.rows, HIDDEN, dtype=torch.bfloat16, device=device),
+            ]
+        else:
+            self.outs = [
+                torch.empty(key.rows, HIDDEN, dtype=torch.bfloat16, device=device)
+                for _ in range(2)
+            ]
 
     def set_deadline(self, seconds: float) -> None:
         """Every wait's deadline (below the server's watchdog timeout)."""
@@ -230,6 +257,10 @@ class Glm53LayerOp:
         key = runtime.key
         if (weights.index is not None) != key.with_indexer:
             raise ValueError("an indexer runtime needs indexer weights, and only it")
+        if weights.dense != key.dense:
+            raise ValueError(
+                f"weights of {weights.dense} dense slices on a runtime of {key.dense}"
+            )
         if weights.shuffled != key.fp8_shuffled:
             raise ValueError(
                 f"weights with shuffled={weights.shuffled} on a runtime with "
@@ -245,10 +276,14 @@ class Glm53LayerOp:
         sin: torch.Tensor,
         step: Glm53Step,
     ) -> torch.Tensor:
-        """The previous layer's hidden stream ``h`` [W, HIDDEN] in; this layer's out
-        (h plus its attention and MoE)."""
+        """The previous layer's hidden stream ``h`` [W, HIDDEN] in (a tokens layer:
+        the step's token ids, int32 [W], -1 a pad row); this layer's out (h plus its
+        attention and MLP)."""
         rt, w, W = self.rt, self.w, self.rt.width
-        _check("h", h, (W, HIDDEN), torch.bfloat16)
+        if rt.key.tokens:
+            _check("token ids", h, (W,), torch.int32)
+        else:
+            _check("h", h, (W, HIDDEN), torch.bfloat16)
         _check("positions", step.positions, (W,), torch.int64)
         _check("slots", step.slots, (W,), torch.int64)
         _check("indptr", step.indptr, (W + 1,), torch.int32)
@@ -319,3 +354,78 @@ class Glm53LayerOp:
             torch.cuda.current_stream(),
         )
         return x_out
+
+
+class Glm53HeadWeights(msgspec.Struct, frozen=True):
+    """The tail's tensors, SGLang's in place: the final norm's weight and this
+    rank's rows of the LM head (bf16 [vocab_rows, HIDDEN])."""
+
+    g_norm: torch.Tensor
+    w_head: torch.Tensor
+
+
+class Glm53HeadOp:
+    """The tail on its runtime (``Glm53Build.head``)."""
+
+    def __init__(self, runtime: Glm53Runtime, weights: Glm53HeadWeights):
+        key = runtime.key
+        if not key.head:
+            raise ValueError("a tail op needs a head runtime")
+        _check("final norm", weights.g_norm, (HIDDEN,), torch.bfloat16)
+        _check("LM head", weights.w_head, (key.vocab_rows, HIDDEN), torch.bfloat16)
+        self.rt, self.w = runtime, weights
+
+    def launch(self, x: torch.Tensor):
+        """The last layer's rows ``x`` [W, HIDDEN] in; the gathered logits (f32 [W,
+        vocab]) and the final norm's rows (bf16 [W, HIDDEN]) out."""
+        rt, w, W = self.rt, self.w, self.rt.width
+        _check("x", x, (W, HIDDEN), torch.bfloat16)
+        logits, normed = rt.outs
+        p = lambda t: t.data_ptr()  # noqa: E731
+        z = p(x)  # the arguments the tail does not read
+        rt.dispatch(
+            p(x),
+            p(logits),
+            z,
+            z,
+            z,
+            z,
+            z,
+            z,
+            z,
+            z,
+            z,
+            p(w.g_norm),
+            z,
+            z,
+            z,
+            z,
+            z,
+            z,
+            z,
+            z,
+            z,
+            z,
+            z,
+            p(normed),
+            z,
+            p(w.w_head),
+            z,
+            z,
+            z,
+            z,
+            z,
+            p(rt.scratch),
+            rt.peer.local,
+            p(rt.peer.addresses),
+            0,
+            p(rt.epoch),
+            z,
+            z,
+            z,
+            rt.rank,
+            0,
+            0,
+            torch.cuda.current_stream(),
+        )
+        return logits, normed

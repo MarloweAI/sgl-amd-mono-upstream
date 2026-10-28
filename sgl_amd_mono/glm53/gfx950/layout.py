@@ -32,6 +32,8 @@ from .tiles import (
 
 INDEX_HEADS = 32
 INDEX_DIM = 128
+# LM-head rows a tail task computes
+HEAD_TILE = 16
 INDEX_Q_ROWS = INDEX_HEADS * INDEX_DIM
 INDEX_TILE = 16
 INDEX_KEYS_PER_TASK = 64
@@ -161,10 +163,24 @@ def layout(
     output_heads: int | None = None,
     dcp_size: int = 1,
     native_fp4_mfma: bool = False,
+    tokens: bool = False,
+    head_vocab: int = 0,
 ):
-    """Return byte offsets for per-rank scratch and symmetric peer buffers."""
+    """Return byte offsets for per-rank scratch and symmetric peer buffers.
+
+    ``tokens``: also the layer input's rows, which the token's owner rank pushes
+    (``xin``, two slots by launch parity). ``head_vocab``: the tail launch's buffers
+    instead, the gathered bf16 logits of a ``head_vocab`` vocabulary (two slots)."""
     from sgl_amd_mono.common.guard import FLAG_BYTES
 
+    if head_vocab:
+        part = samples * head_vocab * 4
+        return {"_bytes": 0}, {
+            "logits": 0,
+            "_logits_stride": part,
+            "flags": 2 * part,
+            "_bytes": 2 * part + FLAG_BYTES,
+        }
     split_count = sparse_attention_topk // sparse_keys_per_task(samples, heads)
     output_heads = heads if output_heads is None else output_heads
     pair_bytes = 8
@@ -238,6 +254,10 @@ def layout(
         "_dcp_part_stride": dcp_part,
         "_bytes": 2 * region + 2 * dcp_part + FLAG_BYTES,
     }
+    if tokens:
+        symmetric["xin"] = symmetric["_bytes"]
+        symmetric["_xin_stride"] = samples * HIDDEN * 4
+        symmetric["_bytes"] += 2 * samples * HIDDEN * 4
     return scratch, symmetric
 
 
@@ -249,10 +269,17 @@ def stage_tasks(
     index_max_seq: int = 4096,
     expert_mxfp4: bool = False,
     inter: int = INTER,
+    tokens: bool = False,
+    head_rows: int = 0,
 ):
-    """Return ``(stage name, task count)`` pairs in execution order."""
+    """Return ``(stage name, task count)`` pairs in execution order; with ``tokens``
+    led by the embedding rows' push. With ``head_rows`` (this rank's LM-head rows)
+    the tail's instead."""
 
-    tasks = [
+    if head_rows:
+        return [("lmhead", head_rows // HEAD_TILE), ("gather", BLOCKS)]
+    tasks = [("embed", N_ROW_TILES)] if tokens else []
+    tasks += [
         # with the indexer, the index K and weights projections' 16-row tiles follow
         (
             "qkv_a",
