@@ -5316,6 +5316,27 @@ def build_glm5_monokernel(
                     s_addr=s_dn + fx.Int64(e) * fx.Int64(DN_S_BYTES),
                 )
 
+            # FP8 experts: mid block b (a row's slot's 128 intermediates) is quantized
+            # once, by wave k of down task t for b = t + k * N_DN_TILES, and every
+            # task reads the FP8 blocks (a quarter of mid's bytes)
+            if const_expr(not expert_mxfp4):
+                assert DN_BLK <= WAVES * N_DN_TILES
+                qb = t + wave * N_DN_TILES
+                if qb < DN_BLK:
+                    m0, m1 = get2(mb("mid"), qb * 128 + lane * 2)
+                    q0, q1, qs = quant_scaled(m0, m1)
+                    w8 = (
+                        fx.Int32(
+                            rocdl.cvt_pk_fp8_f32(T.i32, q0, q1, fx.Int32(0), False)
+                        )
+                        & 0xFFFF
+                    )
+                    word = w8 | (_xshfl(w8, 1) << 16)  # even lanes: bytes 2 lane .. + 3
+                    word_n = _xshfl(word, 2)
+                    if lane % 4 == 0:
+                        put2(mb("midq"), qb * 32 + lane // 2, word, word_n)
+                    if lane == 0:
+                        put(mb("midqs"), qb, qs)
             if const_expr(S <= 4):
                 pre = [u_dn(cc) for cc in range(min(DN_BATCH, DN_UPW))]
             hint_wait(
@@ -5333,17 +5354,20 @@ def build_glm5_monokernel(
                 ),
                 mark=("down", t),
             )
-            mids = get2_many(
-                [
-                    (mb("mid"), fx.min(wave + b * WAVES, DN_BLK - 1) * 128 + lane * 2)
-                    for b in range((DN_BLK + WAVES - 1) // WAVES)
-                ]
-            )
-            stamp("down", t, 2)
-            for b in range_constexpr((DN_BLK + WAVES - 1) // WAVES):
-                blk = wave + b * WAVES
-                if blk < DN_BLK:
-                    if const_expr(expert_mxfp4):
+            if const_expr(expert_mxfp4):
+                mids = get2_many(
+                    [
+                        (
+                            mb("mid"),
+                            fx.min(wave + b * WAVES, DN_BLK - 1) * 128 + lane * 2,
+                        )
+                        for b in range((DN_BLK + WAVES - 1) // WAVES)
+                    ]
+                )
+                stamp("down", t, 2)
+                for b in range_constexpr((DN_BLK + WAVES - 1) // WAVES):
+                    blk = wave + b * WAVES
+                    if blk < DN_BLK:
                         if const_expr(native_fp4_mfma):
                             q0, q1, qs = quant_mxfp8(mids[b][0], mids[b][1])
                             st_mxfp8(blk * 128 + lane * 2, q0, q1)
@@ -5359,15 +5383,33 @@ def build_glm5_monokernel(
                                 blk * 64 + lane,
                                 bf16_pair(mids[b][0], mids[b][1]),
                             )
-                    else:
-                        q0, q1, qs = quant_scaled(mids[b][0], mids[b][1])
-                        st_f8(blk * 128 + lane * 2, q0, q1)
-                        if lane == 0:
+            else:
+                # the FP8 blocks: two words (8 values) a load, the scales one a thread
+                Q_LD = (DN_BLK * 16 + THREADS - 1) // THREADS
+                got = poll(
+                    [
+                        (mb("midq"), fx.min(tid + i * THREADS, DN_BLK * 16 - 1) * 2, 2)
+                        for i in range(Q_LD)
+                    ]
+                    + [(mb("midqs"), fx.min(tid, DN_BLK - 1), 1)]
+                )
+                stamp("down", t, 2)
+                for i in range_constexpr(Q_LD):
+                    j = tid + i * THREADS
+                    if j < DN_BLK * 16:
+                        for e in range_constexpr(2):
                             lds_st(
-                                misc,
-                                blk,
-                                qs * lds_ld(dnw, blk // (expert_inter // 128)),
+                                xs,
+                                f8_word((j * 2 + e) * 4),
+                                got[i][e].bitcast(fx.Float32),
                             )
+                if tid < DN_BLK:
+                    lds_st(
+                        misc,
+                        tid,
+                        got[Q_LD][0].bitcast(fx.Float32)
+                        * lds_ld(dnw, tid // (expert_inter // 128)),
+                    )
             gpu.barrier()
             if const_expr(S > 4):
                 pre = [u_dn(cc) for cc in range(min(DN_BATCH, DN_UPW))]
