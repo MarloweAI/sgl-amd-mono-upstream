@@ -32,8 +32,11 @@ from .tiles import (
 
 INDEX_HEADS = 32
 INDEX_DIM = 128
-# LM-head rows a tail task computes
+# LM-head rows a tail task computes; also the NextN entry's rows (x columns) a task
 HEAD_TILE = 16
+# the NextN entry's pointer-table entries: this rank's eh_proj rows, the enorm and
+# hnorm weights, and (from the tokens) this rank's embedding rows
+EH_ARGS = (8, 9, 10, 11)
 INDEX_Q_ROWS = INDEX_HEADS * INDEX_DIM
 INDEX_TILE = 16
 INDEX_KEYS_PER_TASK = 64
@@ -167,12 +170,17 @@ def layout(
     native_fp4_mfma: bool = False,
     tokens: bool = False,
     head_vocab: int = 0,
+    eh_tiles: int = 0,
 ):
     """Return byte offsets for per-rank scratch and symmetric peer buffers.
 
     ``tokens``: also the layer input's rows, which the token's owner rank pushes
-    (``xin``, two slots by launch parity). ``head_vocab``: the tail launch's buffers
-    instead, the gathered bf16 logits of a ``head_vocab`` vocabulary (two slots)."""
+    (``xin``, two slots by launch parity). ``eh_tiles``: the NextN entry's rows of
+    ``xin`` instead, which every rank pushes its ``eh_tiles`` 16-column tiles of, and
+    the h_prev halves' partial sums (``ehp``); with ``tokens`` the embedding rows go
+    to ``ein`` (as ``xin``). ``head_vocab``: the tail launch's
+    buffers instead, the gathered bf16 logits of a ``head_vocab`` vocabulary (two
+    slots)."""
     from sgl_amd_mono.common.guard import FLAG_BYTES
 
     if head_vocab:
@@ -230,6 +238,8 @@ def layout(
             ),
             ("sel_cand", samples * INDEX_CAND_STAGE_CAP * 2 * pair_bytes),
         ]
+    if eh_tiles:
+        items += [("ehp", eh_tiles * samples * HEAD_TILE * pair_bytes)]
 
     offset, scratch = 0, {}
     for name, size in items:
@@ -254,9 +264,12 @@ def layout(
         "_dcp_part_stride": dcp_part,
         "_bytes": 2 * region + 2 * dcp_part + FLAG_BYTES,
     }
-    if tokens:
+    if tokens or eh_tiles:
         symmetric["xin"] = symmetric["_bytes"]
         symmetric["_xin_stride"] = samples * HIDDEN * 4
+        symmetric["_bytes"] += 2 * samples * HIDDEN * 4
+    if tokens and eh_tiles:
+        symmetric["ein"] = symmetric["_bytes"]
         symmetric["_bytes"] += 2 * samples * HIDDEN * 4
     return scratch, symmetric
 
@@ -271,14 +284,17 @@ def stage_tasks(
     inter: int = INTER,
     tokens: bool = False,
     head_rows: int = 0,
+    eh_tiles: int = 0,
 ):
     """Return ``(stage name, task count)`` pairs in execution order; with ``tokens``
-    led by the embedding rows' push. With ``head_rows`` (this rank's LM-head rows)
-    the tail's instead."""
+    led by the embedding rows' push, with ``eh_tiles`` by the NextN entry (each tile's
+    e and h_prev halves). With ``head_rows`` (this rank's LM-head rows) the tail's
+    instead."""
 
     if head_rows:
         return [("lmhead", head_rows // HEAD_TILE), ("gather", BLOCKS)]
     tasks = [("embed", N_ROW_TILES)] if tokens else []
+    tasks += [("eh", 2 * eh_tiles)] if eh_tiles else []
     tasks += [
         # with the indexer, the index K and weights projections' 16-row tiles follow
         (
