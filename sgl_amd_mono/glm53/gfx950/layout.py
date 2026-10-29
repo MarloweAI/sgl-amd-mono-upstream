@@ -263,6 +263,9 @@ def layout(
                 samples * INDEX_SEL_DIGITS * INDEX_SEL_SLICES * 32 * pair_bytes,
             ),
             ("sel_cand", samples * INDEX_CAND_STAGE_CAP * 2 * pair_bytes),
+            # per row and scoring run, its two slice segments' first-digit counts (64
+            # bins each, two a pair)
+            ("score_hist", samples * BLOCKS * 64 * pair_bytes),
         ]
     if eh_tiles:
         items += [

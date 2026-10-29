@@ -2825,7 +2825,8 @@ def build_glm5_monokernel(
             first row in the launch. A row is of the previous row's request when its
             page table maps that row's position to the slot that row writes (a page
             being written is its request's alone); ``page_of(r, key)``: the block of
-            row r's page table holding key ``key``."""
+            row r's page table holding key ``key``. From 4 rows a row joins only at the
+            next position, so a run spans at most two of each row's slices."""
             same = [fx.Int32(0)]
             for r in range_constexpr(1, S):
                 prev = fx.max(bounds[r - 1] - 1, fx.Int32(0))
@@ -2841,6 +2842,8 @@ def build_glm5_monokernel(
                 live = bounds[r] > 0
                 first = (live & (same[r] != 0)).select(first, fx.Int32(r))
                 joins = live & (same[r] != 0) & (run > 0) & (run < SCORE_ROWS)
+                if const_expr(S >= 4 and r > 0):
+                    joins = joins & (bounds[r] == bounds[r - 1] + 1)
                 starts = live & (joins.select(fx.Int32(1), fx.Int32(0)) == 0)
                 leads = leads | starts.select(fx.Int32(1 << r), fx.Int32(0))
                 firsts = firsts | starts.select(fx.Int64(first) << (3 * r), fx.Int64(0))
@@ -2853,43 +2856,46 @@ def build_glm5_monokernel(
                 )
             return _uniform(leads), sizes, firsts
 
-        if const_expr(PLANNED):
-            # The scoring layout, on the CTAs that score (past the q_norm ones) once
-            # their front tile is done, from scalar loads of each row's cache slot,
-            # position and page-table row
-            if bid >= S:
-                p_slot = [sld_i32(slot_mapping + fx.Int64(8 * r)) for r in range(S)]
-                p_pos = [sld_i32(positions + fx.Int64(8 * r)) for r in range(S)]
-                p_req = [sld_i32(req_ids + fx.Int64(4 * r)) for r in range(S)]
-                # index_bound's value
-                p_bound = [
-                    (p_slot[r] >= 0).select(p_pos[r] + 1, fx.Int32(0)) for r in range(S)
-                ]
-                p_page = [None] + [
-                    sld_i32(
-                        block_table
-                        + fx.Int64(
-                            p_req[r] * bt_stride
-                            + fx.max(p_bound[r - 1] - 1, fx.Int32(0))
-                            // index_block_size
-                        )
-                        * 4
+        def plan_layout():
+            """The scoring layout into the plan words, from scalar loads of each row's
+            cache slot, position and page-table row."""
+            p_slot = [sld_i32(slot_mapping + fx.Int64(8 * r)) for r in range(S)]
+            p_pos = [sld_i32(positions + fx.Int64(8 * r)) for r in range(S)]
+            p_req = [sld_i32(req_ids + fx.Int64(4 * r)) for r in range(S)]
+            # index_bound's value
+            p_bound = [
+                (p_slot[r] >= 0).select(p_pos[r] + 1, fx.Int32(0)) for r in range(S)
+            ]
+            p_page = [None] + [
+                sld_i32(
+                    block_table
+                    + fx.Int64(
+                        p_req[r] * bt_stride
+                        + fx.max(p_bound[r - 1] - 1, fx.Int32(0)) // index_block_size
                     )
-                    for r in range(1, S)
-                ]
-                p_leads, p_sizes, p_firsts = score_groups(
-                    p_bound, lambda r, key: p_page[r], lambda r: p_slot[r]
+                    * 4
                 )
-                if tid == 0:
-                    lds_st(plan, 0, p_leads)
-                    lds_st(plan, 1, fx.Int32(p_sizes))
-                    lds_st(plan, 2, fx.Int32(p_sizes >> 32))
-                    lds_st(plan, 3, fx.Int32(p_firsts))
-                    lds_st(plan, 4, fx.Int32(p_firsts >> 32))
-                    for r in range_constexpr(S):
-                        lds_st(plan, 5 + r, p_bound[r])
-                        lds_st(plan, 5 + S + r, p_req[r])
-                gpu.barrier()
+                for r in range(1, S)
+            ]
+            p_leads, p_sizes, p_firsts = score_groups(
+                p_bound, lambda r, key: p_page[r], lambda r: p_slot[r]
+            )
+            if tid == 0:
+                lds_st(plan, 0, p_leads)
+                lds_st(plan, 1, fx.Int32(p_sizes))
+                lds_st(plan, 2, fx.Int32(p_sizes >> 32))
+                lds_st(plan, 3, fx.Int32(p_firsts))
+                lds_st(plan, 4, fx.Int32(p_firsts >> 32))
+                for r in range_constexpr(S):
+                    lds_st(plan, 5 + r, p_bound[r])
+                    lds_st(plan, 5 + S + r, p_req[r])
+            gpu.barrier()
+
+        if const_expr(PLANNED):
+            # on the CTAs that score (past the q_norm ones), once their front tile is
+            # done
+            if bid >= S:
+                plan_layout()
         for s_norm in range(start("q_norm"), S, G):
             s_norm = fx.Int32(s_norm)
             stamp("q_norm", s_norm, 0)
@@ -3555,6 +3561,11 @@ def build_glm5_monokernel(
                 (index_max_seq // index_block_size + SCORE_CTAS - 1) // SCORE_CTAS,
             )
             BT_OFF = BATCH_WORDS  # the run's block ids, after the batch
+            # from 4 rows, after them: the run's first-digit counts, 64 bins a (row,
+            # slice segment); a run spans at most two of a row's slices
+            SH_OFF = BT_OFF + MAX_RUN_PAGES
+            SH_WORDS = SCORE_ROWS * 2 * 64
+            assert not PAIRED or (SH_OFF + SH_WORDS <= X_WORDS and SH_WORDS == THREADS)
             GROUP_PAGE = index_block_size // 16  # 16-key groups a page
             GROUP_SHIFT = GROUP_PAGE.bit_length() - 1
             assert GROUP_PAGE == 1 << GROUP_SHIFT
@@ -3754,12 +3765,13 @@ def build_glm5_monokernel(
                             )
                 return accs, ws[8].bitcast(fx.Float32)
 
-            def store_scores(accs, k_scale, g, key_lo, s0, rows_w, wf):
+            def store_scores(accs, k_scale, g, key_lo, s0, rows_w, wf, seg):
                 """Group g's scores for the wave's rows ``rows_w`` [(row in the group, bound,
-                live)], stored as pairs where a key is below its row's bound. Each head
-                half is k_scale * the sum over its heads of relu(acc) * weight, summed from
-                0 in head order; the first term is one fma with 0, which rounds as 0 +
-                product does."""
+                live)], stored as pairs where a key is below its row's bound, and counted
+                in the run's first-digit bins: ``seg`` = (the lane's row's bins, the
+                first key of its second slice segment). Each head half is k_scale * the
+                sum over its heads of relu(acc) * weight, summed from 0 in head order;
+                the first term is one fma with 0, which rounds as 0 + product does."""
                 halves = []
                 for ri in range_constexpr(len(rows_w)):
                     parts = []
@@ -3781,13 +3793,19 @@ def build_glm5_monokernel(
                     rows_w[0][2].select(rows_w[0][1], fx.Int32(0)),
                 )
                 key = key_lo + g * 16 + lane % 16
+                ok = (lane % 32 < 16) & (key < bound_r)
                 bo.buffer_store(
                     fx.Vector.from_elements([score.bitcast(fx.Int32), tag], fx.Int32),
                     r_scores,
                     ((s0 + r_w) * index_max_seq + key) * 2,
-                    mask=(lane % 32 < 16) & (key < bound_r),
+                    mask=ok,
                     cache_modifier=CM_DEV,
                 )
+                bins, seg1 = seg
+                digit = fx.Int32(fx.Uint32(radix_key(score.bitcast(fx.Int32))) >> 26)
+                at = bins + (key >= seg1).select(fx.Int32(64), fx.Int32(0)) + digit
+                if ok:
+                    fx.atomic_add(kw + at, fx.Int32(1), syncscope="workgroup")
 
             def score_keys_row(g, key0, s_w, bound_w, qf, wf, kofs):
                 """The wave's group g (16 keys) of the batch, from key key0, for row s_w."""
@@ -3913,6 +3931,8 @@ def build_glm5_monokernel(
                             )
                     if tid < SCORE_ROWS * INDEX_HEADS:
                         lds_st(keys, tid, got[SCORE_ROWS * 2][0])
+                    if const_expr(PAIRED):
+                        lds_st(kw, SH_OFF + tid, fx.Int32(0))
                     gpu.barrier()
                     stamp("index_score", bid, 2)
                     if const_expr(PAIRED):
@@ -4024,6 +4044,17 @@ def build_glm5_monokernel(
                             fx.max(g_hi - g_lo, fx.Int32(0)) + SET_WAVES - 1
                         ) // SET_WAVES
                         n_g = (r_first < n).select(n_g, fx.Int32(0))
+                        # the lane's row's first-digit bins, and the first key of the
+                        # row's slice after the one holding the run's first key
+                        seg1 = []
+                        for _row, bound_w, _live in rows_w:
+                            _, per_w = select_slices(bound_w, fx.min, fx.max)
+                            seg1.append((key_lo // per_w + 1) * per_w)
+                        second = lane >= 32
+                        seg = (
+                            SH_OFF + second.select(rows_w[-1][0], rows_w[0][0]) * 128,
+                            second.select(seg1[-1], seg1[0]),
+                        )
                         bufs = []
                         for i in range_constexpr(DEPTH):
                             bufs += group_keys(fx.Int32(i), n_g, g_lo, n_run_groups)
@@ -4043,7 +4074,7 @@ def build_glm5_monokernel(
                                 refill += group_keys(
                                     gi + DEPTH, n_g, g_lo, n_run_groups
                                 )
-                            store_scores(accs, k_scale, g, key_lo, s0, rows_w, wf)
+                            store_scores(accs, k_scale, g, key_lo, s0, rows_w, wf, seg)
 
                         for j, held in range(0, n_g // DEPTH, 1, init=bufs):
                             refill = []
@@ -4062,8 +4093,18 @@ def build_glm5_monokernel(
                                     gi,
                                     None,
                                 )
-                        # a later run's LDS stores wait for every wave's last block-id read
-                        rocdl.s_barrier()
+                        # each live row's counts, a pair of bins a thread: pairs 0-31 its
+                        # first slice segment's, 32-63 its second's (a later run's LDS
+                        # stores also wait here for every wave's last block-id read)
+                        gpu.barrier()
+                        if fx.Int32(tid) < n * 64:
+                            put(
+                                mb("score_hist"),
+                                ((s0 + fx.Int32(tid) // 64) * G + run) * 64
+                                + fx.Int32(tid) % 64,
+                                lds_ld(kw, SH_OFF + 2 * fx.Int32(tid))
+                                | (lds_ld(kw, SH_OFF + 2 * fx.Int32(tid) + 1) << 16),
+                            )
                     else:
                         kofs = [
                             index_value_word(
@@ -4132,10 +4173,12 @@ def build_glm5_monokernel(
                     stamp("index_score", bid, 4)
 
             if const_expr(PLANNED):
-                # the scoring layout (CTAs before S score nothing)
-                leads = (fx.Int32(bid) >= S).select(
-                    _uniform(lds_ld(plan, 0)), fx.Int32(0)
-                )
+                # the scoring layout; the q_norm CTAs plan it now, for their selection
+                # slices (they score nothing)
+                if bid < S:
+                    plan_layout()
+                row_leads = _uniform(lds_ld(plan, 0))
+                leads = (fx.Int32(bid) >= S).select(row_leads, fx.Int32(0))
                 sizes = fx.Int64(fx.Uint32(_uniform(lds_ld(plan, 1)))) | (
                     fx.Int64(_uniform(lds_ld(plan, 2))) << 32
                 )
@@ -4148,6 +4191,7 @@ def build_glm5_monokernel(
                     lambda r, key: index_block(index_request(r), key),
                     row_slot,
                 )
+                row_leads = leads
             for s in range(0, S, 1):
                 s = fx.Int32(s)
                 if ((leads >> s) & 1) != 0:
@@ -4395,34 +4439,38 @@ def build_glm5_monokernel(
                 LDS): this slice's histogram of its keys under ``prefix``, every
                 slice's, the digit holding the remain-th key. Returns (digit, keys still
                 needed in it, keys in it, keys above it, those in the slices before c,
-                keys in it in the slices before c)."""
+                keys in it in the slices before c). From 4 rows the first digit's
+                histogram is already published, and its totals zeroed."""
                 top = shift + bits
-                if tid < 64:
-                    lds_st(sbins, tid, fx.Int32(0))
-                    lds_st(stot, tid, fx.Int32(0))
-                gpu.barrier()
-                for chunk in range(fx.Int32(0), n_chunks, fx.Int32(1)):
-                    slots = chunk_slots(fx.Int32(chunk))
-                    for j in range_constexpr(SEL_ITEMS):
-                        key = fx.Uint32(lds_ld(skeys, slots[j]))
-                        under = lo + slots[j] < hi
-                        if const_expr(top < 32):
-                            under = under & ((key >> top) == (prefix >> top))
-                        if under:
-                            fx.atomic_add(
-                                sbins
-                                + fx.Int32((key >> shift) & fx.Uint32((1 << bits) - 1)),
-                                fx.Int32(1),
-                                syncscope="workgroup",
-                            )
-                gpu.barrier()
                 hbase = ((s * len(DIGITS) + level) * SEL_SLICES) * HIST_PAIRS
-                if tid < HIST_PAIRS:
-                    put(
-                        mb("sel_hist"),
-                        hbase + c * HIST_PAIRS + tid,
-                        lds_ld(sbins, 2 * tid) | (lds_ld(sbins, 2 * tid + 1) << 16),
-                    )
+                if const_expr(not (PAIRED and level == 0)):
+                    if tid < 64:
+                        lds_st(sbins, tid, fx.Int32(0))
+                        lds_st(stot, tid, fx.Int32(0))
+                    gpu.barrier()
+                    for chunk in range(fx.Int32(0), n_chunks, fx.Int32(1)):
+                        slots = chunk_slots(fx.Int32(chunk))
+                        for j in range_constexpr(SEL_ITEMS):
+                            key = fx.Uint32(lds_ld(skeys, slots[j]))
+                            under = lo + slots[j] < hi
+                            if const_expr(top < 32):
+                                under = under & ((key >> top) == (prefix >> top))
+                            if under:
+                                fx.atomic_add(
+                                    sbins
+                                    + fx.Int32(
+                                        (key >> shift) & fx.Uint32((1 << bits) - 1)
+                                    ),
+                                    fx.Int32(1),
+                                    syncscope="workgroup",
+                                )
+                    gpu.barrier()
+                    if tid < HIST_PAIRS:
+                        put(
+                            mb("sel_hist"),
+                            hbase + c * HIST_PAIRS + tid,
+                            lds_ld(sbins, 2 * tid) | (lds_ld(sbins, 2 * tid + 1) << 16),
+                        )
                 n_pairs = n_sl * HIST_PAIRS
                 qs = [fx.Int32(tid) + q * THREADS for q in range(4)]
                 got = poll(
@@ -4472,6 +4520,63 @@ def build_glm5_monokernel(
                         mine_in = mine_in + (bn == digit).select(n_b, fx.Int32(0))
                 sums = block_isums([mine_above, mine_in])
                 return digit, rem, in_bin, a_all, sums[0], sums[1]
+
+            def first_digit(s, c, bound, lo, hi, per):
+                """From 4 rows: slice c's first-digit histogram (keys lo .. hi - 1, per
+                a slice, of row s's bound) as the sum of its scoring runs' segments,
+                published before its scores are read. The row's group of rows and so
+                its runs are the scoring's: its rows are at consecutive positions, the
+                group's last one bounds the run layout. Also zeroes the totals."""
+                m = row_leads & ((fx.Int32(2) << s) - 1)
+                lead = fx.Int32(0)
+                for r in range_constexpr(S):
+                    lead = (((m >> r) & 1) != 0).select(fx.Int32(r), lead)
+                n_rows = fx.Int32((sizes >> (fx.Int64(lead) * 3)) & fx.Int64(7))
+                bound_g = bound + lead + n_rows - 1 - s
+                n_pg = (bound_g + index_block_size - 1) // index_block_size
+                runs = fx.min(
+                    fx.Int32(SCORE_CTAS), (n_pg + SCORE_PAGES - 1) // SCORE_PAGES
+                )
+                per_g = (n_pg + runs - 1) // runs
+                even = runs == SCORE_CTAS
+
+                p0 = lo // index_block_size
+                r0 = even.select(((p0 + 1) * runs - 1) // n_pg, p0 // per_g)
+                # thread: run r0 + tid / 32 (r0's when that run starts past the slice),
+                # pair tid % 32 of the run's segment in this slice: its second when the
+                # run starts in the slice before
+                i = fx.Int32(tid) // HIST_PAIRS
+                p_lo = even.select((r0 + i) * n_pg // runs, (r0 + i) * per_g)
+                mine = p_lo <= (hi - 1) // index_block_size
+                run = mine.select(r0 + i, r0)
+                seg = (mine & (p_lo * index_block_size < lo)).select(
+                    fx.Int32(1), fx.Int32(0)
+                )
+                w = poll(
+                    [
+                        (
+                            mb("score_hist"),
+                            ((s * G + run) * 2 + seg) * HIST_PAIRS
+                            + fx.Int32(tid) % HIST_PAIRS,
+                            1,
+                        )
+                    ],
+                    batch=1,
+                )[0][0]
+                lds_st(red_i, tid, mine.select(w, fx.Int32(0)))
+                if tid < 64:
+                    lds_st(stot, tid, fx.Int32(0))
+                gpu.barrier()
+                # a bin's sum is at most the slice's keys (< 2^16): pairs add as words
+                if tid < HIST_PAIRS:
+                    total = lds_ld(red_i, tid)
+                    for q in range_constexpr(1, THREADS // HIST_PAIRS):
+                        total = total + lds_ld(red_i, q * HIST_PAIRS + tid)
+                    put(
+                        mb("sel_hist"),
+                        (s * len(DIGITS) * SEL_SLICES + c) * HIST_PAIRS + tid,
+                        total,
+                    )
 
             def sel_place(st, p, i):
                 """Place p of the slice's row := key i (its block id from LDS)."""
@@ -4571,9 +4676,10 @@ def build_glm5_monokernel(
                             SBT + pg,
                             index_block(req, (first_page + pg) * index_block_size),
                         )
-                    # the slice's scores, as radix keys in LDS
-                    for chunk in range(fx.Int32(0), n_chunks, fx.Int32(1)):
-                        slots = chunk_slots(fx.Int32(chunk))
+
+                    def stage_scores(chunk, between=None):
+                        """A chunk of the slice's scores, as radix keys in LDS."""
+                        slots = chunk_slots(chunk)
                         vals = poll(
                             [
                                 (
@@ -4585,9 +4691,20 @@ def build_glm5_monokernel(
                                 for q in slots
                             ],
                             batch=SEL_ITEMS,
+                            between=between,
                         )
                         for j in range_constexpr(SEL_ITEMS):
                             lds_st(skeys, slots[j], radix_key(vals[j][0]))
+
+                    chunk0 = 0
+                    if const_expr(PAIRED):
+                        # the first chunk's scores load while the first digit is summed
+                        stage_scores(
+                            fx.Int32(0), lambda: first_digit(s, c, bound, lo, hi, per)
+                        )
+                        chunk0 = 1
+                    for chunk in range(fx.Int32(chunk0), n_chunks, fx.Int32(1)):
+                        stage_scores(fx.Int32(chunk))
                     gpu.barrier()
                     stamp("index_slice", t, 1)
                     prefix, remain = fx.Uint32(0), count
