@@ -82,9 +82,10 @@ def _rel(a, b) -> float:
 
 class Draft:
     """A NextN layer of one kind at one width: its NextN runtime, the plain runtime
-    of its kind on the same layer weights and caches, and the tail."""
+    of its kind on the same layer weights and caches, and the tail. ``rows``:
+    (positions, requests) in place of ``rowset``'s."""
 
-    def __init__(self, kind, W, rowset, rank, tp, group, device, args):
+    def __init__(self, kind, W, rowset, rank, tp, group, device, args, rows=None):
         from sgl_amd_mono.glm53.gfx950.runner import (
             Glm53Build,
             Glm53HeadOp,
@@ -93,7 +94,7 @@ class Draft:
         )
 
         index = kind == "index"
-        positions, requests = rows_of(W, rowset)
+        positions, requests = rows or rows_of(W, rowset)
         live = [p for p in positions if p is not None]
         self.live = len(live)
         pages = C.Pages(max(requests) + 1, max(live) + W + 1, device)
@@ -135,6 +136,11 @@ class Draft:
     def advance(self):
         for rt in self.runtimes:
             rt.advance_step()
+
+    def step(self):
+        """One NextN launch from the step's rows, then the next epoch."""
+        self.run_nextn()
+        self.advance()
 
     def run_nextn(self):
         self.st.topk.copy_(self.topk0)
