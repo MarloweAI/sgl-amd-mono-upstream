@@ -3602,10 +3602,29 @@ def build_glm5_monokernel(
                     gpu.barrier()
                     first = fetch_batch(fx.Int32(0), p_hi - p_lo)
                     for r in range_constexpr(SCORE_ROWS):
+                        # a thread's 4 words: head tid // 16, dims 8 * (tid % 16) ..
+                        q_at = r * (INDEX_Q_ROWS // 2) + fx.Int32(tid) * 4
+                        if const_expr(PAIRED):
+                            # in MFMA operand order (head half, 32-dim chunk, lane), so a
+                            # wave reads its fragments without bank conflicts
+                            head = fx.Int32(tid) // 16
+                            q_at = (
+                                r * (INDEX_Q_ROWS // 2)
+                                + (
+                                    (
+                                        (head // 16) * (INDEX_DIM // 32)
+                                        + (fx.Int32(tid) % 16) // 4
+                                    )
+                                    * 64
+                                    + head % 16
+                                    + 16 * (fx.Int32(tid) % 4)
+                                )
+                                * 4
+                            )
                         for i in range_constexpr(4):
                             lds_st(
                                 xs,
-                                r * (INDEX_Q_ROWS // 2) + fx.Int32(tid) * 4 + i,
+                                q_at + i,
                                 got[r * 2 + i // 2][i % 2].bitcast(fx.Float32),
                             )
                     if tid < SCORE_ROWS * INDEX_HEADS:
@@ -3631,10 +3650,23 @@ def build_glm5_monokernel(
                             qf.append(
                                 [
                                     [
-                                        load_index_q8(
-                                            r_w * INDEX_HEADS + hg * 16 + lane % 16,
-                                            k32 * 32 + (lane // 16) * 8,
-                                        )
+                                        fx.Vector.from_elements(
+                                            [
+                                                lds_ld(
+                                                    xs,
+                                                    r_w * (INDEX_Q_ROWS // 2)
+                                                    + (
+                                                        (hg * (INDEX_DIM // 32) + k32)
+                                                        * 64
+                                                        + lane
+                                                    )
+                                                    * 4
+                                                    + j,
+                                                )
+                                                for j in range(4)
+                                            ],
+                                            fx.Float32,
+                                        ).bitcast(fx.BFloat16)
                                         for k32 in range(INDEX_DIM // 32)
                                     ]
                                     for hg in range(2)
