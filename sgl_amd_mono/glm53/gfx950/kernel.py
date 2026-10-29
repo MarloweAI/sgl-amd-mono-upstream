@@ -74,6 +74,7 @@ from sgl_amd_mono.common.ops import hw_rcp as _rcp
 from sgl_amd_mono.common.ops import hw_rsq as _rsq
 from sgl_amd_mono.common.ops import mxfp4_to_bf16x8 as _mxfp4_to_bf16x8
 from sgl_amd_mono.common.ops import (
+    permlane_swap,
     read_lane_i32,
 )
 from sgl_amd_mono.common.ops import rsrc as _rsrc
@@ -167,6 +168,18 @@ from .tiles import (
 )
 
 SOURCES = kernel_sources(__name__)
+
+
+class _RowSwapped:
+    """A shuffled FP8 weight load's 16 bytes, its halves swapped between lane rows
+    2i and 2i + 1 where an element is read: words (lo0, lo1, hi0, hi1)."""
+
+    def __init__(self, raw):
+        self.raw = raw
+
+    def __getitem__(self, e):
+        lo, hi = permlane_swap(16, self.raw[e % 2], self.raw[e % 2 + 2])
+        return lo if e < 2 else hi
 
 
 def build_glm5_monokernel(
@@ -845,20 +858,25 @@ def build_glm5_monokernel(
         def ld_fp8_chunk(w_rsrc, rg, kc, NKC, K, ln, shuffled):
             """The 16 bytes lane ``ln`` holds of 64-k chunk ``kc`` of row group ``rg``:
             packed (``pack_fp8``), or two 8-byte halves of AITER's (16, 16) layout
-            ([rows / 16, K / 32, 2, 16 rows, 16 bytes]) in the same order."""
+            ([rows / 16, K / 32, 2, 16 rows, 16 bytes]) in the same order.
+
+            Shuffled: a lane of an even 16-lane row loads the whole 16-byte segment of
+            the first K32 block, its partner 16 lanes up the same segment of the second,
+            and one 8-byte swap gives each lane its two halves. Partner lanes must load
+            the same row group and chunk, and ``ln`` must keep the lane's row and its
+            partner's offset of 16 (``(lane & -16) | f(lane % 16)``). The swap is
+            made where the words are first read, so the load stays in flight until then."""
             if const_expr(shuffled):
                 b, r = ln // 16, ln % 16
                 word = (
                     (rg * (K // 32) + 2 * kc) * 512
                     + (b // 2) * 256
                     + r * 16
-                    + (b % 2) * 8
+                    + (b % 2) * 512
                 ) // 4
-                lo = fx.Vector(bo.buffer_load(w_rsrc, word, vec_width=2, dtype=T.i32))
-                hi = fx.Vector(
-                    bo.buffer_load(w_rsrc, word + 128, vec_width=2, dtype=T.i32)
+                return _RowSwapped(
+                    fx.Vector(bo.buffer_load(w_rsrc, word, vec_width=4, dtype=T.i32))
                 )
-                return fx.Vector.from_elements([lo[0], lo[1], hi[0], hi[1]], fx.Int32)
             return fx.Vector(
                 bo.buffer_load(
                     w_rsrc, ((rg * NKC + kc) * 64 + ln) * 4, vec_width=4, dtype=T.i32
