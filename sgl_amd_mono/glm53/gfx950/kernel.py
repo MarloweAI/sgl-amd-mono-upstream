@@ -2014,12 +2014,21 @@ def build_glm5_monokernel(
                     )
 
         def warm_code(nbytes):
-            """The next ``nbytes`` of this kernel's code into this XCD's L2 (a word of
-            each 64-byte line), ahead of code that runs once a launch."""
-            pc = fx.Int64(llvm.call_intrinsic(T.i64, "llvm.amdgcn.s.getpc", [], [], []))
-            r_code = bo.create_buffer_resource_from_addr(
-                pc, num_records_bytes=fx.Int64(nbytes)
+            """Up to ``nbytes`` of this kernel's code from here into this XCD's L2 (a word
+            of each 64-byte line), ahead of code that runs once a launch. The buffer ends
+            at the code's end: its size is the assembler's distance from the ``s_getpc``
+            to ``.Lfunc_end0``, capped at ``nbytes``, and loads past it read nothing."""
+            pc_left = llvm.inline_asm(
+                llvm.StructType.get_literal([T.i64, T.i32]),
+                [],
+                "s_getpc_b64 $0\n.Lwarm_code${:uid}:\n"
+                "s_mov_b32 $1, .Lfunc_end0-.Lwarm_code${:uid}",
+                "=s,=s",
+                has_side_effects=True,
             )
+            pc = fx.Int64(llvm.extractvalue(T.i64, pc_left, [0]))
+            left = fx.Int32(llvm.extractvalue(T.i32, pc_left, [1]))
+            r_code = _rsrc(pc, fx.min(left, fx.Int32(nbytes)))
             words = fx.Int32(0)
             for i in range_constexpr(nbytes // 64 // THREADS):
                 words = words | fx.Int32(
