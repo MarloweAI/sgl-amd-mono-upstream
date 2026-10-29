@@ -53,7 +53,17 @@ def _model(args, rows: int, rank: int, tp: int, group, device):
     # the spec's builds: a failed wait stops the launch
     head = args.kind in ("full", "head")
     model = cl.Model(
-        kinds, positions, requests, rank, tp, group, device, args, stop=True, head=head
+        kinds,
+        positions,
+        requests,
+        rank,
+        tp,
+        group,
+        device,
+        args,
+        stop=True,
+        head=head,
+        similar=args.similar,
     )
     return model, len(kinds) + head
 
@@ -120,6 +130,7 @@ def main() -> int:
     ap.add_argument("--reps", type=int, default=50, help="graph replays a trial")
     ap.add_argument("--trials", type=int, default=7)
     ap.add_argument("--deadline", type=float, default=60.0)
+    ap.add_argument("--similar", type=float, default=0.0, help="rows routing alike")
     args = ap.parse_args()
     rank, tp = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
