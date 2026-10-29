@@ -26,6 +26,8 @@ NEG = -1.0e30
 
 CM_DEV = 16
 CM_SYS = 17
+# nontemporal: lines streamed once a launch
+CM_NT = 2
 POLL_MAX = 12
 TL_COLS = 8
 
