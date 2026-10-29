@@ -25,10 +25,11 @@ spec's bounds, and the final norm x1.01 fails them. ``--similar X``: the live ro
 request are one random row plus X times their own, so they route alike, as a verify
 step's rows do (with ``--rowsets v4``).
 
-``--dump DIR`` writes, per run and rank, the SHA-256 of every launch's output rows,
-of the cache rows and top-k entries it writes, and after each width of every cache
-whole (``--perturb`` negates one input value, a negative control); ``--compare A B``
-matches two dump directories and exits 1 on any difference."""
+``--dump DIR`` writes, per run and rank, the SHA-256 of every launch's output rows
+(the tail's: its gathered logits), of the cache rows and top-k entries it writes,
+and after each width of every cache whole (``--perturb`` negates one input value, a
+negative control); ``--compare A B`` matches two dump directories and exits 1 on
+any difference."""
 
 import argparse
 import hashlib
@@ -748,6 +749,10 @@ def dump(model: Model, name: str, steps: int, perturb: bool, out: dict) -> str:
             out[f"{name}/s{step}/l{i}"] = d
 
         h = model.step(after=after)
+        if model.head is not None:
+            out[f"{name}/s{step}/tail"] = {
+                f"out.r{s}": _digest(h[s]) for s in range(h.shape[0])
+            }
         torch.cuda.synchronize()
     whole = {f"kv.l{i}": _digest(c.kv) for i, c in enumerate(model.caches)}
     whole.update(
