@@ -317,6 +317,8 @@ def build_glm5_monokernel(
     )
     # x arrives as tagged pairs in xin (the embedding rows or the NextN entry's)
     x_pushed = tokens or eh_entry
+    # the kinds whose stages load their pointer arguments again from the kernarg segment
+    RELOAD_ARGS = bool(eh_entry or with_indexer or dense_experts)
     EH_TILES = HIDDEN // npes // HEAD_TILE if eh_entry else 0
     # the kernel's Int64 arguments in signature order: argument i is the 8 bytes at
     # 8 * i of the kernarg segment
@@ -679,13 +681,14 @@ def build_glm5_monokernel(
         def lds_st(ptr, i, v):
             fx.ptr_store(v, ptr + i)
 
-        # A NextN launch's stages after its entry load the pointer arguments they read
-        # again from the kernarg segment, so no argument stays live in registers across
-        # the launch: with the entry's registers on top, the compiler restores such
-        # values from SGPR spill lanes that were never written. Only the segment's
-        # address stays live.
+        # The stages of a NextN, indexer or dense-MLP launch (after a NextN launch's
+        # entry) load the pointer arguments they read again from the kernarg segment,
+        # so no argument stays live in registers across the launch: with the NextN
+        # entry's registers on top, the compiler restores such values from SGPR spill
+        # lanes that were never written, and those kinds spill far fewer SGPRs. Only
+        # the segment's address stays live.
         kernarg_ptr = ir.Type.parse("!llvm.ptr<4>")
-        if const_expr(eh_entry):
+        if const_expr(RELOAD_ARGS):
             kernarg = fx.Int64(
                 llvm.PtrToIntOp(
                     T.i64,
@@ -697,7 +700,7 @@ def build_glm5_monokernel(
 
         def reload_args():
             """Rebind the pointer arguments to fresh loads from the kernarg segment,
-            and ``xin`` to the pushed rows in the reloaded ``sym``. The segment's
+            and ``xin`` (when x is pushed) to the pushed rows in the reloaded ``sym``. The segment's
             address passes through an empty asm first, so LLVM cannot merge these
             loads with another stage's."""
             nonlocal x_out, positions, slot_mapping, sparse_kv_indptr, kv_cache
@@ -753,11 +756,12 @@ def build_glm5_monokernel(
             block_table = load("block_table")
             req_ids = load("req_ids")
             out_indices = load("out_indices")
-            xin = (
-                sym
-                + fx.Int64(SY["xin"])
-                + fx.Int64(peer_slot) * fx.Int64(SY["_xin_stride"])
-            )
+            if const_expr(x_pushed):
+                xin = (
+                    sym
+                    + fx.Int64(SY["xin"])
+                    + fx.Int64(peer_slot) * fx.Int64(SY["_xin_stride"])
+                )
 
         def fwht128(v0, v1):
             """The orthonormal 128-point Hadamard transform (Sylvester order) of the
@@ -2477,7 +2481,7 @@ def build_glm5_monokernel(
         assert attention_weight is AttentionWeight.FP8_BLOCK128, (
             "the K-split front reads FP8 block-128 q_a / kv_a weights"
         )
-        if const_expr(eh_entry):
+        if const_expr(RELOAD_ARGS):
             reload_args()
         r_wqa, r_sqa = _rsrc(w_qkv_a), _rsrc(s_qkv_a)
         QA_NKC = HIDDEN // 64
@@ -2782,7 +2786,7 @@ def build_glm5_monokernel(
             return out
 
         # ===================== 2. one q_a RMSNorm CTA per sample, shared downstream
-        if const_expr(eh_entry):
+        if const_expr(RELOAD_ARGS):
             reload_args()
         for s_norm in range(start("q_norm"), S, G):
             s_norm = fx.Int32(s_norm)
@@ -2811,7 +2815,7 @@ def build_glm5_monokernel(
             put_bf(mb("q_an"), s_norm * Q_LORA + k, [a0, a1, a2, a3])
             stamp("q_norm", s_norm, 4)
 
-        if const_expr(eh_entry):
+        if const_expr(RELOAD_ARGS):
             reload_args()
         if const_expr(with_indexer):
             # The 128 CTAs without q_b work produce the other 128 index-query tiles
@@ -2981,7 +2985,7 @@ def build_glm5_monokernel(
 
         # ================ 3. KV RMSNorm + k_pe RoPE -> cache (+ this launch's rows)
         # one task a row
-        if const_expr(eh_entry):
+        if const_expr(RELOAD_ARGS):
             reload_args()
         for s in range(start("cache"), S, G):
             s = fx.Int32(s)
@@ -3149,7 +3153,7 @@ def build_glm5_monokernel(
                 raws.append((kv, pe))
             return raws
 
-        if const_expr(eh_entry):
+        if const_expr(RELOAD_ARGS):
             reload_args()
         if const_expr(SPLIT_EARLY):
             e_tt = fx.Int32(start("split"))
@@ -3186,7 +3190,7 @@ def build_glm5_monokernel(
             )
 
         # =============================================== 4. normalized q_a -> q_b (+RoPE)
-        if const_expr(eh_entry):
+        if const_expr(RELOAD_ARGS):
             reload_args()
         r_wqb, r_sqb = _rsrc(w_q_b), _rsrc(s_q_b)
         QB_NKC = Q_LORA // 64
@@ -3309,7 +3313,7 @@ def build_glm5_monokernel(
 
         # ==================================== 4. absorbed query: q_lat = W_UK^T q_nope
         # 8 row groups (128 latent rows of one head) x 3 chunks: one row group per wave
-        if const_expr(eh_entry):
+        if const_expr(RELOAD_ARGS):
             reload_args()
         r_wuk, r_suk = _rsrc(w_uk), _rsrc(s_uk)
         UK_NKC = NOPE_DIM // 64
@@ -3401,7 +3405,7 @@ def build_glm5_monokernel(
             stamp("uk", t, 4)
 
         # ====================== 4b. index scores and the exact top-2048 (paged keys)
-        if const_expr(eh_entry):
+        if const_expr(RELOAD_ARGS):
             reload_args()
         if const_expr(index_paged):
             r_index_cache = _rsrc(indices)
@@ -4489,7 +4493,7 @@ def build_glm5_monokernel(
                     stamp("index_slice", t, 4)
 
         # ================================== 5. sparse MLA split: 32 keys x 8 heads
-        if const_expr(eh_entry):
+        if const_expr(RELOAD_ARGS):
             reload_args()
         r_kv = _rsrc(kv_cache)
         r_pe = _rsrc(pe_cache)
@@ -4845,7 +4849,7 @@ def build_glm5_monokernel(
 
         # ========================== 6. split merge + W_UV: o = W_UV (softmax . KV)
         # 4 row groups x 8 chunks: 2 waves per row group, 4 chunks each
-        if const_expr(eh_entry):
+        if const_expr(RELOAD_ARGS):
             reload_args()
         r_wuv, r_suv = _rsrc(w_uv), _rsrc(s_uv)
         UV_NKC = KV_LORA // 64
@@ -4997,7 +5001,7 @@ def build_glm5_monokernel(
 
         # ====================== 7. W_o + attention TP peer reduce + residual -> a
         # 2 row groups x 32 chunks: 4 waves per row group, 8 chunks each
-        if const_expr(eh_entry):
+        if const_expr(RELOAD_ARGS):
             reload_args()
         r_wo, r_so = _rsrc(w_o), _rsrc(s_o)
         O_NKC = O_K // 64
@@ -5084,7 +5088,7 @@ def build_glm5_monokernel(
         # are scalars: the 8-row build then fits in VGPRs
         if const_expr(S > 4):
             wave = _uniform(tid // 64)
-        if const_expr(eh_entry):
+        if const_expr(RELOAD_ARGS):
             reload_args()
         r_wr = _rsrc(w_r)
         R_NKC = HIDDEN // 64
@@ -5253,7 +5257,7 @@ def build_glm5_monokernel(
                         lds_st(dnw, q, (lane == TOP_K).select(fx.Float32(1.0), w))
 
         # ================================ 9. expert up/gate + SiLU
-        if const_expr(eh_entry):
+        if const_expr(RELOAD_ARGS):
             reload_args()
         # 2 row groups (16 gate + 16 up rows) x 96 chunks: 4 waves per group, 24 chunks each
         UG_NKC = HIDDEN // 64
@@ -6371,7 +6375,7 @@ def build_glm5_monokernel(
                     ug_finish(u, s_u, slot, c, e_sel, lambda: prob, u_ug, pre)
 
         # ======== 10. mid FP8 quant + expert down + route weighting + MoE TP reduce
-        if const_expr(eh_entry):
+        if const_expr(RELOAD_ARGS):
             reload_args()
         # 2 row groups x (sample tile * 9 slots * 4) chunks: 4 waves per group.
         # S=8 is evaluated as two four-sample groups so its FP8 mid tile and
