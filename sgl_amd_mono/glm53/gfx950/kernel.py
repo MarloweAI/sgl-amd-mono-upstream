@@ -462,7 +462,17 @@ def build_glm5_monokernel(
     # all remaining stages need at most these compact output tiles.
     OUT_WORDS = max(S * ROW_TILE, S * 2 * UG_TILE)
     WORK_WORDS = OUT_OFF + OUT_WORDS
-    assert WORK_WORDS <= 32768, "keep static LDS below the MI355X per-workgroup budget"
+    # Above 4 rows, with the paged indexer, the scoring layout (written once a CTA's
+    # front tile is done, read at the scoring stage) sits ahead of the arena: the row
+    # groups scored together and their requests' first rows, then each row's index
+    # bound and page-table row. Up to 4 rows the scoring stage computes it from its own
+    # loads (the build's registers come out worse with it ahead)
+    PLANNED = index_paged and S > 4
+    assert not PLANNED or use_atom_kv_cache
+    PLAN_WORDS = (5 + 2 * S + 3) // 4 * 4 if PLANNED else 0
+    assert WORK_WORDS + PLAN_WORDS <= 32768, (
+        "keep static LDS below the MI355X per-workgroup budget"
+    )
 
     first, acc = {}, 0
     for name, n in stage_tasks(
@@ -489,7 +499,7 @@ def build_glm5_monokernel(
 
     @fx.struct
     class Smem:
-        work: fx.Array[fx.Float32, WORK_WORDS, 16]
+        work: fx.Array[fx.Float32, PLAN_WORDS + WORK_WORDS, 16]
 
     @flyc.kernel(known_block_size=[THREADS, 1, 1])
     def glm5_monokernel(
@@ -559,7 +569,8 @@ def build_glm5_monokernel(
         wave = tid // 64
         allocator = fx.SharedAllocator()
         lds = allocator.allocate(Smem).peek()
-        xs = lds.work.ptr
+        xs = lds.work.ptr + PLAN_WORDS if const_expr(PLAN_WORDS) else lds.work.ptr
+        plan = fx.recast_iter(fx.Int32, lds.work.ptr)
         misc = xs + MISC_OFF
         keys = fx.recast_iter(fx.Int32, xs + KEYS_OFF)
         jobs = fx.recast_iter(fx.Int32, xs + JOB_OFF)
@@ -603,6 +614,10 @@ def build_glm5_monokernel(
             return fx.Float32(
                 llvm.LoadOp(T.f32, ptr, alignment=4, volatile_=True).result
             )
+
+        def sld_i32(addr):
+            """The i32 at a wave-uniform byte address, as a scalar load issued here."""
+            return sld_f32(addr).bitcast(fx.Int32)
 
         def ld_bf16(r, i):
             return fx.Float32(
@@ -2800,6 +2815,81 @@ def build_glm5_monokernel(
         # ===================== 2. one q_a RMSNorm CTA per sample, shared downstream
         if const_expr(RELOAD_ARGS):
             reload_args()
+        # a request's consecutive rows (up to SCORE_ROWS) score its keys together
+        SCORE_ROWS = 1 if S == 1 else 2 if S == 2 else 4
+
+        def score_groups(bounds, page_of, slot_of):
+            """Bit s of the first value: row s leads a group of rows scored together,
+            up to SCORE_ROWS consecutive rows of one request; 3 bits a row of the
+            second: the rows of the group it leads, and of the third: its request's
+            first row in the launch. A row is of the previous row's request when its
+            page table maps that row's position to the slot that row writes (a page
+            being written is its request's alone); ``page_of(r, key)``: the block of
+            row r's page table holding key ``key``."""
+            same = [fx.Int32(0)]
+            for r in range_constexpr(1, S):
+                prev = fx.max(bounds[r - 1] - 1, fx.Int32(0))
+                at = page_of(r, prev) * index_block_size + (prev % index_block_size)
+                same.append(
+                    ((bounds[r - 1] > 0) & (at == slot_of(r - 1))).select(
+                        fx.Int32(1), fx.Int32(0)
+                    )
+                )
+            leads, sizes, firsts = fx.Int32(0), fx.Int64(0), fx.Int64(0)
+            lead, run, first = fx.Int32(0), fx.Int32(0), fx.Int32(0)
+            for r in range_constexpr(S):
+                live = bounds[r] > 0
+                first = (live & (same[r] != 0)).select(first, fx.Int32(r))
+                joins = live & (same[r] != 0) & (run > 0) & (run < SCORE_ROWS)
+                starts = live & (joins.select(fx.Int32(1), fx.Int32(0)) == 0)
+                leads = leads | starts.select(fx.Int32(1 << r), fx.Int32(0))
+                firsts = firsts | starts.select(fx.Int64(first) << (3 * r), fx.Int64(0))
+                lead = starts.select(fx.Int32(r), lead)
+                run = live.select(joins.select(run + 1, fx.Int32(1)), fx.Int32(0))
+                shift = fx.Int64(lead) * 3
+                sizes = live.select(
+                    (sizes & ~(fx.Int64(7) << shift)) | (fx.Int64(run) << shift),
+                    sizes,
+                )
+            return _uniform(leads), sizes, firsts
+
+        if const_expr(PLANNED):
+            # The scoring layout, on the CTAs that score (past the q_norm ones) once
+            # their front tile is done, from scalar loads of each row's cache slot,
+            # position and page-table row
+            if bid >= S:
+                p_slot = [sld_i32(slot_mapping + fx.Int64(8 * r)) for r in range(S)]
+                p_pos = [sld_i32(positions + fx.Int64(8 * r)) for r in range(S)]
+                p_req = [sld_i32(req_ids + fx.Int64(4 * r)) for r in range(S)]
+                # index_bound's value
+                p_bound = [
+                    (p_slot[r] >= 0).select(p_pos[r] + 1, fx.Int32(0)) for r in range(S)
+                ]
+                p_page = [None] + [
+                    sld_i32(
+                        block_table
+                        + fx.Int64(
+                            p_req[r] * bt_stride
+                            + fx.max(p_bound[r - 1] - 1, fx.Int32(0))
+                            // index_block_size
+                        )
+                        * 4
+                    )
+                    for r in range(1, S)
+                ]
+                p_leads, p_sizes, p_firsts = score_groups(
+                    p_bound, lambda r, key: p_page[r], lambda r: p_slot[r]
+                )
+                if tid == 0:
+                    lds_st(plan, 0, p_leads)
+                    lds_st(plan, 1, fx.Int32(p_sizes))
+                    lds_st(plan, 2, fx.Int32(p_sizes >> 32))
+                    lds_st(plan, 3, fx.Int32(p_firsts))
+                    lds_st(plan, 4, fx.Int32(p_firsts >> 32))
+                    for r in range_constexpr(S):
+                        lds_st(plan, 5 + r, p_bound[r])
+                        lds_st(plan, 5 + S + r, p_req[r])
+                gpu.barrier()
         for s_norm in range(start("q_norm"), S, G):
             s_norm = fx.Int32(s_norm)
             stamp("q_norm", s_norm, 0)
@@ -3442,7 +3532,6 @@ def build_glm5_monokernel(
             # query in registers. A key this launch writes is scored from its row's
             # index_k8 pairs (its FP8 values and scale as cached; the cache store need
             # not be visible yet).
-            SCORE_ROWS = 1 if S == 1 else 2 if S == 2 else 4
             # From 4 rows a wave scores two rows, converting each key once for them
             # (their queries staged in MFMA operand order), long rows' runs split
             # evenly; a set of rows takes SET_WAVES waves, which split the run's 16-key
@@ -3520,44 +3609,17 @@ def build_glm5_monokernel(
             # a request's runs from this CTA on (past the q_norm and uk CTAs' work)
             SCORE_BASE = 101
 
-            def score_groups():
-                """Bit s of the first value: row s leads a group of rows scored together,
-                up to SCORE_ROWS consecutive rows of one request; 3 bits a row of the
-                second: the rows of the group it leads, and of the third: its request's
-                first row in the launch. A row is of the previous row's request when its
-                page table maps that row's position to the slot that row writes (a page
-                being written is its request's alone)."""
-                bounds = [index_bound(r) for r in range(S)]
-                same = [fx.Int32(0)]
-                for r in range_constexpr(1, S):
-                    prev = fx.max(bounds[r - 1] - 1, fx.Int32(0))
-                    at = index_block(index_request(r), prev) * index_block_size + (
-                        prev % index_block_size
-                    )
-                    same.append(
-                        ((bounds[r - 1] > 0) & (at == row_slot(r - 1))).select(
-                            fx.Int32(1), fx.Int32(0)
-                        )
-                    )
-                leads, sizes, firsts = fx.Int32(0), fx.Int64(0), fx.Int64(0)
-                lead, run, first = fx.Int32(0), fx.Int32(0), fx.Int32(0)
-                for r in range_constexpr(S):
-                    live = bounds[r] > 0
-                    first = (live & (same[r] != 0)).select(first, fx.Int32(r))
-                    joins = live & (same[r] != 0) & (run > 0) & (run < SCORE_ROWS)
-                    starts = live & (joins.select(fx.Int32(1), fx.Int32(0)) == 0)
-                    leads = leads | starts.select(fx.Int32(1 << r), fx.Int32(0))
-                    firsts = firsts | starts.select(
-                        fx.Int64(first) << (3 * r), fx.Int64(0)
-                    )
-                    lead = starts.select(fx.Int32(r), lead)
-                    run = live.select(joins.select(run + 1, fx.Int32(1)), fx.Int32(0))
-                    shift = fx.Int64(lead) * 3
-                    sizes = live.select(
-                        (sizes & ~(fx.Int64(7) << shift)) | (fx.Int64(run) << shift),
-                        sizes,
-                    )
-                return _uniform(leads), sizes, firsts
+            def plan_bound(i):
+                """Row i's index bound."""
+                if const_expr(PLANNED):
+                    return _uniform(lds_ld(plan, 5 + i))
+                return index_bound(i)
+
+            def plan_request(i):
+                """Row i's page-table row."""
+                if const_expr(PLANNED):
+                    return _uniform(lds_ld(plan, 5 + S + i))
+                return _uniform(index_request(i))
 
             def fetch_batch(page0, n_pages):
                 """This thread's words of the run's pages page0 .. page0 + n_pages - 1
@@ -3766,7 +3828,7 @@ def build_glm5_monokernel(
                 first row in the launch is c0."""
                 rows = [fx.min(s0 + r, fx.Int32(S - 1)) for r in range(SCORE_ROWS)]
                 bounds = [
-                    (fx.Int32(r) < n).select(index_bound(rows[r]), fx.Int32(0))
+                    (fx.Int32(r) < n).select(plan_bound(rows[r]), fx.Int32(0))
                     for r in range(SCORE_ROWS)
                 ]
                 bound_g = bounds[0]
@@ -3863,7 +3925,7 @@ def build_glm5_monokernel(
                         for ri in range_constexpr(WAVE_ROWS):
                             r_w = r_first + ri
                             s_w = s0 + fx.min(r_w, n - 1)
-                            bound_w = _uniform(index_bound(s_w))
+                            bound_w = _uniform(plan_bound(s_w))
                             live_w = r_w < n
                             bound_max = fx.max(
                                 bound_max, live_w.select(bound_w, fx.Int32(0))
@@ -3919,7 +3981,7 @@ def build_glm5_monokernel(
                         g_first = lone.select(wave_u, wave_u % ROW_WAVES)
                         g_step = lone.select(fx.Int32(WAVES), fx.Int32(ROW_WAVES))
                         s_w = s0 + fx.min(r_w, n - 1)
-                        bound_w = _uniform(index_bound(s_w))
+                        bound_w = _uniform(plan_bound(s_w))
                         qf = [
                             [
                                 load_index_q8(
@@ -4069,13 +4131,29 @@ def build_glm5_monokernel(
                         gpu.barrier()
                     stamp("index_score", bid, 4)
 
-            leads, sizes, firsts = score_groups()
+            if const_expr(PLANNED):
+                # the scoring layout (CTAs before S score nothing)
+                leads = (fx.Int32(bid) >= S).select(
+                    _uniform(lds_ld(plan, 0)), fx.Int32(0)
+                )
+                sizes = fx.Int64(fx.Uint32(_uniform(lds_ld(plan, 1)))) | (
+                    fx.Int64(_uniform(lds_ld(plan, 2))) << 32
+                )
+                firsts = fx.Int64(fx.Uint32(_uniform(lds_ld(plan, 3)))) | (
+                    fx.Int64(_uniform(lds_ld(plan, 4))) << 32
+                )
+            else:
+                leads, sizes, firsts = score_groups(
+                    [index_bound(r) for r in range(S)],
+                    lambda r, key: index_block(index_request(r), key),
+                    row_slot,
+                )
             for s in range(0, S, 1):
                 s = fx.Int32(s)
                 if ((leads >> s) & 1) != 0:
                     n = fx.Int32((sizes >> (fx.Int64(s) * 3)) & fx.Int64(7))
                     c0 = fx.Int32((firsts >> (fx.Int64(s) * 3)) & fx.Int64(7))
-                    score_group(s, n, _uniform(index_request(s)), _uniform(c0))
+                    score_group(s, n, plan_request(s), _uniform(c0))
 
             def scan_pair(first, second, parity):
                 """Exclusive block offsets of two flag lists in one scan.
