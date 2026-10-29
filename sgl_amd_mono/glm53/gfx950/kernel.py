@@ -2116,7 +2116,9 @@ def build_glm5_monokernel(
             """Every CTA normalizes all rows into LDS (CTA b also writes columns
             HIDDEN / G * b .. of them to ``w_o``), runs 16-row tiles of this rank's
             LM-head rows and pushes their bf16 logits to every rank (two slots by
-            launch parity), then turns its slice of the gathered logits into f32."""
+            launch parity), then turns its slice of the gathered logits into f32.
+            A wave keeps HD_AHEAD weight units in flight across its tiles: each unit
+            it multiplies is replaced by the next one of its tile sequence."""
             VR = vocab_rows
             VOCAB = VR * W
             N_VT = VR // HEAD_TILE
@@ -2149,16 +2151,22 @@ def build_glm5_monokernel(
                 b_word = n_sel() * (HIDDEN // 2) + kc * 32 + (lane // 16) * 4
                 return ("bf16", wv, None, b_word)
 
-            def ahead(tile):
-                row0 = (tile < N_VT).select(tile * HEAD_TILE, fx.Int32(VR))
-                return [u_h(row0, c) for c in range(HD_AHEAD)]
+            def u_next(tile, c):
+                """Unit c of the tile after ``tile`` (past the last tile: the last row)."""
+                nt = tile + G
+                return u_h((nt < N_VT).select(nt * HEAD_TILE, fx.Int32(VR)), c)
 
-            def tile_task(k, tile, pre):
+            def tile_task(k, tile, window):
                 stamp("lmhead", tile, 0)
-                acc = run_units(
-                    lambda c: u_h(tile * HEAD_TILE, c), HD_CPW, HD_AHEAD, pre
-                )
-                nxt = ahead(tile + G) if k + 1 < HD_ROUNDS else None
+                acc = [fx.Float32(0.0) for _ in range(4)]
+                for c in range_constexpr(HD_CPW):
+                    u = window.pop(0)
+                    n = c + HD_AHEAD
+                    if const_expr(n < HD_CPW):
+                        window.append(u_h(tile * HEAD_TILE, n))
+                    elif const_expr(k + 1 < HD_ROUNDS):
+                        window.append(u_next(tile, n - HD_CPW))
+                    acc = mma_units(acc, [u])
                 reduce_rows(1, acc, emit_out(HEAD_TILE))
                 gpu.barrier()
                 if wave < W:
@@ -2178,10 +2186,7 @@ def build_glm5_monokernel(
                 stamp("lmhead", tile, 4)
                 if const_expr(k + 1 < HD_ROUNDS):
                     if tile + G < N_VT:
-                        tile_task(k + 1, tile + G, nxt)
-
-            t0 = start("lmhead")
-            pre = ahead(t0)
+                        tile_task(k + 1, tile + G, window)
 
             def ld_x(sks):
                 res = []
@@ -2195,7 +2200,14 @@ def build_glm5_monokernel(
                     res.append([v[j] for j in range(4)])
                 return res
 
-            stage_x_rmsnorm(ld_x, HIDDEN, g_in, count=S)
+            # the rows' loads go out first: the norm waits for them, not for the weights
+            t0 = start("lmhead")
+            x_ld = load_x_rmsnorm(ld_x, HIDDEN, g_in, S)
+            window = [
+                u_h((t0 < N_VT).select(t0 * HEAD_TILE, fx.Int32(VR)), c)
+                for c in range(HD_AHEAD)
+            ]
+            stage_x_rmsnorm(ld_x, HIDDEN, g_in, loaded=x_ld, count=S)
             gpu.barrier()
             if tid < S * NC // 4:
                 s = tid // (NC // 4)
@@ -2208,7 +2220,7 @@ def build_glm5_monokernel(
                     _rsrc(w_o),
                     word,
                 )
-            tile_task(0, t0, pre)
+            tile_task(0, t0, window)
             stamp("gather", bid, 0)
             own = sym + logits_base
             r_out = _rsrc(x_out)
