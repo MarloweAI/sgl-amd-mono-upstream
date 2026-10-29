@@ -3443,11 +3443,11 @@ def build_glm5_monokernel(
             # patched into the batch from its row's index_k8 pairs (its FP8 values and
             # scale as cached; the cache store need not be visible yet).
             SCORE_ROWS = 1 if S == 1 else 2 if S == 2 else 4
-            # Above 4 rows (two requests' rows, longer runs a CTA) a wave scores two
-            # rows, reading each key once for them, a run's keys load nontemporal and
-            # long rows' runs split evenly; a set of rows takes SET_WAVES waves, which
-            # split the batch's 16-key groups
-            PAIRED = S > 4
+            # From 4 rows a wave scores two rows, reading each key once for them (their
+            # queries staged in MFMA operand order), a run's keys load nontemporal, long
+            # rows' runs split evenly and the scores go through an LDS stage; a set of
+            # rows takes SET_WAVES waves, which split the batch's 16-key groups
+            PAIRED = S >= 4
             WAVE_ROWS = 2 if PAIRED else 1
             ROW_WAVES = WAVES // SCORE_ROWS
             SET_WAVES = WAVES * WAVE_ROWS // SCORE_ROWS
@@ -3465,6 +3465,40 @@ def build_glm5_monokernel(
                 (index_max_seq // index_block_size + SCORE_CTAS - 1) // SCORE_CTAS,
             )
             BT_OFF = BATCH_WORDS  # the run's block ids, after the batch
+            GROUP_PAGE = index_block_size // 16  # 16-key groups a page
+
+            def group_words(g):
+                """Group g's key: the lane's value word 0 and scale word in the batch. g is
+                wave-uniform, so its page and first key are scalar math and the lane's key
+                is added to their words."""
+                p = g // GROUP_PAGE
+                off0 = (g % GROUP_PAGE) * 16
+                return (
+                    index_value_word(p, off0, 0) + index_value_word(0, lane % 16, 0),
+                    index_scale_word(p, off0) + lane % 16,
+                )
+
+            def swap(off, x, y):
+                """v_permlane{16,32}_swap of two f32 registers."""
+                a, b = permlane_swap(off, x.bitcast(fx.Int32), y.bitcast(fx.Int32))
+                return a.bitcast(fx.Float32), b.bitcast(fx.Float32)
+
+            def head_sums(halves):
+                """Each row's score from its two head halves' lane partials (``halves``: one or
+                two rows of [h0, h1]): a half sums its four lane rows as (r0 + r1) + (r2 + r3),
+                then the row's score is h0 + h1, as two butterflies a half would. Lanes 0-31
+                hold the first row's score, lanes 32-63 the second's."""
+                ts = []
+                for h0, h1 in halves:
+                    a, b = swap(16, h0, h1)
+                    ts.append(
+                        a + b
+                    )  # lane rows: h0 (0 + 1), h1 (0 + 1), h0 (2 + 3), h1 (2 + 3)
+                c, d = swap(32, ts[0], ts[-1])
+                u = c + d  # lane rows: h0, h1 of the first row, then of the second
+                e, f = swap(16, u, u)
+                return e + f
+
             K8 = INDEX_DIM // 4 + 1  # a new key's pairs: its value words, its scale
             assert INDEX_Q_ROWS == THREADS * 8
             assert index_block_size == INDEX_KEYS_PER_TASK
@@ -3536,23 +3570,20 @@ def build_glm5_monokernel(
                                 block * PAGE_WORDS + w % PAGE_WORDS,
                                 vec_width=4,
                                 dtype=T.i32,
-                                # above 4 rows the keys load nontemporal (slc)
+                                # from 4 rows the keys load nontemporal (slc)
                                 cache_modifier=2 if PAIRED else 0,
                             )
                         )
                     out.append(v)
                 return out
 
-            def score_keys(g, key0, rows_w, qf, wf, kofs, s0, direct):
+            def score_keys(g, key0, rows_w, qf, wf, kofs, s0):
                 """The wave's group g (16 keys) of the batch, from key key0, for each of
                 its rows ``rows_w`` [(row in the group, bound, live)]: the keys are read
-                and converted once for all of them; above 4 rows a multi-batch run's
-                scores go to the LDS stage."""
+                and converted once for all of them; the scores go to the LDS stage."""
                 k = g * 16 + lane % 16
-                p = k // index_block_size
-                off = k % index_block_size
-                base_w = index_value_word(p, off, 0)
-                k_scale = lds_ld(kw, index_scale_word(p, off)).bitcast(fx.Float32)
+                base_w, scale_w = group_words(g)
+                k_scale = lds_ld(kw, scale_w).bitcast(fx.Float32)
                 accs = [
                     [
                         fx.Vector.filled(4, 0.0, fx.Float32),
@@ -3572,9 +3603,9 @@ def build_glm5_monokernel(
                                     T.vec(4, T.f32), [qf[ri][hg][k32], kv, accs[ri][hg]]
                                 )
                             )
+                halves = []
                 for ri in range_constexpr(len(rows_w)):
-                    r_w, bound_w, live_w = rows_w[ri]
-                    halves = []
+                    parts = []
                     for hg in range_constexpr(2):
                         acc = accs[ri][hg]
                         partial = fx.Float32(0.0)
@@ -3583,27 +3614,21 @@ def build_glm5_monokernel(
                                 partial
                                 + fx.max(acc[e], fx.Float32(0.0)) * wf[ri][hg][e]
                             )
-                        partial = partial * k_scale
-                        partial = _xred(partial, 16, lambda a, c: a + c)
-                        partial = _xred(partial, 32, lambda a, c: a + c)
-                        halves.append(partial)
-                    score = halves[0] + halves[1]
-                    at = fx.min(s0 + r_w, fx.Int32(S - 1)) * index_max_seq + key0 + k
-                    stored = live_w & (key0 + k < bound_w)
-                    if lane < 16:
-                        if direct != 0:
-                            if stored:
-                                put(mb("index_scores"), at, score)
-                        else:
-                            lds_st(kw, SC_OFF + r_w * BATCH_KEYS + k, score)
+                        parts.append(partial * k_scale)
+                    halves.append(parts)
+                score = head_sums(halves)
+                # lanes 0-15 stage the first row's scores, lanes 32-47 the second's
+                r_w = rows_w[0][0]
+                if const_expr(len(rows_w) > 1):
+                    r_w = (lane >= 32).select(rows_w[1][0], r_w)
+                if lane % 32 < 16:
+                    lds_st(kw, SC_OFF + r_w * BATCH_KEYS + k, score)
 
             def score_keys_row(g, key0, s_w, bound_w, qf, wf, kofs):
                 """The wave's group g (16 keys) of the batch, from key key0, for row s_w."""
                 k = g * 16 + lane % 16
-                p = k // index_block_size
-                off = k % index_block_size
-                base_w = index_value_word(p, off, 0)
-                k_scale = lds_ld(kw, index_scale_word(p, off)).bitcast(fx.Float32)
+                base_w, scale_w = group_words(g)
+                k_scale = lds_ld(kw, scale_w).bitcast(fx.Float32)
                 acc0 = fx.Vector.filled(4, 0.0, fx.Float32)
                 acc1 = acc0
                 for k32 in range_constexpr(INDEX_DIM // 32):
@@ -3621,23 +3646,17 @@ def build_glm5_monokernel(
                             T.vec(4, T.f32), [qf[1][k32], kv, acc1]
                         )
                     )
-                halves = []
+                parts = []
                 for hg in range_constexpr(2):
                     acc = acc1 if hg else acc0
                     partial = fx.Float32(0.0)
                     for e in range_constexpr(4):
                         partial = partial + fx.max(acc[e], fx.Float32(0.0)) * wf[hg][e]
-                    partial = partial * k_scale
-                    partial = _xred(partial, 16, lambda a, c: a + c)
-                    partial = _xred(partial, 32, lambda a, c: a + c)
-                    halves.append(partial)
+                    parts.append(partial * k_scale)
+                score = head_sums([parts])
                 key_pos = key0 + k
                 if (lane < 16) & (key_pos < bound_w):
-                    put(
-                        mb("index_scores"),
-                        s_w * index_max_seq + key_pos,
-                        halves[0] + halves[1],
-                    )
+                    put(mb("index_scores"), s_w * index_max_seq + key_pos, score)
 
             def score_group(s0, n, req, c0):
                 """This CTA's run of the keys of rows s0 .. s0 + n - 1 of a request whose
@@ -3660,7 +3679,7 @@ def build_glm5_monokernel(
                 run = (fx.Int32(bid) - S + (SCORE_CTAS - first_run)) % SCORE_CTAS
                 p_lo = run * per
                 p_hi = fx.min(p_lo + per, n_pages)
-                # above 4 rows, when every scoring CTA has a run, runs differ by at
+                # from 4 rows, when every scoring CTA has a run, runs differ by at
                 # most a page
                 if const_expr(PAIRED):
                     even = runs == SCORE_CTAS
@@ -3788,9 +3807,13 @@ def build_glm5_monokernel(
                             )
                     else:
                         # this wave's row: its query (A operands of both head halves) and
-                        # head weights, held for the whole run
+                        # head weights, held for the whole run; a lone live row takes every
+                        # wave
                         wave_u = _uniform(wave)
-                        r_w = wave_u // ROW_WAVES
+                        lone = _uniform(n) == 1
+                        r_w = lone.select(fx.Int32(0), wave_u // ROW_WAVES)
+                        g_first = lone.select(wave_u, wave_u % ROW_WAVES)
+                        g_step = lone.select(fx.Int32(WAVES), fx.Int32(ROW_WAVES))
                         s_w = s0 + fx.min(r_w, n - 1)
                         bound_w = _uniform(index_bound(s_w))
                         qf = [
@@ -3862,10 +3885,6 @@ def build_glm5_monokernel(
 
                     n_run = p_hi - p_lo
                     n_batches = (n_run + BATCH_PAGES - 1) // BATCH_PAGES
-                    # a one-batch run stores its scores as it goes: nothing to overlap
-                    direct = 1
-                    if const_expr(PAIRED):
-                        direct = (n_batches == 1).select(fx.Int32(1), fx.Int32(0))
                     for bi, words in range(0, n_batches, 1, init=first):
                         bi = fx.Int32(bi)
                         page0 = bi * BATCH_PAGES
@@ -3921,15 +3940,13 @@ def build_glm5_monokernel(
                                 ):
                                     g = fx.Int32(g)
                                     if key0 + g * 16 < bound_max:
-                                        score_keys(
-                                            g, key0, rows_w, qf, wf, kofs, s0, direct
-                                        )
+                                        score_keys(g, key0, rows_w, qf, wf, kofs, s0)
                         else:
                             if r_w < n:
                                 for g in range(
-                                    wave_u % ROW_WAVES,
+                                    g_first,
                                     n_pages_b * (index_block_size // 16),
-                                    fx.Int32(ROW_WAVES),
+                                    g_step,
                                 ):
                                     g = fx.Int32(g)
                                     if key0 + g * 16 < bound_w:
@@ -3939,12 +3956,10 @@ def build_glm5_monokernel(
                         _ = yield nxt
                     gpu.barrier()
                     if const_expr(PAIRED):
-                        if direct == 0:
-                            flush(
-                                (p_lo + (n_batches - 1) * BATCH_PAGES)
-                                * index_block_size,
-                                p_hi * index_block_size,
-                            )
+                        flush(
+                            (p_lo + (n_batches - 1) * BATCH_PAGES) * index_block_size,
+                            p_hi * index_block_size,
+                        )
                     stamp("index_score", bid, 4)
 
             leads, sizes, firsts = score_groups()
