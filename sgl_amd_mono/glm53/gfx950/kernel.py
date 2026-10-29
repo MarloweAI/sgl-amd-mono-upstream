@@ -5299,6 +5299,36 @@ def build_glm5_monokernel(
             s_u = u // (MOE_SLOTS * I_PER_SLOT)
             return s_u, (u // I_PER_SLOT) % MOE_SLOTS, u % I_PER_SLOT
 
+        def job_emit(c, g, e):
+            """SiLU(gate) * up of eight-intermediate tile ``c`` of expert ``e`` (MFMA
+            column n: row n) -> mid at each using row's slot of it; ``g`` 0: the shared
+            expert, which every row uses at slot 0 with weight 1."""
+            if tid < S * UG8 // 2:
+                n = tid // (UG8 // 2)
+                r = (tid % (UG8 // 2)) * 2
+                sl = fx.Int32(0)
+                for k in range_constexpr(1, MOE_SLOTS):
+                    sl = (lds_ld(keys, n * MOE_SLOTS + k) == e).select(fx.Int32(k), sl)
+                if (g == 0) | (sl != 0):
+                    g0, g1 = lds_ld(outs, n * 16 + r), lds_ld(outs, n * 16 + r + 1)
+                    v0 = lds_ld(outs, n * 16 + UG8 + r)
+                    v1 = lds_ld(outs, n * 16 + UG8 + r + 1)
+                    put2(
+                        mb("mid"),
+                        (n * MOE_SLOTS + sl) * expert_inter + c * UG8 + r,
+                        g0 * _rcp(1.0 + _exp(-g0)) * v0,
+                        g1 * _rcp(1.0 + _exp(-g1)) * v1,
+                    )
+                    if (c == 0) & (r == 0):  # routing record (debug / tests)
+                        put(mb("sel"), n * MOE_SLOTS + sl, e)
+                        put(
+                            mb("prob"),
+                            n * MOE_SLOTS + sl,
+                            (g == 0).select(
+                                fx.Float32(1.0), lds_ld(dnw, n * MOE_SLOTS + sl)
+                            ),
+                        )
+
         if const_expr(S == 1):
             # one task per CTA: task u takes intermediates (u % 32) * 8 of routed slot
             # u // 32 (slot 8 for u < 32, which also take the shared expert's); the 8 gate
@@ -5787,38 +5817,6 @@ def build_glm5_monokernel(
                 e = (g == 0).select(fx.Int32(SHARED), read_lane_i32(p_e, at))
                 return live, g, e, ug8_units(tile0, e, None, live)
 
-            def job_emit(g, e):
-                """SiLU(gate) * up of every column whose row uses the job's expert ->
-                mid at that row's slot of it."""
-                c = tile0[0]
-                if tid < S * UG8 // 2:
-                    n = tid // (UG8 // 2)
-                    r = (tid % (UG8 // 2)) * 2
-                    sl = fx.Int32(0)
-                    for k in range_constexpr(1, MOE_SLOTS):
-                        sl = (lds_ld(keys, n * MOE_SLOTS + k) == e).select(
-                            fx.Int32(k), sl
-                        )
-                    if (g == 0) | (sl != 0):
-                        g0, g1 = lds_ld(outs, n * 16 + r), lds_ld(outs, n * 16 + r + 1)
-                        v0 = lds_ld(outs, n * 16 + UG8 + r)
-                        v1 = lds_ld(outs, n * 16 + UG8 + r + 1)
-                        put2(
-                            mb("mid"),
-                            (n * MOE_SLOTS + sl) * expert_inter + c * UG8 + r,
-                            g0 * _rcp(1.0 + _exp(-g0)) * v0,
-                            g1 * _rcp(1.0 + _exp(-g1)) * v1,
-                        )
-                        if (c == 0) & (r == 0):  # routing record (debug / tests)
-                            put(mb("sel"), n * MOE_SLOTS + sl, e)
-                            put(
-                                mb("prob"),
-                                n * MOE_SLOTS + sl,
-                                (g == 0).select(
-                                    fx.Float32(1.0), lds_ld(dnw, n * MOE_SLOTS + sl)
-                                ),
-                            )
-
             first_job = []
             stage_xq(list(range(S)), between=lambda: first_job.append(job(0)))
             cur = first_job[0]
@@ -5835,7 +5833,7 @@ def build_glm5_monokernel(
                         emit_out(16),
                     )
                     gpu.barrier()
-                    job_emit(g, e)
+                    job_emit(tile0[0], g, e)
                     stamp("ug", r * G + u0, 4)
 
         elif const_expr(S > 1):
@@ -6051,9 +6049,8 @@ def build_glm5_monokernel(
                     for i in range_constexpr(len(held)):
                         lds_st(stash, i * 64 + lane, held[i])
                 gpu.barrier()
-                units = ug8_units(
-                    job_tile(0), _uniform(lds_ld(route_scr, slot0 - 1) & 0xFF), my_row
-                )
+                e0 = _uniform(lds_ld(route_scr, slot0 - 1) & 0xFF)
+                units = ug8_units(job_tile(0), e0, None)
                 if wave < S:
                     held = [lds_ld(stash, i * 64 + lane) for i in range(10)]
                     raws2 = [r.bitcast(fx.Float32) for r in held[6:]]
@@ -6072,18 +6069,36 @@ def build_glm5_monokernel(
                     # its shared tile's weights (if any) issued only here
                     stage()
                     shared(ug8_units(tile0, fx.Int32(SHARED), None, has_sh))
+                # An expert several rows picked streams once, every picking row an
+                # MFMA column: its owner is the row whose job of it comes first (a
+                # row's job j takes its picks j * SPAN ..), the lowest such row on a
+                # tie. Other rows' later jobs of it load nothing (a first job is issued
+                # before the other rows' picks are known), and only the owner writes mid.
+                NP = S * TOP_K
+                p_e = (lane < NP).select(
+                    lds_ld(
+                        keys,
+                        fx.min(lane, NP - 1) // TOP_K * MOE_SLOTS + lane % TOP_K + 1,
+                    ),
+                    fx.Int32(-1),
+                )
+
+                def owns(e):
+                    m = ballot((p_e == e) & (lane % TOP_K >= (S - 1) * SPAN))
+                    for j in range_constexpr(S - 2, -1, -1):
+                        mj = ballot((p_e == e) & (lane % TOP_K // SPAN == j))
+                        m = (mj != 0).select(mj, m)
+                    first = popcount((m - 1) & (m ^ fx.Int64(-1)))
+                    return first // TOP_K == my_row
+
+                e_cur = e0
                 for j in range_constexpr(S):
-                    pre = units
+                    pre, e_j = units, e_cur
                     if const_expr(j + 1 < S):
-                        units = ug8_units(
-                            job_tile(j + 1),
-                            _uniform(
-                                lds_ld(
-                                    keys, my_row * MOE_SLOTS + slot0 + (j + 1) * SPAN
-                                )
-                            ),
-                            my_row,
+                        e_cur = _uniform(
+                            lds_ld(keys, my_row * MOE_SLOTS + slot0 + (j + 1) * SPAN)
                         )
+                        units = ug8_units(job_tile(j + 1), e_cur, None, owns(e_cur))
                     stamp("ug", j * G + u0, 0)
                     reduce_rows(
                         1,
@@ -6091,7 +6106,8 @@ def build_glm5_monokernel(
                         emit_out(16),
                     )
                     gpu.barrier()
-                    ug8_emit(job_tile(j), my_row, False)
+                    if owns(e_j):  # a routed expert: group > 0
+                        job_emit(tile0[0], fx.Int32(1), e_j)
                     stamp("ug", j * G + u0, 4)
             else:
                 dn_route(bs)
