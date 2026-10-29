@@ -21,7 +21,9 @@ inputs, within the spec's bounds, and one rank's down or gate | up scales x2 fai
 them; ``--check-embed``: layer 0 from the token ids equals the dense launch fed the
 gathered embedding rows (outputs, cache rows, top-k), and a changed token id differs;
 ``--check-head``: the tail's logits against a torch and an f32 tail, within the
-spec's bounds, and the final norm x1.01 fails them.
+spec's bounds, and the final norm x1.01 fails them. ``--similar X``: the live rows of a
+request are one random row plus X times their own, so they route alike, as a verify
+step's rows do (with ``--rowsets v4``).
 
 ``--dump DIR`` writes, per run and rank, the SHA-256 of every launch's output rows,
 of the cache rows and top-k entries it writes, and after each width of every cache
@@ -318,6 +320,7 @@ class Model:
         stop=False,
         head=False,
         first=None,
+        similar=0.0,
     ):
         from sgl_amd_mono.glm53.gfx950.runner import (
             Glm53Build,
@@ -380,7 +383,14 @@ class Model:
             rt.set_deadline(args.deadline)
             self.head = Glm53HeadOp(rt, head_weights(rank, tp, device))
         g = _gen(3, device)
-        self.h = torch.randn(W, HIDDEN, generator=g, device=device).bfloat16()
+        h = torch.randn(W, HIDDEN, generator=g, device=device)
+        if similar:
+            base = h.clone()
+            noise = similar * torch.randn(W, HIDDEN, generator=g, device=device)
+            for s, (p, r) in enumerate(zip(positions, requests)):
+                if p is not None:
+                    h[s] = base[r] + noise[s]
+        self.h = h.bfloat16()
         if kinds[:1] == ["embed"]:
             self.h = token_ids(positions, device)
 
@@ -800,6 +810,7 @@ def main() -> int:
     ap.add_argument("--check-head", action="store_true")
     ap.add_argument("--dump", default="", help="write the digests into DIR")
     ap.add_argument("--perturb", action="store_true", help="negate one input value")
+    ap.add_argument("--similar", type=float, default=0.0, help="rows routing alike")
     ap.add_argument("--compare", nargs=2, metavar=("A_DIR", "B_DIR"))
     args = ap.parse_args()
     if args.compare:
@@ -817,7 +828,16 @@ def main() -> int:
     ]:
         positions, requests = rows_of(W, rowset)
         model = Model(
-            kinds, positions, requests, rank, tp, group, device, args, head=head
+            kinds,
+            positions,
+            requests,
+            rank,
+            tp,
+            group,
+            device,
+            args,
+            head=head,
+            similar=args.similar,
         )
         name = f"{args.kv}-{args.kind}/w{W}{rowset}"
         if args.dump:
