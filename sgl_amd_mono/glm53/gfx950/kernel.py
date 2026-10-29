@@ -169,6 +169,7 @@ from .layout import (
 )
 from .tiles import (
     CM_DEV,
+    CM_NT,
     CM_SYS,
     LAYER_SLOTS,
     NEG,
@@ -999,7 +1000,13 @@ def build_glm5_monokernel(
             return t
 
         # ------------------------------------------------ MFMA GEMV machinery
-        def ld_fp8_chunk(w_rsrc, rg, kc, NKC, K, ln, shuffled):
+        # Weights read once a launch load nontemporal: at 2 and 8 rows the attention
+        # weights and the experts; at 4 rows the up/gate tiles when a job streams each
+        # expert once for every row (EARLY_ISSUE). Down's 4-row tiles re-read the
+        # shared expert's and repeated experts' lines per row.
+        AT_CM = CM_NT if S != 4 else 0
+
+        def ld_fp8_chunk(w_rsrc, rg, kc, NKC, K, ln, shuffled, cm=0):
             """The 16 bytes lane ``ln`` holds of 64-k chunk ``kc`` of row group ``rg``:
             packed (``pack_fp8``), or two 8-byte halves of AITER's (16, 16) layout
             ([rows / 16, K / 32, 2, 16 rows, 16 bytes]) in the same order.
@@ -1009,7 +1016,8 @@ def build_glm5_monokernel(
             and one 8-byte swap gives each lane its two halves. Partner lanes must load
             the same row group and chunk, and ``ln`` must keep the lane's row and its
             partner's offset of 16 (``(lane & -16) | f(lane % 16)``). The swap is
-            made where the words are first read, so the load stays in flight until then."""
+            made where the words are first read, so the load stays in flight until then.
+            ``cm``: the load's cache policy."""
             if const_expr(shuffled):
                 b, r = ln // 16, ln % 16
                 word = (
@@ -1019,20 +1027,28 @@ def build_glm5_monokernel(
                     + (b % 2) * 512
                 ) // 4
                 return _RowSwapped(
-                    fx.Vector(bo.buffer_load(w_rsrc, word, vec_width=4, dtype=T.i32))
+                    fx.Vector(
+                        bo.buffer_load(
+                            w_rsrc, word, vec_width=4, dtype=T.i32, cache_modifier=cm
+                        )
+                    )
                 )
             return fx.Vector(
                 bo.buffer_load(
-                    w_rsrc, ((rg * NKC + kc) * 64 + ln) * 4, vec_width=4, dtype=T.i32
+                    w_rsrc,
+                    ((rg * NKC + kc) * 64 + ln) * 4,
+                    vec_width=4,
+                    dtype=T.i32,
+                    cache_modifier=cm,
                 )
             )
 
         def unit_fp8(
-            w_rsrc, s_rsrc, rg, kc, NKC, K, BK, b_word, coef=None, shuffled=False
+            w_rsrc, s_rsrc, rg, kc, NKC, K, BK, b_word, coef=None, shuffled=False, cm=0
         ):
             """Issue one 64-k chunk of row group ``rg`` of an FP8 matrix; the
             bf16 activation chunk starts at LDS word ``b_word``."""
-            wv = ld_fp8_chunk(w_rsrc, rg, kc, NKC, K, lane, shuffled)
+            wv = ld_fp8_chunk(w_rsrc, rg, kc, NKC, K, lane, shuffled, cm)
             s = ld_f32(s_rsrc, (rg * 16 // SCALE_BM) * (K // BK) + kc * 64 // BK)
             if const_expr(callable(coef)):  # factor known only after a later wait
                 return ("fp8", [wv], lambda: s * coef(), b_word + (lane // 16) * 4)
@@ -1051,10 +1067,11 @@ def build_glm5_monokernel(
             coef=None,
             scale_rows=SCALE_BM,
             shuffled=False,
+            cm=0,
         ):
             """Issue both 64-k halves of one 128-k FP8 weight-scale block."""
             wv = [
-                ld_fp8_chunk(w_rsrc, rg, kc + h, NKC, K, lane, shuffled)
+                ld_fp8_chunk(w_rsrc, rg, kc + h, NKC, K, lane, shuffled, cm)
                 for h in range(2)
             ]
             s = ld_f32(s_rsrc, (rg * 16 // scale_rows) * (K // 128) + kc // 2)
@@ -1076,16 +1093,18 @@ def build_glm5_monokernel(
             ln=None,
             shuffled=False,
             s_addr=None,
+            cm=0,
         ):
             """Issue one 128-k chunk (packed 64-k chunks kc, kc + 1; kc even) of row group
             ``rg`` against the FP8 activation of LDS words ``b_word`` + [0, 32) (``f8_word``
             order); ``coef()`` = activation block scale (times route weight).  ``ln``
             = the lane whose weights are loaded (default: own lane). With ``s_addr``
             (the byte address of the expert's scales; ``rg`` and ``kc`` wave-uniform)
-            the scale is a scalar load."""
+            the scale is a scalar load. ``cm``: the weight loads' cache policy."""
             ln = lane if ln is None else ln
             wv = [
-                ld_fp8_chunk(w_rsrc, rg, kc + h, NKC, K, ln, shuffled) for h in range(2)
+                ld_fp8_chunk(w_rsrc, rg, kc + h, NKC, K, ln, shuffled, cm)
+                for h in range(2)
             ]
             si = (rg * 16 // SCALE_BM) * (K // 128) + kc // 2
             if const_expr(s_addr is None):
@@ -1255,6 +1274,7 @@ def build_glm5_monokernel(
             scale_rows=SCALE_BM,
             coef=None,
             shuffled=False,
+            cm=0,
         ):
             if const_expr(attention_bf16):
                 return unit_bf16(w_rsrc, rg, kc, NKC, b_word, ln)
@@ -1264,7 +1284,7 @@ def build_glm5_monokernel(
                 return unit_ptpc(w_rsrc, rg, kc, NKC, b_word, coef=coef, ln=ln)
             if const_expr(BK == 64):
                 return unit_fp8(
-                    w_rsrc, s_rsrc, rg, kc, NKC, K, BK, b_word, shuffled=shuffled
+                    w_rsrc, s_rsrc, rg, kc, NKC, K, BK, b_word, shuffled=shuffled, cm=cm
                 )
             return unit_fp8x2(
                 w_rsrc,
@@ -1276,6 +1296,7 @@ def build_glm5_monokernel(
                 b_word,
                 scale_rows=scale_rows,
                 shuffled=shuffled,
+                cm=cm,
             )
 
         def mma_units(acc, units):
@@ -2584,6 +2605,7 @@ def build_glm5_monokernel(
                     HIDDEN,
                     (n_sel(group_count) * kn + kc * 64 - k0) // 2,
                     shuffled=fp8_shuffled,
+                    cm=AT_CM,
                 )
 
             pre = None
@@ -3188,6 +3210,7 @@ def build_glm5_monokernel(
                     128,
                     attention_b_word(n_sel() * Q_LORA + kc * 64),
                     shuffled=fp8_shuffled,
+                    cm=AT_CM,
                 )
 
             pre = [u_qb(c) for c in range(QB_UNITS)]
@@ -3320,6 +3343,7 @@ def build_glm5_monokernel(
                         if const_expr(attention_ptpc)
                         else None
                     ),
+                    cm=AT_CM,
                 )
 
             pre = [u_uk(c) for c in range(UK_NKC)]
@@ -4996,6 +5020,7 @@ def build_glm5_monokernel(
                     128,
                     attention_b_word(n_sel() * O_K + kc * 64),
                     shuffled=fp8_shuffled,
+                    cm=AT_CM,
                 )
 
             pre = [u_o(c) for c in range(O_UNITS)]
@@ -5232,6 +5257,7 @@ def build_glm5_monokernel(
             reload_args()
         # 2 row groups (16 gate + 16 up rows) x 96 chunks: 4 waves per group, 24 chunks each
         UG_NKC = HIDDEN // 64
+        UG_CM = CM_NT if S != 4 or EARLY_ISSUE else 0
         UG_CPW = UG_NKC // (WAVES // 2)
         UG_W_BYTES = 2 * expert_inter * HIDDEN // (2 if expert_mxfp4 else 1)
         UG_S_BYTES = (
@@ -5540,7 +5566,14 @@ def build_glm5_monokernel(
                         d_kc = (wave * UG8_UNITS + cc) * 2
                         d_wv = [
                             ld_fp8_chunk(
-                                rw, w_rg, d_kc + j, UG_NKC, HIDDEN, w_ln, fp8_shuffled
+                                rw,
+                                w_rg,
+                                d_kc + j,
+                                UG_NKC,
+                                HIDDEN,
+                                w_ln,
+                                fp8_shuffled,
+                                UG_CM,
                             )
                             for j in range(2)
                         ]
@@ -5668,7 +5701,7 @@ def build_glm5_monokernel(
                         continue
                     wv = [
                         ld_fp8_chunk(
-                            rw, w_rg, kc + j, UG_NKC, HIDDEN, w_ln, fp8_shuffled
+                            rw, w_rg, kc + j, UG_NKC, HIDDEN, w_ln, fp8_shuffled, UG_CM
                         )
                         for j in range(2)
                     ]
@@ -5917,7 +5950,7 @@ def build_glm5_monokernel(
                         continue
                     wv = [
                         ld_fp8_chunk(
-                            rw, w_rg, kc + j, UG_NKC, HIDDEN, w_ln, fp8_shuffled
+                            rw, w_rg, kc + j, UG_NKC, HIDDEN, w_ln, fp8_shuffled, UG_CM
                         )
                         for j in range(2)
                     ]
@@ -6344,6 +6377,7 @@ def build_glm5_monokernel(
         # S=8 is evaluated as two four-sample groups so its FP8 mid tile and
         # in-flight weight batches fit comfortably in LDS/VGPRs.
         DN_NKC = expert_inter // 64
+        DN_CM = CM_NT if S != 4 else 0
         DN_R = (
             (DN_TILE + 15) // 16
         )  # 16-row groups touched by a tile (24-row tiles start at row 0 or 8 of one)
@@ -6409,6 +6443,7 @@ def build_glm5_monokernel(
                     lambda: lds_ld(misc, qn // 2),
                     dn_ln,
                     shuffled=fp8_shuffled,
+                    cm=DN_CM,
                 )
 
             def u_dn(cc):  # cc: 128-k chunk of this wave
@@ -6486,6 +6521,7 @@ def build_glm5_monokernel(
                     dn_ln,
                     shuffled=fp8_shuffled,
                     s_addr=s_dn + fx.Int64(e) * fx.Int64(DN_S_BYTES),
+                    cm=DN_CM,
                 )
 
             # Above 4 rows (FP8 experts) down streams each expert the step uses once:
@@ -6526,6 +6562,7 @@ def build_glm5_monokernel(
                     dn_ln,
                     shuffled=fp8_shuffled,
                     s_addr=s_dn + fx.Int64(e) * fx.Int64(DN_S_BYTES),
+                    cm=DN_CM,
                 )
                 return unit, live, sl, h
 
