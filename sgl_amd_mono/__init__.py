@@ -31,6 +31,12 @@ SPECS = {
         "MiniMaxM3SparseForConditionalGeneration",
         None,
     ): "sgl_amd_mono.minimax.spec:SPEC",
+    # the MTP draft routes its own steps (qwen38_flash_next/draft.py)
+    ("Qwen4ExpForCausalLMMTP", None): "sgl_amd_mono.qwen38_flash_next.draft:SPEC",
+    (
+        "Qwen4ExpForConditionalGeneration",
+        None,
+    ): "sgl_amd_mono.qwen38_flash_next.spec:SPEC",
 }
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
