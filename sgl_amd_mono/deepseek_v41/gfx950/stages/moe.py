@@ -111,8 +111,9 @@ DOWN_TASKS = HIDDEN // ROWS
 # (task, slot) scale blocks a down wave holds a round: at 4 the wave spills
 DOWN_R_MAX = 2
 # a down slot's K steps on this many independent MFMA accumulators
-DOWN_CHAINS = 3
-PIPE_WIDTHS = (4, 8, 12, 16, 20)
+DOWN_CHAINS = 2
+# a down slot of this many K steps or more spills unpipelined (TP2: 9 steps); below it (TP4: 5) the pipeline only adds latency
+PIPE_MIN_STEPS = 8
 # routed intermediate K steps up to which down round 0's weights fit beside the shared
 # down's (``down_round0_early``): TP4 and up
 DOWN_EARLY_STEPS = 5
@@ -1133,7 +1134,7 @@ def down_round_loads(c, tasks, rnd, slots, nu):
     flags = [(c["ugf"], f, 1) for f in down_ug_flags(c, ucs)]
     first = c["poll_issue"](flags)
     svs, avs, es = down_weights(
-        c, tasks, rnd, slots, nu, weights=c["S"] not in PIPE_WIDTHS
+        c, tasks, rnd, slots, nu, weights=c["d"].inter // 128 < PIPE_MIN_STEPS
     )
     return flags, first, svs, avs, es
 
@@ -1156,7 +1157,7 @@ def down_round(c, tasks, rnd, slots, nu, loads):
         scale_block_store(c, svs[q], sl + q * sw)
     for i in range_constexpr(slots):
         for j in range_constexpr(n):
-            if const_expr(s in PIPE_WIDTHS):
+            if const_expr(d.inter // 128 >= PIPE_MIN_STEPS):
                 wptr = fx.recast_iter(fx.Int32, c["red"]) + c["wave"] * 512
                 down_mfma_pipelined(
                     c,
@@ -1188,7 +1189,7 @@ def down_round(c, tasks, rnd, slots, nu, loads):
                 if j0 < counts[i]:
                     more = mid_operands(c, firsts[i] + j0, counts[i] - j0)
                     for j in range_constexpr(n):
-                        if const_expr(s in PIPE_WIDTHS):
+                        if const_expr(d.inter // 128 >= PIPE_MIN_STEPS):
                             wptr = fx.recast_iter(fx.Int32, c["red"]) + c["wave"] * 512
                             down_mfma_pipelined(
                                 c,
