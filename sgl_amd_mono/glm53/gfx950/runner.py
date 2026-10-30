@@ -6,7 +6,9 @@
 every covered layer of that kind in a step, and one op per layer holding its
 weights. The layer kinds are the MoE layers that run the indexer and those that
 reuse the previous top-k, and the dense layers (from the step's tokens for the
-first); the tail (final norm, LM head, logits) is one more runtime and op."""
+first); the tail (final norm, LM head, logits) is one more runtime and op. The NextN
+(MTP draft) layer runs the MoE kinds from its entry (``eh``), and the tail with its
+own norm."""
 
 from __future__ import annotations
 
@@ -20,7 +22,7 @@ import msgspec
 import torch
 
 from .config import GLM5_GLOBAL_HEADS, GLM5_GLOBAL_INTER, HIDDEN, KV_LORA, PE_DIM
-from .layout import INDEX_DIM, layout
+from .layout import EH_ARGS, HEAD_TILE, INDEX_DIM, layout
 
 TOPK = 2048
 # SGLang's DSA index cache: 64-token pages of FP8 keys (16 x 16 tiles), then one
@@ -37,7 +39,8 @@ class Glm53Build(msgspec.Struct, frozen=True):
     cache holds E4M3 (``kv_fp8``), and the guard's test fault injection. ``dense``:
     a dense MLP of that many expert-shaped slices instead of the MoE; ``tokens``:
     the layer starts from the step's tokens and ``vocab_rows`` embedding rows a
-    rank; ``head``: the tail, on ``vocab_rows`` LM-head rows a rank."""
+    rank; ``eh``: the layer starts from the NextN entry, eh_proj(enorm(e) |
+    hnorm(h)); ``head``: the tail, on ``vocab_rows`` LM-head rows a rank."""
 
     rows: int
     tp: int
@@ -53,6 +56,7 @@ class Glm53Build(msgspec.Struct, frozen=True):
     tokens: bool = False
     head: bool = False
     vocab_rows: int = 0
+    eh: bool = False
 
     @property
     def heads(self) -> int:
@@ -61,6 +65,11 @@ class Glm53Build(msgspec.Struct, frozen=True):
     @property
     def inter(self) -> int:
         return GLM5_GLOBAL_INTER // self.tp
+
+    @property
+    def eh_tiles(self) -> int:
+        """The NextN entry's 16-column tiles of x a rank computes."""
+        return HIDDEN // self.tp // HEAD_TILE if self.eh else 0
 
 
 class Glm53Weights(msgspec.Struct, frozen=True):
@@ -108,6 +117,17 @@ class Glm53Caches(msgspec.Struct, frozen=True):
     idx: Optional[torch.Tensor] = None
 
 
+class Glm53EhWeights(msgspec.Struct, frozen=True):
+    """The NextN entry's tensors, SGLang's in place: this rank's rows of eh_proj (bf16
+    [HIDDEN / tp, 2 * HIDDEN], a row view), the enorm and hnorm weights and, for a
+    launch from the tokens, this rank's embedding rows."""
+
+    w_eh: torch.Tensor
+    g_e: torch.Tensor
+    g_h: torch.Tensor
+    emb: Optional[torch.Tensor] = None
+
+
 class Glm53Step(msgspec.Struct, frozen=True):
     """A step's rows for every launch of one width (the spec's ``_Built._step`` fills them):
     int64 positions and MLA slots (-1: a pad row), int32 ``indptr`` [W + 1] (row
@@ -142,12 +162,40 @@ def ensure_writable_flydsl_cache() -> None:
     os.environ["FLYDSL_RUNTIME_CACHE_DIR"] = str(path)
 
 
+class Glm53Epochs:
+    """The guard blocks of several runtimes in one tensor, so that one launch
+    advances all their step epochs (``advance``)."""
+
+    def __init__(self, n: int, device: torch.device):
+        from sgl_amd_mono.common import guard
+
+        self.blocks = torch.zeros(
+            n, guard.GUARD_WORDS, dtype=torch.int32, device=device
+        )
+        self.used = 0
+
+    def take(self) -> torch.Tensor:
+        block = self.blocks[self.used]
+        self.used += 1
+        return block
+
+    def advance(self) -> None:
+        self.blocks[: self.used, 0].add_(1)
+
+
 class Glm53Runtime:
     """The compiled launch for one (width, kind) plus the state its layers share:
     scratch mailboxes, the symmetric peer buffer, and the guard block, whose word 0
-    is the step epoch (``advance_step``)."""
+    is the step epoch (``advance_step``, or the ``Glm53Epochs`` it is taken from)."""
 
-    def __init__(self, key: Glm53Build, rank: int, group, device: torch.device):
+    def __init__(
+        self,
+        key: Glm53Build,
+        rank: int,
+        group,
+        device: torch.device,
+        epochs: Optional[Glm53Epochs] = None,
+    ):
         from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
         from sgl_amd_mono.common import guard
@@ -169,6 +217,7 @@ class Glm53Runtime:
             output_heads=key.heads,
             tokens=key.tokens,
             head_vocab=key.vocab_rows * key.tp if key.head else 0,
+            eh_tiles=key.eh_tiles,
         )
         self.launch = build_glm5_monokernel(
             key.rows,
@@ -197,6 +246,7 @@ class Glm53Runtime:
             tokens=key.tokens,
             vocab_rows=key.vocab_rows,
             tail=key.head,
+            eh_entry=key.eh,
         )
         self.dispatch = partial(_run_compiled, self.launch)
         self.peer = PeerBuffer(self.sy["_bytes"], group, rank, key.tp, device)
@@ -206,7 +256,11 @@ class Glm53Runtime:
         # buffer still needs an address (an uncached allocation of 0 bytes has none)
         self._scratch = PeerBuffer(max(self.sc["_bytes"], 256), group, rank, 1, device)
         self.scratch = self._scratch.bytes
-        self.epoch = torch.zeros(guard.GUARD_WORDS, dtype=torch.int32, device=device)
+        self.epoch = (
+            torch.zeros(guard.GUARD_WORDS, dtype=torch.int32, device=device)
+            if epochs is None
+            else epochs.take()
+        )
         # two outputs, by layer parity: a layer never writes what it reads; the
         # tail's: the gathered f32 logits and the final norm's rows
         if key.head:
@@ -251,9 +305,16 @@ def _check(name: str, t: torch.Tensor, shape: tuple, dtype: torch.dtype) -> None
 
 
 class Glm53LayerOp:
-    """One covered layer: its weights and its ordinal among its kind's layers."""
+    """One covered layer: its weights and its ordinal among its kind's layers; on an
+    ``eh`` runtime also the NextN entry's weights."""
 
-    def __init__(self, runtime: Glm53Runtime, weights: Glm53Weights, layer: int):
+    def __init__(
+        self,
+        runtime: Glm53Runtime,
+        weights: Glm53Weights,
+        layer: int,
+        eh: Optional[Glm53EhWeights] = None,
+    ):
         key = runtime.key
         if (weights.index is not None) != key.with_indexer:
             raise ValueError("an indexer runtime needs indexer weights, and only it")
@@ -266,7 +327,28 @@ class Glm53LayerOp:
                 f"weights with shuffled={weights.shuffled} on a runtime with "
                 f"fp8_shuffled={key.fp8_shuffled}"
             )
+        if (eh is not None) != key.eh:
+            raise ValueError(
+                "a NextN entry runtime needs the entry's weights, and only it"
+            )
         self.rt, self.w, self.layer = runtime, weights, layer
+        # the pointer table: an indexer layer's; a NextN layer's own copy with the
+        # entry's tensors at EH_ARGS
+        self.index = weights.index
+        if eh is not None:
+            rows = HIDDEN // key.tp
+            _check("eh_proj rows", eh.w_eh, (rows, 2 * HIDDEN), torch.bfloat16)
+            _check("enorm", eh.g_e, (HIDDEN,), torch.bfloat16)
+            _check("hnorm", eh.g_h, (HIDDEN,), torch.bfloat16)
+            if key.tokens:
+                _check("embedding", eh.emb, (key.vocab_rows, HIDDEN), torch.bfloat16)
+            device = weights.g_in.device
+            self.index = torch.zeros(max(EH_ARGS) + 1, dtype=torch.int64, device=device)
+            if weights.index is not None:
+                self.index[: weights.index.numel()] = weights.index
+            for i, t in zip(EH_ARGS, (eh.w_eh, eh.g_e, eh.g_h, eh.emb)):
+                if t is not None:
+                    self.index[i] = t.data_ptr()
 
     def launch(
         self,
@@ -275,15 +357,25 @@ class Glm53LayerOp:
         cos: torch.Tensor,
         sin: torch.Tensor,
         step: Glm53Step,
+        h_prev: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """The previous layer's hidden stream ``h`` [W, HIDDEN] in (a tokens layer:
-        the step's token ids, int32 [W], -1 a pad row); this layer's out (h plus its
-        attention and MLP)."""
+        the step's token ids, int32 [W], -1 a pad row; a NextN layer: the e rows ``h``,
+        or the token ids, and the h rows ``h_prev``, bf16 [rows <= W, HIDDEN], whose
+        pad rows are not read); this layer's out (its input plus its attention and
+        MLP)."""
         rt, w, W = self.rt, self.w, self.rt.width
         if rt.key.tokens:
             _check("token ids", h, (W,), torch.int32)
-        else:
+        elif not rt.key.eh:
             _check("h", h, (W, HIDDEN), torch.bfloat16)
+        if rt.key.eh:
+            n = h_prev.shape[0] if h_prev is not None and h_prev.dim() == 2 else 0
+            if not 1 <= n <= W:
+                raise ValueError(f"needs 1 to {W} h rows, got {n}")
+            _check("h rows", h_prev, (n, HIDDEN), torch.bfloat16)
+            if not rt.key.tokens:
+                _check("e rows", h, (n, HIDDEN), torch.bfloat16)
         _check("positions", step.positions, (W,), torch.int64)
         _check("slots", step.slots, (W,), torch.int64)
         _check("indptr", step.indptr, (W + 1,), torch.int32)
@@ -311,7 +403,8 @@ class Glm53LayerOp:
         rt.dispatch(
             p(h),
             p(x_out),
-            p(step.positions),
+            # a NextN layer reads its h rows where the others read nothing
+            p(h_prev) if rt.key.eh else p(step.positions),
             p(step.positions),
             p(step.slots),
             p(step.indptr),
@@ -343,7 +436,7 @@ class Glm53LayerOp:
             p(rt.scratch),
             rt.peer.local,
             p(rt.peer.addresses),
-            p(w.index) if w.index is not None else 0,
+            p(self.index) if self.index is not None else 0,
             p(rt.epoch),
             p(pt),
             p(step.req_ids),

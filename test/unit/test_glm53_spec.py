@@ -15,6 +15,7 @@ from unittest import mock
 
 import pytest
 import torch
+import triton_interpreter
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 
 try:
@@ -92,7 +93,7 @@ class _Lm:
         return "the model's forward"
 
 
-def _built(lm, layers, runtimes, tp=8, context_len=202752, heads=None):
+def _built(lm, layers, runtimes, tp=8, context_len=202752, heads=None, epochs=None):
     return glm53._Built(
         lm,
         layers,
@@ -103,6 +104,7 @@ def _built(lm, layers, runtimes, tp=8, context_len=202752, heads=None):
         tp,
         "cpu",
         context_len=context_len,
+        epochs=epochs,
     )
 
 
@@ -145,8 +147,24 @@ def test_the_logits_processor_returns_the_tail_s_logits_on_a_routed_step():
 
 
 def _step_rows(key, positions, slots, seq_lens, context_len=202752):
-    """``_Built._step`` on CPU for a 4-row step: each row's position and its keys
-    (indptr). ``seq_lens`` is what SGLang passes: one length per request."""
+    """``_Built._step`` on CPU for a 4-row step (its step tables under Triton's
+    interpreter): each row's position and its keys (indptr). ``seq_lens`` is what
+    SGLang passes: one length per request."""
+    return triton_interpreter.run(
+        __file__,
+        "_interpreted_step_rows",
+        key.forward_mode,
+        key.batch_size,
+        key.tokens_per_request,
+        positions,
+        slots,
+        seq_lens,
+        context_len,
+    )
+
+
+def _interpreted_step_rows(mode, bs, tokens, positions, slots, seq_lens, context_len):
+    key = registry.ShapeKey(forward_mode=mode, batch_size=bs, tokens_per_request=tokens)
     W = 4
     runtimes = {(W, k): None for k in KINDS}
     built = _built(_Lm(), {3: None}, runtimes, context_len=context_len)
@@ -744,10 +762,14 @@ class _Head:
 class _Rt:
     kv_dtype = torch.bfloat16
 
+
+class _Epochs:
+    """A width's runtimes' step epochs."""
+
     def __init__(self):
         self.steps = 0
 
-    def advance_step(self):
+    def advance(self):
         self.steps += 1
 
 
@@ -766,9 +788,10 @@ class _Processor:
         return self._get_logits(hidden, lm_head, forward_batch)
 
 
-def test_a_routed_step_runs_every_layer_and_the_tail(monkeypatch):
-    # one decode row at width 2 on fake launches. SGLang's layer_boundary needs a
-    # GPU to import, so its two calls are stand-ins here
+def _interpreted_routed_step():
+    """One decode row at width 2 on fake launches (the step tables under Triton's
+    interpreter). SGLang's layer_boundary needs a GPU to import, so its two calls are
+    stand-ins here."""
     import contextlib
 
     import sglang.srt.model_executor.forward_context as forward_context
@@ -781,45 +804,67 @@ def test_a_routed_step_runs_every_layer_and_the_tail(monkeypatch):
         clear=lambda fb: boundary.append("clear"),
     )
     ctx = SimpleNamespace(maybe_input_scattered=lambda fb: contextlib.nullcontext())
-    monkeypatch.setitem(
-        sys.modules,
-        "sglang.srt.layers.layer_boundary",
-        SimpleNamespace(get_attn_tp_context=lambda: ctx),
-    )
-    monkeypatch.setitem(
-        sys.modules, "sglang.srt.layers.layer_boundary.residual.batch", batch
-    )
     backend = SimpleNamespace(
         forward_metadata=SimpleNamespace(real_page_table=torch.zeros(1, 4))
     )
-    monkeypatch.setattr(forward_context, "get_attn_backend", lambda: backend)
-    monkeypatch.setattr(glm53._Built, "_bind", staticmethod(lambda L, kv_dtype: None))
     runtimes = {(w, k): _Rt() for w in (2, 4, 8) for k in KINDS}
+    epochs = {w: _Epochs() for w in (2, 4, 8)}
     layers = {}
     for i in range(78):
         layers[i] = glm53._Layer(i, None, SimpleNamespace(index=None, dense=i < 3))
         layers[i].ops[2] = _Op(i, calls, runtimes[2, "shared"])
     lm = _Lm()
     lm.logits_processor, lm.lm_head = _Processor(), "lm_head"
-    built = _built(lm, layers, runtimes, heads={2: _Head(calls)})
+    built = _built(lm, layers, runtimes, heads={2: _Head(calls)}, epochs=epochs)
     key = registry.ShapeKey(forward_mode="decode", batch_size=1, tokens_per_request=1)
     fb = SimpleNamespace(out_cache_loc=torch.tensor([300]))
-    out = built.forward(
-        registry.Plan(key=key), torch.tensor([11]), torch.tensor([42]), fb
-    )
+    with (
+        mock.patch.dict(
+            sys.modules,
+            {
+                "sglang.srt.layers.layer_boundary": SimpleNamespace(
+                    get_attn_tp_context=lambda: ctx
+                ),
+                "sglang.srt.layers.layer_boundary.residual.batch": batch,
+            },
+        ),
+        mock.patch.object(forward_context, "get_attn_backend", lambda: backend),
+        mock.patch.object(
+            glm53._Built, "_bind", staticmethod(lambda L, kv_dtype: None)
+        ),
+    ):
+        out = built.forward(
+            registry.Plan(key=key), torch.tensor([11]), torch.tensor([42]), fb
+        )
+    return {
+        "order": [c[0] for c in calls],
+        "ids": calls[0][1].tolist(),
+        "one_step": all(c[2] is calls[0][2] for c in calls[:78]),
+        "slots": calls[0][2].slots.tolist(),
+        "tail_in": calls[-1][1][0, 0].item(),
+        "out": out.tolist(),
+        "hidden_shape": list(lm.logits_processor.hidden.shape),
+        "hidden": lm.logits_processor.hidden[0, 0].item(),
+        "cleared": built._logits is None and boundary == ["start", "clear"],
+        "epochs": {w: e.steps for w, e in epochs.items()},
+        "HIDDEN": HIDDEN,
+    }
+
+
+def test_a_routed_step_runs_every_layer_and_the_tail():
+    r = triton_interpreter.run(__file__, "_interpreted_routed_step")
     # every layer in order, then the tail; layer 0 from the step's token ids, the
     # width's row past the step a pad row (-1)
-    assert [c[0] for c in calls] == list(range(78)) + ["head"]
-    assert calls[0][1].tolist() == [11, -1]
-    assert all(c[2] is calls[0][2] for c in calls[:78])
-    assert calls[0][2].slots.tolist() == [300, -1]
+    assert r["order"] == list(range(78)) + ["head"]
+    assert r["ids"] == [11, -1]
+    assert r["one_step"]
+    assert r["slots"] == [300, -1]
     # the tail reads the last layer's rows: the token id plus one a layer
-    assert calls[-1][1][0, 0].item() == 11 + 78
+    assert r["tail_in"] == 11 + 78
     # the logits processor returns the tail's logits, the step's row of the width's,
     # and stores the tail's normed rows as the step's hidden states
-    assert torch.equal(out, torch.tensor([[89.0, 178.0]]))
-    assert lm.logits_processor.hidden.shape == (1, HIDDEN)
-    assert lm.logits_processor.hidden[0, 0].item() == 2 * 89
-    assert built._logits is None and boundary == ["start", "clear"]
+    assert r["out"] == [[89.0, 178.0]]
+    assert r["hidden_shape"] == [1, r["HIDDEN"]] and r["hidden"] == 2 * 89
+    assert r["cleared"]
     # this width's runtimes moved to the next step, once
-    assert all(rt.steps == (w == 2) for (w, _), rt in runtimes.items())
+    assert r["epochs"] == {"2": 1, "4": 0, "8": 0}

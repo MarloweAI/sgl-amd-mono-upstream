@@ -9,10 +9,13 @@ selected token of a row past 2048 keys is a pair tagged with its indexer launch'
 tag that holds the slot the launch publishes; a dense layer's MLP and the tail's
 logits are within the spec's bounds against f32 references, and fail them with a
 scale or the final norm off; layer 0 from the token ids equals the dense launch fed
-the gathered embedding rows; and every indexer row's list is the exact top-k of the
+the gathered embedding rows; every indexer row's list is the exact top-k of the
 launch's scores in the selection's order (``glm53/check_topk.py``), on random, tied,
 zero and recency-heavy index caches, at about 8K and 300K keys (and for layer 0 and
-a dense layer at 8K and 128K)."""
+a dense layer at 8K and 128K); and each NextN (MTP draft) launch equals the plain
+launch of its kind fed its own entry rows, bitwise, with its entry within its
+bounds, its step tables equal to the torch ops, and a draft step's graph replaying
+bitwise (``glm53/check_nextn.py``)."""
 
 import subprocess
 import sys
@@ -33,6 +36,7 @@ def _gfx950_gpus() -> int:
 
 CHECK = Path(__file__).with_name("glm53") / "check_layer.py"
 TOPK = Path(__file__).with_name("glm53") / "check_topk.py"
+NEXTN = Path(__file__).with_name("glm53") / "check_nextn.py"
 # the widths the spec builds at each TP size (TP4 runs at most 4 rows)
 WIDTHS = {4: "2,4", 8: "2,4,8"}
 
@@ -97,6 +101,10 @@ class TestMonoGlm53Kernels(CustomTestCase):
 
     def test_selected_tokens_carry_the_launch_tag(self):
         self._check("--kind", "index", "--check-tags", "--rowsets", "p0,v4")
+
+    def test_the_nextn_launches_equal_the_plain_ones_on_their_entry(self):
+        for kv in ("bf16", "fp8"):
+            self._check("--kv", kv, script=NEXTN)
 
     def test_indexer_selects_the_exact_top_k(self):
         self._check("--pos", "8447,300000", script=TOPK)

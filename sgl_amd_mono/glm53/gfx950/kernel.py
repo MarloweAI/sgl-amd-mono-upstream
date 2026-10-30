@@ -112,6 +112,7 @@ from .config import (
 from .layout import (
     BLOCKS,
     DCP_SUMMARY_PAIRS,
+    EH_ARGS,
     HEAD_TILE,
     INDEX_CAND_STAGE_CAP,
     INDEX_DIM,
@@ -201,6 +202,7 @@ def build_glm5_monokernel(
     tokens: bool = False,
     vocab_rows: int = 0,
     tail: bool = False,
+    eh_entry: bool = False,
 ):
     """Return the ``@flyc.jit`` launcher for one rank's whole layer.
 
@@ -231,6 +233,16 @@ def build_glm5_monokernel(
     ``vocab_rows`` rows of the vocab-parallel embedding (bf16 [vocab_rows, HIDDEN]).
     The rank that holds a token's row pushes it to every rank (a pad row's zeros come
     from rank 0), which equals the embedding's all-reduce: one rank holds each row.
+
+    ``eh_entry=True`` (a NextN layer) starts from ``eh_proj(enorm(e) | hnorm(h))``:
+    ``h_in`` holds the e rows and ``cur_pos`` the h rows (bf16 [S, HIDDEN]; a pad
+    row's are read as zeros), and ``timeline_buf`` a pointer table whose entries
+    EH_ARGS are this rank's HIDDEN / npes rows of eh_proj (bf16 [rows, 2 * HIDDEN],
+    row-major), the enorm and hnorm weights and, with ``tokens``, this rank's
+    ``vocab_rows`` embedding rows (entries 0-6 the indexer's, 7 the timeline). Each
+    rank computes its rows of x (f32 sums, rounded to bf16) and pushes them to every
+    rank, where the layer reads x. With ``tokens`` the e rows come from the token ids
+    in ``h_in``, as layer 0's do.
 
     ``tail=True`` builds the tail instead of a layer: the final RMSNorm of the rows
     ``h_in`` (bf16 [S, HIDDEN]) with weight ``g_in``, written to ``w_o`` (bf16
@@ -271,8 +283,16 @@ def build_glm5_monokernel(
         and index_block_bytes % 4 == 0
         and (not index_shuffled or index_block_size % 16 == 0)
     )
-    assert not tokens or (vocab_rows > 0 and dense_experts and not attention_ptpc)
+    assert not tokens or (
+        vocab_rows > 0 and (dense_experts or eh_entry) and not attention_ptpc
+    )
     assert not tail or (vocab_rows % HEAD_TILE == 0 and not tokens)
+    assert not eh_entry or (
+        not tail and not dense_experts and HIDDEN % (npes * HEAD_TILE) == 0
+    )
+    # x arrives as tagged pairs in xin (the embedding rows or the NextN entry's)
+    x_pushed = tokens or eh_entry
+    EH_TILES = HIDDEN // npes // HEAD_TILE if eh_entry else 0
     assert 0 <= dense_experts <= MOE_SLOTS
     assert not dense_experts or (S > 1 and (atom_experts or not expert_mxfp4))
     # the slots past an FP8 dense MLP's slices: weight 0, no weight loads
@@ -299,6 +319,7 @@ def build_glm5_monokernel(
         native_fp4_mfma=native_fp4_mfma,
         tokens=tokens,
         head_vocab=vocab_rows * W if tail else 0,
+        eh_tiles=EH_TILES,
     )
     N_SPLIT = topk // SPLIT_KEYS
     QB_ROWS = H * (NOPE_DIM + PE_DIM)
@@ -345,8 +366,8 @@ def build_glm5_monokernel(
         SPLIT_X_WORDS,
         0 if index_paged else index_max_seq,
         down_x_words(S, expert_inter, expert_mxfp4, native_fp4_mfma),
-        # the tail's normed rows, every row at once
-        S * HIDDEN // 2 if tail else 0,
+        # the tail's normed rows, or one half of the NextN entry's, every row at once
+        S * HIDDEN // 2 if tail or eh_entry else 0,
     )
     # Paged top-k: a 4096-bin histogram, then (key, position) candidates of
     # the threshold bin, both in the X region of the selecting CTA.
@@ -385,6 +406,7 @@ def build_glm5_monokernel(
         inter=expert_inter,
         tokens=tokens,
         head_rows=vocab_rows if tail else 0,
+        eh_tiles=EH_TILES,
     ):
         first[name] = acc
         acc += n
@@ -394,6 +416,8 @@ def build_glm5_monokernel(
     # the embedding push runs ahead of qkv_a on the CTAs from 0; the tail's stages
     # start at CTA 0
     base["embed"] = base["lmhead"] = base["gather"] = 0
+    # the NextN entry on the last CTAs, past qkv_a's where the grid allows
+    base["eh"] = max(G - 2 * EH_TILES, 0)
 
     @fx.struct
     class Smem:
@@ -1797,7 +1821,11 @@ def build_glm5_monokernel(
             if const_expr(timeline):
                 if tid == lead:
                     now = mem_realtime()
-                    tl_addr = index_arg(7) if const_expr(with_indexer) else timeline_buf
+                    tl_addr = (
+                        index_arg(7)
+                        if const_expr(with_indexer or eh_entry)
+                        else timeline_buf
+                    )
                     fx.generic_store(
                         fx.inttoptr(
                             fx.PointerType.get(
@@ -1932,11 +1960,7 @@ def build_glm5_monokernel(
             guarded.__exit__(None, None, None)
             return
 
-        # ============================== 0. the step's embedding rows (layer 0)
-        # The token's owner rank pushes its row's 32-column tile to every rank, one
-        # wave a destination, as tagged packed bf16 pairs; the layer reads them back
-        # from its own buffer where it would read x.
-        if const_expr(tokens):
+        if const_expr(x_pushed):
             xin = (
                 sym
                 + fx.Int64(SY["xin"])
@@ -1947,7 +1971,27 @@ def build_glm5_monokernel(
                 + fx.Int64(SY["xin"])
                 + fx.Int64(peer_slot) * fx.Int64(SY["_xin_stride"])
             )
-            e_ids, e_emb = _rsrc(h_in), _rsrc(w_r)
+        if const_expr(tokens and eh_entry):  # a NextN layer's e rows
+            ein = (
+                sym
+                + fx.Int64(SY["ein"])
+                + fx.Int64(peer_slot) * fx.Int64(SY["_xin_stride"])
+            )
+            ein_dst = (
+                peer_dst
+                + fx.Int64(SY["ein"])
+                + fx.Int64(peer_slot) * fx.Int64(SY["_xin_stride"])
+            )
+
+        # ============================== 0. the step's embedding rows (layer 0)
+        # The token's owner rank pushes its row's 32-column tile to every rank, one
+        # wave a destination, as tagged packed bf16 pairs; the layer reads them back
+        # from its own buffer where it would read x (a NextN layer: where its entry
+        # reads e).
+        if const_expr(tokens):
+            e_ids = _rsrc(h_in)
+            e_emb = _rsrc(index_arg(EH_ARGS[3]) if const_expr(eh_entry) else w_r)
+            e_dst = ein_dst if const_expr(eh_entry) else xin_dst
             EMB_PAIRS = S * (ROW_TILE // 2)
             for e_t in range(start("embed"), N_ROW_TILES, G):
                 e_t = fx.Int32(e_t)
@@ -1980,11 +2024,127 @@ def build_glm5_monokernel(
                                         [e_live.select(e_word, fx.Int32(0)), tag],
                                         fx.Int32,
                                     ),
-                                    _rsrc(xin_dst),
+                                    _rsrc(e_dst),
                                     e_s * HIDDEN + e_col,
                                     cache_modifier=CM_SYS,
                                 )
                 stamp("embed", e_t, 4)
+
+        # ============================================ 0. the NextN entry (eh_entry)
+        # Task k < EH_TILES: x columns 16 k .. of this rank's rows of eh_proj over the
+        # e half (enorm(e)); task EH_TILES + k: over the h half (hnorm(h)), whose f32
+        # partial goes to task k's CTA. Task k adds it, rounds to bf16 and pushes the
+        # tile to every rank, one wave a destination, as tagged packed bf16 pairs.
+        if const_expr(eh_entry):
+            EH_K = 2 * HIDDEN
+            EH_CPW = HIDDEN // 64 // WAVES
+            EH_AHEAD = EH_CPW if S <= 4 else EH_CPW // 2
+            r_weh = _rsrc(index_arg(EH_ARGS[0]))
+            for et in range(start("eh"), 2 * EH_TILES, G):
+                et = fx.Int32(et)
+                stamp("eh", et, 0)
+                e_half = et // EH_TILES
+                e_tile = et % EH_TILES
+
+                def u_eh(c):
+                    kc = wave * EH_CPW + c
+                    r = e_tile * HEAD_TILE + lane % 16
+                    wv = [
+                        fx.Vector(
+                            bo.buffer_load(
+                                r_weh,
+                                (
+                                    r * EH_K
+                                    + e_half * HIDDEN
+                                    + kc * 64
+                                    + sp * 32
+                                    + (lane // 16) * 8
+                                )
+                                // 2,
+                                vec_width=4,
+                                dtype=T.i32,
+                            )
+                        )
+                        for sp in range(2)
+                    ]
+                    b_word = n_sel() * (HIDDEN // 2) + kc * 32 + (lane // 16) * 4
+                    return ("bf16", wv, None, b_word)
+
+                pre = [u_eh(c) for c in range(EH_AHEAD)]
+                if const_expr(tokens):  # e from the pushed embedding rows
+                    r_src = _rsrc(cur_pos)
+                else:
+                    r_src = _rsrc((e_half == 0).select(h_in, cur_pos))
+                # a pad row reads row 0 and takes zeros
+                e_live = [row_writes_cache(s) for s in range(S)]
+
+                def ld_ein(sks):
+                    got = poll(
+                        [(ein, (s * HIDDEN + k) // 2, 2) for s, k in sks], "one-as"
+                    )
+                    return [list(bf2_f32(w[0])) + list(bf2_f32(w[1])) for w in got]
+
+                def ld_eh(sks):
+                    res = []
+                    for s, k in sks:
+                        live = e_live[s]
+                        w = fx.Vector(
+                            bo.buffer_load(
+                                r_src,
+                                (live.select(fx.Int32(s), fx.Int32(0)) * HIDDEN + k)
+                                // 2,
+                                vec_width=2,
+                                dtype=T.i32,
+                            )
+                        )
+                        v = w.bitcast(fx.BFloat16).to(fx.Float32)
+                        res.append(
+                            [live.select(v[j], fx.Float32(0.0)) for j in range(4)]
+                        )
+                    return res
+
+                if const_expr(tokens):
+                    if e_half == 0:
+                        stage_x_rmsnorm(ld_ein, HIDDEN, index_arg(EH_ARGS[1]), count=S)
+                    else:
+                        stage_x_rmsnorm(ld_eh, HIDDEN, index_arg(EH_ARGS[2]), count=S)
+                else:
+                    e_gamma = (e_half == 0).select(
+                        index_arg(EH_ARGS[1]), index_arg(EH_ARGS[2])
+                    )
+                    stage_x_rmsnorm(ld_eh, HIDDEN, e_gamma, count=S)
+                gpu.barrier()
+                stamp("eh", et, 2)
+                acc = run_units(u_eh, EH_CPW, EH_AHEAD, pre)
+                reduce_rows(1, acc, emit_out(HEAD_TILE))
+                stamp("eh", et, 3)
+                gpu.barrier()
+                if e_half == 1:
+                    if tid < S * HEAD_TILE:
+                        put(mb("ehp"), e_tile * S * HEAD_TILE + tid, lds_ld(outs, tid))
+                else:
+                    if tid < S * HEAD_TILE:
+                        hp = poll([(mb("ehp"), e_tile * S * HEAD_TILE + tid, 1)])[0][0]
+                        lds_st(outs, tid, lds_ld(outs, tid) + hp.bitcast(fx.Float32))
+                    gpu.barrier()
+                    if wave < W:
+                        if lane < S * HEAD_TILE // 2:
+                            si = lane // (HEAD_TILE // 2)
+                            ri = (lane % (HEAD_TILE // 2)) * 2
+                            put_bf(
+                                xin_dst,
+                                si * HIDDEN
+                                + rank * (EH_TILES * HEAD_TILE)
+                                + e_tile * HEAD_TILE
+                                + ri,
+                                [
+                                    lds_ld(outs, si * HEAD_TILE + ri),
+                                    lds_ld(outs, si * HEAD_TILE + ri + 1),
+                                ],
+                                CM_SYS,
+                            )
+                    gpu.barrier()
+                stamp("eh", et, 4)
 
         # ================================================= 1. q_a / kv_a GEMV
         # 1 row group x 96 chunks: 8 waves split K, 12 chunks each (all prefetched).
@@ -2016,7 +2176,7 @@ def build_glm5_monokernel(
 
             def ld_h(sample_base):
                 def f(sks):
-                    if const_expr(tokens):  # the rows the tokens' owner ranks pushed
+                    if const_expr(x_pushed):  # the rows pushed to every rank
                         got = poll(
                             [
                                 (xin, ((sample_base + s) * HIDDEN + k) // 2, 2)
@@ -2058,7 +2218,7 @@ def build_glm5_monokernel(
                 scales = []
                 for first in range_constexpr(0, group_count, NORM_ROWS):
                     count = min(NORM_ROWS, group_count - first)
-                    if const_expr(tokens):  # the weights go out before the rows' wait
+                    if const_expr(x_pushed):  # the weights go out before the rows' wait
                         if const_expr(pre is None):
                             pre = [make_unit(c, group_count) for c in range(ahead)]
                         scales += stage(sample_base + first, count, None, first)
@@ -4099,7 +4259,7 @@ def build_glm5_monokernel(
             gpu.barrier()
 
             def resid_h(s, row):
-                if const_expr(tokens):
+                if const_expr(x_pushed):
                     return bf2_f32(
                         poll([(xin, (s * HIDDEN + row) // 2, 1)], "one-as")[0][0]
                     )
