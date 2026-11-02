@@ -5,11 +5,11 @@
 # model's PR adds its line.
 **/*deepseek_v4* @1am9trash @RolaoDenthu
 **/*deepseek_v41* @kkHuang-amd
-**/*glm53* @jhinpan
-**/*glm53_flash* @jhinpan
+**/*glm53* @jhinpan @Jacob0226
+**/*glm53_flash* @jhinpan @Jacob0226
 **/*minimax_m3* @zijiecode
 **/*minimax_m31* @kevin-mii
 sgl_amd_mono/minimax/ @zijiecode @kevin-mii
-**/*muse_spark* @zijiecode
-**/*qwen38_a95b_mxfp4* @omirosh @yichiche @chuyeh-amd
-**/*qwen38_flash_next* @amd-cgilli @yichiche @chuyeh-amd
+**/*muse_spark* @zijiecode @RolaoDenthu
+**/*qwen38_a95b_mxfp4* @yichiche
+**/*qwen38_flash_next* @yichiche
