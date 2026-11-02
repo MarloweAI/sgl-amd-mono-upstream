@@ -40,12 +40,21 @@ from sgl_amd_mono.common.sync import Mailbox, preg, publish, sreg
 from .attention import back as mb_back
 from .attention import front as mb_front
 from .attention import index_query
-from .attention.plan import WINDOW, Dims, back_scratch, front_scratch
+from .attention.plan import (
+    WINDOW,
+    WQKV_TASKS,
+    Dims,
+    back_scratch,
+    front_scratch,
+    wqkv_split,
+)
 from .stages import moe, seam
 from .stages.dims import Dims as StageDims
 from .stages.gemv import plus
 from .stages.moe_shape import EXPERTS, SORT_NETS, TOPK, MoeBuild, route_shape
 from .token_par import (
+    chunk_pairs,
+    half_pair,
     own_view,
     peer_layout,
     peer_offsets,
@@ -221,8 +230,9 @@ def build_mono_k1(key: MonoBuild):
     FrontLds = mb_front.front_lds(s, Dims(tp))
     # token parallel: the seam, wqkv and qkv on this rank's rows
     own_n = s // tp if key.tok_par else s
-    NORM0 = SLICES  # the norms on the CTAs past the slices: the wqkv waits on them
-    GATE0 = SLICES + own_n
+    # the norms past the slices' CTAs (the wqkv waits on them), and past a split wqkv's
+    NORM0 = 2 * WQKV_TASKS if wqkv_split(s, own_n) else SLICES
+    GATE0 = NORM0 + own_n
     assert GATE0 + own_n <= BLOCKS
 
     @fx.struct
@@ -239,6 +249,7 @@ def build_mono_k1(key: MonoBuild):
     # the index query here (``index_query``) only where it is reproduced
     assert not key.iq or (key.index and index_query.fused(s, key.tok_par)), key
     IW0 = (GATE0 + own_n) % BLOCKS  # the head weights' CTAs, past the gates'
+    QKV0 = GATE0 + own_n if GATE0 + 2 * own_n <= BLOCKS else 0
     name = kernel_symbol(
         "dsv41_mono_k1",
         s=s,
@@ -265,6 +276,7 @@ def build_mono_k1(key: MonoBuild):
         attn_w: Int64,
         res_out: Int64,
         aux_out: Int64,
+        aux_stride: Int32,
         post_out: Int64,
         comb_out: Int64,
         pre_out: Int64,
@@ -395,8 +407,10 @@ def build_mono_k1(key: MonoBuild):
                     "post_out": post_out,
                     "comb_out": comb_out,
                     "pre_out": pre_out,
-                    # DSpark's capture of this layer: its streams' mean (0: none)
+                    # DSpark's capture of this layer: its streams' mean (0: none), rows
+                    # ``aux_stride`` elements apart (a column block of the packed captures)
                     "aux_out": aux_out,
+                    "aux_stride": aux_stride,
                 },
                 "d": StageDims(tp),
                 # SGLang's Triton boundary + rmsnorm arithmetic (seam.slice_row, stage_norm)
@@ -462,6 +476,10 @@ def build_mono_k1(key: MonoBuild):
                 before_wqkv=seam_slice,
                 after_wqkv=seam_norm,
                 before_wqb=seam_gate,
+                # past the slices, norms and gates where the grid has room: a slice CTA
+                # issues its weights after its slice, and the norms' publish (vmcnt(0))
+                # waited for them to land
+                qkv_first=QKV0,
             )
             if const_expr(key.tok_par):
                 # K1's outputs hold every row: copy in the rows the other ranks computed
@@ -489,6 +507,7 @@ def build_mono_k1(key: MonoBuild):
         attn_w: Int64,
         res_out: Int64,
         aux_out: Int64,
+        aux_stride: Int32,
         post_out: Int64,
         comb_out: Int64,
         pre_out: Int64,
@@ -542,6 +561,7 @@ def build_mono_k1(key: MonoBuild):
             attn_w,
             res_out,
             aux_out,
+            aux_stride,
             post_out,
             comb_out,
             pre_out,
@@ -590,15 +610,21 @@ def build_mono_k1(key: MonoBuild):
 
 @flyc.jit
 def store_normed(normed, t, col, ys, live):
-    """Store the FFN seam's norm output as the MoE input row (bf16, device scope)."""
+    """Store the FFN seam's norm output as the MoE input row (bf16, device scope), the 8
+    values in one 16 B store: as 8 stores of 2 B they held the norm's publish back."""
+    words = [
+        fx.Vector.from_elements([ys[2 * i], ys[2 * i + 1]], fx.Float32)
+        .to(fx.BFloat16)
+        .bitcast(fx.Int32)[0]
+        for i in range(4)
+    ]
     if live:
-        for j in range_constexpr(8):
-            bo.buffer_store(
-                ys[j].to(fx.BFloat16),
-                rsrc(normed),
-                t * HIDDEN + col + j,
-                cache_modifier=CM_DEV,
-            )
+        bo.buffer_store(
+            fx.Vector.from_elements(words, fx.Int32),
+            rsrc(normed),
+            (t * HIDDEN + col) // 2,
+            cache_modifier=CM_DEV,
+        )
 
 
 @flyc.jit
@@ -632,8 +658,9 @@ def push_bf_row(c, bases, off, t, col, ys, live):
         for p in range_constexpr(c["d"].tp):
             if c["rank"] != p:
                 dst = preg(bases[p], off, "gather")
-                c["put_bf"](dst, t * HIDDEN + col, ys[0:4])
-                c["put_bf"](dst, t * HIDDEN + col + 4, ys[4:8])
+                for h in range_constexpr(2):
+                    at = t * HIDDEN + 2 * half_pair(HIDDEN // 2, col // 8, h)
+                    c["put_bf"](dst, at, ys[4 * h : 4 * h + 4])
 
 
 @flyc.jit
@@ -647,7 +674,7 @@ def gather_row(c, src, t, dst):
             bo.buffer_store(
                 fx.Vector.from_elements([w[0], w[1]], fx.Int32),
                 rsrc(dst),
-                t * (HIDDEN // 2) + 2 * q,
+                t * (HIDDEN // 2) + chunk_pairs(HIDDEN // 2, q),
                 cache_modifier=CM_DEV,
             )
 

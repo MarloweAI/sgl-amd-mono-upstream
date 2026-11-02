@@ -103,6 +103,7 @@ SGLANG_READS = {
         "_track_mamba_state_decode(ssm_states)",
         "_track_mamba_state_decode(cache_indices)",
         "_track_mamba_state_decode(layer_id)",
+        "state_layer_cache",
     ),
     "srt/layers/attention/mamba/mamba2_metadata.py": ("mamba_cache_indices",),
     "srt/layers/layer_boundary/__init__.py": ("get_attn_tp_context",),
@@ -122,7 +123,6 @@ SGLANG_READS = {
         "final_logit_softcapping",
     ),
     "srt/mem_cache/memory_pool.py": (
-        "mamba2_layer_cache",
         "conv",
         "temporal",
         "get_key_buffer",
@@ -137,7 +137,6 @@ SGLANG_READS = {
     ),
     "srt/model_executor/forward_context.py": (
         "get_attn_backend",
-        "get_req_to_token_pool",
         "get_token_to_kv_pool",
     ),
     "srt/models/deepseek_v2.py": ("indexer",),
@@ -525,7 +524,7 @@ class _Built:
             hidden = self.model.embed_tokens(input_ids[:S]) if L.i == 0 else streams
             ref = check.reference(L, positions, hidden, forward_batch, S, idx[:S])
         if L.kda:
-            self._bind_kda(L)
+            self._bind_kda(L, backend.linear_attn_backend)
             out = op.launch(*ins, state=L.state, state_idx=idx, step=step)
             backend.linear_attn_backend._track_mamba_state_decode(
                 forward_batch, L.state.conv_state, L.state.rec_state, slots, L.i
@@ -542,14 +541,12 @@ class _Built:
         return _Owed(*out)
 
     @staticmethod
-    def _bind_kda(L: _Layer) -> None:
-        from sglang.srt.model_executor.forward_context import get_req_to_token_pool
-
+    def _bind_kda(L: _Layer, kda) -> None:
         from sgl_amd_mono.glm53_flash.gfx950.runner import (
             FlashKdaState,
         )
 
-        cache = get_req_to_token_pool().mamba2_layer_cache(L.i)
+        cache = kda.state_layer_cache(L.i)
         conv, rec = cache.conv[0], cache.temporal
         if L.state is not None and (
             L.state.conv_state.data_ptr() == conv.data_ptr()

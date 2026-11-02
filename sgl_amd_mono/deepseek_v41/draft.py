@@ -33,6 +33,7 @@ except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
     )
 
 from sgl_amd_mono.common.plan import BLOCKS
+from sgl_amd_mono.deepseek_v41 import draft_sampler, fused
 from sgl_amd_mono.deepseek_v41 import spec as target
 
 EXPERTS, TOPK, UG_GROUPS = 128, 3, 1  # the draft's route; a FP4 group an ug task
@@ -195,17 +196,22 @@ class _Draft:
                 )
             x = target.embed(lm.embed_tokens, input_ids).unsqueeze(1)
             x = x.repeat(1, lm.hc_mult, 1)
-        # a stage's post folds into the next stage's K1; the last stage settles its own
+        # a stage's post folds into the next stage's K1, the last stage's into the head's
+        # combine (``fused.post_combine``)
         pending, pre = (None, x, None, None), None
+        fuse = fused.enabled()
         for j, L in enumerate(self.stages):
             out = target._launch(
                 self.runner, L, plan, positions, forward_batch, pending, pre
             )
-            defer = j + 1 < len(self.stages)
+            defer = j + 1 < len(self.stages) or fuse
             x, pre, post = target._boundary_out(L.module, defer, *out)
             pending = post if defer else (None, x, None, None)
-        # mhc_combine widens x on load: no f32 copy first
-        x = mhc_combine(x.flatten(1), pre, lm.hc_mult, x.dtype)
+        if pending[0] is None:
+            # mhc_combine widens x on load: no f32 copy first
+            x = mhc_combine(x.flatten(1), pre, lm.hc_mult, x.dtype)
+        else:
+            _, x = fused.post_combine(self.stages[-1].module, pending, pre, lm.hc_mult)
         return LogitsProcessorOutput(next_token_logits=None, hidden_states=x)
 
 
@@ -239,6 +245,7 @@ def _build(model, hf_config, ctx) -> _Draft:
     for m in widths[start:] + widths[:start]:
         # K1 with and without an owed post; K2 on the window: no index source, no top-k
         runner.precompile(m, k1={(False, False), (True, False)}, k2={(False, False)})
+    draft_sampler.install(model, ctx.deadline_s)
     return _Draft(model, runner, stages)
 
 

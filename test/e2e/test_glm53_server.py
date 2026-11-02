@@ -3,10 +3,12 @@ switch points: decode steps of 1 to 8 rows run the kernels, wider ones the norma
 path, and requests join and leave a running batch that steps past 8 rows and back
 (a short GSM8K run, for gross failures); the tokens of covered steps scored again by
 the normal prefill path (KL consistency); with MTP, verify steps of 1 and 2 requests
-(4 and 8 rows) on the kernels (GSM8K and the draft's accept length); each covered
-layer against the normal one, in decode and verify steps, and in verify steps on the
-E4M3 MLA cache; and a fault on one rank that stops the server before any token of
-the failed step is sent."""
+(4 and 8 rows) on the kernels, and the NextN draft's extend of 1 and 2 requests on
+its launches (GSM8K and the draft's accept length); each covered layer against the
+normal one, in decode and verify steps, and in verify steps on the E4M3 MLA cache,
+the dense layers' MLPs, the tail's logits and each MTP draft step against SGLang's
+NextN included; the hidden states a covered step returns; and a fault on one rank
+that stops the server before any token of the failed step is sent."""
 
 import os
 import re
@@ -16,6 +18,7 @@ import unittest
 from types import SimpleNamespace
 
 import requests
+import torch
 from glm53_server import ARGS, ENV, MODEL, MTP
 from sglang.test.kl_test_utils import (
     test_input_output_logprobs_match_helper as assert_logprobs_match,
@@ -111,12 +114,18 @@ class TestMonokernelMtp(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.process = _launch(extra_args=[*MTP, "--watchdog-timeout", "1200"])
+        cls.out = tempfile.NamedTemporaryFile("w+", suffix=".out")
+        cls.err = tempfile.NamedTemporaryFile("w+", suffix=".err")
+        cls.process = _launch(
+            extra_args=[*MTP, "--watchdog-timeout", "1200"], log=(cls.out, cls.err)
+        )
 
     @classmethod
     def tearDownClass(cls):
         if cls.process is not None:
             terminate_and_kill_process_tree(cls.process)
+        cls.out.close()
+        cls.err.close()
 
     def test_gsm8k_and_accept_length_past_the_largest_width(self):
         # 12 requests at a time: verify steps of 1 and 2 requests run the kernels,
@@ -128,6 +137,16 @@ class TestMonokernelMtp(CustomTestCase):
         print(f"{metrics=} {accept=}")
         self.assertGreater(metrics["score"], GSM8K_BOUND)
         self.assertGreater(accept, MTP_ACCEPT_BOUND)
+        # the draft extends of 1 and 2 requests ran the NextN launches (these
+        # requests sample, so under rejection sampling the draft decode steps run
+        # SGLang's path; the check-mode test runs them greedy)
+        self.err.seek(0)
+        self.out.seek(0)
+        log = self.err.read() + self.out.read()
+        steps = re.findall(r"runs the MTP draft step \('(\w+)', (\d+), (\d+)\)", log)
+        self.assertLessEqual(
+            {("DRAFT_EXTEND_V2", "1", "4"), ("DRAFT_EXTEND_V2", "2", "8")}, set(steps)
+        )
 
 
 class TestMonokernelCheck(CustomTestCase):
@@ -155,11 +174,12 @@ class TestMonokernelCheck(CustomTestCase):
         )
 
     def test_each_covered_layer_past_the_parallel_top_k(self):
-        # rows of about 108k keys (27 chunks: 14 slices, 13 of two chunks) at widths 2
-        # and 4, and of about 36k keys (9 one-chunk slices) at width 8. Past 98304
-        # keys each wave's score walk refills its buffers and looks blocks ahead.
+        # rows of about 108k keys at widths 2 and 4 and of about 36k keys at width 8:
+        # past 98304 keys a row's top-k runs on every slice
         past = 98304
-        self.assertGreaterEqual(past, layout.INDEX_SEL_SLICES * layout.INDEX_SEL_CHUNK)
+        self.assertGreaterEqual(
+            past, layout.INDEX_SEL_SLICES * layout.INDEX_SEL_SLICE_KEYS
+        )
         self._check_layers(
             [],
             ((1, 9000), (3, 9000), (8, 3000)),
@@ -209,25 +229,95 @@ class TestMonokernelCheck(CustomTestCase):
             out.seek(0)
             log = err.read() + out.read()
         checks = re.findall(
-            r"monokernel check layer \d+ \((indexer|shared), (\d+) rows, positions "
-            r"\d+\.\.(\d+)\): (.*)",
+            r"monokernel check layer \d+ \((indexer|shared|dense), (\d+) rows, "
+            r"positions \d+\.\.(\d+)\): (.*)",
             log,
         )
+        # each dense layer's MLP and each tail: (rows, fields)
+        mlps = re.findall(
+            r"monokernel check dense MLP layer \d+ \((\d+) rows\): (.*)", log
+        )
+        tails = re.findall(r"monokernel check tail \((\d+) rows\): (.*)", log)
         values = {}
-        for _, _, _, fields in checks:
+        for fields in [c[3] for c in checks] + [m[1] for m in mlps + tails]:
             for name, v in re.findall(r"(\S+)=(\S+)", fields):
                 values.setdefault(name, []).append(float(v))
         for name, vs in sorted(values.items()):
             print(f"{name}: min {min(vs):.6g} max {max(vs):.6g} ({len(vs)} checks)")
         seen = {(kind, int(n)) for kind, n, _, _ in checks}
-        want = {(kind, n) for kind in ("indexer", "shared") for n in rows}
+        want = {(kind, n) for kind in ("indexer", "shared", "dense") for n in rows}
         self.assertTrue(want <= seen, seen)
+        for found in (mlps, tails):
+            self.assertEqual({int(n) for n, _ in found} & set(rows), set(rows))
         self.assertIn("layer.topk_exact.max_abs", values)
         self.assertTrue(
             any(k == "indexer" and int(hi) >= past for k, _, hi, _ in checks)
         )
+        if "--speculative-algorithm" in extra_args:
+            # each MTP draft step on the NextN launches, checked against SGLang's
+            drafts = re.findall(r"monokernel check draft (\d) \((index|shared),", log)
+            self.assertEqual(
+                {(int(n), kind) for n, kind in drafts},
+                {(1, "index"), (2, "shared"), (3, "shared")},
+            )
         violations = re.findall(r"monokernel check violation: .*", log)
         self.assertEqual(violations, [], "\n".join(violations[:20]))
+
+
+def _lm_head() -> torch.Tensor:
+    """The checkpoint's LM head [vocab, hidden]."""
+    import json
+
+    from huggingface_hub import hf_hub_download
+    from safetensors import safe_open
+
+    def path(name):
+        if os.path.isdir(MODEL):
+            return os.path.join(MODEL, name)
+        return hf_hub_download(MODEL, name)
+
+    index = json.load(open(path("model.safetensors.index.json")))
+    with safe_open(path(index["weight_map"]["lm_head.weight"]), "pt") as f:
+        return f.get_tensor("lm_head.weight")
+
+
+class TestMonokernelHiddenStates(CustomTestCase):
+    def test_returned_hidden_states_give_the_sampled_tokens(self):
+        # each covered decode step's returned row is the final norm's: times the LM
+        # head, its argmax is the token the server sampled (greedy)
+        process = _launch(
+            extra_args=["--enable-return-hidden-states", "--watchdog-timeout", "1200"]
+        )
+        try:
+            r = requests.post(
+                DEFAULT_URL_FOR_TEST + "/generate",
+                json={
+                    "text": [
+                        "The capital of France is",
+                        "Count from one to ten: one, two,",
+                        "Write a haiku about the sea.",
+                    ],
+                    "sampling_params": {"max_new_tokens": 8, "temperature": 0},
+                    "return_hidden_states": True,
+                },
+                timeout=600,
+            )
+            r.raise_for_status()
+        finally:
+            terminate_and_kill_process_tree(process)
+        head = _lm_head().float()
+        hits = rows = 0
+        for out in r.json():
+            # hidden_states[0] is the prefill's block; row i the step sampling token i
+            decode = out["meta_info"]["hidden_states"][1:]
+            got = (torch.tensor(decode) @ head.T).argmax(-1)
+            want = torch.tensor(out["output_ids"][1 : 1 + len(decode)])
+            hits += int((got == want).sum())
+            rows += len(decode)
+        print(f"decode rows giving the sampled token: {hits} / {rows}")
+        self.assertGreaterEqual(rows, 15)
+        # bf16 near ties may part one row's argmax
+        self.assertGreaterEqual(hits, rows - 1)
 
 
 class TestMonokernelFault(CustomTestCase):

@@ -25,11 +25,20 @@ SPECS = {
     ): "sgl_amd_mono.deepseek_v41.draft:SPEC",
     ("Glm5NextForConditionalGeneration", None): "sgl_amd_mono.glm53_flash.spec:SPEC",
     ("GlmMoeDsaForCausalLM", None): "sgl_amd_mono.glm53.spec:SPEC",
+    ("GlmMoeDsaForCausalLMNextN", None): "sgl_amd_mono.glm53.draft:SPEC",
     ("MiniMaxM3SparseForCausalLM", None): "sgl_amd_mono.minimax.spec:SPEC",
     (
         "MiniMaxM3SparseForConditionalGeneration",
         None,
     ): "sgl_amd_mono.minimax.spec:SPEC",
+    # the MTP draft routes its own steps (qwen38_flash_next/draft.py)
+    ("Qwen4ExpForCausalLMMTP", None): "sgl_amd_mono.qwen38_flash_next.draft:SPEC",
+    (
+        "Qwen4ExpForConditionalGeneration",
+        None,
+    ): "sgl_amd_mono.qwen38_flash_next.spec:SPEC",
+    ("MuseSparkForConditionalGeneration", None): "sgl_amd_mono.muse_spark.spec:SPEC",
+    ("DFlash2DraftModel", None): "sgl_amd_mono.muse_spark.draft:SPEC",
 }
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)

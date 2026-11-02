@@ -21,6 +21,10 @@ logger = logging.getLogger(__name__)
 SGLANG_READS = {
     "kernels/ops/layernorm/mhc.py": ("hc_contract",),
     "srt/distributed/parallel_state.py": ("device_group",),
+    "srt/layers/attention/hybrid_linear_attn_backend.py": (
+        "linear_attn_backend",
+        "state_layer_cache",
+    ),
     "srt/layers/layer_boundary/residual/batch.py": (
         "start",
         "take_output",
@@ -30,7 +34,6 @@ SGLANG_READS = {
     "srt/layers/layernorm.py": ("variance_epsilon",),
     "srt/models/glm5_next.py": ("model", "norm", "lm_head"),
     "srt/mem_cache/memory_pool.py": (
-        "mamba2_layer_cache",
         "conv",
         "temporal",
         "get_key_buffer",
@@ -39,7 +42,7 @@ SGLANG_READS = {
     ),
     "srt/model_executor/forward_batch_info.py": ("out_cache_loc", "req_pool_indices"),
     "srt/model_executor/forward_context.py": (
-        "get_req_to_token_pool",
+        "get_attn_backend",
         "get_token_to_kv_pool",
     ),
     "srt/runtime_context.py": (
@@ -88,12 +91,12 @@ def _outputs(name: str, a: torch.Tensor, b: torch.Tensor) -> dict[str, dict]:
 def _regions(L, forward_batch, S: int, state_idx) -> dict:
     """The cache entries the layer writes this step: name -> (tensor, index)."""
     from sglang.srt.model_executor.forward_context import (
-        get_req_to_token_pool,
+        get_attn_backend,
         get_token_to_kv_pool,
     )
 
     if L.kda:
-        cache = get_req_to_token_pool().mamba2_layer_cache(L.i)
+        cache = get_attn_backend().linear_attn_backend.state_layer_cache(L.i)
         sel = state_idx[state_idx > 0].long()
         return {"conv": (cache.conv[0], sel), "state": (cache.temporal, sel)}
     pool = get_token_to_kv_pool()

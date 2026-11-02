@@ -27,9 +27,16 @@ POLL_MAX = 12  # mailbox specs polled per batch (bounds live registers)
 CHECK_POLLS = 64  # a pending wait checks its deadline and the failure flags this often
 
 
+def _first_load(load_all, first):
+    """``first`` when the first load is in flight already, else ``load_all()`` (plain
+    Python: the choice is made at trace time)."""
+    return load_all() if first is None else first
+
+
 @flyc.jit
-def _spin(load_all, pending, guarded=True):
-    """Re-issue ``load_all`` until ``pending`` clears.
+def _spin(load_all, pending, guarded=True, first=None):
+    """Re-issue ``load_all`` until ``pending`` clears (``first``: the first load's
+    words, issued already).
 
     Under a guard (``guard.scope``) the wait also stops once its deadline passes
     or once this GPU or a peer failed: a timeout sets the error word and the
@@ -38,7 +45,7 @@ def _spin(load_all, pending, guarded=True):
     come. ``guarded=False``: a wait the guard need not bound"""
     g = guard.current()
     if const_expr(g is None or not guarded):
-        v = load_all()
+        v = _first_load(load_all, first)
         while pending(v):
             rocdl.s_sleep(1)
             v = load_all()
@@ -46,7 +53,7 @@ def _spin(load_all, pending, guarded=True):
     site = g.next_site()
     # bound before the traced loops: a local whose method a loop calls becomes loop state
     deadline_of, stopped, fail, note_peer = g.deadline, g.stopped, g.fail, g.note_peer
-    v = load_all()
+    v = _first_load(load_all, first)
     if const_expr(g.stop and g.fault_site != site):
         # a failed check stops the launch inside the loop, so the loop carries no stop
         # value: one copies the polled words every poll and spills at large batches
@@ -175,6 +182,22 @@ class Mailbox:
             return []
         if const_expr(len(specs) > batch):
             return self.poll(specs[:batch], batch) + self.poll(specs[batch:], batch)
+        load_all, pending, unpack = self._batch(specs)
+        return unpack(_spin(load_all, pending))
+
+    def poll_issue(self, specs):
+        """Issue the first loads of ``poll(specs)`` (at most ``POLL_MAX``) now, ahead of
+        loads that would otherwise hold their results back (loads return in issue
+        order); ``poll_wait`` checks them."""
+        assert 0 < len(specs) <= POLL_MAX, len(specs)
+        return self._batch(specs)[0]()
+
+    def poll_wait(self, specs, first):
+        """``poll(specs)`` from the words ``poll_issue(specs)`` returned."""
+        load_all, pending, unpack = self._batch(specs)
+        return unpack(_spin(load_all, pending, first=first))
+
+    def _batch(self, specs):
         spaces = {a.space for a, _, _ in specs}
         assert len(spaces) == 1, f"one poll batch spans {spaces}"
         cm = _SCOPE_CM[spaces.pop()]
@@ -204,12 +227,14 @@ class Mailbox:
                 bad = bad | (v[e] != tag)
             return bad
 
-        v = _spin(load_all, pending)
-        outs, e = [], 0
-        for _, _, n in specs:
-            outs.append([v[e + 2 * q] for q in range(n)])
-            e += 2 * n
-        return outs
+        def unpack(v):
+            outs, e = [], 0
+            for _, _, n in specs:
+                outs.append([v[e + 2 * q] for q in range(n)])
+                e += 2 * n
+            return outs
+
+        return load_all, pending, unpack
 
 
 @flyc.jit

@@ -42,7 +42,8 @@ def _files(pattern: str) -> list:
 @lru_cache(maxsize=None)
 def _provided(path: Path) -> frozenset:
     """What a source file provides: definitions, assignment targets (``x.name = ...``
-    too), imported names, parameters as ``f(p)`` and string literals as ``"x"``."""
+    too), imported names, parameters as ``f(p)`` (and ``C.f(p)`` for a method of class
+    ``C``) and string literals as ``"x"``."""
     names = set()
     for node in ast.walk(_tree(path)):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
@@ -50,6 +51,11 @@ def _provided(path: Path) -> frozenset:
             if not isinstance(node, ast.ClassDef):
                 params = node.args.posonlyargs + node.args.args + node.args.kwonlyargs
                 names.update(f"{node.name}({p.arg})" for p in params)
+            else:
+                for f in node.body:
+                    if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        args = f.args.posonlyargs + f.args.args + f.args.kwonlyargs
+                        names.update(f"{node.name}.{f.name}({a.arg})" for a in args)
         elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
             for target in targets:

@@ -32,26 +32,33 @@ from .tiles import (
 
 INDEX_HEADS = 32
 INDEX_DIM = 128
+# LM-head rows a tail task computes; also the NextN entry's rows (x columns) a task
+HEAD_TILE = 16
+# the NextN entry's pointer-table entries: this rank's eh_proj rows, the enorm and
+# hnorm weights, and (from the tokens) this rank's embedding rows
+EH_ARGS = (8, 9, 10, 11)
 INDEX_Q_ROWS = INDEX_HEADS * INDEX_DIM
 INDEX_TILE = 16
 INDEX_KEYS_PER_TASK = 64
-# a long row's paged top-k runs on up to this many slices (CTAs) per row, each with
-# staging room for this many threshold-bin candidates
-INDEX_SEL_SLICES = 16
+# a row's top-k runs on up to this many slices (CTAs), with staging room for this many
+# candidates of the threshold's prefix
+INDEX_SEL_SLICES = 64
 INDEX_CAND_STAGE_CAP = 16384
-# keys a select chunk (a CTA's 512 threads x 8), and the chunks past which a row selects
-# on up to INDEX_SEL_SLICES CTAs: up to 8 chunks the hand-offs cost what the slices save
-INDEX_SEL_CHUNK = 4096
-INDEX_SEL_PAR_CHUNKS = 8
+# radix digits of the sliced top-k; a row has a slice per this many keys (rounded up),
+# at most INDEX_SEL_SLICES
+INDEX_SEL_DIGITS = 6
+INDEX_SEL_SLICE_KEYS = 1024
 
 
-def select_slices(bound):
-    """(slices, chunks a slice) of a row of ``bound`` > 0 keys whose top-k runs on
-    several CTAs: runs of whole chunks in position order, at most INDEX_SEL_SLICES, none
-    empty. The kernel calls it on traced Int32 and the CPU test on ints."""
-    chunks = (bound + INDEX_SEL_CHUNK - 1) // INDEX_SEL_CHUNK
-    per = (chunks + INDEX_SEL_SLICES - 1) // INDEX_SEL_SLICES
-    return (chunks + per - 1) // per, per
+def select_slices(bound, minimum=min, maximum=max):
+    """(slices, keys a slice) of a row of ``bound`` keys: runs of the row's keys in
+    position order, none empty (one for an empty row). The kernel calls it on traced
+    Int32 with ``fx.min`` and ``fx.max``, the CPU test on ints."""
+    n = minimum(
+        (bound + INDEX_SEL_SLICE_KEYS - 1) // INDEX_SEL_SLICE_KEYS, INDEX_SEL_SLICES
+    )
+    n = maximum(n, 1)
+    return n, (bound + n - 1) // n
 
 
 DCP_SUMMARY_PAIRS = KV_LORA // 2 + 2
@@ -161,10 +168,29 @@ def layout(
     output_heads: int | None = None,
     dcp_size: int = 1,
     native_fp4_mfma: bool = False,
+    tokens: bool = False,
+    head_vocab: int = 0,
+    eh_tiles: int = 0,
 ):
-    """Return byte offsets for per-rank scratch and symmetric peer buffers."""
+    """Return byte offsets for per-rank scratch and symmetric peer buffers.
+
+    ``tokens``: also the layer input's rows, which the token's owner rank pushes
+    (``xin``, two slots by launch parity). ``eh_tiles``: the NextN entry's rows of
+    ``xin`` instead, which every rank pushes its ``eh_tiles`` 16-column tiles of, and
+    the h_prev halves' partial sums (``ehp``); with ``tokens`` the embedding rows go
+    to ``ein`` (as ``xin``). ``head_vocab``: the tail launch's
+    buffers instead, the gathered bf16 logits of a ``head_vocab`` vocabulary (two
+    slots)."""
     from sgl_amd_mono.common.guard import FLAG_BYTES
 
+    if head_vocab:
+        part = samples * head_vocab * 4
+        return {"_bytes": 0}, {
+            "logits": 0,
+            "_logits_stride": part,
+            "flags": 2 * part,
+            "_bytes": 2 * part + FLAG_BYTES,
+        }
     split_count = sparse_attention_topk // sparse_keys_per_task(samples, heads)
     output_heads = heads if output_heads is None else output_heads
     pair_bytes = 8
@@ -197,23 +223,23 @@ def layout(
     if with_indexer:
         items += [
             ("index_k", samples * INDEX_DIM * pair_bytes),
-            ("index_k_new", samples * INDEX_DIM // 2 * pair_bytes),
-            ("index_ready", samples * pair_bytes),
+            # each row's new key as cached: its FP8 value words, then its scale
+            ("index_k8", samples * (INDEX_DIM // 4 + 1) * pair_bytes),
             ("index_w", samples * INDEX_HEADS * pair_bytes),
             ("index_q", samples * INDEX_Q_ROWS // 2 * pair_bytes),
+            ("index_qh", samples * INDEX_Q_ROWS // 2 * pair_bytes),
             ("index_scores", samples * index_max_seq * pair_bytes),
             ("indices", samples * sparse_attention_topk * pair_bytes),
-            # parallel top-k: per slice a 4096-bin histogram and its ready pair, per
-            # row the threshold (bin prefix, keys still needed, keys in the bin), per
-            # slice its winners' positions, its (key, position) candidates and their
-            # counts
-            ("index_part_hist", samples * INDEX_SEL_SLICES * 4096 * 4),
-            ("index_part_ready", samples * INDEX_SEL_SLICES * pair_bytes),
-            ("index_thresh", samples * 4 * pair_bytes),
-            ("index_win_stage", samples * INDEX_SEL_SLICES * sparse_attention_topk * 4),
-            ("index_cand_stage", samples * INDEX_SEL_SLICES * INDEX_CAND_STAGE_CAP * 8),
-            ("index_gather_count", samples * INDEX_SEL_SLICES * pair_bytes),
+            # sliced top-k: per row, digit and slice the slice's 64 counts (two a
+            # pair); per row the candidates (key, cache slot) under the threshold's prefix
+            (
+                "sel_hist",
+                samples * INDEX_SEL_DIGITS * INDEX_SEL_SLICES * 32 * pair_bytes,
+            ),
+            ("sel_cand", samples * INDEX_CAND_STAGE_CAP * 2 * pair_bytes),
         ]
+    if eh_tiles:
+        items += [("ehp", eh_tiles * samples * HEAD_TILE * pair_bytes)]
 
     offset, scratch = 0, {}
     for name, size in items:
@@ -238,6 +264,13 @@ def layout(
         "_dcp_part_stride": dcp_part,
         "_bytes": 2 * region + 2 * dcp_part + FLAG_BYTES,
     }
+    if tokens or eh_tiles:
+        symmetric["xin"] = symmetric["_bytes"]
+        symmetric["_xin_stride"] = samples * HIDDEN * 4
+        symmetric["_bytes"] += 2 * samples * HIDDEN * 4
+    if tokens and eh_tiles:
+        symmetric["ein"] = symmetric["_bytes"]
+        symmetric["_bytes"] += 2 * samples * HIDDEN * 4
     return scratch, symmetric
 
 
@@ -249,29 +282,45 @@ def stage_tasks(
     index_max_seq: int = 4096,
     expert_mxfp4: bool = False,
     inter: int = INTER,
+    tokens: bool = False,
+    head_rows: int = 0,
+    eh_tiles: int = 0,
 ):
-    """Return ``(stage name, task count)`` pairs in execution order."""
+    """Return ``(stage name, task count)`` pairs in execution order; with ``tokens``
+    led by the embedding rows' push, with ``eh_tiles`` by the NextN entry (each tile's
+    e and h_prev halves). With ``head_rows`` (this rank's LM-head rows) the tail's
+    instead."""
 
-    tasks = [
-        ("qkv_a", N_QKV_A),
+    if head_rows:
+        return [("lmhead", head_rows // HEAD_TILE), ("gather", BLOCKS)]
+    tasks = [("embed", N_ROW_TILES)] if tokens else []
+    tasks += [("eh", 2 * eh_tiles)] if eh_tiles else []
+    tasks += [
+        # with the indexer, the index K and weights projections' 16-row tiles follow
+        (
+            "qkv_a",
+            N_QKV_A + ((INDEX_DIM + INDEX_HEADS) // QKV_A_TILE if with_indexer else 0),
+        ),
         ("q_norm", samples),
-        ("cache", 1),
+        ("cache", samples),
+    ]
+    if with_indexer:
+        tasks += [("index_key", samples)]
+    tasks += [
         ("q_b", heads * (NOPE_DIM + PE_DIM) // Q_B_TILE),
     ]
     if with_indexer:
-        tasks += [("index_q", INDEX_Q_ROWS // INDEX_TILE)]
+        # index_qh: each row's query, rotated and Hadamard-transformed, 8 heads a task
+        tasks += [
+            ("index_q", INDEX_Q_ROWS // INDEX_TILE),
+            ("index_qh", samples * INDEX_HEADS // 8),
+        ]
     tasks += [("uk", heads * KV_LORA // UK_TILE)]
     if with_indexer:
         tasks += [
-            (
-                "index_score",
-                samples
-                * ((index_max_seq + INDEX_KEYS_PER_TASK - 1) // INDEX_KEYS_PER_TASK),
-            ),
-            ("index_hist", samples * INDEX_SEL_SLICES),
-            ("index_thresh", samples),
-            ("index_gather", samples * INDEX_SEL_SLICES),
-            ("index_select", samples),
+            # one task a CTA: its runs of the requests' keys
+            ("index_score", BLOCKS),
+            ("index_slice", samples * INDEX_SEL_SLICES),
         ]
     tasks += [
         (
@@ -298,3 +347,68 @@ def stage_tasks(
         ("down", HIDDEN // dn_tile(samples, expert_mxfp4)),
     ]
     return tasks
+
+
+def stage_bases(
+    samples: int,
+    heads: int,
+    sparse_attention_topk: int,
+    with_indexer: bool = False,
+    index_max_seq: int = 4096,
+    expert_mxfp4: bool = False,
+    inter: int = INTER,
+):
+    """Return ``{stage name: base CTA}``: task ``t`` of a stage runs on CTA
+    ``(base + t) % BLOCKS``."""
+
+    tasks = dict(
+        stage_tasks(
+            samples,
+            heads,
+            sparse_attention_topk,
+            with_indexer,
+            index_max_seq,
+            expert_mxfp4,
+            inter=inter,
+        )
+    )
+    base, acc = {}, 0
+    # q_norm (with each row's cache task) on the first CTAs past qkv_a's, so it polls
+    # from the launch start; q_b after it. split from the CTA past q_b's, so its tiles
+    # land on CTAs freed by qkv_a, the last few on the q_norm CTAs; the cache keeps one
+    # CTA of the sequence after split, so uk (on the q_b CTAs it waits on anyway) and
+    # the later stages keep their CTAs.
+    for name in (
+        "qkv_a",
+        "q_norm",
+        "q_b",
+        "split",
+        "cache",
+        "uk",
+        "uv",
+        "o",
+        "router",
+        "ug",
+        "down",
+    ):
+        base[name] = acc % BLOCKS
+        acc += 1 if name == "cache" else tasks[name]
+    base["cache"] = base["q_norm"]
+    # o from split's first CTA: its tasks fill the split CTAs, free once the
+    # attention ends
+    base["o"] = base["split"]
+    if with_indexer:
+        # q_b occupies exactly half the grid.  Put the second half of index-Q on
+        # the complementary CTAs while q_b CTAs reuse their normalized q_lora
+        # tile for the first half, instead of serializing two index-Q tiles on
+        # every q_b CTA.
+        base["index_q"] = (base["q_b"] + tasks["q_b"]) % BLOCKS
+        # on the first CTAs of index_q's own tiles, after their tile
+        base["index_qh"] = base["index_q"]
+        # each row's index key on its q_norm CTA, after the CTA's index-query tile
+        base["index_key"] = base["q_norm"]
+        # one scoring task a CTA, numbered by its CTA
+        base["index_score"] = 0
+        # the selection's slices past uk's CTAs
+        base["index_slice"] = (base["uk"] + tasks["uk"]) % BLOCKS
+    return base

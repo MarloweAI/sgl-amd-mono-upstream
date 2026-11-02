@@ -10,5 +10,6 @@
 **/*minimax_m3* @zijiecode
 **/*minimax_m31* @kevin-mii
 sgl_amd_mono/minimax/ @zijiecode @kevin-mii
+**/*muse_spark* @zijiecode
 **/*qwen38_a95b_mxfp4* @omirosh @yichiche @chuyeh-amd
 **/*qwen38_flash_next* @amd-cgilli @yichiche @chuyeh-amd
