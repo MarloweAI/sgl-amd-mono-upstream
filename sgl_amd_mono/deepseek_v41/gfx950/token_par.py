@@ -28,7 +28,6 @@ LINE = 128  # every peer region starts on a cache line
 ROW_BYTES = {
     "res_in": HC * HIDDEN * 2,
     "res_out": HC * HIDDEN * 2,
-    "aux_out": HIDDEN * 2,
     "pend": HIDDEN * 2,
     "post_in": HC * 4,
     "pre_in": HC * 4,
@@ -91,4 +90,6 @@ def own_view(c: dict, t0, n: int) -> dict:
         k: v + lo * fx.Int64(ROW_BYTES[k]) if k in ROW_BYTES else v
         for k, v in c["args"].items()
     }
+    if "aux_out" in args:  # its rows ``aux_stride`` bf16 apart
+        args["aux_out"] = args["aux_out"] + lo * fx.Int64(args["aux_stride"]) * 2
     return {**c, "S": n, "args": args}

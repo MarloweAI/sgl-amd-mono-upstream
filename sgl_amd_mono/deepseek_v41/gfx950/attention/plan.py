@@ -96,6 +96,13 @@ def wqkv_order(s):
     return 5, True, (0, 4, 1, 2, 3)
 
 
+def wqkv_split(s, own):
+    """Whether K1 runs each wqkv row tile's chains on two CTAs: SGLang's order of an even
+    chain count, and room past their 224 of 256 CTAs for the norms, gates, qkv and key table."""
+    waves, halves, _ = wqkv_order(s)
+    return not halves and waves % 2 == 0 and 2 * WQKV_TASKS + 4 * own < 256
+
+
 def token_tiles(s):
     return [(t0, min(TILE, s - t0)) for t0 in range(0, s, TILE)]
 

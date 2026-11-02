@@ -959,22 +959,23 @@ def stage_down(c, tasks):
     slots = DOWN_R_MAX // n
     per_round = WAVES * slots
     rounds = (nu + per_round - 1) // per_round
-    # round r + 1's loads go out while round r multiplies, round 0's before the shared down
-    loads = down_weights(c, tasks, 0, slots, nu)
     # the shared expert's down projection first: its input is ready long before the routed results
     down_shared(c, tasks)
     for rnd in range(0, rounds, 1):
-        svs, avs = loads
         us = [wave + WAVES * (slots * rnd + i) for i in range(slots)]
         ucs = [fx.min(u, nu - 1) for u in us]
         firsts = [c["rs"].slot_first(tab, u) for u in ucs]
-        # wait only on this round's slots' ug tasks
-        c["poll"]([(c["ugf"], f, 1) for f in down_ug_flags(c, ucs)])
+        # wait only on this round's slots' ug tasks; their flags' first loads go out ahead of
+        # the round's weights (loads return in issue order: behind them, a flag set long
+        # before would wait for every weight)
+        flags = [(c["ugf"], f, 1) for f in down_ug_flags(c, ucs)]
+        first = c["poll_issue"](flags)
+        svs, avs = down_weights(c, tasks, rnd, slots, nu)
+        c["poll_wait"](flags, first)
         counts = [c["rs"].slot_first(tab, u + 1) - f for u, f in zip(ucs, firsts)]
         mids = [mid_operands(c, f, k) for f, k in zip(firsts, counts)]
         for q in range_constexpr(len(svs)):
             scale_block_store(c, svs[q], sl + q * sw)
-        loads = down_weights(c, tasks, rnd + 1, slots, nu)
         for i in range_constexpr(slots):
             for j in range_constexpr(n):
                 down_mfma(
@@ -1336,6 +1337,8 @@ def moe_context(s, rs, lds, mb, bases, layout, scratch, args, rank, sym):
         "put_bf": mb.put_bf,
         "put_words": mb.put_words,
         "poll": mb.poll,
+        "poll_issue": mb.poll_issue,
+        "poll_wait": mb.poll_wait,
         "tag": mb.tag,
         "peer_addr": lambda p: bases[p],
         "rank": rank,

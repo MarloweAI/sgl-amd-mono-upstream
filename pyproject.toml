@@ -18,3 +18,7 @@ sgl_amd_mono = "sgl_amd_mono:register_specs"
 
 [tool.setuptools.packages.find]
 include = ["sgl_amd_mono*"]
+
+# HIP sources a model's glue builds at first use (sgl_amd_mono.common.hip_ext)
+[tool.setuptools.package-data]
+"*" = ["*.hip", "*.h"]

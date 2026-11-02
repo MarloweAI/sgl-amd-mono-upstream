@@ -157,13 +157,18 @@ def gemv_mfmas(c, k, xl, xsl, red, ops, split=None, tiled=False, rows=16, nsteps
 # SGLang's mxfp8_gemv chains per wave and sums in wave order; a chain here plays one wave
 
 
-def chain_slots(c, nsteps, waves):
-    """This wave's chains (w, w + WAVES, ...): [(chain, [(step, live)])]."""
+def chain_slots(c, nsteps, waves, first=0, count=None):
+    """This wave's chains of the ``count`` from ``first`` (first + w, first + w + WAVES, ...):
+    [(chain, [(step, live)])]; a wave past them is dead, its slot past the ``waves`` chains'."""
     per = (nsteps + waves - 1) // waves
+    count = waves if count is None else count
     out = []
-    for i in range((waves + WAVES - 1) // WAVES):
-        ch = c["wave"] + WAVES * i
-        out.append((ch, [(ch * per + j, ch * per + j < nsteps) for j in range(per)]))
+    for i in range((count + WAVES - 1) // WAVES):
+        k = c["wave"] + WAVES * i
+        ch = first + k
+        mine = k < count
+        steps = [(ch * per + j, mine & (ch * per + j < nsteps)) for j in range(per)]
+        out.append((mine.select(ch, waves + k - count), steps))
     return out
 
 
@@ -208,12 +213,12 @@ def chain_store(c, red, accs, slots):
         fx.ptr_store(acc, red + (ch * 64 + c["lane"]) * 4)
 
 
-def chain_sum(red, r, t, order):
-    """Row r, token t: the chains' partials summed one by one in ``order``."""
+def chain_sum(red, r, t, order, tot=None):
+    """Row r, token t: the chains' partials summed one by one in ``order`` (onto ``tot``)."""
     at = lambda w: red + ((w * 64 + 16 * (r // 4) + t) * 4 + r % 4)  # noqa: E731
-    tot = fx.ptr_load(at(order[0]))
-    for w in order[1:]:
-        tot = tot + fx.ptr_load(at(w))
+    for w in order:
+        v = fx.ptr_load(at(w))
+        tot = v if tot is None else tot + v
     return tot
 
 
@@ -276,8 +281,11 @@ def _store_span(c, regs, width, dst, n, lrow=None):
         if const_expr((i + 1) * rpr <= n and rpr * wq == THREADS):
             fx.ptr_store(regs[i], base + i * rpr * lrow)
         else:
-            if (row0 + rpr * i < n) & (tid < rpr * wq):
-                fx.ptr_store(regs[i], base + i * rpr * lrow)
+            # rows past n hold row n - 1 (``rows_loads`` clamps), stored over it, and a
+            # thread past a round's rows holds the next round's row: no branch, which let
+            # the compiler sink the round's load behind the weights' loads issued after it
+            row = fx.min(row0 + rpr * i, n - 1)
+            fx.ptr_store(regs[i], dst + (row * lrow + col * 4))
 
 
 def rows_store(c, regs, words, groups, xl, xsl, n, row_w=None, row_g=None):
