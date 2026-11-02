@@ -295,7 +295,11 @@ def main():
         # a settled residual: no post owed, the seam reads only the residual
         xk, postk, combk = (x, post, comb) if fold else (res, res, res)
         # DSpark's capture of the layer, which K1 writes beside its residual
-        aux = torch.full((M, HIDDEN), float("nan"), dtype=torch.bfloat16, device=dev)
+        # a column block of the packed captures, as the forward hands it out
+        packed = torch.full(
+            (M, 3 * HIDDEN), float("nan"), dtype=torch.bfloat16, device=dev
+        )
+        aux = packed[:, HIDDEN : 2 * HIDDEN]
 
         def launch():
             # the FFN launch moves the epoch; K1 alone must not see the last launch's tags
@@ -304,7 +308,7 @@ def main():
                 res.data_ptr(), xk.data_ptr(), postk.data_ptr(), combk.data_ptr(), pre.data_ptr(),
                 m.hc_ffn_fn.data_ptr(), m.hc_ffn_scale.data_ptr(), m.hc_ffn_base.data_ptr(),
                 m.ffn_norm.data_ptr(),
-                r.res_mid.data_ptr(), aux.data_ptr(), r.post_a.data_ptr(), r.comb_a.data_ptr(),
+                r.res_mid.data_ptr(), aux.data_ptr(), aux.stride(0), r.post_a.data_ptr(), r.comb_a.data_ptr(),
                 r.pre_a.data_ptr(), kw["wqkv"].data_ptr(), a["wqkv_s"].data_ptr(), a["q_norm"].data_ptr(), a["kv_norm"].data_ptr(),
                 kw["wqb"].data_ptr(), a["wqb_s"].data_ptr(), cos_sin.data_ptr(), pos.data_ptr(),
                 slot.data_ptr(), 1, swa.data_ptr(), swa.stride(0), BLOCK, 0, 0, 0, 0, 0, 0, r.q.data_ptr(),
@@ -350,6 +354,9 @@ def main():
             got = records(swa, slot.long())
             # the mean SGLang's DSpark takes of the layer's input residual
             want_aux = r.res_mid[:M][own].mean(dim=1)
+            # the blocks beside this layer's stay unwritten
+            diff["aux"] += int(packed[:, :HIDDEN].isnan().logical_not().sum())
+            diff["aux"] += int(packed[:, 2 * HIDDEN :].isnan().logical_not().sum())
             diff["aux"] += int(
                 (aux[own].view(torch.int16) != want_aux.view(torch.int16)).sum()
             )

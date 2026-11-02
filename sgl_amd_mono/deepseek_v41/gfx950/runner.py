@@ -615,7 +615,7 @@ class DSV41MonoRunner:
         keys: tuple,  # int32 [>= M, ...]: window slots, window lengths, top-k slots, top-k lengths
         index: bool = False,
         tok_par: bool = False,
-        aux: torch.Tensor | None = None,  # [>= M, 5120] bf16: DSpark's capture
+        aux: torch.Tensor | None = None,  # [>= M, 5120] bf16, any row stride: a capture
     ):
         """Run K1: the pending post, this layer's attention seam and the attention front.
 
@@ -641,9 +641,16 @@ class DSV41MonoRunner:
                 "post": (post, HC, f32),
                 "comb": (comb, HC * HC, f32),
             }
-        if aux is not None:
-            want["aux"] = (aux, HIDDEN, bf)
         check_rows("K1", M, self.device, want)
+        if aux is not None and not (
+            aux.dtype == bf
+            and aux.shape[0] >= M
+            and aux.shape[-1] == HIDDEN
+            and aux.stride(-1) == 1
+            and aux.stride(0) % 8 == 0
+            and aux.device == self.device
+        ):
+            raise RuntimeError(f"K1 aux: {tuple(aux.shape)} {aux.stride()} {aux.dtype}")
         if not fold:  # unread: the seam takes the residual as it is
             x = post = comb = residual
         for name, t, dtypes in (
@@ -690,6 +697,7 @@ class DSV41MonoRunner:
             w.norm.data_ptr(),
             self.res_mid.data_ptr(),
             0 if aux is None else aux.data_ptr(),
+            HIDDEN if aux is None else aux.stride(0),
             self.post_a.data_ptr(),
             self.comb_a.data_ptr(),
             self.pre_a.data_ptr(),

@@ -121,7 +121,7 @@ def slice_input(c, task, idx):
                     bo.buffer_store(
                         means[k].to(fx.BFloat16),
                         rsrc(a["aux_out"]),
-                        t * HIDDEN + c0 + cc + k,
+                        t * a["aux_stride"] + c0 + cc + k,
                     )
 
 
