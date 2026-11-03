@@ -129,10 +129,11 @@ def _bytes(name: str, t: torch.Tensor, shape: tuple) -> torch.Tensor:
     return t.view(torch.uint8)
 
 
-def experts_reason(layer) -> Optional[str]:
-    """Why the layer's routed experts are not in the layout the launch reads, or None.
-    It reads AITER's A4W4 layout: (16, 16)-shuffled MXFP4 gate rows, then up rows,
-    and 3-D e8m0_shuffle scales (the GU-interleaved A16W4 layout keeps them 2-D)."""
+def experts_reason(layer, inter: int) -> Optional[str]:
+    """Why the layer's routed or shared experts are not in a layout the launch reads,
+    or None. It reads AITER's A4W4 layout: (16, 16)-shuffled MXFP4 gate rows, then up
+    rows, and 3-D e8m0_shuffle scales (the GU-interleaved A16W4 layout keeps them
+    2-D); an unfused shared expert as ``_shared_rows`` takes it."""
     experts = layer.mlp.experts
     w13, s13 = experts.w13_weight, experts.w13_weight_scale
     if not getattr(w13, "is_shuffled", False):
@@ -141,6 +142,11 @@ def experts_reason(layer) -> Optional[str]:
         return (
             "needs the A4W4 expert layout (gate rows, then up rows), not GU-interleaved"
         )
+    if layer.mlp.num_fused_shared_experts == 0:
+        try:
+            _shared_rows(layer, inter)
+        except ValueError as e:
+            return str(e)
     return None
 
 
@@ -165,15 +171,43 @@ def _mxfp4_rows(name: str, linear, rows: int, k: int):
     return w.view(torch.uint8).contiguous(), sc.view(torch.uint8).contiguous()
 
 
+def _shared_rows(layer, inter: int):
+    """An unfused shared expert as SGLang keeps it: (gate | up, its scale, down, its
+    scale), row-major bf16 [2 I, HIDDEN] and [HIDDEN, I] with scales None, or
+    row-major MXFP4 (``_mxfp4_rows``)."""
+    shared = layer.mlp.shared_experts
+    gate_up, down = shared.gate_up_proj, shared.down_proj
+    if gate_up.weight.dtype == torch.bfloat16:
+        bf16 = (torch.bfloat16,)
+        return (
+            _need(
+                "shared_experts.gate_up_proj.weight",
+                gate_up.weight,
+                (2 * inter, HIDDEN),
+                bf16,
+            ),
+            None,
+            _need(
+                "shared_experts.down_proj.weight", down.weight, (HIDDEN, inter), bf16
+            ),
+            None,
+        )
+    return (
+        *_mxfp4_rows("gate_up_proj", gate_up, 2 * inter, HIDDEN),
+        *_mxfp4_rows("down_proj", down, HIDDEN, inter),
+    )
+
+
 def _shared_expert(layer, i: int, inter: int, copies: dict):
-    """The shared expert of an unfused layer (SGLang fuses it only at TP4 and TP8),
-    packed once as one expert of AITER's MoE layout."""
+    """The shared expert of an unfused layer (SGLang fuses it only at TP4 and TP8, and
+    only an MXFP4 one): bf16 views, or MXFP4 packed once as one expert of AITER's MoE
+    layout."""
     from .packing import pack_shared_expert
 
-    shared = layer.mlp.shared_experts
-    gate_up = _mxfp4_rows("gate_up_proj", shared.gate_up_proj, 2 * inter, HIDDEN)
-    down = _mxfp4_rows("down_proj", shared.down_proj, HIDDEN, inter)
-    packed = pack_shared_expert(*gate_up, *down)
+    rows = _shared_rows(layer, inter)
+    if rows[1] is None:
+        return rows
+    packed = pack_shared_expert(*rows)
     for name, t in zip(("w_ug", "s_ug", "w_dn", "s_dn"), packed):
         copies["shared expert packed", i, name] = t
     return packed
@@ -181,11 +215,12 @@ def _shared_expert(layer, i: int, inter: int, copies: dict):
 
 def layer_weights(layer, i: int, inter: int, copies: dict):
     """The MoE side: the routed experts as stored, the router packed once and its
-    bias in f32, and the shared expert as the fused expert slot or a packed copy."""
+    bias in f32, and the shared expert as the fused expert slot, a packed copy or bf16
+    views."""
     from .packing import pack_bf16
     from .runner import FlashFfnWeights
 
-    why = experts_reason(layer)
+    why = experts_reason(layer, inter)
     if why is not None:
         raise ValueError(why)
     mlp, experts = layer.mlp, layer.mlp.experts
@@ -402,7 +437,7 @@ def kda_weights(layer, i: int, tp: int, copies: dict):
 
 def dense_weights(layer, i: int, tp: int, copies: dict):
     """A dense layer's FFN side: its MLP's gate | up and down as SGLang keeps them,
-    block FP8 (row-major or AITER-shuffled, the same for both), and the FFN mHC."""
+    both block FP8 (row-major or AITER-shuffled) or both bf16, and the FFN mHC."""
     from .runner import FlashDenseWeights
 
     mlp = layer.mlp
@@ -413,10 +448,8 @@ def dense_weights(layer, i: int, tp: int, copies: dict):
         )
     w_ug, s_ug, ug_sh = _proj("mlp.gate_up_proj", mlp.gate_up_proj, 2 * inter, HIDDEN)
     w_dn, s_dn, dn_sh = _proj("mlp.down_proj", mlp.down_proj, HIDDEN, inter)
-    if s_ug is None or s_dn is None:
-        raise ValueError("needs the dense MLP as block FP8, got bf16")
-    if ug_sh != dn_sh:
-        raise ValueError("needs the dense MLP's gate | up and down in one FP8 layout")
+    if (s_ug is None, ug_sh) != (s_dn is None, dn_sh):
+        raise ValueError("needs the dense MLP's gate | up and down in one format")
     return FlashDenseWeights(
         w_ug=w_ug,
         s_ug=s_ug,

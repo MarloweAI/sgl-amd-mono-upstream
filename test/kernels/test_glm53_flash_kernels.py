@@ -10,7 +10,11 @@ the TP size builds. The dense launch's MLP output is within the spec's bound of 
 MLP on its own FFN input, on shuffled and row-major FP8 alike; the launch from the
 step's tokens equals the dense launch on the gathered embedding rows and writes the
 spec's step tables, for steps of fewer rows than the width too; the tail's logits
-match a torch tail and an f32 tail, back-to-back tails included."""
+match a torch tail and an f32 tail, back-to-back tails included. With bf16 weights (the
+dense MLP, the shared expert and the sparse attention's projections, as a checkpoint
+that keeps them in bf16 loads them) each launch kind runs as above, its graph replays bitwise, the
+dense MLP and the shared expert are within their bounds of f32 ones, and the bf16
+projections match the FP8 ones on the same weights."""
 
 import subprocess
 import sys
@@ -60,6 +64,9 @@ class TestMonoGlm53FlashKernels(CustomTestCase):
         # 4 rows (TP2 builds no wider launch), the last a pad row
         for kind in ("ffn", "kda", "dsa", "dense", "embed", "head"):
             self._check("--kind", kind, "--rows", "4", "--pad-rows", "1", "--writes")
+        for kind in ("ffn", "kda", "dsa", "dense", "embed"):
+            args = ("--kind", kind, "--rows", "4", "--pad-rows", "1", "--writes")
+            self._check(*args, "--bf16")
 
     def test_shuffled_fp8_projections_match_row_major(self):
         for kind in ("dsa", "dense"):
@@ -82,6 +89,9 @@ class TestMonoGlm53FlashKernels(CustomTestCase):
                 "20",
                 widths=(2, 4, 8),
             )
+        for kind, layers in (("kda", 4), ("dsa", 4), ("dense", 2)):
+            args = ("--kind", kind, "--layers", str(layers), "--replays", "20")
+            self._check(*args, "--bf16", widths=(2, 4, 8))
         # back-to-back tails: each writes its logits in the slot the last did not
         self._check(
             "--kind", "head", "--layers", "4", "--replays", "20", widths=(2, 4, 8)
@@ -89,6 +99,13 @@ class TestMonoGlm53FlashKernels(CustomTestCase):
 
     def test_dense_mlp_matches_an_fp32_mlp(self):
         self._check("--kind", "dense", "--check-dense", widths=(2, 4, 8))
+        self._check("--kind", "dense", "--check-dense", "--bf16", widths=(2, 4, 8))
+
+    def test_bf16_shared_expert_matches_an_fp32_one(self):
+        self._check("--kind", "ffn", "--check-shared", "--bf16", widths=(2, 4, 8))
+
+    def test_bf16_projections_match_fp8_ones(self):
+        self._check("--kind", "dsa", "--compare-bf16", widths=(2, 4, 8))
 
     def test_the_launch_from_the_tokens_matches_the_dense_launch(self):
         # 3 of 4 rows: the width's last row a pad row

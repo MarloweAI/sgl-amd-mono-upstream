@@ -14,7 +14,10 @@ input; ``--check-embed``: the launch from the tokens equals the dense launch on 
 gathered embedding rows, and writes the spec's step tables (``--step-rows``: the
 step's rows, fewer than the width); ``--check-head``: the tail's logits against a
 torch tail and an f32 tail; ``--replays N``: a graph of ``--layers`` launches
-replays the eager step bitwise."""
+replays the eager step bitwise. ``--bf16``: the dense MLP, the shared expert and the
+sparse attention's projections in bf16 (``as_bf16``), with ``--check-shared``: the
+shared expert against an f32 one; ``--compare-bf16``: a sparse-attention launch on bf16
+projections against the FP8 one on the same weights."""
 
 import argparse
 import os
@@ -23,6 +26,7 @@ import sys
 import torch
 import torch.distributed as dist
 
+from sgl_amd_mono.glm53_flash.check import _dequant
 from sgl_amd_mono.glm53_flash.gfx950.config import (
     DENSE_INTER,
     GLOBAL_INTER,
@@ -173,6 +177,52 @@ def _fp8_block(w):
     s = wb.abs().amax((1, 3)) / 448.0 + 1e-12
     q = (wb / s[:, None, :, None]).to(torch.float8_e4m3fn)
     return q.view(R, K), s.contiguous()
+
+
+def as_bf16(w, rank: int, tp: int, device):
+    """``w`` as a checkpoint with bf16 FFN and attention weights loads it: a dense MLP
+    or the sparse attention's projections dequantized to row-major bf16, or a random
+    bf16 shared expert (every rank builds the same; this rank's shard) for the MXFP4
+    one."""
+    from msgspec.structs import replace
+
+    from sgl_amd_mono.glm53_flash.gfx950.runner import (
+        FlashDenseWeights,
+        FlashDsaWeights,
+    )
+
+    if isinstance(w, FlashDenseWeights):
+        assert not w.shuffled
+        return replace(
+            w,
+            w_ug=_dequant(w.w_ug, w.s_ug, False).bfloat16(),
+            s_ug=None,
+            w_dn=_dequant(w.w_dn, w.s_dn, False).bfloat16(),
+            s_dn=None,
+        )
+    if isinstance(w, FlashDsaWeights):
+        assert not any(w.shuffled)
+        return replace(
+            w,
+            w_qkv=_dequant(w.w_qkv, w.s_qkv, False).bfloat16(),
+            s_qkv=None,
+            w_qb=_dequant(w.w_qb, w.s_qb, False).bfloat16(),
+            s_qb=None,
+            w_o=_dequant(w.w_o, w.s_o, False).bfloat16(),
+            s_o=None,
+        )
+    g = _gen(10, device)
+    full, inter = GLOBAL_INTER, GLOBAL_INTER // tp
+    lo, hi = rank * inter, (rank + 1) * inter
+    gu = torch.randn(2 * full, HIDDEN, generator=g, device=device) * HIDDEN**-0.5
+    dn = torch.randn(HIDDEN, full, generator=g, device=device) * full**-0.5
+    return replace(
+        w,
+        w_sh_ug=torch.cat([gu[lo:hi], gu[full + lo : full + hi]]).bfloat16(),
+        s_sh_ug=None,
+        w_sh_dn=dn[:, lo:hi].bfloat16().contiguous(),
+        s_sh_dn=None,
+    )
 
 
 def dsa_weights(rank: int, tp: int, device):
@@ -789,6 +839,7 @@ def build(args, kind, rank, tp, group, device, layers=1, shuffled=False):
 
     kda, dsa = kind in ("kda", "dense", "embed"), kind == "dsa"
     dense = kind in ("dense", "embed")
+    fp8 = not (args.bf16 and dsa)
     key = FlashBuild(
         rows=args.rows,
         tp=tp,
@@ -800,8 +851,12 @@ def build(args, kind, rank, tp, group, device, layers=1, shuffled=False):
         qkv_shuffled=shuffled and dsa,
         qb_shuffled=shuffled and dsa,
         o_shuffled=shuffled and dsa,
+        qkv_fp8=fp8,
+        qb_fp8=fp8,
+        o_fp8=fp8,
         dense=dense,
         dense_shuffled=shuffled and dense,
+        ffn_bf16=args.bf16 and kind != "head",
         tokens=kind == "embed",
         head=kind == "head",
         stop=False,
@@ -817,6 +872,9 @@ def build(args, kind, rank, tp, group, device, layers=1, shuffled=False):
     ffn = ffn or ffn_weights(rank, tp, device)
     attn = kda_weights(rank, tp, device) if kda else None
     attn = dsa_weights(rank, tp, device) if dsa else attn
+    if args.bf16:
+        ffn = as_bf16(ffn, rank, tp, device)
+        attn = as_bf16(attn, rank, tp, device) if dsa else attn
     emb = embedding(rank, tp, device)[0] if kind == "embed" else None
     if kind == "ffn":
         x = x / tp  # the FFN launch takes this rank's unreduced attention share
@@ -929,15 +987,6 @@ def check_replays(args, rank, tp, group, device) -> bool:
     return ok and not any(words) and agree
 
 
-def _dequant(w, s, shuffled: bool) -> torch.Tensor:
-    """A block-FP8 weight (row-major or AITER (16, 16)-shuffled) in f32."""
-    n, k = w.shape
-    if shuffled:
-        w = w.view(torch.uint8).reshape(n // 16, k // 32, 2, 16, 16)
-        w = w.permute(0, 3, 1, 2, 4).reshape(n, k).view(torch.float8_e4m3fn)
-    return w.float() * s.repeat_interleave(128, 0).repeat_interleave(128, 1)
-
-
 def _rel(a, b) -> float:
     a, b = a.float(), b.float()
     return ((a - b).norm() / b.norm()).item()
@@ -950,8 +999,8 @@ DENSE_X_VS_FP32 = 1.2e-2
 def check_dense(args, rank, tp, group, device) -> bool:
     """A dense launch's MLP output against an f32 MLP (dequantized weights, the
     clamped SwiGLU) on the launch's own FFN input, summed over the ranks: within the
-    spec's ``dense.x_vs_fp32.rel``. With one rank's down scales doubled the launch
-    must fail it (negative control)."""
+    spec's ``dense.x_vs_fp32.rel``. With one rank's down scales (bf16: down weights)
+    doubled the launch must fail it (negative control)."""
     import msgspec
 
     from sgl_amd_mono.glm53_flash.gfx950.config import SWIGLU_LIMIT
@@ -962,7 +1011,9 @@ def check_dense(args, rank, tp, group, device) -> bool:
         rt, launches, _, ins = build(args, "dense", rank, tp, group, device)
         op, kw = launches[0]
         w = op.w
-        if control and rank == 0:
+        if control and rank == 0 and w.s_dn is None:
+            op.w = msgspec.structs.replace(w, w_dn=w.w_dn * 2)
+        elif control and rank == 0:
             op.w = msgspec.structs.replace(w, s_dn=w.s_dn * 2)
         out = op.launch(*ins, **kw)
         torch.cuda.synchronize()
@@ -980,6 +1031,119 @@ def check_dense(args, rank, tp, group, device) -> bool:
         f"rank {rank}: dense x vs f32 MLP rel {results[0]:.3e} (bound "
         f"{DENSE_X_VS_FP32}); one rank's down scales x2: {results[1]:.3e} (caught "
         f"{results[1] > DENSE_X_VS_FP32})",
+        flush=True,
+    )
+    return ok
+
+
+# the bf16 shared expert's output against an f32 one: its bf16 roundings
+SHARED_X_VS_FP32 = 1.2e-2
+
+
+def check_shared(args, rank, tp, group, device) -> bool:
+    """FFN launches with a bf16 shared expert and the routed experts muted (their down
+    scales 2^-127): the output against an f32 shared expert on the launch's own FFN
+    input, summed over the ranks, within ``SHARED_X_VS_FP32``; the launch's mid against
+    ``check.shared_mid_fp32`` within the spec's ``kda.shared_mid_vs_fp32.rel``. With
+    rank 0's shared down doubled the first must fail, with its gate | up doubled the
+    second on rank 0 (negative controls)."""
+    from msgspec.structs import replace
+
+    from sgl_amd_mono.glm53_flash import check
+    from sgl_amd_mono.glm53_flash.spec import NUMERICS
+
+    assert args.bf16
+    mid_bound = NUMERICS.bounds["kda.shared_mid_vs_fp32.rel"]
+    torch.backends.cuda.matmul.allow_tf32 = False
+    valid = args.rows - args.pad_rows
+    rels = []
+    for control in (None, "down", "gate_up"):
+        rt, launches, _, ins = build(args, "ffn", rank, tp, group, device)
+        op, kw = launches[0]
+        w = op.w = replace(op.w, s_dn=torch.zeros_like(op.w.s_dn))
+        if control == "down" and rank == 0:
+            op.w = replace(w, w_sh_dn=w.w_sh_dn * 2)
+        if control == "gate_up" and rank == 0:
+            op.w = replace(w, w_sh_ug=w.w_sh_ug * 2)
+        out = op.launch(*ins, **kw)
+        torch.cuda.synchronize()
+        mid32 = check.shared_mid_fp32(w, ffn_input(rt, args.rows))
+        x32 = mid32 @ w.w_sh_dn.float().T
+        dist.all_reduce(x32)
+        mid = check.shared_mid(rt, args.rows)
+        rels.append(
+            (_rel(out[0][:valid], x32[:valid]), _rel(mid[:valid], mid32[:valid]))
+        )
+        rt.close()
+    (x, mid), (x_down, _), (_, mid_gu) = rels
+    ok = x <= SHARED_X_VS_FP32 < x_down and mid <= mid_bound
+    ok = ok and (rank != 0 or mid_gu > mid_bound)
+    print(
+        f"rank {rank}: shared x vs f32 rel {x:.3e} (bound {SHARED_X_VS_FP32}), mid "
+        f"{mid:.3e} (bound {mid_bound}); rank 0 down x2: x {x_down:.3e}, gate | up x2: "
+        f"mid {mid_gu:.3e}; {ok}",
+        flush=True,
+    )
+    return ok
+
+
+# a sparse-attention launch on bf16 projections against the FP8 one: the FP8 and bf16
+# MFMA units sum the same products in other groupings
+BF16_VS_FP8 = 1e-3
+
+
+def compare_bf16(args, rank, tp, group, device) -> bool:
+    """A sparse-attention launch on bf16 projections against the FP8 launch on the same
+    weights (FP8 values times power-of-two block scales, exact in bf16): the streams
+    after its attention and the MLA cache rows it writes within ``BF16_VS_FP8``. With
+    every rank's bf16 o_proj doubled the streams must part, with its kv_a rows scaled
+    by 0.5 to 1.5 the MLA cache rows (negative controls)."""
+    from msgspec.structs import astuple, replace
+
+    from sgl_amd_mono.glm53_flash.gfx950.config import KV_LORA, Q_LORA
+    from sgl_amd_mono.glm53_flash.gfx950.kernel import FlashBuild
+    from sgl_amd_mono.glm53_flash.gfx950.layout import ROW_POS, ROW_SLOT
+    from sgl_amd_mono.glm53_flash.gfx950.runner import FlashLayerOp, FlashRuntime
+
+    key = FlashBuild(
+        rows=args.rows,
+        tp=tp,
+        launches_per_step=1,
+        inter=GLOBAL_INTER // tp,
+        dsa=True,
+        max_pools=args.max_pools,
+        stop=False,
+    )
+    key16 = replace(key, qkv_fp8=False, qb_fp8=False, o_fp8=False)
+    w = dsa_weights(rank, tp, device)
+    pow2 = lambda s: torch.exp2(torch.round(torch.log2(s)))  # noqa: E731
+    w = replace(w, s_qkv=pow2(w.s_qkv), s_qb=pow2(w.s_qb), s_o=pow2(w.s_o))
+    w16 = as_bf16(w, rank, tp, device)
+    ffn = ffn_weights(rank, tp, device)
+    x, res, post, comb = layer_inputs(args.rows, device)
+    caches, table, pt = dsa_caches(args.rows, device)
+    slots = table[table[:, ROW_POS] >= 0, ROW_SLOT].long()
+    kv_a = w16.w_qkv.clone()
+    kv_a[Q_LORA:] *= torch.linspace(0.5, 1.5, KV_LORA, device=device)[:, None]
+    controls = (replace(w16, w_o=w16.w_o * 2), replace(w16, w_qkv=kv_a))
+    results = []
+    for k, weights in ((key, w), (key16, w16), *((key16, c) for c in controls)):
+        rt = FlashRuntime(k, rank, group, device)
+        rt.set_deadline(args.deadline)
+        op = FlashLayerOp(rt, ffn, 0, dsa=weights)
+        c = type(caches)(*(t.clone() for t in astuple(caches)))
+        out = op.launch(x, res, post, comb, caches=c, rows=table, page_table=pt)
+        torch.cuda.synchronize()
+        results.append((out[1].clone(), c.kv_cache[slots].clone()))
+        rt.close()
+    (r8, kv8), (r16, kv16), (bad_o, _), (_, bad_kv) = results
+    streams, kv = _rel(r16, r8), _rel(kv16, kv8)
+    o_control, kv_control = _rel(bad_o, r8), _rel(bad_kv, kv8)
+    ok = max(streams, kv) <= BF16_VS_FP8 < min(o_control, kv_control)
+    print(
+        f"rank {rank}: bf16 vs FP8 projections: streams rel {streams:.3e}, MLA cache "
+        f"rows rel {kv:.3e} (bound {BF16_VS_FP8}); o_proj x2: streams "
+        f"{o_control:.3e}; kv_a rows scaled: MLA cache rows {kv_control:.3e}; {ok}",
         flush=True,
     )
     return ok
@@ -1136,6 +1300,9 @@ def main() -> int:
     ap.add_argument("--check-dense", action="store_true")
     ap.add_argument("--check-embed", action="store_true")
     ap.add_argument("--check-head", action="store_true")
+    ap.add_argument("--check-shared", action="store_true")
+    ap.add_argument("--compare-bf16", action="store_true")
+    ap.add_argument("--bf16", action="store_true", help="bf16 FFN and projections")
     ap.add_argument("--replays", type=int, default=0, help="graph replays of a step")
     ap.add_argument("--layers", type=int, default=1, help="launches a step (--replays)")
     ap.add_argument("--pad-rows", type=int, default=0, help="trailing pad rows")
@@ -1156,6 +1323,8 @@ def main() -> int:
         (args.check_dense, check_dense),
         (args.check_embed, check_embed),
         (args.check_head, check_head),
+        (args.check_shared, check_shared),
+        (args.compare_bf16, compare_bf16),
         (args.replays, check_replays),
     ):
         if flag:

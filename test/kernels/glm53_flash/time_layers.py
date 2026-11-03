@@ -6,17 +6,19 @@
 One HIP graph holds a step of launches, inputs chained layer to layer, every row
 live. Each layer has its own random weights (``check_layer.py``'s, seeded by layer,
 so they stream from HBM as in a served step), its own state or caches, and every
-sparse-attention row sits at position ``--pos``. ``--kind model`` is the served
-step: layers 3 to 43 in model order (30 KDA, 11 sparse attention) on one runtime a
-kind; ``--kind full`` the whole served step as the spec builds it: layer 0 from the
-step's tokens, the dense layers 1 and 2, layers 3 to 44, then the tail. ``kda``,
-``dsa``, ``dense``, ``embed`` (layer 0 from the tokens) and ``head`` (the tail) run
-``--layers`` launches of one kind; each ``embed`` and ``head`` launch takes the step's
-input, the others the previous launch's output. FP8 projections are read in place (AITER's (16, 16) layout), or row-major with
-``--row-major``. After an eager step and 20 warm-up replays, each of ``--trials``
-trials replays the graph ``--reps`` times; rank 0 prints per-launch microseconds
-(trial time / (reps x launches)): the median, minimum and maximum over trials, the
-slowest rank's median, and whether every error word stayed clean."""
+sparse-attention row sits at position ``--pos``. ``--kind model`` is the served step:
+layers 3 to 43 in model order (30 KDA, 11 sparse attention) on one runtime a kind;
+``--kind full`` the whole served step as the spec builds it: layer 0 from the step's
+tokens, the dense layers 1 and 2, layers 3 to 44, then the tail. ``kda``, ``dsa``,
+``dense``, ``embed`` (layer 0 from the tokens) and ``head`` (the tail) run
+``--layers`` launches of one kind; each ``embed`` and ``head`` launch takes the
+step's input, the others the previous launch's output. FP8 projections are read in
+place (AITER's (16, 16) layout), or row-major with ``--row-major``; with ``--bf16``
+the dense MLP, the shared expert and the sparse attention's projections are bf16
+(``check_layer.as_bf16``). After an eager step and 20 warm-up replays, each of
+``--trials`` trials replays the graph ``--reps`` times; rank 0 prints per-launch
+microseconds (trial time / (reps x launches)): the median, minimum and maximum over
+trials, the slowest rank's median, and whether every error word stayed clean."""
 
 import argparse
 import gc
@@ -57,7 +59,7 @@ def _build(args, kinds: list, rows: int, rank: int, tp: int, group, device):
         FlashRuntime,
     )
 
-    shuffled = not args.row_major
+    shuffled = not (args.row_major or args.bf16)
     runtimes = {}
     for kind in sorted(set(kinds)):
         dsa, head = kind == "dsa", kind == "head"
@@ -70,11 +72,15 @@ def _build(args, kinds: list, rows: int, rank: int, tp: int, group, device):
             kda=not (dsa or head),
             dsa=dsa,
             max_pools=args.max_pools if dsa else 0,
+            qkv_fp8=not args.bf16,
+            qb_fp8=not args.bf16,
+            o_fp8=not args.bf16,
             qkv_shuffled=shuffled and dsa,
             qb_shuffled=shuffled and dsa,
             o_shuffled=shuffled and dsa,
             dense=dense,
             dense_shuffled=shuffled and dense,
+            ffn_bf16=args.bf16 and not head,
             tokens=kind == "embed",
             head=head,
         )
@@ -93,6 +99,7 @@ def _build(args, kinds: list, rows: int, rank: int, tp: int, group, device):
             continue
         if kind in ("dense", "embed"):
             ffn = cl.dense_weights(rank, tp, device, shuffled)
+            ffn = cl.as_bf16(ffn, rank, tp, device) if args.bf16 else ffn
             attn = cl.kda_weights(rank, tp, device)
             state, idx = cl.kda_state(rows, tp, device)
             embedding = cl.embedding(rank, tp, device)[0] if kind == "embed" else None
@@ -104,6 +111,7 @@ def _build(args, kinds: list, rows: int, rank: int, tp: int, group, device):
             extra.append(kw)
             continue
         ffn = cl.ffn_weights(rank, tp, device)
+        ffn = cl.as_bf16(ffn, rank, tp, device) if args.bf16 else ffn
         if kind == "kda":
             attn = cl.kda_weights(rank, tp, device)
             state, idx = cl.kda_state(rows, tp, device)
@@ -113,6 +121,8 @@ def _build(args, kinds: list, rows: int, rank: int, tp: int, group, device):
             attn = cl.dsa_weights(rank, tp, device)
             if shuffled:
                 attn = cl.shuffled_copy(attn)
+            if args.bf16:
+                attn = cl.as_bf16(attn, rank, tp, device)
             caches, table, pt = cl.dsa_caches(rows, device, [args.pos + 1] * rows)
             ops.append(FlashLayerOp(runtimes[kind], ffn, n, dsa=attn))
             extra.append(dict(caches=caches, rows=table, page_table=pt))
@@ -175,7 +185,8 @@ def _time(args, rows: int, rank: int, tp: int, group, device) -> None:
     if rank == 0:
         print(
             f"TIME kind={args.kind} rows={rows} tp={tp} launches={len(kinds)} "
-            f"pos={args.pos} fp8={'row-major' if args.row_major else 'in-place'} "
+            f"pos={args.pos} weights="
+            f"{'bf16' if args.bf16 else 'row-major' if args.row_major else 'in-place'} "
             f"us_per_launch median={median:.2f} min={min(per_launch):.2f} "
             f"max={max(per_launch):.2f} "
             f"slowest_rank_median={max(m for m, _ in medians):.2f} "
@@ -209,6 +220,7 @@ def main() -> int:
     ap.add_argument("--pos", type=int, default=2047, help="sparse-attention position")
     ap.add_argument("--max-pools", type=int, default=262144, help="1M-token context")
     ap.add_argument("--row-major", action="store_true", help="row-major FP8 weights")
+    ap.add_argument("--bf16", action="store_true", help="bf16 FFN and projections")
     args = ap.parse_args()
     rank, tp = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))

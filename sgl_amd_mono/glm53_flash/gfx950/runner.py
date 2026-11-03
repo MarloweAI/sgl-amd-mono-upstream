@@ -23,7 +23,8 @@ from .layout import DSA_TAB, ROW_WORDS, STEP_TAB
 
 class FlashFfnWeights(msgspec.Struct, frozen=True):
     """One layer's MoE-side tensors as the kernel reads them; ``*_sh_*`` is the
-    shared expert, a slice of the routed tensors or a packed copy."""
+    shared expert: MXFP4, a slice of the routed tensors or a packed copy, or row-major
+    bf16 gate | up [2 I, HIDDEN] and down [HIDDEN, I] (scales None)."""
 
     w_r: torch.Tensor  # router [288, HIDDEN] bf16, packed in 16 x 64 MFMA tiles
     bias: torch.Tensor  # [288] f32
@@ -32,9 +33,9 @@ class FlashFfnWeights(msgspec.Struct, frozen=True):
     w_dn: torch.Tensor
     s_dn: torch.Tensor
     w_sh_ug: torch.Tensor
-    s_sh_ug: torch.Tensor
+    s_sh_ug: Optional[torch.Tensor]
     w_sh_dn: torch.Tensor
-    s_sh_dn: torch.Tensor
+    s_sh_dn: Optional[torch.Tensor]
     hc_fn: torch.Tensor  # [24, 4 * HIDDEN] f32: the FFN mHC
     hc_scale: torch.Tensor  # [3] f32
     hc_base: torch.Tensor  # [24] f32
@@ -44,12 +45,13 @@ class FlashFfnWeights(msgspec.Struct, frozen=True):
 class FlashDenseWeights(msgspec.Struct, frozen=True):
     """One dense layer's FFN tensors: the merged gate | up [2 I, HIDDEN] and down
     [HIDDEN, I], FP8 E4M3 with f32 128 x 128 block scales, row-major or in AITER's
-    (16, 16) preshuffled layout (``shuffled``); the FFN mHC and its norm weight."""
+    (16, 16) preshuffled layout (``shuffled``), or row-major bf16 (scales None); the
+    FFN mHC and its norm weight."""
 
     w_ug: torch.Tensor
-    s_ug: torch.Tensor
+    s_ug: Optional[torch.Tensor]
     w_dn: torch.Tensor
-    s_dn: torch.Tensor
+    s_dn: Optional[torch.Tensor]
     hc_fn: torch.Tensor
     hc_scale: torch.Tensor
     hc_base: torch.Tensor
@@ -282,6 +284,9 @@ class FlashLayerOp:
             raise ValueError(
                 f"dense weights (shuffled {weights.shuffled}) on another runtime"
             )
+        bf16 = (weights.s_ug if key.dense else weights.s_sh_ug) is None
+        if bf16 != key.ffn_bf16:
+            raise ValueError(f"FFN weights (bf16 {bf16}) on another runtime")
         if (embedding is None) == key.tokens:
             raise ValueError(
                 "a launch from the tokens needs the embedding, and only it"
@@ -428,7 +433,7 @@ class FlashLayerOp:
         _check("post", post, (S, HC_MULT, 1), torch.float32)
         _check("comb", comb, (S, HC_MULT, HC_MULT), torch.float32)
         x_out, res_out, post_out, comb_out = rt.outs[self.layer % 2]
-        p = lambda t: t.data_ptr()  # noqa: E731
+        p = lambda t: 0 if t is None else t.data_ptr()  # noqa: E731
         kda_args = [0] * 17
         dsa_args = [0, 0, 0, 0]
         if self.dsa is not None:

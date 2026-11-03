@@ -267,6 +267,9 @@ class FlashBuild(msgspec.Struct, frozen=True):
     # down in AITER's (16, 16) preshuffled layout with dense_shuffled
     dense: bool = False
     dense_shuffled: bool = False
+    # row-major bf16 instead of FP8 or MXFP4: with dense the dense MLP, else the shared
+    # expert, which then runs its own bf16 passes beside the routed experts
+    ffn_bf16: bool = False
     # the model's tail instead of a layer
     head: bool = False
     # with kda: the step's first launch, from the step's tokens
@@ -285,7 +288,8 @@ def build_flash_kernel(key: FlashBuild):
     The shared expert is read from ``w_sh_*`` (one expert each), not the routed
     tensors, so it may be fused into them or stored apart.
 
-    With ``dense`` (and ``kda``) the FFN is the dense FP8 SwiGLU MLP of layers 0-2.
+    With ``dense`` (and ``kda``) the FFN is the dense SwiGLU MLP of layers 0-2, FP8
+    or bf16 (``ffn_bf16``).
     With ``head`` the launch is the model's tail: the owed mHC post, the stream mean,
     the final RMSNorm (``g_norm``), this rank's LM-head rows (``w_r``) and the logits'
     all-gather into ``x_out`` (f32 [S, VOCAB]). With ``tokens`` (and ``kda``) the
@@ -304,7 +308,7 @@ def build_flash_kernel(key: FlashBuild):
     assert not kda or S <= 8
     assert not (kda and dsa)
     assert not dense or (kda and dn_tile(S) == HIDDEN // BLOCKS)
-    assert not head or not (kda or dsa)
+    assert not head or not (kda or dsa or key.ffn_bf16)
     assert not tokens or (kda and W > 1)
     assert not dsa or (S <= 8 and max_pools % POOLS_PER_TASK == 0)
     SH = FlashShard(W)
@@ -317,12 +321,13 @@ def build_flash_kernel(key: FlashBuild):
     QKV8, QB8, O8 = key.qkv_fp8, key.qb_fp8, key.o_fp8
     QKV_SH, QB_SH, O_SH = key.qkv_shuffled, key.qb_shuffled, key.o_shuffled
     DENSE_SH = key.dense_shuffled
+    F16 = key.ffn_bf16
     whole = kda or dsa
     assert W <= guard.FLAG_WORDS
     if head:
         name = kernel_symbol("glm53_flash_tail", s=S, tp=W)
     else:
-        extra = {k: 1 for k, on in (("n", dense), ("e", tokens)) if on}
+        extra = {k: 1 for k, on in (("n", dense), ("e", tokens), ("b", F16)) if on}
         name = kernel_symbol(
             "glm53_flash_layer",
             s=S,
@@ -368,19 +373,23 @@ def build_flash_kernel(key: FlashBuild):
     # input (ug), the seam tile (x_attn + R', R after the layer's own attention, the
     # tile's mix weights), every row's MXFP8 mid (down); with KDA every row's bf16
     # attention input (inproj) and o (oproj); with DSA the attention input, q_a, a
-    # split tile, the pool select
+    # split tile, the pool select; with a bf16 shared expert every row's bf16 FFN input
+    # (its gate | up) and its mid past the routed slots' (down)
     X_WORDS = max(
         HIDDEN // 2 + 64,
         S * HIDDEN // 4,
         S * ROW_TILE * (1 + 2 * HC_MULT) + HC_MULT * N_MIX * (ROW_TILE + 4),
         down_x_words(S, expert_inter),
-        S * HIDDEN // 2 if whole or head else 0,
+        S * HIDDEN // 2 if whole or head or F16 else 0,
         S * SH.dense_inter // 2 if dense else 0,
         S * P // 2 if kda else 0,
         S * KDA_DIM if kda else 0,
         S * MH * V_DIM // 2 if dsa else 0,
         SPLIT_WORDS if dsa else 0,
         SEL_BINS + 2 * 2048 if dsa else 0,
+        down_x_words(S, expert_inter) + S * expert_inter // 2
+        if F16 and not dense
+        else 0,
     )
     SEL_CAP = (X_WORDS - SEL_BINS) // 2
     # the routed up/gate tiles' sums go past the rows' MXFP8 input in X when they fit
@@ -1673,10 +1682,12 @@ def build_flash_kernel(key: FlashBuild):
         # 16-byte polls a thread holds at once when staging a projection's rows
         STAGE_GROUP = 8
 
-        def unit_rm(w_rsrc, row0, kc, K, rows, b_word):
+        def unit_rm(w_rsrc, row0, kc, K, rows, b_word, r=None):
             """One 64-K bf16 MFMA unit of a row-major [rows, K] weight; rows past the
-            end load the last row and are dropped by the caller."""
-            r = fx.min(row0 + lane % 16, rows - 1)
+            end load the last row and are dropped by the caller. ``r``: the lane's row
+            in place of row0 + lane % 16."""
+            if const_expr(r is None):
+                r = fx.min(row0 + lane % 16, rows - 1)
             wv = [
                 fx.Vector(
                     bo.buffer_load(
@@ -2247,11 +2258,11 @@ def build_flash_kernel(key: FlashBuild):
                         QKV_SH,
                     )
 
-                pre = [u8(c) for c in range(4)]
+                pre = [u8(c) for c in range(QKV_CPW)]
                 wait_ready("box_a_in")
                 stage_plain(mb("a_in"), HIDDEN)
                 gpu.barrier()
-                acc = run_units(u8, QKV_CPW, 4, pre)
+                acc = run_units(u8, QKV_CPW, QKV_CPW, pre)
 
                 def emit_qkv(rl, n, v):
                     row = row0 + rl
@@ -2483,11 +2494,10 @@ def build_flash_kernel(key: FlashBuild):
                         QB_SH,
                     )
 
-                QB_AHEAD = min(QB_CPW, 4)
-                pre = [u_qb(c) for c in range(QB_AHEAD)]
+                pre = [u_qb(c) for c in range(QB_CPW)]
                 stage_rows(mb("q_an"), Q_LORA)
                 gpu.barrier()
-                acc = run_units(u_qb, QB_CPW, QB_AHEAD, pre)
+                acc = run_units(u_qb, QB_CPW, QB_CPW, pre)
                 reduce_rows(2, acc, emit_out(QB_TILE))
                 gpu.barrier()
                 if tid < S * QB_TILE // 4:
@@ -3589,7 +3599,7 @@ def build_flash_kernel(key: FlashBuild):
                 ),
                 OK,
                 O8_CPW,
-                min(4, O8_CPW),
+                min(4 if O8 else 8, O8_CPW),
             )
 
         def run_dsa():
@@ -3818,14 +3828,16 @@ def build_flash_kernel(key: FlashBuild):
         else:
             run_seam("seam", "ffn")
         run_gate("gate", "ffn")
-        # ======== dense MLP (layers 0-2): FP8 gate | up + clamped SiLU, FP8 down + TP reduce
-        # bf16 activations; gate and up rounded to bf16 as SGLang's GEMM stores them, mid
-        # rounded to bf16 as its activation stores it
+        # ======== dense MLP (layers 0-2): FP8 or bf16 gate | up + clamped SiLU, down +
+        # TP reduce. bf16 activations; gate and up rounded to bf16 as SGLang's GEMM
+        # stores them, mid rounded to bf16 as its activation stores it
         DI = SH.dense_inter
         DXW = HIDDEN // 2
-        DUG_CPW = HIDDEN // FP8_BLOCK // (WAVES // 2)
+        # K values a weight unit holds: an FP8 block or 64 bf16 values
+        DKC = 64 if F16 else FP8_BLOCK
+        DUG_CPW = HIDDEN // DKC // (WAVES // 2)
         DUG_AHEAD = DUG_CPW if S <= 4 else DUG_CPW // 2
-        DDN_KB = DI // FP8_BLOCK
+        DDN_KB = DI // DKC
         DDN_CPW = -(-DDN_KB // WAVES)
 
         def store_x(s, row, v0, v1):
@@ -3834,6 +3846,23 @@ def build_flash_kernel(key: FlashBuild):
                 _rsrc(x_out),
                 s * HIDDEN + row,
             )
+
+        def silu_pair(gate_at, up_at, rounded):
+            """The clamped SiLU of the gate and up sums at LDS ``outs`` words
+            gate_at(j) and up_at(j), j = 0, 1; ``rounded``: both rounded to bf16 first,
+            as SGLang's bf16 GEMM stores them."""
+            mids = []
+            for j in range_constexpr(2):
+                g = lds_ld(outs, gate_at(j))
+                if const_expr(rounded):
+                    g = bf16_round(g)
+                g = fx.min(g, SWIGLU_LIMIT)
+                v = lds_ld(outs, up_at(j))
+                if const_expr(rounded):
+                    v = bf16_round(v)
+                v = fx.min(fx.max(v, -SWIGLU_LIMIT), SWIGLU_LIMIT)
+                mids.append(g * _rcp(1.0 + _exp(-g)) * v)
+            return mids
 
         def run_dense():
             r_gu, r_gus = _rsrc(w_ug), _rsrc(s_ug)
@@ -3845,15 +3874,15 @@ def build_flash_kernel(key: FlashBuild):
 
                 def u_gu(c):
                     kb = (wave % (WAVES // 2)) * DUG_CPW + c
-                    return unit_fp8_rm(
+                    return proj_unit(
+                        not F16,
                         r_gu,
                         r_gus,
                         row0,
                         kb,
                         HIDDEN,
                         2 * DI,
-                        n_sel() * DXW + kb * 64,
-                        HIDDEN // FP8_BLOCK,
+                        n_sel() * DXW,
                         DENSE_SH,
                     )
 
@@ -3867,22 +3896,11 @@ def build_flash_kernel(key: FlashBuild):
                 if tid < S * DUG_TILE // 2:
                     n = tid // (DUG_TILE // 2)
                     r = (tid % (DUG_TILE // 2)) * 2
-                    mids = []
-                    for j in range_constexpr(2):
-                        g = fx.min(
-                            bf16_round(lds_ld(outs, n * 2 * DUG_TILE + r + j)),
-                            SWIGLU_LIMIT,
-                        )
-                        v = fx.min(
-                            fx.max(
-                                bf16_round(
-                                    lds_ld(outs, n * 2 * DUG_TILE + DUG_TILE + r + j)
-                                ),
-                                -SWIGLU_LIMIT,
-                            ),
-                            SWIGLU_LIMIT,
-                        )
-                        mids.append(g * _rcp(1.0 + _exp(-g)) * v)
+                    mids = silu_pair(
+                        lambda j: n * 2 * DUG_TILE + r + j,
+                        lambda j: n * 2 * DUG_TILE + DUG_TILE + r + j,
+                        True,
+                    )
                     put(
                         mb("dmid"),
                         (n * DI + t * DUG_TILE + r) // 2,
@@ -3899,15 +3917,15 @@ def build_flash_kernel(key: FlashBuild):
                     kb = wave * DDN_CPW + c
                     if const_expr(DDN_KB % WAVES):
                         kb = fx.min(kb, DDN_KB - 1)
-                    unit = unit_fp8_rm(
+                    unit = proj_unit(
+                        not F16,
                         r_dn,
                         r_dns,
                         row0,
                         kb,
                         DI,
                         HIDDEN,
-                        n_sel() * (DI // 2) + kb * 64,
-                        DDN_KB,
+                        n_sel() * (DI // 2),
                         DENSE_SH,
                     )
                     if const_expr(DDN_KB % WAVES):
@@ -4039,14 +4057,17 @@ def build_flash_kernel(key: FlashBuild):
         SH_EARLY = S * N_ROUTER + N_SH <= G
         u = start("ug")
         has_sh = u < N_SH
-        r_sh = bo.create_buffer_resource_from_addr(
-            w_sh_ug, num_records_bytes=has_sh.select(fx.Int32(UG_W_BYTES), fx.Int32(0))
-        )
-        r_sh_s = bo.create_buffer_resource_from_addr(
-            s_sh_ug, num_records_bytes=has_sh.select(fx.Int32(UG_S_BYTES), fx.Int32(0))
-        )
-        w_rg = ((lane % 16) // 8) * (expert_inter // 16) + u // 2
-        w_ln = (lane & -16) | ((u % 2) * 8 + lane % 8)
+        if const_expr(not F16):
+            r_sh = bo.create_buffer_resource_from_addr(
+                w_sh_ug,
+                num_records_bytes=has_sh.select(fx.Int32(UG_W_BYTES), fx.Int32(0)),
+            )
+            r_sh_s = bo.create_buffer_resource_from_addr(
+                s_sh_ug,
+                num_records_bytes=has_sh.select(fx.Int32(UG_S_BYTES), fx.Int32(0)),
+            )
+            w_rg = ((lane % 16) // 8) * (expert_inter // 16) + u // 2
+            w_ln = (lane & -16) | ((u % 2) * 8 + lane % 8)
         bias_c = load_bias()
 
         def sh_units():
@@ -4064,7 +4085,48 @@ def build_flash_kernel(key: FlashBuild):
                 for k in range(UG_KU)
             ]
 
-        if const_expr(SH_EARLY):
+        def sh_mid():
+            """Every row's clamped SiLU of the task's 8 gate and 8 up sums (``outs``)
+            -> ``mid``: f32, or with F16 bf16 pairs of bf16-rounded gate and up, as
+            SGLang's unquantized path rounds them."""
+            if tid < S * UG8 // 2:
+                n = tid // (UG8 // 2)
+                r = (tid % (UG8 // 2)) * 2
+                mids = silu_pair(
+                    lambda j: n * 16 + r + j, lambda j: n * 16 + UG8 + r + j, F16
+                )
+                box = mb("mid")
+                i = n * expert_inter + u * UG8 + r
+                if const_expr(F16):
+                    put(box, i // 2, bf16_pair(mids[0], mids[1]))
+                else:
+                    put2(box, i, mids[0], mids[1])
+
+        if const_expr(F16):
+            # the bf16 shared expert's task on the gate's bf16 rows, before the
+            # activation blocks take the LDS: 8 gate rows (MFMA rows 0-7) and the same 8
+            # up rows, the whole K
+            if has_sh:
+                SH_CPW = HIDDEN // 64 // WAVES
+                r_s16 = _rsrc(w_sh_ug)
+                s_row = ((lane % 16) // 8) * expert_inter + u * UG8 + lane % 8
+
+                def u_sh(c):
+                    kc = wave * SH_CPW + c
+                    return unit_rm(
+                        r_s16, 0, kc, HIDDEN, 0, n_sel() * DXW + kc * 32, s_row
+                    )
+
+                pre = [u_sh(c) for c in range(SH_CPW)]
+                wait_ready("box_a")
+                stage_rows(mb("a"), HIDDEN)
+                gpu.barrier()
+                acc = run_units(u_sh, SH_CPW, SH_CPW, pre)
+                reduce_rows(1, acc, emit_out(16))
+                gpu.barrier()
+                sh_mid()
+                gpu.barrier()
+        elif const_expr(SH_EARLY):
             sh_pre = sh_units()
 
         # the activation blocks are the gate's, ready with its row: a CTA idle since the
@@ -4084,26 +4146,18 @@ def build_flash_kernel(key: FlashBuild):
                 stage_all_xq()
         else:
             stage_all_xq()
-        if const_expr(not SH_EARLY):
+        if const_expr(not SH_EARLY and not F16):
             sh_pre = sh_units()
         if has_sh:
-            gpu.barrier()
-            reduce_rows(
-                1, mma_units([fx.Float32(0.0) for _ in range(4)], sh_pre), emit_out(16)
-            )
-            gpu.barrier()
-            if tid < S * UG8 // 2:
-                n = tid // (UG8 // 2)
-                r = (tid % (UG8 // 2)) * 2
-                mids = []
-                for j in range_constexpr(2):
-                    g = fx.min(lds_ld(outs, n * 16 + r + j), SWIGLU_LIMIT)
-                    v = fx.min(
-                        fx.max(lds_ld(outs, n * 16 + UG8 + r + j), -SWIGLU_LIMIT),
-                        SWIGLU_LIMIT,
-                    )
-                    mids.append(g * _rcp(1.0 + _exp(-g)) * v)
-                put2(mb("mid"), n * expert_inter + u * UG8 + r, mids[0], mids[1])
+            if const_expr(not F16):
+                gpu.barrier()
+                reduce_rows(
+                    1,
+                    mma_units([fx.Float32(0.0) for _ in range(4)], sh_pre),
+                    emit_out(16),
+                )
+                gpu.barrier()
+                sh_mid()
             if (u == 0) & (tid < S):
                 put(mb("sel"), tid * MOE_SLOTS, fx.Int32(SHARED))
                 put(mb("prob"), tid * MOE_SLOTS, fx.Float32(1.0))
@@ -4245,6 +4299,12 @@ def build_flash_kernel(key: FlashBuild):
         DN_W_BYTES = HIDDEN * expert_inter // 2
         DN_S_BYTES = HIDDEN * (expert_inter // 32)
         DN_NKC = expert_inter // 64
+        # with F16 the MXFP4 units are the routed slots' (slot 1 ..); the shared
+        # expert's bf16 down has its own units, its rows' mid at LDS word SM_OFF
+        RS = 1 if F16 else 0
+        SM_OFF = down_x_words(S, expert_inter)
+        SDN_CPW = -(-DN_NKC // WAVES)
+        assert not F16 or DN_TILE == 16
         for t in range(start("down"), N_DN_TILES, G):
             t = fx.Int32(t)
             gpu.barrier()
@@ -4255,7 +4315,7 @@ def build_flash_kernel(key: FlashBuild):
             dn_lr = gu * 16 + lane % 16 - dn_off
             dn_ln = ((dn_lr >= 0) & (dn_lr < DN_TILE)).select(lane, lane ^ 8)
 
-            DN_NU = S * MOE_SLOTS * DN_NKC // 2
+            DN_NU = S * (MOE_SLOTS - RS) * DN_NKC // 2
             DN_UPW = (DN_NU + DN_WPR - 1) // DN_WPR
             # poll specs a thread: word pairs of the routed slots' MXFP8 mid, their
             # exponents, value pairs of the shared expert's mid
@@ -4292,8 +4352,14 @@ def build_flash_kernel(key: FlashBuild):
                 live = qu < DN_NU
                 unit = fx.min(qu, DN_NU - 1)
                 q = unit * 2  # 64-k chunk index over (s, slot, kc)
-                s_q = q // (MOE_SLOTS * DN_NKC)
-                slot_q = (q // DN_NKC) % MOE_SLOTS
+                s_q = q // ((MOE_SLOTS - RS) * DN_NKC)
+                slot_q = (q // DN_NKC) % (MOE_SLOTS - RS)
+                if const_expr(F16):
+                    slot_q = slot_q + 1
+                    # the unit's 128 values in the rows' MXFP8 mid, every slot's
+                    unit = (s_q * MOE_SLOTS + slot_q) * (expert_inter // 128) + unit % (
+                        expert_inter // 128
+                    )
                 e = _uniform(lds_ld(keys, s_q * MOE_SLOTS + slot_q))
                 is_sh = e == SHARED
                 wb = bo.create_buffer_resource_from_addr(
@@ -4343,13 +4409,37 @@ def build_flash_kernel(key: FlashBuild):
                     scale,
                 )
 
+            def u_sdn(c):
+                kc = k = wave * SDN_CPW + c
+                coef = None
+                # fewer K units than waves: the others load the last one and drop it
+                if const_expr(DN_NKC % WAVES):
+                    k = fx.min(kc, DN_NKC - 1)
+                    coef = (kc < DN_NKC, None)
+                fmt, wv, _, bw = unit_rm(
+                    r_sdn,
+                    t * DN_TILE,
+                    k,
+                    expert_inter,
+                    HIDDEN,
+                    SM_OFF + n_sel() * (expert_inter // 2) + k * 32,
+                )
+                return fmt, wv, coef, bw
+
             if const_expr(S <= 8):
                 pre = [u_dn(cc) for cc in range(min(DN_BATCH, DN_UPW))]
-            # every row's mid into LDS as MXFP8: the routed slots' words and exponents as
-            # up/gate published them, the shared expert's f32 values quantized here
+            if const_expr(F16):
+                r_sdn = _rsrc(w_sh_dn)
+                pre_sh = [u_sdn(c) for c in range(SDN_CPW)]
+            # every row's mid into LDS as MXFP8: the routed slots' words and exponents
+            # as up/gate published them, the shared expert's f32 values quantized here
+            # (with F16 its bf16 pairs as published)
             specs = [(mb("midq"), dn_word(q), 2) for q in range(DN_NRQ)]
             specs += [(mb("midqs"), dn_blk(q), 1) for q in range(DN_NBQ)]
-            specs += [(mb("mid"), dn_sh(q) * 2, 2) for q in range(DN_NSQ)]
+            if const_expr(F16):
+                specs += [(mb("mid"), dn_sh(q), 1) for q in range(DN_NSQ)]
+            else:
+                specs += [(mb("mid"), dn_sh(q) * 2, 2) for q in range(DN_NSQ)]
             got = poll(specs)
             for q in range_constexpr(DN_NRQ):
                 if tid + q * THREADS < S * DN_RQ:
@@ -4361,13 +4451,16 @@ def build_flash_kernel(key: FlashBuild):
             for q in range_constexpr(DN_NSQ):
                 if tid + q * THREADS < S * DN_SQ:
                     v = got[DN_NRQ + DN_NBQ + q]
-                    q0, q1, qs = quant_mxfp8(
-                        v[0].bitcast(fx.Float32), v[1].bitcast(fx.Float32)
-                    )
-                    k = dn_sh_flat(q)
-                    st_mxfp8(k, q0, q1)
-                    if lane % 16 == 0:
-                        lds_st(misc, k // 32, qs.bitcast(fx.Float32))
+                    if const_expr(F16):
+                        lds_st(xs, SM_OFF + dn_sh(q), v[0].bitcast(fx.Float32))
+                    else:
+                        q0, q1, qs = quant_mxfp8(
+                            v[0].bitcast(fx.Float32), v[1].bitcast(fx.Float32)
+                        )
+                        k = dn_sh_flat(q)
+                        st_mxfp8(k, q0, q1)
+                        if lane % 16 == 0:
+                            lds_st(misc, k // 32, qs.bitcast(fx.Float32))
             gpu.barrier()
             if const_expr(S > 8):
                 pre = [u_dn(cc) for cc in range(min(DN_BATCH, DN_UPW))]
@@ -4379,6 +4472,15 @@ def build_flash_kernel(key: FlashBuild):
 
             reduce_rows(DN_R, acc, emit_dn)
             gpu.barrier()
+            if const_expr(F16):
+                # the bf16 shared output added to the bf16 routed sum, as SGLang adds
+                # them before the TP reduce
+                def emit_sh(rl, n, v):
+                    i = n * DN_TILE + rl
+                    lds_st(outs, i, bf16_round(lds_ld(outs, i)) + bf16_round(v))
+
+                reduce_rows(1, mma_units([fx.Float32(0.0)] * 4, pre_sh), emit_sh)
+                gpu.barrier()
 
             def store_x(s, row, v0, v1):
                 bo.buffer_store(
