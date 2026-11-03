@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """The DSpark draft's vocab projection in FP8 (SGLang's FP8 lm_head path), its per-row quant
 in one launch bitwise SGLang's; only the proposals see it, the target verifies in bf16.
-``SGLANG_AMD_MONO_DSV41_DRAFT_HEAD_FP8=0`` keeps the bf16 projection."""
+Off by default, as SGLang's ``SGLANG_ROCM_OPT_DSPARK_FP8_LM_HEAD``: it lowers the
+acceptance more than it saves. ``SGLANG_AMD_MONO_DSV41_DRAFT_HEAD_FP8=1`` turns it on."""
 
 from __future__ import annotations
 
@@ -98,7 +99,7 @@ def _project(orig, hidden, lm_head):
 
 
 def install() -> None:
-    if not flag(ENV) or torch.version.hip is None:
+    if not flag(ENV, default="0") or torch.version.hip is None:
         return
     import importlib
 

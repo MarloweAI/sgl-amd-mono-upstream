@@ -2,6 +2,7 @@
 // Adapted from AKLR (https://github.com/AMD-AGI/AKLR, MIT, Copyright (C) 2025-2026 Advanced Micro Devices, Inc.).
 // Every DSpark draft stage's SWA KV of a verify's committed target hidden in one launch (grid rows x stages), the bytes
 // of SGLang's fused_k_norm_rope_flashmla (main_norm_rope.cuh) per stage: the same sums in the same order.
+#include <algorithm>
 #include <cstdint>
 #include <optional>
 
@@ -37,7 +38,7 @@ struct Params {
     const int32_t *loc; // null: the committed slots below
     const int64_t *cache_loc, *map;
     const int32_t *commit;
-    int64_t map_n;
+    int64_t map_n, positions;
     int width, rows, stages, page_bits;
     int64_t page_bytes;
     float eps;
@@ -73,6 +74,7 @@ template <bool V41> __global__ void __launch_bounds__(THREADS) swa_store_kernel(
     const int warp = tx / LANES, lane = tx % LANES;
     const bfloat16 *x = p.kv + row * p.kv_stride + stage * p.stage_stride;
     const int64_t position = p.pos_i32 ? static_cast<const int32_t *>(p.pos)[row] : static_cast<const int64_t *>(p.pos)[row];
+    if (position < 0 || position >= p.positions) return;
     int loc = -1;
     if (p.loc != nullptr) {
         loc = p.loc[row];
@@ -151,6 +153,7 @@ void swa_store_op(const at::Tensor &kv, int64_t stage_stride, at::TensorList wei
     TORCH_CHECK(page_size > 0 && (page_size & (page_size - 1)) == 0);
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA guard(kv.device());
     Params p{};
+    p.positions = INT64_MAX;
     for (int64_t s = 0; s < stages; ++s) {
         TORCH_CHECK(weights[s].scalar_type() == at::kBFloat16 && weights[s].numel() == DIM && weights[s].is_contiguous());
         TORCH_CHECK(freqs[s].scalar_type() == at::kFloat && freqs[s].dim() == 2 && freqs[s].size(1) == ROPE &&
@@ -160,6 +163,7 @@ void swa_store_op(const at::Tensor &kv, int64_t stage_stride, at::TensorList wei
         p.weight[s] = static_cast<const bfloat16 *>(weights[s].data_ptr());
         p.freqs[s] = freqs[s].data_ptr<float>();
         p.cache[s] = static_cast<uint8_t *>(caches[s].data_ptr());
+        p.positions = std::min(p.positions, freqs[s].size(0));
     }
     if (cache_loc.has_value()) {
         TORCH_CHECK(mapping.has_value() && commit.has_value() && width > 0 && rows % width == 0);
@@ -184,6 +188,7 @@ void swa_store_op(const at::Tensor &kv, int64_t stage_stride, at::TensorList wei
     p.rows = static_cast<int>(rows);
     p.stages = static_cast<int>(stages);
     p.page_bits = __builtin_ctzll(page_size);
+    TORCH_CHECK(caches[0].size(0) * page_size <= INT32_MAX, "SWA slots past int32");
     p.page_bytes = caches[0].stride(0);
     p.eps = static_cast<float>(eps);
     if (rows == 0) return;

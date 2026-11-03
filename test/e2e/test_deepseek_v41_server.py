@@ -166,6 +166,11 @@ class TestMonokernelVerify(_Serving, CustomTestCase):
         "size [1, 2, 3, 4, 5, 6, 7, 8] x 6 tokens",
         "monokernel deepseek_v41_dspark_draft_hip on gfx950 runs target_verify steps "
         "of batch size [1, 2, 3, 4, 5, 6, 7, 8",
+        # the glue under real acceptance, its GSM8K and KL checks below
+        "DSV4.1 glue verify_meta: one launch",
+        "DSV4.1 glue draft_block_meta: one launch",
+        "DSV4.1 glue inject_store: one launch",
+        "DSV4.1 glue post_combine: one launch",
     )
 
     def test_long_prompts_match_prefill(self):
