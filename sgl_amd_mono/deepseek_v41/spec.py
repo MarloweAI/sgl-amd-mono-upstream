@@ -157,9 +157,14 @@ SGLANG_READS = {
         "forward_low_ratio_sources(positions)",
         "forward_low_ratio_sources(forward_batch)",
         "forward_low_ratio_sources(run_indexer)",
-        # its projection, where K1 computed it
+        # what its fused compression reads, which KC stands in for
         "_low_ratio_compress_fused",
-        "_low_ratio_compress_fused(projected)",
+        "tail_source_kv_layer_id",
+        "low_ratio_req_indices",
+        "low_ratio_pos_i64",
+        "c2_out_loc",
+        "c1_out_loc",
+        "raw_out_loc",
     ),
     "srt/layers/attention/deepseek_v4_backend_hip_radix.py": (
         "forward_low_ratio_sources",
@@ -201,11 +206,11 @@ SGLANG_READS = {
         "weights_proj_hip_max_tokens",
         "rope_head_dim",
         "head_weight_scale",
-        # its compressor's projection, which K1 stands in for
-        "project_fused",
         # the compressor's projection weights (``_compressor_weight``)
         "use_fused_compress",
         "wkv_gate",
+        "wk",
+        "k_norm",
     ),
     "srt/layers/quantization/fp8.py": (
         "aiter_bpreshuffled",
@@ -224,7 +229,14 @@ SGLANG_READS = {
         "maybe_input_scattered",
     ),
     "srt/layers/logits_processor.py": ("forward(hidden_states_before_norm)",),
+    # the compressor state KC reads and writes
+    "srt/mem_cache/deepseek_v4_compress_state.py": (
+        "kv_score_buffer",
+        "kv_score",
+        "ring_size",
+    ),
     "srt/mem_cache/deepseek_v4_memory_pool.py": (
+        "get_attention_compress_states",
         "get_swa_raw_buffer",
         "get_swa_key_page_size",
         "get_extra_key_buffer",
@@ -233,7 +245,10 @@ SGLANG_READS = {
         "get_index_k_fp4_scale_buffer",
         "low_ratio_index_k_is_split",
         "get_index_k_page_size",
+        "uniform_fp8",
+        "low_ratio_index_k_page8",
     ),
+    "srt/model_executor/forward_batch_info.py": ("encoder_swa_replay",),
     "srt/model_executor/forward_context.py": (
         "get_attn_backend",
         "get_token_to_kv_pool",
@@ -703,7 +718,10 @@ def _weights(copies: dict, tables: list, layer, i: int) -> _Layer:
         L.k1.iw_scale = float(ix.head_weight_scale)
         cp = _compressor_weight(a)
         if cp is not None:
+            from sgl_amd_mono.deepseek_v41.gfx950.indexer.compress import wk_order
+
             L.k1.cp_w, L.k1.cp_ratio = cp, a.compress_ratio
+            L.k1.kc_wk = _keep(copies, wk_order(ix.wk.weight), "kc wk", i)
     L.k1.check(d)
     if a.wo_a.weight.dtype == e4m3:
         woa, woa_s = a.wo_a.weight, _codes(copies, i, "wo_a", a.wo_a)
@@ -801,9 +819,16 @@ def _launch(
             L.swa_block, L.comp, L.comp_block, keys, tok_par=tok_par, aux=aux,
             embed=embed,
         )  # fmt: skip
+    kc = None
+    if _kc_fused(runner=runner, L=L, M=M, tok_par=tok_par):
+        # K1 runs the source's compressor past its projection
+        kc = _kc_args(
+            runner=runner, L=L, backend=backend, forward_batch=forward_batch, M=M,
+            per_req=plan.key.tokens_per_request,
+        )  # fmt: skip
     runner.k1(
         L.k1, x, residual, post, comb, prev_pre, pos, slot, L.swa, L.swa_block,
-        keys, index=True, tok_par=tok_par, aux=aux,
+        keys, index=True, tok_par=tok_par, aux=aux, kc=kc,
     )  # fmt: skip
     _select(
         runner=runner, L=L, plan=plan, backend=backend, positions=positions,
@@ -834,14 +859,17 @@ def _select(*, runner, L, plan, backend, positions, pos, forward_batch, M) -> No
     )
 
     attn, r = L.module.self_attn, L.ratio
-    if attn.compressor is not None:
-        projected = None
-        if L.k1.cp_w is not None and runner.cp_fused(M, plan.state["tok_par"]):
-            projected = runner.cproj(M, r)  # K1 computed it
-        _compress(
-            backend, layer=attn, x=runner.normed[:M], positions=positions,
-            forward_batch=forward_batch, projected=projected,
-        )  # fmt: skip
+    if attn.compressor is not None and not _kc_fused(
+        runner=runner, L=L, M=M, tok_par=plan.state["tok_par"]
+    ):
+        backend.forward_low_ratio_sources(
+            layer=attn,
+            x=runner.normed[:M],
+            q_lora=None,
+            positions=positions,
+            forward_batch=forward_batch,
+            run_indexer=False,
+        )
     ix = attn.indexer
     if ix is None:
         return
@@ -881,9 +909,10 @@ def _select(*, runner, L, plan, backend, positions, pos, forward_batch, M) -> No
             bounds = bounds.to(torch.int32).contiguous()
         plan.state["k2i bounds", r] = bounds
     k2i, per_req = runner.k2i, plan.key.tokens_per_request
-    if kind != "reindex" and ("k2i plan", r) not in plan.state:
-        # the step's walk plan of this ratio: its FULL and producer layers share it
-        k2i.walk_plan(ratio=r, bounds=bounds, rows=M, per_req=per_req)
+    # the step's walk plan of this ratio: its first FULL or producer layer lays it out, the
+    # later ones read it
+    fill_plan = kind != "reindex" and ("k2i plan", r) not in plan.state
+    if fill_plan:
         plan.state["k2i plan", r] = True
     if L.k1.iq_w is not None and runner.iq_fused(M, plan.state["tok_par"]):
         query = (runner.iq[:M], runner.iqs[:M], runner.iw[:M])  # K1 computed it
@@ -906,6 +935,7 @@ def _select(*, runner, L, plan, backend, positions, pos, forward_batch, M) -> No
         candidates=plan.state["k2i candidates"] if kind == "reindex" else None,
         # the step's REINDEX layers share one table (same blocks, page table, bounds)
         reindex_table_built=kind == "reindex" and ("k2i reindex", r) in plan.state,
+        fill_plan=fill_plan,
     )
     if kind == "reindex":
         plan.state["k2i reindex", r] = True
@@ -913,27 +943,67 @@ def _select(*, runner, L, plan, backend, positions, pos, forward_batch, M) -> No
         plan.state["k2i candidates"] = published
 
 
-def _compress(backend, *, layer, x, positions, forward_batch, projected) -> None:
-    """SGLang's compressor of KV source ``layer`` on K1's normed rows ``x``, as its
-    low-ratio path runs it before the attention; its fused compression takes K1's
-    projection ``projected`` where given, in place of its GEMM."""
-    if projected is not None:
-        fused = backend._low_ratio_compress_fused
-        backend._low_ratio_compress_fused = lambda *a, **kw: fused(
-            *a, **{**kw, "projected": projected}
+def _kc_fused(*, runner, L, M, tok_par) -> bool:
+    """Whether K1 runs index KV source ``L``'s compressor: where it computes its projection."""
+    return (
+        L.module.self_attn.compressor is not None
+        and L.k1.cp_w is not None
+        and runner.cp_fused(M, tok_par)
+    )
+
+
+def _kc_args(*, runner, L, backend, forward_batch, M, per_req):
+    """KV source ``L``'s compressor past its projection, as SGLang's fused decode / verify
+    compression runs it (``_low_ratio_compress_fused``: its state ring, record and index-key
+    stores): K1's arguments for it (``K2iRunner.kc_args``), None on a step SGLang compresses
+    nothing (the replay tail's source, an encoder replay)."""
+    from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+
+    attn, ratio = L.module.self_attn, L.ratio
+
+    if (
+        forward_batch.encoder_swa_replay
+        or attn.layer_id == backend.tail_source_kv_layer_id
+    ):
+        return None
+    pool, i = get_token_to_kv_pool(), attn.layer_id
+    meta = backend.forward_metadata
+    core = meta.core_attn_metadata
+    out_loc = core.c2_out_loc if ratio == 2 else core.c1_out_loc
+    req, pos = meta.low_ratio_req_indices, meta.low_ratio_pos_i64
+    state = pool.get_attention_compress_states(i) if ratio == 2 else None
+    # SGLang compresses the step's live rows, as many as its hoisted positions
+    n = min(pos.shape[0], M) if pos is not None else 0
+    for name, t in (("raw_out_loc", core.raw_out_loc), ("out_loc", out_loc), ("req", req),
+                    ("positions", pos)):  # fmt: skip
+        if (
+            t is None
+            or t.dtype not in (torch.int32, torch.int64)
+            or t.shape[0] < n
+            or not t.is_contiguous()
+        ):
+            raise RuntimeError(
+                f"KC: {name} {None if t is None else (t.shape, t.dtype)} for {n} rows"
+            )
+    if pool.uniform_fp8 or pool.low_ratio_index_k_page8(i):
+        raise RuntimeError(
+            "KC: the compressed cache in V4 pages and the plain FP4 plane"
         )
-    try:
-        backend.forward_low_ratio_sources(
-            layer=layer,
-            x=x,
-            q_lora=None,
-            positions=positions,
-            forward_batch=forward_batch,
-            run_indexer=False,
-        )
-    finally:
-        if projected is not None:
-            del backend._low_ratio_compress_fused
+    ix, comp = attn.indexer, attn.compressor
+    return runner.k2i.kc_args(
+        live=n, per_req=per_req, state=None if state is None else state.kv_score_buffer.kv_score,
+        ring_size=0 if state is None else state.ring_size,
+        norm=comp.norm.weight, eps=comp.norm.eps,
+        freqs=torch.view_as_real(attn.freqs_cis).flatten(-2), pos=pos, req=req,
+        raw_loc=core.raw_out_loc, index_loc=out_loc,
+        cache=pool.get_extra_key_buffer(i).view(torch.uint8),
+        page_size=pool.get_extra_key_page_size(i), wk=L.k1.kc_wk,
+        k_norm=ix.k_norm.weight, k_eps=ix.k_norm.eps,
+        plane=(
+            pool.get_index_k_fp4_payload_buffer(i).view(torch.uint8),
+            pool.get_index_k_fp4_scale_buffer(i),
+        ),
+    )  # fmt: skip
 
 
 def _index_query(*, attn, x, q_lora, positions) -> tuple:

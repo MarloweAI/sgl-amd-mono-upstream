@@ -25,6 +25,7 @@ from .layer import (
     HIDDEN,
     K1_ARGS,
     K1_CP_ARGS,
+    K1_KC_ARGS,
     K2_ARGS,
     K2_OF_LAYER,
     LAYER_ARGS,
@@ -206,6 +207,9 @@ class K1Weights(msgspec.Struct):
     # query: wkv_gate [1024, 5120] bf16 at compress ratio 2, wkv [512, 5120] at ratio 1
     cp_w: torch.Tensor | None = None
     cp_ratio: int = 0
+    # its indexer's wk, for the rest of the compressor (``kc``): [128, 512] bf16 in KC's
+    # thread order (``compress.wk_order``)
+    kc_wk: torch.Tensor | None = None
 
     def check(self, d: Dims) -> None:
         """Raise unless the attention-front tensors have K1's layout."""
@@ -661,9 +665,10 @@ class DSV41MonoRunner:
         tok_par: bool = False,
         aux: torch.Tensor | None = None,  # [>= M, 5120] bf16, any row stride: a capture
         embed: tuple | None = None,  # (table [vocab, 5120] bf16, ids [M] int32 / int64)
+        kc: tuple | None = None,  # ``K2iRunner.kc_args``: the source's compressor
     ):
-        """K1's launch arguments by name (``K1_ARGS``, then ``K1_CP_ARGS``), after the
-        checks, and (rows, fold, iq, cp). ``embed``: the first layer, its streams each the
+        """K1's launch arguments by name (``K1_ARGS``, ``K1_CP_ARGS``, ``K1_KC_ARGS``),
+        after the checks, and (rows, fold, iq, cp). ``embed``: the first layer, its streams each the
         token's embedding row (``residual`` None)."""
         bf, f32 = torch.bfloat16, torch.float32
         ids, ids_words = None, 0
@@ -790,6 +795,8 @@ class DSV41MonoRunner:
             "iw_out": self.iw.data_ptr(),
             "cp_w": w.cp_w.data_ptr() if cp else 0,
             "cp_out": self._cproj.data_ptr(),
+            # no compressor: no live rows
+            **dict(zip(K1_KC_ARGS, kc if cp and kc else (0,) * len(K1_KC_ARGS))),
             "scratch": self.scratch(M).data_ptr(),
             "sym": self.peer.local,
             "peers": self.peer.addresses.data_ptr(),
@@ -817,6 +824,7 @@ class DSV41MonoRunner:
         tok_par: bool = False,
         aux: torch.Tensor | None = None,  # [>= M, 5120] bf16, any row stride: a capture
         embed: tuple | None = None,
+        kc: tuple | None = None,  # ``K2iRunner.kc_args``: the source's compressor
     ):
         """Run K1: the pending post, this layer's attention seam and the attention front.
 
@@ -826,14 +834,16 @@ class DSV41MonoRunner:
         write). ``index``: an index source, whose top-k comes after K1, so K1 writes
         ``normed`` and ``qr`` for the indexer and leaves the key table to K2.
         ``tok_par`` (``token_par``): the residual, post, comb and pre rows in and out
-        are this rank's alone. ``aux`` receives the residual streams' mean for DSpark."""
+        are this rank's alone. ``aux`` receives the residual streams' mean for DSpark.
+        ``kc``: where K1 computes an index KV source's compressor projection, the rest
+        of that compressor, which K1 runs too (None: it compresses nothing)."""
         args, M, fold, iq, cp = self._k1_args(
             w, x, residual, post, comb, pre, pos, slot, swa, swa_block, keys, index,
-            tok_par, aux, embed,
+            tok_par, aux, embed, kc,
         )  # fmt: skip
         _run_compiled(
             self.k1_kernel(M, fold, index, iq, cp, tok_par, embed is not None),
-            *(args[n] for n in K1_ARGS + K1_CP_ARGS),
+            *(args[n] for n in K1_ARGS + K1_CP_ARGS + K1_KC_ARGS),
             torch.cuda.current_stream(),
         )
         return (

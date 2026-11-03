@@ -14,7 +14,7 @@ import numpy as np
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu
 from flydsl.expr import math as fmath
-from flydsl.expr import range_constexpr
+from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from sgl_amd_mono.common.ops import (
@@ -29,6 +29,7 @@ from sgl_amd_mono.common.ops import (
 from sgl_amd_mono.common.plan import first_task
 from sgl_amd_mono.deepseek_v41.gfx950.stages.gemv import ld_f32, plus
 
+from ..indexer import compress
 from .device import BLOCKS, WAVES, ld_i32
 from .gemv import _step_load, _step_mfma
 from .plan import HIDDEN, Q_RANK, ROPE, ROWS
@@ -278,6 +279,7 @@ def stage_cp(c, a, t0, n, tile, ct, ctiles, part, lds, ratio):
                     fx.Vector.from_elements(vs, fx.Float32).bitcast(fx.Int32),
                     rsrc(a["cp_out"]),
                     at,
+                    cache_modifier=CM_DEV,
                 )
             else:
                 word = (
@@ -285,8 +287,13 @@ def stage_cp(c, a, t0, n, tile, ct, ctiles, part, lds, ratio):
                     .to(fx.BFloat16)
                     .bitcast(fx.Int32)[0]
                 )
-                bo.buffer_store(word, rsrc(a["cp_out"]), at // 2)
+                bo.buffer_store(word, rsrc(a["cp_out"]), at // 2, cache_modifier=CM_DEV)
+    # part 0: its columns visible device-wide, then their flag (``run_kc`` waits on it)
+    if part == 0:
+        rocdl.s_waitcnt(vmcnt=0)
     gpu.barrier()
+    if (part == 0) & (tid == 0):
+        c["mb"].put(c["cprdy"], tile * ctiles + ct, fx.Int32(1))
 
 
 @flyc.jit
@@ -308,6 +315,38 @@ def run_cp(c, a, rows, cp0, lds, ratio):
             c, a, t0, n, tile, (task // CP_PARTS) % ctiles, ctiles, task % CP_PARTS, lds,
             ratio,
         )  # fmt: skip
+
+
+def kc_context(c, ratio):
+    """``compress``'s context on this K1 CTA: its LDS the front's X tile (free past the
+    front)."""
+    return {
+        "tid": c["tid"], "lane": c["lane"], "wave": c["wave"], "lds": c["xl"], "r": ratio,
+        "tl": c.get("tl"),
+    }  # fmt: skip
+
+
+@flyc.jit
+def run_kc(c, a, rows, ratio):
+    """The rest of an index KV source's compressor (``compress.run_row``, its arguments
+    ``a``) at the end of K1: row r on CTA BLOCKS - 1 - r (the grid's last CTAs finish their
+    front first), once the projection's column tiles of its token tile and those before (a
+    verify block's row pools with the row before) are in."""
+    rc = kc_context(c, ratio)
+    row = BLOCKS - 1 - c["bid"]
+    if row < fx.min(a["live"], fx.Int32(rows)):
+        _kc_row(c, rc, a, row, ratio)
+
+
+@flyc.jit
+def _kc_row(c, rc, a, row, ratio):
+    # what the row loads past the projection, out while the flags come in
+    inputs = compress.row_inputs(rc, a, row)
+    ws = compress.wk_loads(a, c["tid"])
+    if c["tid"] < (row // 16 + 1) * (cp_cols(ratio) // 16):
+        c["mb"].poll([(c["cprdy"], c["tid"], 1)])
+    gpu.barrier()
+    compress.run_row(rc, a, row, inputs, ws)
 
 
 # ---------------------------------------------------------------- iq

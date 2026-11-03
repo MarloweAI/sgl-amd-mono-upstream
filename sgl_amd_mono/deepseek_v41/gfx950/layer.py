@@ -52,6 +52,7 @@ from .attention.plan import (
     front_scratch,
     wqkv_split,
 )
+from .indexer import compress
 from .stages import moe, seam
 from .stages.dims import Dims as StageDims
 from .stages.gemv import plus, token_tiles
@@ -300,8 +301,10 @@ K1_ARGS = (
     "ids",
     "ids_words",
 )
-# an index K1's past K1_ARGS: its compressor's projection weights and output
+# an index K1's past K1_ARGS: its compressor's projection weights and output, then the
+# rest of the compressor's arguments (``compress.KC_ARGS`` past the projection)
 K1_CP_ARGS = ("cp_w", "cp_out")
+K1_KC_ARGS = tuple(f"kc_{n}" for n in compress.KC_ARGS[1:])
 
 
 @flyc.jit
@@ -561,6 +564,14 @@ def run_k1(key: MonoBuild, sl, front, a: dict, ep, k2=None):
                 # one launch per layer: every row's record is in (the others' copied
                 # past this CTA's q flags)
                 mb_front.hand_off(c, "vrdy", t * FLAG_STRIDE)
+    if const_expr(key.cp):
+        # the rest of the compressor, on the CTAs that finish their front first, in the
+        # front's X tile
+        xl = mb_front.tile_rows(s) * mb_front.lds_row(mb_front.X_WORDS)
+        assert compress.LDS_WORDS <= xl, s
+        kc = {n: a[f"kc_{n}"] for n in compress.KC_ARGS[1:]}
+        kc.update(kv=a["cp_out"], ratio=fx.Int32(key.cp), cm=CM_DEV)
+        index_query.run_kc(c, kc, s, key.cp)
     stamp(c, 40)
 
 
@@ -657,6 +668,26 @@ def build_mono_k1(key: MonoBuild):
         ids_words: Int32,
         cp_w: Int64,
         cp_out: Int64,
+        kc_per_req: Int32,
+        kc_state: Int64,
+        kc_ring: Int32,
+        kc_norm: Int64,
+        kc_eps: Int32,
+        kc_freqs: Int64,
+        kc_pos: Int64,
+        kc_req: Int64,
+        kc_raw_loc: Int64,
+        kc_iloc: Int64,
+        kc_cache: Int64,
+        kc_page_bits: Int32,
+        kc_page_bytes: Int32,
+        kc_wk: Int64,
+        kc_knorm: Int64,
+        kc_keps: Int32,
+        kc_payload: Int64,
+        kc_pscale: Int64,
+        kc_wide: Int32,
+        kc_live: Int32,
     ):
         _ = keyed
         # every wait runs under the guard, so a timeout flags every peer and stops the launch
@@ -728,6 +759,26 @@ def build_mono_k1(key: MonoBuild):
                 "ids_words": ids_words,
                 "cp_w": cp_w,
                 "cp_out": cp_out,
+                "kc_per_req": kc_per_req,
+                "kc_state": kc_state,
+                "kc_ring": kc_ring,
+                "kc_norm": kc_norm,
+                "kc_eps": kc_eps,
+                "kc_freqs": kc_freqs,
+                "kc_pos": kc_pos,
+                "kc_req": kc_req,
+                "kc_raw_loc": kc_raw_loc,
+                "kc_iloc": kc_iloc,
+                "kc_cache": kc_cache,
+                "kc_page_bits": kc_page_bits,
+                "kc_page_bytes": kc_page_bytes,
+                "kc_wk": kc_wk,
+                "kc_knorm": kc_knorm,
+                "kc_keps": kc_keps,
+                "kc_payload": kc_payload,
+                "kc_pscale": kc_pscale,
+                "kc_wide": kc_wide,
+                "kc_live": kc_live,
             }
             run_k1(key, lds.seam.peek(), lds.front.peek(), a, _epoch(epoch))
 
@@ -787,6 +838,26 @@ def build_mono_k1(key: MonoBuild):
         ids_words: Int32,
         cp_w: Int64,
         cp_out: Int64,
+        kc_per_req: Int32,
+        kc_state: Int64,
+        kc_ring: Int32,
+        kc_norm: Int64,
+        kc_eps: Int32,
+        kc_freqs: Int64,
+        kc_pos: Int64,
+        kc_req: Int64,
+        kc_raw_loc: Int64,
+        kc_iloc: Int64,
+        kc_cache: Int64,
+        kc_page_bits: Int32,
+        kc_page_bytes: Int32,
+        kc_wk: Int64,
+        kc_knorm: Int64,
+        kc_keps: Int32,
+        kc_payload: Int64,
+        kc_pscale: Int64,
+        kc_wide: Int32,
+        kc_live: Int32,
         stream: fx.Stream = _STREAM,
     ):
         _ = keyed
@@ -845,6 +916,26 @@ def build_mono_k1(key: MonoBuild):
             ids_words,
             cp_w,
             cp_out,
+            kc_per_req,
+            kc_state,
+            kc_ring,
+            kc_norm,
+            kc_eps,
+            kc_freqs,
+            kc_pos,
+            kc_req,
+            kc_raw_loc,
+            kc_iloc,
+            kc_cache,
+            kc_page_bits,
+            kc_page_bytes,
+            kc_wk,
+            kc_knorm,
+            kc_keps,
+            kc_payload,
+            kc_pscale,
+            kc_wide,
+            kc_live,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 
     return launch

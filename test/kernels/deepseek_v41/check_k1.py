@@ -198,6 +198,7 @@ def main():
 
     from sgl_amd_mono.deepseek_v41.gfx950.attention.index_query import fused as iq_fused
     from sgl_amd_mono.deepseek_v41.gfx950.layer import (
+        K1_KC_ARGS,
         MonoBuild,
         build_mono_k1,
         scratch_layout,
@@ -342,6 +343,7 @@ def main():
                 r.peer.local, r.peer.addresses.data_ptr(), r.rank, r.epoch.data_ptr(),
                 0, 0,  # no token ids: not the first layer's embedding read
                 cp_ws[cp].data_ptr() if cp else 0, r.cproj(M, 2).data_ptr(),
+                *(0,) * len(K1_KC_ARGS),  # no compressor past the projection
                 stream=torch.cuda.current_stream(),
             )  # fmt: skip
 

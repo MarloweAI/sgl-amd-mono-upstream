@@ -19,8 +19,9 @@ from sglang.kernels.ops.attention.dsv4.candidate_blocks_hip import (
 
 from . import index_plan as ip
 from .candidate_table import PLANE_ROWS, map_compact_selection, reindex_table
+from .compress import THREADS, build_kc
 from .k2i import MAX_ROWS, build_k2i
-from .walk_plan import fill_walk_plan_device, new_plan
+from .walk_plan import new_plan
 
 # the SGLang names this module reads, pinned by test/unit/test_contract.py
 SGLANG_READS = {
@@ -100,17 +101,61 @@ class K2iRunner:
             self._kernels[rows] = build_k2i(rows)
         return self._kernels[rows]
 
-    def walk_plan(
-        self, *, ratio: int, bounds: torch.Tensor, rows: int, per_req: int
-    ) -> None:
-        """Lay out the step's FULL walk plan for compress ratio ``ratio`` from device bounds.
+    def kc_args(
+        self, *, live, per_req, state, ring_size, norm, eps, freqs, pos, req, raw_loc,
+        index_loc, cache, page_size, wk, k_norm, k_eps, plane,
+    ) -> tuple:  # fmt: skip
+        """An index KV source's compressor's arguments past its projection
+        (``compress.KC_ARGS[1:]``), for K1 (which runs it, ``index_query.run_kc``) or
+        ``compress``: the compressed record into ``cache`` (V4 pages of ``page_size`` slots,
+        ``[pages, page bytes]`` uint8) at ``raw_loc`` (>> 1 at ratio 2), the index key into
+        ``plane`` at ``index_loc``; at ratio 2 each even position parks in ``state`` (ring
+        ``ring_size``). ``pos``, ``req``, ``raw_loc``, ``index_loc``: int32 or int64 [live]:
+        the first ``live`` of the step's rows, SGLang's live rows. ``wk``: the indexer's, in
+        ``compress.wk_order``."""
+        if not (
+            wk.dtype == torch.bfloat16
+            and wk.shape == (16, THREADS, 8)
+            and wk.is_contiguous()
+        ):
+            raise RuntimeError(
+                f"KC: wk {tuple(wk.shape)} {wk.dtype}, not in KC's order"
+            )
+        if page_size & (page_size - 1):
+            raise RuntimeError(f"KC: compressed pages of {page_size} slots")
+        if not (
+            cache.dim() == 2 and cache.dtype == torch.uint8 and cache.stride(1) == 1
+        ):
+            raise RuntimeError(
+                f"KC: compressed cache {tuple(cache.shape)} {cache.dtype}"
+            )
+        payload, pscale = plane
+        arrays = (pos, req, raw_loc, index_loc)  # ``compress.INDEX_ARRAYS``
+        wide = sum(
+            int(t is not None and t.dtype == torch.int64) << k
+            for k, t in enumerate(arrays)
+        )
+        return (
+            per_req, state.data_ptr() if state is not None else 0, ring_size,
+            norm.data_ptr(), _f32_bits(eps), freqs.data_ptr(), pos.data_ptr(),
+            req.data_ptr() if req is not None else 0, raw_loc.data_ptr(),
+            index_loc.data_ptr(), cache.data_ptr(), page_size.bit_length() - 1,
+            cache.stride(0), wk.data_ptr(), k_norm.data_ptr(), _f32_bits(k_eps),
+            payload.data_ptr(), pscale.data_ptr(), wide, live,
+        )  # fmt: skip
 
-        Once a step and ratio, before its first FULL or producer layer, which both read it."""
-        fill_walk_plan_device(
-            bounds=bounds,
-            owners=self.owners[per_req - 1],
-            plan=self.plans[ratio],
-            rows=rows,
+    def compress(self, *, ratio, rows, projected, kc) -> None:
+        """The compressor of ``kc_args`` alone, in one launch, from ``projected``
+        (``project_fused`` [rows, 1024] f32 at ratio 2, ``wkv`` [rows, 512] bf16 at
+        ratio 1)."""
+        key = ("kc", rows, ratio)
+        if key not in self._kernels:
+            from ..runner import no_capture
+
+            no_capture(f"KC width {rows}")
+            self._kernels[key] = build_kc(rows, ratio)
+        _run_compiled(
+            self._kernels[key], projected.data_ptr(), *kc, torch.cuda.current_stream()
         )
 
     def select(
@@ -128,11 +173,13 @@ class K2iRunner:
         page_out: torch.Tensor,  # int32 [rows, 512]: sparse_page_indices
         candidates=None,  # a REINDEX layer's: the producer's CandidateBlocks
         reindex_table_built=False,  # a later REINDEX layer of the step: table kept
+        fill_plan=True,  # FULL / producer: the step's first of ``ratio`` lays out its walk plan
     ):
         """An index source's top-512 of each row (``kind`` in KINDS).
 
-        FULL and producer layers read the step's walk plan of ``ratio``; a producer returns its
-        candidate blocks for the step's REINDEX layers."""
+        FULL and producer layers walk the step's plan of ``ratio``, which the step's first of
+        them lays out (``fill_plan``); a producer returns its candidate blocks for the step's
+        REINDEX layers."""
         assert kind in KINDS, kind
         _check(
             rows=rows, per_req=per_req, query=query, page_table=page_table,
@@ -163,7 +210,7 @@ class K2iRunner:
                 page_out=page_out,
             )
             return None
-        logits = self.score(ratio=ratio, **inputs)
+        logits = self.score(ratio=ratio, fill_plan=fill_plan, **inputs)
         published = None
         if kind == "producer":
             published = select_candidate_blocks_hip(
@@ -183,9 +230,10 @@ class K2iRunner:
         return published
 
     def score(
-        self, *, rows, per_req, ratio, query, plane, page_table, bounds
+        self, *, rows, per_req, ratio, query, plane, page_table, bounds, fill_plan=True
     ) -> torch.Tensor:
-        """A FULL or producer layer's logits [rows, width] f32, valid below each row's bound.
+        """A FULL or producer layer's logits [rows, width] f32, valid below each row's bound
+        (``fill_plan``: laying out the step's walk plan of ``ratio`` first).
 
         ``width`` spans the page table's columns, as wide as SGLang's logits for its top-k."""
         width = min(page_table.shape[1] * PLANE_ROWS, self.bound_max)
@@ -194,7 +242,7 @@ class K2iRunner:
             rows=rows, query=query, plane=plane, plan=self.plans[ratio], itab=page_table,
             itab_stride=page_table.stride(0), itab_len=page_table.shape[1],
             ibatch=self.owners[per_req - 1], ishift=3, ibound=bounds, lstride=width,
-            reindex=0,
+            reindex=0, fill_plan=int(fill_plan),
         )  # fmt: skip
         return self.ilog[: rows * width].view(rows, width)
 
@@ -226,13 +274,13 @@ class K2iRunner:
         self._score(
             rows=rows, query=query, plane=plane, plan=self.plans[1], itab=self.cand_table,
             itab_stride=ip.TOPK_BLOCKS, itab_len=ip.TOPK_BLOCKS, ibatch=owners, ishift=0,
-            ibound=lens, lstride=COMPACT, reindex=1,
+            ibound=lens, lstride=COMPACT, reindex=1, fill_plan=0,
         )  # fmt: skip
         return self.ilog[: rows * COMPACT].view(rows, COMPACT), lens, ids
 
     def _score(
         self, *, rows, query, plane, plan, itab, itab_stride, itab_len, ibatch, ishift,
-        ibound, lstride, reindex,
+        ibound, lstride, reindex, fill_plan,
     ) -> None:  # fmt: skip
         q_fp4, q_scale, weights = query
         payload, scale = plane
@@ -240,9 +288,15 @@ class K2iRunner:
             self.kernel(rows),
             q_fp4.data_ptr(), q_scale.data_ptr(), weights.data_ptr(), payload.data_ptr(), scale.data_ptr(),
             plan.data_ptr(), itab.data_ptr(), itab_stride, itab_len, ibatch.data_ptr(), ishift,
-            ibound.data_ptr(), self.ilog.data_ptr(), lstride, reindex,
+            ibound.data_ptr(), self.ilog.data_ptr(), lstride, reindex, fill_plan,
             torch.cuda.current_stream(),
         )  # fmt: skip
+
+
+def _f32_bits(x: float) -> int:
+    import struct
+
+    return struct.unpack("<i", struct.pack("<f", x))[0]
 
 
 def _check(*, rows, per_req, query, page_table, bounds, raw_out, page_out) -> None:
