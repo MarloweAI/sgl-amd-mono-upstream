@@ -1,6 +1,6 @@
 """Check the sampled DSpark Markov block (gfx950/markov) against SGLang's arithmetic (torchrun,
-TP2 or TP4): the tokens on every rank alike, the step logits and the noise counter, eager
-and under graph replay."""
+TP2 or TP4): the tokens on every rank alike, the whole step logits of the sampled rows (a
+temperature-0 row's left unwritten) and the noise counter, eager and under graph replay."""
 
 import argparse
 import os
@@ -64,15 +64,14 @@ def main():
     g = torch.Generator(device=dev).manual_seed(7)
     w1 = (torch.randn(VOCAB, DIM, generator=g, device=dev) * 0.05).bfloat16()
     w2 = (torch.randn(VOCAB, DIM, generator=g, device=dev) * 0.5).bfloat16()
-    part = VOCAB // tp
-    padded = part + 64  # the partition's padding past the vocab
+    key, gamma, fails = 0x1234_5678_9ABC, args.gamma, []
+    part = padded = VOCAB // tp
     vocab_start = rank * part
     w2s = w2[vocab_start : vocab_start + part]
-    ops, x = markov.ops(), markov.Exchange(cpu, rank, tp, dev)
+    ops, x = markov.ops(), markov.Exchange(cpu, rank, tp, dev, gamma, part)
     scratch = torch.empty(
         markov.MAX_SEQUENCES, markov.blocks(padded), 2, dtype=torch.float32, device=dev
     )
-    key, gamma, fails = 0x1234_5678_9ABC, args.gamma, []
     for bs in range(1, markov.MAX_SEQUENCES + 1):
         gr = torch.Generator(device=dev).manual_seed(100 + 13 * rank + bs)
         base = (torch.randn(bs, gamma, padded, generator=gr, device=dev) * 3).bfloat16()
@@ -85,27 +84,37 @@ def main():
         )
         temps = torch.tensor([1.0, 0.0, 0.7, 1.3][:bs], device=dev)
         offset0 = 17 * bs
-        want, want_logits = reference(
+        want, shard_logits = reference(
             base, w1, w2s, anchor, temps, key, offset0, vocab_start, None
         )
+        every = [torch.empty_like(shard_logits) for _ in range(tp)]
+        dist.all_gather(every, shard_logits)
+        want_logits = torch.cat(every, dim=2)
+        every = [torch.empty_like(base) for _ in range(tp)]
+        dist.all_gather(every, base)
+        whole_base = torch.cat(every, dim=2).float()
+        sampled = temps != 0
         offset = torch.tensor([offset0], dtype=torch.int64, device=dev)
         out = torch.zeros(bs * gamma, dtype=torch.int64, device=dev)
-        logits = torch.zeros(bs, gamma, padded, dtype=torch.float32, device=dev)
+        logits = torch.zeros(bs, gamma, VOCAB, dtype=torch.float32, device=dev)
 
         def block():
             for s in range(gamma):
                 ops.markov_sample_step(
-                    base[:, s], w1, w2s, anchor, logits[:, s], temps, offset, key,
+                    base[:, s], w1, w2s, anchor, x.slab[:bs, s], temps, offset, key,
                     vocab_start, s, scratch, out, gamma, x.tok, x.calls, x.peers, rank,
                     s == gamma - 1, 20.0,
                 )  # fmt: skip
+            ops.markov_gather(logits, temps, x.peers, markov.EXCHANGE_BYTES, part)
 
         block()
         torch.cuda.synchronize()
         bad_tok = int((out.view(bs, gamma) != want).sum())
-        bias = (want_logits - base.float()).abs()
-        apart = (logits - want_logits).abs()
-        bad_logit = int((apart > bias * 2**-7 + 1e-6).sum())
+        bias = (want_logits - whole_base).abs()[sampled]
+        apart = (logits - want_logits).abs()[sampled]
+        bad_logit = int((apart > bias * 2**-7 + 1e-6).sum()) + int(
+            logits[~sampled].count_nonzero()
+        )
         counter = int(offset.item()) == offset0 + 1
         # graph replay: the same block, the counter put back each time
         graph = torch.cuda.CUDAGraph()
@@ -126,8 +135,9 @@ def main():
         if rank == 0:
             print(
                 f"bs={bs} {'PASS' if ok else 'FAIL'} | tokens differing {bad_tok} of "
-                f"{bs * gamma} | step logits past a bias rounding {bad_logit} | max "
-                f"{apart.max().item():.3g} | counter {counter} | replays differing "
+                f"{bs * gamma} | step logits past a bias rounding or written at "
+                f"temperature 0 {bad_logit} | max {apart.max().item():.3g} | counter "
+                f"{counter} | replays differing "
                 f"{bad_replay} | ranks alike {alike}",
                 flush=True,
             )
