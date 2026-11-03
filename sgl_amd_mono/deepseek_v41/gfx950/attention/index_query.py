@@ -69,6 +69,11 @@ def fused(s: int, tok_par: bool = False) -> bool:
     return iq_chains(s) is not None
 
 
+def iw_tasks(rows: int) -> int:
+    """The head weights' CTAs at rows rows: a (16-row tile, 16-head tile) each."""
+    return 2 * -(-rows // 16)
+
+
 # ---------------------------------------------------------------- iw
 
 
@@ -314,8 +319,7 @@ def run_iw(c, a, rows, iw0, lds, row0=0, push=None):
     parallel this rank's), a (token tile, 16-head tile) a CTA from CTA ``iw0``,
     once its rows' norms published them (``xrdy``: two flags a row, at its local
     index)."""
-    tiles = -(-rows // 16)
-    for task in range(first_task(c["bid"], iw0), 2 * tiles, BLOCKS):
+    for task in range(first_task(c["bid"], iw0), iw_tasks(rows), BLOCKS):
         t0 = (task // 2) * 16
         n = fx.min(fx.Int32(16), rows - t0)
         if c["tid"] < 2 * n:

@@ -249,7 +249,7 @@ def build_mono_k1(key: MonoBuild):
     # the index query here (``index_query``) only where it is reproduced
     assert not key.iq or (key.index and index_query.fused(s, key.tok_par)), key
     IW0 = (GATE0 + own_n) % BLOCKS  # the head weights' CTAs, past the gates'
-    iw = 2 * -(-own_n // 16) if key.iq else 0
+    iw = index_query.iw_tasks(own_n) if key.iq else 0
     QKV0 = IW0 + iw if GATE0 + 2 * own_n + iw <= BLOCKS else 0
     name = kernel_symbol(
         "dsv41_mono_k1",
