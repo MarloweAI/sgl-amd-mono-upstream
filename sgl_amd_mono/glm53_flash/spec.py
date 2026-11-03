@@ -3,14 +3,16 @@
 sgl-project/sglang#43949).
 
 Every layer is one launch for the whole decoder layer (``gfx950/kernel.py``); the
-dense layers 0 to 2 run the FP8 SwiGLU MLP in place of the MoE. Layer 0 takes the
-step's tokens (SGLang's embedding is not run) and writes the step's tables. Between
-layers the forward hands on ``_Owed`` (x, residual, post, comb): the kernel owes
-each layer's FFN post to the next layer's seam. After the last layer the tail launch
-runs the owed post, the stream mean, the final norm, the LM head and the logits'
-all-gather; SGLang's final norm is not run, and its logits processor returns the
-tail's logits (``_get_logits``) and stores the final norm's rows only when the step
-captures hidden states.
+dense layers 0 to 2 run the SwiGLU MLP in place of the MoE. The dense MLP, the shared
+expert and the sparse attention's projections run in the format SGLang loaded (FP8 or
+bf16; MXFP4 or bf16 for the shared expert), each format a build of its own. Layer 0
+takes the step's tokens (SGLang's embedding is not run) and writes the step's tables.
+Between layers the forward hands on ``_Owed`` (x, residual, post, comb): the kernel
+owes each layer's FFN post to the next layer's seam. After the last layer the tail
+launch runs the owed post, the stream mean, the final norm, the LM head and the
+logits' all-gather; SGLang's final norm is not run, and its logits processor returns
+the tail's logits (``_get_logits``) and stores the final norm's rows only when the
+step captures hidden states.
 
 A KDA pad row (state index not positive) keeps every state; a sparse-attention pad
 row (SGLang's padding slot 0) writes no cache. After each KDA launch the forward runs
@@ -18,8 +20,8 @@ SGLang's decode track-state copy for the radix cache.
 
 The kernels read SGLang's weights in place, except the copies logged at startup:
 the router packed for the MFMA tiles and its bias in f32, W_UK^T from kv_b_proj, the indexer's
-wk | weights_proj in bf16, the o_norm weight in f32, and the shared expert packed
-as one AITER expert where SGLang keeps it apart (TP2).
+wk | weights_proj in bf16, the o_norm weight in f32, and an MXFP4 shared expert
+packed as one AITER expert where SGLang keeps it apart (TP2).
 """
 
 from __future__ import annotations
@@ -200,6 +202,11 @@ NUMERICS = Numerics(
         "dense.conv.rel": 3e-3,
         "dense.state.rel": 3.5e-3,
         "dense.x_vs_fp32.rel": 1.2e-2,
+        # a bf16 shared expert's mid (this rank's) against an f32 gate | up and SwiGLU
+        # on the launch's own FFN input: the bf16 roundings of gate, up and mid; 3x the
+        # serving max (5.5e-3 over TP2 and TP4)
+        "kda.shared_mid_vs_fp32.rel": 1.7e-2,
+        "dsa.shared_mid_vs_fp32.rel": 1.7e-2,
         # the launch's FFN input against the input of SGLang's MLP (serving max
         # 6.2e-3 at TP2 and TP4)
         "dense.mlp_in.rel": 2e-2,
@@ -265,10 +272,7 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
         )
     quant = (getattr(hf_config, "quantization_config", None) or {}).get("quant_method")
     if quant != "quark":
-        reasons.append(
-            f"needs a Quark checkpoint (MXFP4 experts, FP8 block-128 attention), got "
-            f"{quant!r}"
-        )
+        reasons.append(f"needs a Quark checkpoint (MXFP4 experts), got {quant!r}")
     if importlib.util.find_spec("flydsl") is None:
         reasons.append("needs FlyDSL")
     return reasons
@@ -277,6 +281,7 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
 def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
     from sglang.srt.runtime_context import get_parallel
 
+    from sgl_amd_mono.glm53_flash.gfx950.config import GLOBAL_INTER
     from sgl_amd_mono.glm53_flash.gfx950.weights import (
         dense_weights,
         embed_weights,
@@ -319,7 +324,7 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
             except ValueError as e:
                 reasons.append(f"layer {i}: {e}")
         else:
-            why = experts_reason(layer)
+            why = experts_reason(layer, GLOBAL_INTER // tp)
             if why is not None:
                 reasons.append(f"layer {i}: {why}")
         attn = layer.self_attn
@@ -703,14 +708,22 @@ def _build(model, hf_config, ctx) -> _Built:
     (qkv8, qb8, o8), (qkv_sh, qb_sh, o_sh) = (
         dsa_formats.pop() if dsa_formats else ((True, True, True), (False,) * 3)
     )
-    dense_formats = {
-        weights[i][0].shuffled for i in layers if layers[i].kind == "dense"
-    }
-    if len(dense_formats) > 1:
-        raise ValueError(
-            "GLM-5.3-Flash monokernel: the dense MLPs' FP8 layouts differ between layers"
-        )
-    dense_sh = dense_formats.pop() if dense_formats else False
+    # (dense MLP shuffled, bf16) and the shared experts' bf16
+    ffn_formats = {}
+    for i in layers:
+        w = weights[i][0]
+        if layers[i].kind == "dense":
+            ffn_formats.setdefault("dense", set()).add((w.shuffled, w.s_ug is None))
+        else:
+            ffn_formats.setdefault("shared", set()).add(w.s_sh_ug is None)
+    for name, formats in ffn_formats.items():
+        if len(formats) > 1:
+            raise ValueError(
+                f"GLM-5.3-Flash monokernel: the {name} FFN formats differ between "
+                f"layers: {sorted(formats)}"
+            )
+    dense_sh, dense16 = ffn_formats.get("dense", {(False, False)}).pop()
+    shared16 = ffn_formats.get("shared", {False}).pop()
     # layer 0 (from the tokens) has its own runtime; the other dense layers share one
     kinds = {"embed": [0]}
     for kind in ("dense", "kda", "dsa"):
@@ -760,6 +773,7 @@ def _build(model, hf_config, ctx) -> _Built:
                 o_shuffled=o_sh,
                 dense=kind in ("dense", "embed"),
                 dense_shuffled=dense_sh if kind in ("dense", "embed") else False,
+                ffn_bf16=dense16 if kind in ("dense", "embed") else shared16,
                 tokens=kind == "embed",
                 fault_site=fault_site,
                 fault_after=fault_after,

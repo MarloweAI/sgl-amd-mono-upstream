@@ -267,9 +267,9 @@ def layout(
             ("xqs", samples * XQ_GROUPS * pair_bytes),
             ("sel", samples * MOE_SLOTS * pair_bytes),
             ("prob", samples * MOE_SLOTS * pair_bytes),
-            # the shared expert's mid (f32); the routed slots' mid as MXFP8 (4 values
-            # a word) and its E8M0 block exponents, indexed (row, slot) like the
-            # shared one's
+            # the shared expert's mid (f32; bf16 pairs for a bf16 shared expert); the
+            # routed slots' mid as MXFP8 (4 values a word) and its E8M0 block
+            # exponents, indexed (row, slot) like the shared one's
             ("mid", samples * inter * pair_bytes),
             ("midq", samples * MOE_SLOTS * inter // 4 * pair_bytes),
             ("midqs", samples * MOE_SLOTS * (inter // 32) * pair_bytes),

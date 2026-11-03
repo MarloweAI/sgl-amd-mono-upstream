@@ -217,7 +217,11 @@ def test_sglang_refuses_its_jit_grouped_topk(monkeypatch):
     assert reasons() - off == {f"{name} True is not False"}
 
 
-def _layer(kda=True, shuffled=True, scale_dims=3, fused=True, indexer=True):
+def _layer(
+    kda=True, shuffled=True, scale_dims=3, fused=True, indexer=True, shared=None
+):
+    """A MoE layer; ``shared``: an unfused shared expert's (gate | up, down) linears,
+    else SGLang's fused slot."""
     w13 = SimpleNamespace(is_shuffled=shuffled)
     experts = SimpleNamespace(
         w13_weight=w13, w13_weight_scale=torch.zeros((1,) * scale_dims)
@@ -225,9 +229,17 @@ def _layer(kda=True, shuffled=True, scale_dims=3, fused=True, indexer=True):
     attn = SimpleNamespace(
         do_fuse_qkvbfg=fused, indexer=SimpleNamespace() if indexer else None
     )
-    return SimpleNamespace(
-        is_linear_attn=kda, self_attn=attn, mlp=SimpleNamespace(experts=experts)
-    )
+    mlp = SimpleNamespace(experts=experts, num_fused_shared_experts=1)
+    if shared is not None:
+        mlp.num_fused_shared_experts = 0
+        mlp.shared_experts = SimpleNamespace(
+            gate_up_proj=shared[0], down_proj=shared[1]
+        )
+    return SimpleNamespace(is_linear_attn=kda, self_attn=attn, mlp=mlp)
+
+
+def _linear(rows, cols, dtype=torch.bfloat16):
+    return SimpleNamespace(weight=torch.zeros(rows, cols, dtype=dtype))
 
 
 def _lp(**kw):
@@ -279,6 +291,15 @@ def test_model_reasons(monkeypatch):
     layers[5] = _layer(scale_dims=2)
     layers[6] = _layer(fused=False)
     layers[7] = _layer(kda=False, indexer=False)
+    # an unfused bf16 shared expert runs; one with an MXFP4
+    # down, or of another TP's shape, is refused before packing
+    inter, hidden = 2048 // 4, 4096
+    layers[8] = _layer(shared=(_linear(2 * inter, hidden), _linear(hidden, inter)))
+    fp4 = torch.uint8
+    layers[9] = _layer(
+        shared=(_linear(2 * inter, hidden), _linear(hidden, inter // 2, fp4))
+    )
+    layers[10] = _layer(shared=(_linear(4096, hidden), _linear(hidden, 2048)))
     model.is_mrope_enabled = True
     reasons = flash.SPEC.model_disable_reasons(model, FLASH, {})
     assert [r.split(":")[0] for r in reasons] == [
@@ -287,8 +308,12 @@ def test_model_reasons(monkeypatch):
         "layer 5",
         "layer 6",
         "layer 7",
+        "layer 9",
+        "layer 10",
     ], reasons
     assert "shuffled" in reasons[1] and "GU-interleaved" in reasons[2]
+    assert "shared_experts.down_proj" in reasons[5], reasons[5]
+    assert "shared_experts.gate_up_proj" in reasons[6], reasons[6]
 
 
 def test_model_reasons_of_the_tail_the_embedding_and_the_dense_layers(monkeypatch):
@@ -365,7 +390,7 @@ def _dense_layer(tp, ug=None, dn=None, limit=10.0):
     )
 
 
-def test_the_dense_mlp_is_read_in_place_and_must_be_block_fp8():
+def test_the_dense_mlp_is_read_in_place_as_block_fp8_or_bf16():
     import pytest
 
     from sgl_amd_mono.glm53_flash.gfx950.config import DENSE_INTER, HIDDEN
@@ -377,13 +402,22 @@ def test_the_dense_mlp_is_read_in_place_and_must_be_block_fp8():
     assert w.shuffled and not copies
     assert w.w_ug.data_ptr() == layer.mlp.gate_up_proj.weight.data_ptr()
     inter = DENSE_INTER // tp
-    # a bf16 dense MLP (OneNexus-style), mixed layouts and another SwiGLU limit refuse
-    bf16 = _dense_layer(tp, ug=_fp8_linear(2 * inter, HIDDEN, dtype=torch.bfloat16))
-    with pytest.raises(ValueError, match="block FP8"):
-        dense_weights(bf16, 0, tp, copies)
+    # a bf16 dense MLP is read in place too
+    bf16 = _dense_layer(
+        tp,
+        ug=_fp8_linear(2 * inter, HIDDEN, dtype=torch.bfloat16),
+        dn=_fp8_linear(HIDDEN, inter, dtype=torch.bfloat16),
+    )
+    w = dense_weights(bf16, 0, tp, copies)
+    assert w.s_ug is None and w.s_dn is None and not w.shuffled and not copies
+    assert w.w_dn.data_ptr() == bf16.mlp.down_proj.weight.data_ptr()
+    # mixed layouts or formats and another SwiGLU limit refuse
     mixed = _dense_layer(tp, dn=_fp8_linear(HIDDEN, inter, shuffled=False))
-    with pytest.raises(ValueError, match="one FP8 layout"):
+    with pytest.raises(ValueError, match="one format"):
         dense_weights(mixed, 0, tp, copies)
+    half = _dense_layer(tp, dn=_fp8_linear(HIDDEN, inter, dtype=torch.bfloat16))
+    with pytest.raises(ValueError, match="one format"):
+        dense_weights(half, 0, tp, copies)
     with pytest.raises(ValueError, match="SwiGLU limit"):
         dense_weights(_dense_layer(tp, limit=7.0), 0, tp, copies)
 

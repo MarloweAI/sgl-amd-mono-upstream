@@ -3,7 +3,8 @@
 layer on its input (layer 0: SGLang's embedding of the step's tokens), on the caches
 as they were, and checks the kernel's outputs against it: the written streams (the
 last layer's contracted), and the state or cache rows the layer writes; a dense
-layer's MLP output also against an f32 MLP on the launch's own FFN input. The tail's
+layer's MLP output also against an f32 MLP on the launch's own FFN input, and a bf16
+shared expert's mid against an f32 one on it. The tail's
 logits are checked against SGLang's final norm and logits, and against an f32 tail.
 Each value against its ``spec.NUMERICS`` bound. Every check is logged; a miss is
 logged as a violation."""
@@ -173,8 +174,11 @@ def _all_reduce(t: torch.Tensor) -> torch.Tensor:
     return t
 
 
-def _dequant(w: torch.Tensor, s: torch.Tensor, shuffled: bool) -> torch.Tensor:
-    """A block-FP8 weight (row-major or AITER (16, 16)-shuffled) in f32."""
+def _dequant(w: torch.Tensor, s, shuffled: bool) -> torch.Tensor:
+    """A block-FP8 weight (row-major or AITER (16, 16)-shuffled), or a bf16 one (``s``
+    None), in f32."""
+    if s is None:
+        return w.float()
     n, k = w.shape
     if shuffled:
         w = w.view(torch.uint8).reshape(n // 16, k // 32, 2, 16, 16)
@@ -212,11 +216,33 @@ def dense_mlp_fp32(L, W: int, S: int) -> torch.Tensor:
     return _all_reduce(x)
 
 
+def shared_mid(rt, S: int) -> torch.Tensor:
+    """A launch's bf16 shared-expert mid (this rank's [S, I]), from its scratch."""
+    inter = rt.key.inter
+    m = rt.scratch[rt.sc["mid"] :].view(torch.int32)[: S * inter : 2]
+    return m.contiguous().view(torch.bfloat16).view(S, inter)
+
+
+def shared_mid_fp32(w, a: torch.Tensor) -> torch.Tensor:
+    """This rank's shared-expert mid in f32 (bf16 gate | up ``w.w_sh_ug``, the clamped
+    SwiGLU) on the FFN input rows ``a``."""
+    from sgl_amd_mono.glm53_flash.gfx950.config import SWIGLU_LIMIT
+
+    tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        gate, up = (a.float() @ w.w_sh_ug.float().T).chunk(2, dim=-1)
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = tf32
+    gate = gate.clamp(max=SWIGLU_LIMIT)
+    return F.silu(gate) * up.clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
+
+
 # the outputs each kind's check reports (``<kind>.<output>.<metric>``)
 REPORTED = {
-    "kda": ("streams", "conv", "state"),
+    "kda": ("streams", "conv", "state", "shared_mid_vs_fp32"),
     "dense": ("streams", "conv", "state", "x_vs_fp32", "mlp_in"),
-    "dsa": ("streams", "kv", "index", "tail_k", "tail_g"),
+    "dsa": ("streams", "kv", "index", "tail_k", "tail_g", "shared_mid_vs_fp32"),
     "head": ("logits", "logits_vs_fp32"),
 }
 METRICS = ("cosine", "rel", "max_abs")
@@ -268,9 +294,14 @@ def compare(
     outputs = _outputs("streams", streams, ref["streams"])
     for name, (t, idx) in _regions(L, forward_batch, S, state_idx).items():
         outputs.update(_outputs(name, t[idx], ref[name]))
+    W = out[0].shape[0]
     if x32 is not None:
         outputs["x_vs_fp32"] = _metrics(out[0][:S], x32)
-        outputs["mlp_in"] = _metrics(ffn_input(L, out[0].shape[0], S), ref["mlp_in"])
+        outputs["mlp_in"] = _metrics(ffn_input(L, W, S), ref["mlp_in"])
+    w = L.ops[W].w
+    if L.kind != "dense" and w.s_sh_ug is None:
+        mid32 = shared_mid_fp32(w, ffn_input(L, W, S))
+        outputs["shared_mid_vs_fp32"] = _metrics(shared_mid(L.ops[W].rt, S), mid32)
     values = {
         f"{L.kind}.{out}.{metric}": v
         for out, ms in outputs.items()
