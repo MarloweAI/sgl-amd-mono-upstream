@@ -141,6 +141,8 @@ def front_scratch(s: int, d: Dims) -> dict:
             # an index source's ``index_query``: bf16 IQ, a flag a (token tile, 16-column task)
             ("iq", s * 4096 * 2),
             ("iqrdy", cdiv(s, 16) * 256 * PAIR),
+            # its head weights' partials, a pair a (token, head, 512-K split)
+            ("iwp", cdiv(s, 16) * 32 * 16 * (HIDDEN // 512) * PAIR),
         ]
     )
 
