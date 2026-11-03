@@ -44,6 +44,9 @@ IW_SPLITS = HIDDEN // IW_SPLIT  # 10
 IW_STEPS = IW_SPLIT // 32  # 16 MFMAs a partial
 IW_PART_SPLITS = 2  # a CTA's splits of a head tile, a wave each
 IW_PARTS = IW_SPLITS // IW_PART_SPLITS  # CTAs a (token tile, head tile)
+CP_DIM = 512  # a compressor's kv (and score) columns: head_dim
+CP_PARTS = 4  # a compressor column tile's K parts, a CTA each
+CP_WAVE_K = HIDDEN // (CP_PARTS * WAVES)  # 160: a wave's K of a part
 FP4_AMAX_FLOOR = 6 * 2.0**-126
 INV6 = float(np.float32(1.0 / 6.0))  # Triton's fp32 constant
 E2M1_EDGES = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
@@ -176,6 +179,135 @@ def stage_iw(c, x, w, out, scale, t0, n, tile, ht, part, lds, iwp, push=None):
         if const_expr(push is not None):
             push(row, 16 * ht + h, ws[0], ws[1])
     gpu.barrier()
+
+
+# ---------------------------------------------------------------- the compressor
+
+
+def cp_cols(ratio: int) -> int:
+    """A compressor's projection columns: kv and score at ratio 2, kv at ratio 1."""
+    return CP_DIM * ratio
+
+
+def _cp_chain(c, x, w, t0, n, k0, ct):
+    """One wave's partial of columns 16 ct .. of x [T, HIDDEN] bf16 against w [cols,
+    HIDDEN] bf16, rows t0 .. t0 + n, K k0 .. k0 + CP_WAVE_K in 32-K MFMA steps, every
+    step's loads issued first. Returns the accumulator (``_iw_chain``'s layout)."""
+    lane = c["lane"]
+    row = lane % 16
+    k8 = 8 * (lane // 16)
+    live = row < n
+    t = plus(t0, fx.min(row, n - 1))
+    xs, ws = [], []
+    for st in range_constexpr(CP_WAVE_K // 32):
+        k = k0 + st * 32 + k8
+        xs.append(
+            fx.Vector(
+                bo.buffer_load(
+                    rsrc(x), (t * HIDDEN + k) // 2, vec_width=4, dtype=T.i32,
+                    cache_modifier=CM_DEV,
+                )
+            )
+        )  # fmt: skip
+        ws.append(
+            fx.Vector(
+                bo.buffer_load(
+                    rsrc(w),
+                    ((16 * ct + row) * HIDDEN + k) // 2,
+                    vec_width=4,
+                    dtype=T.i32,
+                )
+            )
+        )
+    acc = fx.Vector.filled(4, 0.0, fx.Float32)
+    zero = fx.Vector.filled(4, 0, fx.Int32)
+    for st in range_constexpr(CP_WAVE_K // 32):
+        xv = live.select(xs[st], zero)
+        acc = mfma_bf16(xv.bitcast(fx.BFloat16), ws[st].bitcast(fx.BFloat16), acc)
+    return acc
+
+
+def cp_pair(tile, ct, ctiles, part, r, h):
+    """Part ``part``'s pair of row r, column 16 ct + h of token tile ``tile`` in CPP."""
+    return ((tile * ctiles + ct) * CP_PARTS + part) * 256 + r * 16 + h
+
+
+@flyc.jit
+def stage_cp(c, a, t0, n, tile, ct, ctiles, part, lds, ratio):
+    """Part ``part`` (K quarter) of compressor columns 16 ct .. of rows t0 .. t0 + n: a
+    K range a wave, the waves' partials summed in wave order. The other parts put theirs
+    in CPP; part 0 adds them in part order and writes ``cp_out`` (f32 at ratio 2, bf16
+    at ratio 1)."""
+    tid, lane, wave = c["tid"], c["lane"], c["wave"]
+    k0 = part * (HIDDEN // CP_PARTS) + wave * CP_WAVE_K
+    acc = _cp_chain(c, a["normed_out"], a["cp_w"], t0, n, k0, ct)
+    for q in range_constexpr(4):
+        r = 4 * (lane // 16) + q
+        fx.ptr_store(acc[q].bitcast(fx.Int32), lds + (wave * 16 + r) * 16 + lane % 16)
+    gpu.barrier()
+    if tid < n * 8:
+        r, h = tid // 8, 2 * (tid % 8)
+        vs = []
+        for d in range_constexpr(2):
+            v = fx.ptr_load(lds + (r * 16 + h + d)).bitcast(fx.Float32)
+            for w_ in range_constexpr(1, WAVES):
+                v = v + fx.ptr_load(lds + (w_ * 16 + r) * 16 + h + d).bitcast(
+                    fx.Float32
+                )
+            vs.append(v)
+        if part != 0:
+            c["mb"].put_words(
+                c["cpp"],
+                cp_pair(tile, ct, ctiles, part, r, h),
+                [vs[0].bitcast(fx.Int32), vs[1].bitcast(fx.Int32)],
+            )
+        else:
+            theirs = c["mb"].poll(
+                [
+                    (c["cpp"], cp_pair(tile, ct, ctiles, p, r, h), 2)
+                    for p in range(1, CP_PARTS)
+                ]
+            )
+            for p in range_constexpr(CP_PARTS - 1):
+                for d in range_constexpr(2):
+                    vs[d] = vs[d] + theirs[p][d].bitcast(fx.Float32)
+            cols = cp_cols(ratio)
+            at = plus(t0, r) * cols + 16 * ct + h
+            if const_expr(ratio == 2):
+                bo.buffer_store(
+                    fx.Vector.from_elements(vs, fx.Float32).bitcast(fx.Int32),
+                    rsrc(a["cp_out"]),
+                    at,
+                )
+            else:
+                word = (
+                    fx.Vector.from_elements(vs, fx.Float32)
+                    .to(fx.BFloat16)
+                    .bitcast(fx.Int32)[0]
+                )
+                bo.buffer_store(word, rsrc(a["cp_out"]), at // 2)
+    gpu.barrier()
+
+
+@flyc.jit
+def run_cp(c, a, rows, cp0, lds, ratio):
+    """An index KV source's compressor projection (SGLang's ``project_fused`` at ratio 2,
+    f32, ``wkv`` at ratio 1, rounded to bf16) of rows 0 .. rows -> ``cp_out``, a (token
+    tile, 16-column tile, K quarter) a CTA from CTA ``cp0``, once its rows' norms
+    published them."""
+    tiles = -(-rows // 16)
+    ctiles = cp_cols(ratio) // 16
+    for task in range(first_task(c["bid"], cp0), tiles * ctiles * CP_PARTS, BLOCKS):
+        tile = task // (ctiles * CP_PARTS)
+        t0 = tile * 16
+        n = fx.min(fx.Int32(16), rows - t0)
+        if c["tid"] < 2 * n:
+            c["mb"].poll([(c["xrdy"], 2 * t0 + fx.min(c["tid"], 2 * n - 1), 1)])
+        gpu.barrier()
+        stage_cp(
+            c, a, t0, n, tile, (task // CP_PARTS) % ctiles, ctiles, task % CP_PARTS, lds,
+            ratio,
+        )  # fmt: skip
 
 
 # ---------------------------------------------------------------- iq

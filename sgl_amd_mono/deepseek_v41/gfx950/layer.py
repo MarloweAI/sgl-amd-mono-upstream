@@ -106,6 +106,8 @@ class MonoBuild(msgspec.Struct, frozen=True):
     tok_par: bool = False
     # K1 also computes an index source's index query, where ``index_query.fused``
     iq: bool = False
+    # with the index query, an index KV source's compressor projection (its compress ratio)
+    cp: int = 0
     # wqkv, wq_b and wo_b in SGLANG_ROCM_MXFP8_AITER_PRESHUFFLE's (16, 16) layout; wo_a row-major
     shuffled: bool = False
     # the first layer: K1 reads each stream from the embedding table at the token's id
@@ -298,6 +300,8 @@ K1_ARGS = (
     "ids",
     "ids_words",
 )
+# an index K1's past K1_ARGS: its compressor's projection weights and output
+K1_CP_ARGS = ("cp_w", "cp_out")
 
 
 @flyc.jit
@@ -370,9 +374,12 @@ def run_k1(key: MonoBuild, sl, front, a: dict, ep, k2=None):
     assert GATE0 + own_n <= BLOCKS
     # the index query here (``index_query``) only where it is reproduced
     assert not key.iq or (key.index and index_query.fused(s, key.tok_par)), key
+    assert not key.cp or (key.iq and not key.tok_par and key.cp in (1, 2)), key
     QKV0 = GATE0 + own_n if GATE0 + 2 * own_n <= BLOCKS else 0
     # the head weights' CTAs, past the q / kv norms': they run in q's wait
     IW0 = (QKV0 + own_n) % BLOCKS
+    # the compressor projection's CTAs, past the head weights'
+    CP0 = (IW0 + index_query.iw_tasks(own_n)) % BLOCKS
     half = peer_half_bytes(tp)
     bid = fx.block_idx.x
     tag = (ep << 1) + 1
@@ -409,6 +416,9 @@ def run_k1(key: MonoBuild, sl, front, a: dict, ep, k2=None):
         "iq_out": iq_out,
         "iqs_out": iqs_out,
         "iw_out": iw_out,
+        # an index KV source's compressor projection (``key.cp``; K1's own launch only)
+        "cp_w": a.get("cp_w", 0),
+        "cp_out": a.get("cp_out", 0),
     }
     flayout = {n: layout[n] for n in front_scratch(s, Dims(tp))}
     c = mb_front.front_context(fkey, front, fargs, scratch, tag, flayout)
@@ -519,6 +529,9 @@ def run_k1(key: MonoBuild, sl, front, a: dict, ep, k2=None):
                     cp, bases, pl["iwg"], row, h, [w0, w1]
                 )
             index_query.run_iw(c, c["args"], own_n, IW0, c["xl"], t0, push)
+        if const_expr(key.cp):
+            # the compressor projection fills it too, on the CTAs past them
+            index_query.run_cp(c, c["args"], own_n, CP0, c["xl"], key.cp)
 
     mb_front.run_front(
         c,
@@ -582,6 +595,7 @@ def build_mono_k1(key: MonoBuild):
         f=key.fold,
         i=key.index,
         **({"q": 1} if key.iq else {}),
+        **({"cp": key.cp} if key.cp else {}),
         **_variant(key),
     )
     keyed = key_tuple(key, SOURCES)
@@ -641,6 +655,8 @@ def build_mono_k1(key: MonoBuild):
         epoch: Int64,
         ids: Int64,
         ids_words: Int32,
+        cp_w: Int64,
+        cp_out: Int64,
     ):
         _ = keyed
         # every wait runs under the guard, so a timeout flags every peer and stops the launch
@@ -710,6 +726,8 @@ def build_mono_k1(key: MonoBuild):
                 "epoch": epoch,
                 "ids": ids,
                 "ids_words": ids_words,
+                "cp_w": cp_w,
+                "cp_out": cp_out,
             }
             run_k1(key, lds.seam.peek(), lds.front.peek(), a, _epoch(epoch))
 
@@ -767,6 +785,8 @@ def build_mono_k1(key: MonoBuild):
         epoch: Int64,
         ids: Int64,
         ids_words: Int32,
+        cp_w: Int64,
+        cp_out: Int64,
         stream: fx.Stream = _STREAM,
     ):
         _ = keyed
@@ -823,6 +843,8 @@ def build_mono_k1(key: MonoBuild):
             epoch,
             ids,
             ids_words,
+            cp_w,
+            cp_out,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 
     return launch

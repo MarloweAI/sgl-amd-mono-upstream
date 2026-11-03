@@ -17,12 +17,14 @@ from sgl_amd_mono.common.plan import BLOCKS
 
 from .attention.index_query import DIM as IQ_DIM
 from .attention.index_query import HEADS as IQ_HEADS
+from .attention.index_query import cp_cols
 from .attention.index_query import fused as iq_fused
 from .attention.plan import DATA, HEAD_DIM, KEYS, Q_RANK, TOPK, WINDOW, Dims
 from .layer import (
     EPOCH_WORDS,
     HIDDEN,
     K1_ARGS,
+    K1_CP_ARGS,
     K2_ARGS,
     K2_OF_LAYER,
     LAYER_ARGS,
@@ -200,6 +202,10 @@ class K1Weights(msgspec.Struct):
     iq_ws: torch.Tensor | None = None  # its E8M0 blocks [128, 40]
     iw_w: torch.Tensor | None = None  # weights_proj [32, 5120] bf16
     iw_scale: float = 0.0
+    # an index KV source's compressor (replicated), for K1's projection with the index
+    # query: wkv_gate [1024, 5120] bf16 at compress ratio 2, wkv [512, 5120] at ratio 1
+    cp_w: torch.Tensor | None = None
+    cp_ratio: int = 0
 
     def check(self, d: Dims) -> None:
         """Raise unless the attention-front tensors have K1's layout."""
@@ -226,6 +232,8 @@ class K1Weights(msgspec.Struct):
                 "iq_ws": ((IQ_HEADS * IQ_DIM // 32, 1280 // 32), u8),
                 "iw_w": ((IQ_HEADS, HIDDEN), bf),
             }
+        if self.cp_w is not None:
+            want["cp_w"] = ((cp_cols(self.cp_ratio), HIDDEN), bf)
         _check_tensors(self, "K1", want)
         if not (
             self.norm.shape == (HIDDEN,)
@@ -343,6 +351,9 @@ class DSV41MonoRunner:
         )
         self.iqs = torch.zeros(MAX_TOKENS, 1, 4, 16, 4, dtype=torch.uint8, device=dev)
         self.iw = torch.zeros(MAX_TOKENS, IQ_HEADS, dtype=torch.bfloat16, device=dev)
+        # an index KV source's compressor projection: [rows, 1024] f32 at compress ratio 2,
+        # [rows, 512] bf16 at ratio 1 (``cproj``)
+        self._cproj = torch.zeros(MAX_TOKENS, 1024, dtype=torch.float32, device=dev)
         # the record an absent key reads: zero data and scales, masked anyway
         self.zero_rec = torch.zeros(1024, dtype=torch.uint8, device=dev)
         self.qk_scale = (
@@ -422,6 +433,18 @@ class DSV41MonoRunner:
     def supports(tokens: int) -> bool:
         return 1 <= tokens <= MAX_TOKENS
 
+    def cproj(self, rows: int, ratio: int) -> torch.Tensor:
+        """K1's compressor projection of ``rows`` rows at compress ratio ``ratio``, as SGLang's
+        compressor returns it: ``project_fused`` [rows, 1024] f32, or ``wkv`` [rows, 512] bf16."""
+        if ratio == 2:
+            return self._cproj[:rows]
+        return self._cproj.view(torch.bfloat16).view(-1)[: rows * 512].view(rows, 512)
+
+    def cp_fused(self, tokens: int, tok_par: bool) -> bool:
+        """Whether an index KV source's K1 at this width computes its compressor projection
+        (with the index query, not token parallel); else SGLang's compressor does."""
+        return self.iq_fused(tokens, tok_par) and not tok_par
+
     def iq_fused(self, tokens: int, tok_par: bool = False) -> bool:
         """Whether an index source's K1 at this width computes its index query
         (``index_query``); else SGLang's chain does, after K1."""
@@ -433,14 +456,17 @@ class DSV41MonoRunner:
         fold: bool = True,
         index: bool = False,
         iq: bool = False,
+        cp: int = 0,
         tok_par: bool = False,
         embed: bool = False,
     ):
         """K1 at this width; it writes K2's key table unless the layer is an index
         source (whose top-k comes after K1). ``iq``: the index query too, where
-        ``iq_fused``. ``embed``: the first layer, on the embedding table."""
+        ``iq_fused``; ``cp``: with it, an index KV source's compressor projection (its
+        compress ratio). ``embed``: the first layer, on the embedding table."""
         iq = iq and self.iq_fused(tokens, tok_par)
-        key = (tokens, "k1", fold, index, iq, tok_par, embed)
+        cp = cp if iq and not tok_par else 0
+        key = (tokens, "k1", fold, index, iq, cp, tok_par, embed)
         if key not in self._kernels:
             no_capture(f"K1 width {tokens}")
             self._kernels[key] = build_mono_k1(
@@ -457,6 +483,7 @@ class DSV41MonoRunner:
                     tok_par=tok_par,
                     iq=iq,
                     embed=embed,
+                    cp=cp,
                     **self.route_at(tokens),
                 )
             )
@@ -474,7 +501,7 @@ class DSV41MonoRunner:
     ) -> None:
         """Allocate this width's scratch and compile its launches without running them.
 
-        K1 for each (fold, index, iq) in ``k1``, K2 for each (compressed, index) in
+        K1 for each (fold, index, iq, cp) in ``k1``, K2 for each (compressed, index) in
         ``k2``, the layer launch for each (fold, compressed, embed) in ``layer``, the FFN
         launch, and K2i (``enable_k2i`` first)."""
         self.scratch(tokens)
@@ -635,8 +662,9 @@ class DSV41MonoRunner:
         aux: torch.Tensor | None = None,  # [>= M, 5120] bf16, any row stride: a capture
         embed: tuple | None = None,  # (table [vocab, 5120] bf16, ids [M] int32 / int64)
     ):
-        """K1's launch arguments by name (``K1_ARGS``), after the checks. ``embed``: the
-        first layer, its streams each the token's embedding row (``residual`` None)."""
+        """K1's launch arguments by name (``K1_ARGS``, then ``K1_CP_ARGS``), after the
+        checks, and (rows, fold, iq, cp). ``embed``: the first layer, its streams each the
+        token's embedding row (``residual`` None)."""
         bf, f32 = torch.bfloat16, torch.float32
         ids, ids_words = None, 0
         if embed is not None:
@@ -715,6 +743,7 @@ class DSV41MonoRunner:
             else (0, 0, 0)
         )
         iw_bits = struct.unpack("<i", struct.pack("<f", w.iw_scale))[0]
+        cp = w.cp_ratio if iq and not tok_par and w.cp_w is not None else 0
         args = {
             "res_in": residual.data_ptr(),
             "pend": x.data_ptr(),
@@ -759,6 +788,8 @@ class DSV41MonoRunner:
             "iq_out": self.iq.data_ptr(),
             "iqs_out": self.iqs.data_ptr(),
             "iw_out": self.iw.data_ptr(),
+            "cp_w": w.cp_w.data_ptr() if cp else 0,
+            "cp_out": self._cproj.data_ptr(),
             "scratch": self.scratch(M).data_ptr(),
             "sym": self.peer.local,
             "peers": self.peer.addresses.data_ptr(),
@@ -767,7 +798,7 @@ class DSV41MonoRunner:
             "ids": 0 if ids is None else ids.data_ptr(),
             "ids_words": ids_words,
         }
-        return args, M, fold, iq
+        return args, M, fold, iq, cp
 
     def k1(
         self,
@@ -796,13 +827,13 @@ class DSV41MonoRunner:
         ``normed`` and ``qr`` for the indexer and leaves the key table to K2.
         ``tok_par`` (``token_par``): the residual, post, comb and pre rows in and out
         are this rank's alone. ``aux`` receives the residual streams' mean for DSpark."""
-        args, M, fold, iq = self._k1_args(
+        args, M, fold, iq, cp = self._k1_args(
             w, x, residual, post, comb, pre, pos, slot, swa, swa_block, keys, index,
             tok_par, aux, embed,
         )  # fmt: skip
         _run_compiled(
-            self.k1_kernel(M, fold, index, iq, tok_par, embed is not None),
-            *(args[n] for n in K1_ARGS),
+            self.k1_kernel(M, fold, index, iq, cp, tok_par, embed is not None),
+            *(args[n] for n in K1_ARGS + K1_CP_ARGS),
             torch.cuda.current_stream(),
         )
         return (
@@ -1018,7 +1049,7 @@ class DSV41MonoRunner:
         its outputs, with their arguments; returns K2's outputs."""
         if aw.cos_sin.data_ptr() != w.cos_sin.data_ptr():
             raise RuntimeError("the layer launch takes K1's rope table for K2's too")
-        a1, M, fold, _ = self._k1_args(
+        a1, M, fold, _, _ = self._k1_args(
             w, x, residual, post, comb, pre, pos, slot, swa, swa_block, keys, False,
             tok_par, aux, embed,
         )  # fmt: skip

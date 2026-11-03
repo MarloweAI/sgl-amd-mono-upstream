@@ -157,6 +157,9 @@ SGLANG_READS = {
         "forward_low_ratio_sources(positions)",
         "forward_low_ratio_sources(forward_batch)",
         "forward_low_ratio_sources(run_indexer)",
+        # its projection, where K1 computed it
+        "_low_ratio_compress_fused",
+        "_low_ratio_compress_fused(projected)",
     ),
     "srt/layers/attention/deepseek_v4_backend_hip_radix.py": (
         "forward_low_ratio_sources",
@@ -198,6 +201,11 @@ SGLANG_READS = {
         "weights_proj_hip_max_tokens",
         "rope_head_dim",
         "head_weight_scale",
+        # its compressor's projection, which K1 stands in for
+        "project_fused",
+        # the compressor's projection weights (``_compressor_weight``)
+        "use_fused_compress",
+        "wkv_gate",
     ),
     "srt/layers/quantization/fp8.py": (
         "aiter_bpreshuffled",
@@ -347,6 +355,10 @@ NUMERICS = Numerics(
         "k1.normed.max_abs": 0.0,
         # its qr: q_norm's sum of squares in another order, so bf16 flips
         "k1.qr.rel": 4e-3,
+        # a KV source's compressor projection (f32; bf16 at ratio 1) against fp64: summed in
+        # another order than SGLang's GEMM
+        "k1.cp.rel": 1e-5,
+        "k1.cp_bf16.rel": 8e-3,
         # K2: the attention core output, wo_a's MXFP8 output and wo_b's partial
         "k2.attn_out.cosine": 0.9998,
         "k2.wo_a.rel": 5e-3,
@@ -485,6 +497,17 @@ def _iq_readable(attn) -> bool:
         and getattr(w, "mxfp8_aiter_preshuffled", False)
         == getattr(attn.wq_b, "mxfp8_aiter_preshuffled", False)
     )
+
+
+def _compressor_weight(attn):
+    """A KV source's compressor projection as K1 computes it beside the index query: the
+    bf16 ``wkv_gate`` (ratio 2) or ``wkv`` (ratio 1) of SGLang's fused compressor, which
+    takes K1's projection (``_low_ratio_compress_fused(projected)``); else None."""
+    comp = getattr(attn, "compressor", None)
+    if comp is None or not comp.use_fused_compress or attn.compress_ratio not in (1, 2):
+        return None
+    w = (comp.wkv_gate if attn.compress_ratio == 2 else comp.wkv).weight
+    return w if w.dtype == torch.bfloat16 and w.is_contiguous() else None
 
 
 def shuffled_layout(attns) -> bool | None:
@@ -678,6 +701,9 @@ def _weights(copies: dict, tables: list, layer, i: int) -> _Layer:
         L.k1.iq_ws = _codes(copies, i, "index wq_b", ix.wq_b)
         L.k1.iw_w = ix.weights_proj.weight
         L.k1.iw_scale = float(ix.head_weight_scale)
+        cp = _compressor_weight(a)
+        if cp is not None:
+            L.k1.cp_w, L.k1.cp_ratio = cp, a.compress_ratio
     L.k1.check(d)
     if a.wo_a.weight.dtype == e4m3:
         woa, woa_s = a.wo_a.weight, _codes(copies, i, "wo_a", a.wo_a)
@@ -809,14 +835,13 @@ def _select(*, runner, L, plan, backend, positions, pos, forward_batch, M) -> No
 
     attn, r = L.module.self_attn, L.ratio
     if attn.compressor is not None:
-        backend.forward_low_ratio_sources(
-            layer=attn,
-            x=runner.normed[:M],
-            q_lora=None,
-            positions=positions,
-            forward_batch=forward_batch,
-            run_indexer=False,
-        )
+        projected = None
+        if L.k1.cp_w is not None and runner.cp_fused(M, plan.state["tok_par"]):
+            projected = runner.cproj(M, r)  # K1 computed it
+        _compress(
+            backend, layer=attn, x=runner.normed[:M], positions=positions,
+            forward_batch=forward_batch, projected=projected,
+        )  # fmt: skip
     ix = attn.indexer
     if ix is None:
         return
@@ -886,6 +911,29 @@ def _select(*, runner, L, plan, backend, positions, pos, forward_batch, M) -> No
         plan.state["k2i reindex", r] = True
     if kind == "producer":
         plan.state["k2i candidates"] = published
+
+
+def _compress(backend, *, layer, x, positions, forward_batch, projected) -> None:
+    """SGLang's compressor of KV source ``layer`` on K1's normed rows ``x``, as its
+    low-ratio path runs it before the attention; its fused compression takes K1's
+    projection ``projected`` where given, in place of its GEMM."""
+    if projected is not None:
+        fused = backend._low_ratio_compress_fused
+        backend._low_ratio_compress_fused = lambda *a, **kw: fused(
+            *a, **{**kw, "projected": projected}
+        )
+    try:
+        backend.forward_low_ratio_sources(
+            layer=layer,
+            x=x,
+            q_lora=None,
+            positions=positions,
+            forward_batch=forward_batch,
+            run_indexer=False,
+        )
+    finally:
+        if projected is not None:
+            del backend._low_ratio_compress_fused
 
 
 def _index_query(*, attn, x, q_lora, positions) -> tuple:
@@ -1349,7 +1397,7 @@ def _build(model, hf_config, ctx) -> _Built:
     # with and without an owed post (none on the first layer and after an Engram write):
     # an index source's K1 and K2, a reuse layer's one launch
     k1 = {
-        (fold, True, L.k1.iq_w is not None)
+        (fold, True, L.k1.iq_w is not None, L.k1.cp_ratio)
         for L in layers.values()
         if L.index
         for fold in (True, False)
