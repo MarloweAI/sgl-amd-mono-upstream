@@ -1,6 +1,7 @@
-"""GLM-5.3-Flash with --monokernel-backend amd on MI35x, TP4 (RFC #43949), across the
-switch points: decode steps of 1 to 8 rows run the kernels, wider ones the normal
-path, and requests join and leave a running batch that steps past 8 rows and back
+"""GLM-5.3-Flash with --monokernel-backend amd on MI35x, TP4 by default (RFC #43949;
+the server's TP and checkpoint in ``glm53_flash_server.py``), across the switch
+points: decode steps of 1 to 8 rows (4 at TP2) run the kernels, wider ones the normal
+path, and requests join and leave a running batch that steps past them and back
 (a short GSM8K run, for gross failures); the tokens of covered steps scored again by
 the normal prefill path (KL consistency); each layer's launch against SGLang's own
 layer, and the tail's logits against SGLang's, under SGLANG_AMD_MONO_CHECK; the
@@ -16,7 +17,7 @@ from types import SimpleNamespace
 
 import requests
 import torch
-from glm53_flash_server import ARGS, ENV, MODEL
+from glm53_flash_server import ARGS, ENV, MODEL, TP
 from sglang.test.kl_test_utils import (
     test_input_output_logprobs_match_helper as assert_logprobs_match,
 )
@@ -29,6 +30,7 @@ from sglang.test.test_utils import (
 )
 
 from sgl_amd_mono import BACKEND
+from sgl_amd_mono.glm53_flash.spec import TP_MAX_ROWS, WIDTHS
 
 LAUNCH_TIMEOUT = 3600
 # The normal path scores about 0.97 on GSM8K (thinking on); the bound is for gross
@@ -37,9 +39,13 @@ GSM8K_BOUND = 0.90
 # Decode against prefill, one batch of prompts at a time (every decode step covered);
 # the normal path itself averages about 0.04 on 8 prompts
 KL_BOUND = 0.06
+# the widest step the kernels run at this TP
+WIDEST = TP_MAX_ROWS.get(TP, max(WIDTHS))
 
 
 def _launch(extra_env=None, extra_args=(), log=None):
+    # --monokernel-backend amd: the flag of SGLang before sgl-project/sglang#45389, a
+    # deprecated alias of --enable-amd-monokernel after it
     env = {**os.environ, **ENV, **(extra_env or {})}
     return popen_launch_server(
         MODEL,
@@ -83,10 +89,10 @@ class TestMonokernelDecode(CustomTestCase):
 
     def test_covered_steps_match_prefill(self):
         # one graph per batch (ignore_eos keeps its rows): 2, 3, 7 and 8 rows (widths
-        # 2, 4 and 8, pad rows at 3 and 7). Each graph reads its own metadata buffers;
-        # with the cache flushed, a graph replayed first on another's reads none of
-        # this batch's pages
-        for rows in (2, 3, 7, 8):
+        # 2, 4 and 8, pad rows at 3 and 7; 2, 3 and 4 at TP2). Each graph reads its own
+        # metadata buffers; with the cache flushed, a graph replayed first on another's
+        # reads none of this batch's pages
+        for rows in sorted({2, 3, WIDEST - 1, WIDEST}):
             requests.post(DEFAULT_URL_FOR_TEST + "/flush_cache").raise_for_status()
             assert_logprobs_match(
                 DEFAULT_URL_FOR_TEST,
@@ -102,8 +108,9 @@ class TestMonokernelCheck(CustomTestCase):
     def test_each_covered_layer_within_its_numerics(self):
         # SGLANG_AMD_MONO_CHECK (eager) runs the normal layer next to each layer's
         # launch, and SGLang's final norm and logits next to the tail; 1, 3 and 8
-        # rows run at widths 2, 4 and 8 (pad rows on the first two), and the long
-        # prompt's positions pass 2048, where the sparse attention selects keys
+        # rows (4 at TP2) run at widths 2, 4 and 8 (pad rows on the first two), and
+        # the long prompt's positions pass 2048, where the sparse attention selects
+        # keys
         para = "The river valley archive lists the flood height of every year. "
         with (
             tempfile.NamedTemporaryFile("w+", suffix=".out") as out,
@@ -115,7 +122,7 @@ class TestMonokernelCheck(CustomTestCase):
                 log=(out, err),
             )
             try:
-                for n, repeats in ((1, 2), (3, 2), (8, 2), (1, 200)):
+                for n, repeats in ((1, 2), (3, 2), (WIDEST, 2), (1, 200)):
                     r = requests.post(
                         DEFAULT_URL_FOR_TEST + "/generate",
                         json={
@@ -144,10 +151,11 @@ class TestMonokernelCheck(CustomTestCase):
         for name, vs in sorted(values.items()):
             print(f"{name}: min {min(vs):.6g} max {max(vs):.6g} ({len(vs)} checks)")
         seen = {(kind, int(rows)) for kind, rows, _, _ in checks}
-        want = {(kind, rows) for kind in ("kda", "dsa", "dense") for rows in (1, 3, 8)}
+        widths = {1, 3, WIDEST}
+        want = {(kind, rows) for kind in ("kda", "dsa", "dense") for rows in widths}
         self.assertTrue(want <= seen, seen)
         tails = re.findall(r"monokernel check tail \((\d+) rows\): (.*)", log)
-        self.assertEqual({int(rows) for rows, _ in tails} & {1, 3, 8}, {1, 3, 8})
+        self.assertEqual({int(rows) for rows, _ in tails} & widths, widths)
         self.assertTrue(any(k == "dsa" and int(hi) >= 2048 for k, _, hi, _ in checks))
         violations = re.findall(r"monokernel check violation: .*", log)
         self.assertEqual(violations, [], "\n".join(violations[:20]))
