@@ -310,7 +310,7 @@ class DSV41MonoRunner:
         if dev.index is None:
             dev = torch.device(dev.type, torch.cuda.current_device())
         self.device = dev
-        self._scratch: dict[int, torch.Tensor] = {}
+        self._scratch: dict = {}  # width -> its scratch's PeerBuffer
         # [epoch, the guard block (deadline, error words), a mark per CTA, the MoE's counters]
         self.epoch = torch.zeros(EPOCH_WORDS, dtype=torch.int32, device=dev)
         self.fault_site, self.fault_after = guard.fault_injection(rank) or (0, 0)
@@ -375,19 +375,20 @@ class DSV41MonoRunner:
         self.epoch[guard.GUARD_DEADLINE + 1] = ticks >> 32
 
     def scratch(self, tokens: int) -> torch.Tensor:
-        """Return this width's scratch, allocated before graph capture."""
+        """Return this width's scratch, allocated before graph capture: uncached (a
+        one-rank ``PeerBuffer``), so the hand-offs between CTAs miss no cache, and
+        zeroed."""
+        from sgl_amd_mono.common.peer import PeerBuffer
+
         buf = self._scratch.get(tokens)
         if buf is None:
             no_capture(f"step width {tokens}")
-            buf = torch.zeros(
-                scratch_bytes(
-                    tokens, self.tp, self.timeline_on, **self.route_at(tokens)
-                ),
-                dtype=torch.uint8,
-                device=self.device,
+            nbytes = scratch_bytes(
+                tokens, self.tp, self.timeline_on, **self.route_at(tokens)
             )
+            buf = PeerBuffer(nbytes, None, self.rank, 1, self.device)
             self._scratch[tokens] = buf
-        return buf
+        return buf.bytes
 
     def route_at(self, tokens: int) -> dict:
         """The route every launch and the scratch of this width share.

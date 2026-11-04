@@ -543,6 +543,7 @@ def stage_combine(c, unit):
                 ((t * nchunk + cc) * d.heads + h) * 2,
                 vec_width=2,
                 dtype=T.f32,
+                cache_modifier=CM_DEV,
             )
         )
         pv = fx.Vector(
@@ -551,6 +552,7 @@ def stage_combine(c, unit):
                 (((t * nchunk + cc) * d.heads + h) * HEAD_DIM + d0) // 2,
                 vec_width=4,
                 dtype=T.i32,
+                cache_modifier=CM_DEV,
             )
         )
         mc = live.select(stv[0], fx.Float32(NEG))
