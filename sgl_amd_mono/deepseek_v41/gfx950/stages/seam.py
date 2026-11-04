@@ -177,6 +177,12 @@ def slice_fn_loads(c, task):
     return out
 
 
+def slice_prefetch_fits(s: int) -> bool:
+    """Whether a slice's first loads fit in registers through the FFN seam's reduce: up to
+    32 rows, where the reduce takes one pass."""
+    return s * COLS // 2 <= THREADS
+
+
 def slice_prefetch(c, task):
     """Issue slice ``task``'s first loads, its rows' first batch and its mix weights,
     ahead of a wait they do not depend on (the FFN seam's attention partials)."""
@@ -402,8 +408,13 @@ def stage_norm(c, t, store):
 def stage_reduce(c, task):
     """Sum the TP ranks' attention partials at this slice's 32 columns in rank order into ``pend_lds``."""
     s, tid = c["S"], c["tid"]
-    for pas in range_constexpr(0, s * COLS // 2, THREADS):
-        reduce_attn_pair(c, task, plus(pas, tid))
+    pairs = s * COLS // 2
+    if const_expr(pairs <= THREADS):
+        reduce_attn_pair(c, task, tid)
+    else:
+        # past one pass a traced loop: one pass's polls in flight at a time, not every pass's
+        for pas in range(0, pairs, THREADS):
+            reduce_attn_pair(c, task, pas + tid)
     gpu.barrier()
 
 

@@ -996,8 +996,9 @@ def run_ffn(key: MonoBuild, lds, a: dict, amb, bases, own, rank, ep, part=None):
                 poll([(grdy, tid * FLAG_STRIDE, 1)])
             gpu.barrier()
     for task in range(first_task(bid, 0), SLICES, BLOCKS):
-        # the slice's own loads go out ahead of the wait on the ranks' partials
-        pre = seam.slice_prefetch(ca, task)
+        # the slice's own loads go out ahead of the wait on the ranks' partials, where
+        # they fit in registers beside the reduce
+        pre = seam.slice_prefetch(ca, task) if seam.slice_prefetch_fits(own_n) else None
         if const_expr(part is not None):
             seam.stage_push(ca, task, part)
         seam.stage_reduce(ca, task)
