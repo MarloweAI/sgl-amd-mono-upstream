@@ -103,6 +103,9 @@ DOWN_TASKS = HIDDEN // ROWS
 DOWN_R_MAX = 2
 # a down slot's K steps on this many independent MFMA accumulators
 DOWN_CHAINS = 2
+# routed intermediate K steps up to which down round 0's weights fit beside the shared
+# down's (``down_round0_early``): TP4 and up
+DOWN_EARLY_STEPS = 5
 # a reduce task's columns: 32 keeps each thread's poll to 1-2 passes
 RED_COLS = 32
 RED_TASKS = HIDDEN // RED_COLS
@@ -950,66 +953,102 @@ def ug_epilogue(c, part0, idx, first, count):
 @flyc.jit
 def stage_down(c, tasks):
     """Run the CTA's down tasks: routed experts of U, the shared expert, their sum pushed to every rank."""
-    s, wave, tab, d = c["S"], c["wave"], c["tab"], c["d"]
-    n = len(tasks)
+    s, tab, d = c["S"], c["tab"], c["d"]
     nu = c["rs"].n_union(tab, s)
-    sl = c["wsl"] + wave * wsl_words(d)
-    sw = down_scale_words(d)
     # slots of U a round: the loads of a round stay the same
-    slots = DOWN_R_MAX // n
+    slots = DOWN_R_MAX // len(tasks)
     per_round = WAVES * slots
     rounds = (nu + per_round - 1) // per_round
-    # the shared expert's down projection first: its input is ready long before the routed results
-    down_shared(c, tasks)
-    for rnd in range(0, rounds, 1):
-        us = [wave + WAVES * (slots * rnd + i) for i in range(slots)]
-        ucs = [fx.min(u, nu - 1) for u in us]
-        firsts = [c["rs"].slot_first(tab, u) for u in ucs]
-        # wait only on this round's slots' ug tasks; their flags' first loads go out ahead of
-        # the round's weights (loads return in issue order: behind them, a flag set long
-        # before would wait for every weight)
-        flags = [(c["ugf"], f, 1) for f in down_ug_flags(c, ucs)]
-        first = c["poll_issue"](flags)
-        svs, avs = down_weights(c, tasks, rnd, slots, nu)
-        c["poll_wait"](flags, first)
-        counts = [c["rs"].slot_first(tab, u + 1) - f for u, f in zip(ucs, firsts)]
-        mids = [mid_operands(c, f, k) for f, k in zip(firsts, counts)]
-        for q in range_constexpr(len(svs)):
-            scale_block_store(c, svs[q], sl + q * sw)
-        for i in range_constexpr(slots):
-            for j in range_constexpr(n):
-                down_mfma(
-                    c,
-                    j,
-                    tasks[j],
-                    sl + (j * slots + i) * sw,
-                    mids[i],
-                    firsts[i],
-                    counts[i],
-                    avs[j * slots + i],
-                    us[i] < nu,
-                )
-            # a slot of more than 16 picks: its next pick tile's rows
-            if const_expr(s > TILE):
-                for j0 in range_constexpr(TILE, s, TILE):
-                    if j0 < counts[i]:
-                        more = mid_operands(c, firsts[i] + j0, counts[i] - j0)
-                        for j in range_constexpr(n):
-                            down_mfma(
-                                c,
-                                j,
-                                tasks[j],
-                                sl + (j * slots + i) * sw,
-                                more,
-                                firsts[i] + j0,
-                                counts[i] - j0,
-                                avs[j * slots + i],
-                                us[i] < nu,
-                            )
+    # the shared expert's down projection first, its input ready long before the routed
+    # results: its weights, then its rows into LDS, then (where both fit in registers)
+    # round 0's flags and weights, in flight through its MFMAs
+    early = down_round0_early(d)
+    shops = down_shared_loads(c, tasks)
+    r0 = None
+    for t0, nn in token_tiles(s):
+        load_smid_tile(c, t0, nn, d.sh_inter // 32)
+        if const_expr(early and r0 is None):
+            r0 = down_round_loads(c, tasks, 0, slots, nu)
+        down_shared_tile(c, tasks, shops, t0, nn)
+    if const_expr(early):
+        down_round(c, tasks, 0, slots, nu, r0)
+    # past the shared down, in the rounds' loop: the compiler hoists no round's loads above it
+    for rnd in range(1 if early else 0, rounds, 1):
+        down_round(c, tasks, rnd, slots, nu, down_round_loads(c, tasks, rnd, slots, nu))
     gpu.barrier()
     for t0, nn in token_tiles(s):
-        for j in range_constexpr(n):
+        for j in range_constexpr(len(tasks)):
             down_combine(c, tasks[j], j, t0, nn)
+
+
+def down_round0_early(d) -> bool:
+    """Whether down round 0's weights go out under the shared down's MFMAs: where they fit
+    in registers beside the shared down's, a routed intermediate of at most
+    ``DOWN_EARLY_STEPS`` K steps."""
+    return d.inter // 128 <= DOWN_EARLY_STEPS
+
+
+def down_round_loads(c, tasks, rnd, slots, nu):
+    """Issue down round ``rnd``'s ug flags' first loads, then its weights: (flags, first
+    loads, scales, weights)."""
+    wave = c["wave"]
+    us = [wave + WAVES * (slots * rnd + i) for i in range(slots)]
+    ucs = [fx.min(u, nu - 1) for u in us]
+    # wait only on this round's slots' ug tasks; their flags' first loads go out ahead of
+    # the round's weights (loads return in issue order: behind them, a flag set long
+    # before would wait for every weight)
+    flags = [(c["ugf"], f, 1) for f in down_ug_flags(c, ucs)]
+    first = c["poll_issue"](flags)
+    svs, avs = down_weights(c, tasks, rnd, slots, nu)
+    return flags, first, svs, avs
+
+
+@flyc.jit
+def down_round(c, tasks, rnd, slots, nu, loads):
+    """Run down round ``rnd`` on ``down_round_loads``' loads once its ug flags are set."""
+    s, wave, tab, d = c["S"], c["wave"], c["tab"], c["d"]
+    n = len(tasks)
+    sl = c["wsl"] + wave * wsl_words(d)
+    sw = down_scale_words(d)
+    flags, first, svs, avs = loads
+    us = [wave + WAVES * (slots * rnd + i) for i in range(slots)]
+    ucs = [fx.min(u, nu - 1) for u in us]
+    firsts = [c["rs"].slot_first(tab, u) for u in ucs]
+    c["poll_wait"](flags, first)
+    counts = [c["rs"].slot_first(tab, u + 1) - f for u, f in zip(ucs, firsts)]
+    mids = [mid_operands(c, f, k) for f, k in zip(firsts, counts)]
+    for q in range_constexpr(len(svs)):
+        scale_block_store(c, svs[q], sl + q * sw)
+    for i in range_constexpr(slots):
+        for j in range_constexpr(n):
+            down_mfma(
+                c,
+                j,
+                tasks[j],
+                sl + (j * slots + i) * sw,
+                mids[i],
+                firsts[i],
+                counts[i],
+                avs[j * slots + i],
+                us[i] < nu,
+            )
+        # a slot of more than 16 picks: its next pick tile's rows
+        if const_expr(s > TILE):
+            for j0 in range_constexpr(TILE, s, TILE):
+                if j0 < counts[i]:
+                    more = mid_operands(c, firsts[i] + j0, counts[i] - j0)
+                    for j in range_constexpr(n):
+                        down_mfma(
+                            c,
+                            j,
+                            tasks[j],
+                            sl + (j * slots + i) * sw,
+                            more,
+                            firsts[i] + j0,
+                            counts[i] - j0,
+                            avs[j * slots + i],
+                            us[i] < nu,
+                        )
 
 
 @flyc.jit
@@ -1131,27 +1170,30 @@ def _down_ug_flag(c, ucs, f, per_slot):
     )
 
 
-@flyc.jit
-def down_shared(c, tasks):
-    """Run the shared expert's down projection of ``tasks``' rows for every token into LDS."""
-    s, tid, red, d = c["S"], c["tid"], c["red"], c["d"]
-    a = c["args"]
-    shops = [
+def down_shared_loads(c, tasks):
+    """Issue the shared expert's down weights of ``tasks``' rows."""
+    a, d = c["args"], c["d"]
+    return [
         gemv_fp8_loads(c, a["sw2"], a["sw2_s"], d.sh_inter, task, row_major=True)
         for task in tasks
     ]
-    for t0, nn in token_tiles(s):
-        load_smid_tile(c, t0, nn, d.sh_inter // 32)
-        for j in range_constexpr(len(tasks)):
-            gemv_fp8_mfmas(
-                c, d.sh_inter, c["shared_xl"], c["shared_xsl"], red, shops[j], rows=nn
-            )
-            gpu.barrier()
-            if tid < ROWS * nn:
-                v = row_sum(red, tid % ROWS, tid // ROWS)
-                at = (j * s + plus(t0, tid // ROWS)) * ROWS + tid % ROWS
-                fx.ptr_store(bf16_round(v).bitcast(fx.Int32), c["sdl"] + at)
-            gpu.barrier()
+
+
+@flyc.jit
+def down_shared_tile(c, tasks, shops, t0, nn):
+    """The shared expert's down projection of ``tasks``' rows for tokens t0 .. t0 + nn into
+    LDS, their rows in LDS (``load_smid_tile``)."""
+    s, tid, red, d = c["S"], c["tid"], c["red"], c["d"]
+    for j in range_constexpr(len(tasks)):
+        gemv_fp8_mfmas(
+            c, d.sh_inter, c["shared_xl"], c["shared_xsl"], red, shops[j], rows=nn
+        )
+        gpu.barrier()
+        if tid < ROWS * nn:
+            v = row_sum(red, tid % ROWS, tid // ROWS)
+            at = (j * s + plus(t0, tid // ROWS)) * ROWS + tid % ROWS
+            fx.ptr_store(bf16_round(v).bitcast(fx.Int32), c["sdl"] + at)
+        gpu.barrier()
 
 
 @flyc.jit
