@@ -108,6 +108,8 @@ class MonoBuild(msgspec.Struct, frozen=True):
     iq: bool = False
     # wqkv, wq_b and wo_b in SGLANG_ROCM_MXFP8_AITER_PRESHUFFLE's (16, 16) layout; wo_a row-major
     shuffled: bool = False
+    # the first layer: K1 reads each stream from the embedding table at the token's id
+    embed: bool = False
 
 
 ROUTE = ("experts", "topk", "ug_groups", "swa_width")
@@ -127,6 +129,7 @@ def _variant(key: MonoBuild) -> dict:
         | ({"tl": 1} if key.timeline else {})
         | ({"p": 1} if key.tok_par else {})
         | ({"sh": 1} if key.shuffled else {})
+        | ({"em": 1} if key.embed else {})
     )
 
 
@@ -290,6 +293,8 @@ K1_ARGS = (
     "peers",
     "rank",
     "epoch",
+    "ids",
+    "ids_words",
 )
 
 
@@ -349,6 +354,8 @@ def run_k1(key: MonoBuild, sl, front, a: dict, ep, k2=None):
         peers,
         rank,
         epoch,
+        ids,
+        ids_words,
     ) = (a[n] for n in K1_ARGS)
     s, tp = key.tokens, key.tp
     layout = scratch_layout(s, tp, key.timeline, **route_of(key))
@@ -457,6 +464,11 @@ def run_k1(key: MonoBuild, sl, front, a: dict, ep, k2=None):
         ca[region] = sreg(scratch, layout[region][0], region)
     if const_expr(k2 is not None):
         ca["dev"] = True
+    if const_expr(key.embed):
+        # the first layer: ``res_in`` is the embedding table, a row by ``ids``
+        assert not key.fold, key
+        ca["embed"] = True
+        ca["args"] = {**ca["args"], "emb": res_in, "ids": ids, "ids_words": ids_words}
     t0 = 0
     if const_expr(key.tok_par):
         t0 = rank * own_n
@@ -625,6 +637,8 @@ def build_mono_k1(key: MonoBuild):
         peers: Int64,
         rank: Int32,
         epoch: Int64,
+        ids: Int64,
+        ids_words: Int32,
     ):
         _ = keyed
         # every wait runs under the guard, so a timeout flags every peer and stops the launch
@@ -692,6 +706,8 @@ def build_mono_k1(key: MonoBuild):
                 "peers": peers,
                 "rank": rank,
                 "epoch": epoch,
+                "ids": ids,
+                "ids_words": ids_words,
             }
             run_k1(key, lds.seam.peek(), lds.front.peek(), a, _epoch(epoch))
 
@@ -747,6 +763,8 @@ def build_mono_k1(key: MonoBuild):
         peers: Int64,
         rank: Int32,
         epoch: Int64,
+        ids: Int64,
+        ids_words: Int32,
         stream: fx.Stream = _STREAM,
     ):
         _ = keyed
@@ -801,6 +819,8 @@ def build_mono_k1(key: MonoBuild):
             peers,
             rank,
             epoch,
+            ids,
+            ids_words,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 
     return launch
@@ -1771,7 +1791,7 @@ K2_OF_LAYER = {
 # the layer launch's 32-bit arguments (the others are 64-bit)
 LAYER_I32 = frozenset(
     ("aux_stride", "slot_words", "swa_block", "iw_scale", "num_pos", "rank")
-    + ("comp_block", "qk_scale")
+    + ("ids_words", "comp_block", "qk_scale")
 )
 
 
@@ -1907,6 +1927,8 @@ def build_mono_layer(key: MonoBuild):
         peers: Int64,
         rank: Int32,
         epoch: Int64,
+        ids: Int64,
+        ids_words: Int32,
         comp: Int64,
         comp_stride: Int64,
         comp_block: Int32,
@@ -2003,6 +2025,8 @@ def build_mono_layer(key: MonoBuild):
                 "peers": peers,
                 "rank": rank,
                 "epoch": epoch,
+                "ids": ids,
+                "ids_words": ids_words,
                 "comp": comp,
                 "comp_stride": comp_stride,
                 "comp_block": comp_block,
@@ -2096,6 +2120,8 @@ def build_mono_layer(key: MonoBuild):
         peers: Int64,
         rank: Int32,
         epoch: Int64,
+        ids: Int64,
+        ids_words: Int32,
         comp: Int64,
         comp_stride: Int64,
         comp_block: Int32,
@@ -2179,6 +2205,8 @@ def build_mono_layer(key: MonoBuild):
             peers,
             rank,
             epoch,
+            ids,
+            ids_words,
             comp,
             comp_stride,
             comp_block,

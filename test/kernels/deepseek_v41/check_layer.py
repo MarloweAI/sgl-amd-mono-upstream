@@ -1,8 +1,9 @@
 """Check one launch per layer (torchrun, TP2 or TP4): a reuse layer's layer launch bit for
 bit against its K1 then its K2 (two launches) on the same inputs, every row's window
 holding the step's own new records; with and without an owed post, with and without
-compressed keys, and token parallel where the width allows; then every step in one graph,
-bit for bit under replay."""
+compressed keys, and token parallel where the width allows; the first layer on the
+embedding table bit for bit against the same launch on the broadcast rows; then every step
+in one graph, bit for bit under replay."""
 
 import argparse
 import os
@@ -23,9 +24,9 @@ from check_k2 import (
 )
 
 POSITIONS = 131072
-SENTINEL = (
-    -3.25
-)  # in the outputs before a launch: a token-parallel step writes its rows only
+VOCAB = 4096  # the test's embedding table rows
+# in the outputs before a launch: a token-parallel step writes its rows only
+SENTINEL = -3.25
 
 
 def step_inputs(M, tp, rank, dev):
@@ -109,16 +110,20 @@ def main():
     comp, _ = make_cache(COMP_PAGES, COMP_BLOCK, gc, dev)
     swa = swa0.clone()
 
-    def launches(M, step, fold, compressed, tok_par, one, outs):
+    table = (torch.randn(VOCAB, HIDDEN, generator=g, device=dev) * 0.05).bfloat16()
+
+    def launches(M, step, fold, compressed, tok_par, one, outs, embed=None):
         x, res, post, comb, pre, pos, slot, keys = step
         cc = comp if compressed else None
+        if embed is not None:  # the first layer: the table at the step's ids
+            res = None
         if not compressed:  # a window-only layer has no top-k (as the server passes it)
             keys = (*keys[:2], runner.no_topk, runner.no_topk_lens)
         x = x if fold else None
         if one:
             return runner.layer(
                 k1w, aw, mw, x, res, post, comb, pre, pos, slot, swa, SWA_BLOCK, cc,
-                COMP_BLOCK, keys, outs=outs, tok_par=tok_par,
+                COMP_BLOCK, keys, outs=outs, tok_par=tok_par, embed=embed,
             )  # fmt: skip
         runner.k1(
             k1w, x, res, post, comb, pre, pos, slot, swa, SWA_BLOCK, keys,
@@ -169,6 +174,31 @@ def main():
                         fails.append(name)
                     outs = runner._outs(M, step[1])
                     steps.append((M, step, fold, compressed, tok_par, outs, got[1]))
+                    if fold:
+                        continue
+                    # the first layer: on (table, ids) and on the rows hc_broadcast makes
+                    gi = torch.Generator().manual_seed(M)
+                    ids = torch.randint(0, VOCAB, (M,), generator=gi).to(dev)
+                    rows = table[ids].unsqueeze(1).repeat(1, 4, 1).contiguous()
+                    st = (step[0], rows, *step[2:])
+                    got = []
+                    for e in ((table, ids), None):
+                        outs = runner._outs(M, rows)
+                        for t in outs:
+                            t.fill_(SENTINEL)
+                        swa.copy_(swa0)
+                        launches(M, st, False, compressed, tok_par, True, outs, e)
+                        torch.cuda.synchronize()
+                        got.append(state(M, outs))
+                    same = all(
+                        x.view(torch.uint8).equal(y.view(torch.uint8))
+                        for x, y in zip(*got)
+                    )
+                    name = f"M={M} embedding compressed={compressed} tok_par={tok_par}"
+                    if rank == 0:
+                        print(f"{name}: {'bitwise' if same else 'DIFFERS'}", flush=True)
+                    if not same:
+                        fails.append(name)
 
     # every step's layer launch in one graph: bit for bit against eager under replay; the
     # steps share the cache their K1s write, so each pass starts from the same one

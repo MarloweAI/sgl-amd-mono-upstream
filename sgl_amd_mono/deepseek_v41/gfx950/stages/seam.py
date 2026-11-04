@@ -135,6 +135,12 @@ def slice_loads(c, c0, e):
     """Element e's loads of ``stage_slice`` (e clamped into the step's)."""
     a = c["args"]
     t, o, col = slice_at(c0, e)
+    if const_expr(c.get("embed", False)):
+        # the first layer: every stream is the token's embedding row (SGLang's hc_broadcast)
+        row = fx.Int32(
+            bo.buffer_load(rsrc(a["ids"]), a["ids_words"] * t, vec_width=1, dtype=T.i32)
+        )
+        return (ld_bf(a["emb"], row * HIDDEN + col),)
     if const_expr(not c.get("fold", True)):
         return (ld_bf(a["res_in"], (t * HC + o) * HIDDEN + col),)
     r = [ld_bf(a["res_in"], (t * HC + h) * HIDDEN + col) for h in range(HC)]

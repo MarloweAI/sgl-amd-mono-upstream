@@ -92,4 +92,6 @@ def own_view(c: dict, t0, n: int) -> dict:
     }
     if "aux_out" in args:  # its rows ``aux_stride`` bf16 apart
         args["aux_out"] = args["aux_out"] + lo * fx.Int64(args["aux_stride"]) * 2
+    if "ids" in args:  # the first layer's token ids, ``ids_words`` words a row
+        args["ids"] = args["ids"] + lo * fx.Int64(args["ids_words"]) * 4
     return {**c, "S": n, "args": args}

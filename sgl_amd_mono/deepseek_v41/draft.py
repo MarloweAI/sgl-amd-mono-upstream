@@ -188,22 +188,29 @@ class _Draft:
 
         lm = self.lm
         x = input_embeds
+        # the first stage's launch reads the target's whole table itself where it is kept
+        first = None
         if x is None:  # ``forward_embed``, from the target's whole table
             if lm.embed_tokens is None:
                 raise ValueError(
                     "DeepseekV4ForCausalLMDSpark requires the target embed_tokens "
                     "(call attach_shared_modules first)."
                 )
-            x = target.embed(lm.embed_tokens, input_ids).unsqueeze(1)
-            x = x.repeat(1, lm.hc_mult, 1)
+            table = lm.embed_tokens.__dict__.get(target.FULL_EMBEDDING)
+            if table is not None:
+                first = (table, input_ids.contiguous())
+            else:
+                x = target.embed(lm.embed_tokens, input_ids).unsqueeze(1)
+                x = x.repeat(1, lm.hc_mult, 1)
         # a stage's post folds into the next stage's K1, the last stage's into the head's
         # combine (``fused.post_combine``)
         pending, pre = (None, x, None, None), None
         fuse = fused.enabled()
         for j, L in enumerate(self.stages):
             out = target._launch(
-                self.runner, L, plan, positions, forward_batch, pending, pre
-            )
+                self.runner, L, plan, positions, forward_batch, pending, pre,
+                embed=first if j == 0 else None,
+            )  # fmt: skip
             defer = j + 1 < len(self.stages) or fuse
             x, pre, post = target._boundary_out(L.module, defer, *out)
             pending = post if defer else (None, x, None, None)
@@ -244,7 +251,9 @@ def _build(model, hf_config, ctx) -> _Draft:
     start = len(widths) * p.tp_rank // p.tp_size
     for m in widths[start:] + widths[:start]:
         # with and without an owed post, on the window: no index source, no top-k
-        runner.precompile(m, layer={(False, False), (True, False)})
+        runner.precompile(
+            m, layer={(False, False, False), (True, False, False), (False, False, True)}
+        )
     draft_sampler.install(model, ctx.deadline_s)
     return _Draft(model, runner, stages)
 

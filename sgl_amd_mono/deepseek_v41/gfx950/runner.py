@@ -433,12 +433,13 @@ class DSV41MonoRunner:
         index: bool = False,
         iq: bool = False,
         tok_par: bool = False,
+        embed: bool = False,
     ):
         """K1 at this width; it writes K2's key table unless the layer is an index
         source (whose top-k comes after K1). ``iq``: the index query too, where
-        ``iq_fused``."""
+        ``iq_fused``. ``embed``: the first layer, on the embedding table."""
         iq = iq and self.iq_fused(tokens, tok_par)
-        key = (tokens, "k1", fold, index, iq, tok_par)
+        key = (tokens, "k1", fold, index, iq, tok_par, embed)
         if key not in self._kernels:
             no_capture(f"K1 width {tokens}")
             self._kernels[key] = build_mono_k1(
@@ -454,6 +455,7 @@ class DSV41MonoRunner:
                     timeline=self.timeline_on,
                     tok_par=tok_par,
                     iq=iq,
+                    embed=embed,
                     **self.route_at(tokens),
                 )
             )
@@ -472,7 +474,7 @@ class DSV41MonoRunner:
         """Allocate this width's scratch and compile its launches without running them.
 
         K1 for each (fold, index, iq) in ``k1``, K2 for each (compressed, index) in
-        ``k2``, the layer launch for each (fold, compressed) in ``layer``, the FFN
+        ``k2``, the layer launch for each (fold, compressed, embed) in ``layer``, the FFN
         launch, and K2i (``enable_k2i`` first)."""
         self.scratch(tokens)
         kernels = [self.k1_kernel(tokens, *v, tok_par=tok_par) for v in sorted(k1)]
@@ -630,17 +632,39 @@ class DSV41MonoRunner:
         index: bool = False,
         tok_par: bool = False,
         aux: torch.Tensor | None = None,  # [>= M, 5120] bf16, any row stride: a capture
+        embed: tuple | None = None,  # (table [vocab, 5120] bf16, ids [M] int32 / int64)
     ):
-        """K1's launch arguments by name (``K1_ARGS``), after the checks."""
-        M = residual.shape[0]
+        """K1's launch arguments by name (``K1_ARGS``), after the checks. ``embed``: the
+        first layer, its streams each the token's embedding row (``residual`` None)."""
+        bf, f32 = torch.bfloat16, torch.float32
+        ids, ids_words = None, 0
+        if embed is not None:
+            table, ids = embed
+            if residual is not None or x is not None:
+                raise RuntimeError("K1 on the embedding takes no residual and no post")
+            if not (
+                table.dtype == bf
+                and table.dim() == 2
+                and table.shape[1] == HIDDEN
+                and table.is_contiguous()
+                and table.device == self.device
+                # the seam's row loads take 32-bit byte offsets
+                and table.numel() * 2 < 2**31
+            ):
+                raise RuntimeError(f"K1 embedding: {tuple(table.shape)} {table.dtype}")
+            if not (
+                ids.dtype in SLOT_DTYPES and ids.dim() == 1 and ids.is_contiguous()
+            ):
+                raise RuntimeError(f"K1 token ids: {tuple(ids.shape)} {ids.dtype}")
+            ids_words = slot_words(ids)
+            residual = table
+        M = residual.shape[0] if ids is None else ids.shape[0]
         if not self.supports(M):
             raise RuntimeError(f"DSv4.1 mono decode: {M} rows")
-        bf, f32 = torch.bfloat16, torch.float32
         fold = x is not None
-        want = {
-            "residual": (residual, HC * HIDDEN, bf),
-            "pre": (pre, HC, f32),
-        }
+        want = {"pre": (pre, HC, f32)}
+        if ids is None:
+            want["residual"] = (residual, HC * HIDDEN, bf)
         if fold:
             want |= {
                 "x": (x, HIDDEN, bf),
@@ -739,6 +763,8 @@ class DSV41MonoRunner:
             "peers": self.peer.addresses.data_ptr(),
             "rank": self.rank,
             "epoch": self.epoch.data_ptr(),
+            "ids": 0 if ids is None else ids.data_ptr(),
+            "ids_words": ids_words,
         }
         return args, M, fold, iq
 
@@ -758,6 +784,7 @@ class DSV41MonoRunner:
         index: bool = False,
         tok_par: bool = False,
         aux: torch.Tensor | None = None,  # [>= M, 5120] bf16, any row stride: a capture
+        embed: tuple | None = None,
     ):
         """Run K1: the pending post, this layer's attention seam and the attention front.
 
@@ -770,10 +797,10 @@ class DSV41MonoRunner:
         are this rank's alone. ``aux`` receives the residual streams' mean for DSpark."""
         args, M, fold, iq = self._k1_args(
             w, x, residual, post, comb, pre, pos, slot, swa, swa_block, keys, index,
-            tok_par, aux,
+            tok_par, aux, embed,
         )  # fmt: skip
         _run_compiled(
-            self.k1_kernel(M, fold, index, iq, tok_par),
+            self.k1_kernel(M, fold, index, iq, tok_par, embed is not None),
             *(args[n] for n in K1_ARGS),
             torch.cuda.current_stream(),
         )
@@ -938,10 +965,12 @@ class DSV41MonoRunner:
         tokens: int,
         fold: bool = True,
         compressed: bool = True,
+        embed: bool = False,
         tok_par: bool = False,
     ):
-        """A reuse layer's one launch at this width (``build_mono_layer``)."""
-        key = (tokens, "layer", fold, compressed, tok_par)
+        """A reuse layer's one launch at this width (``build_mono_layer``); ``embed``:
+        the first layer, on the embedding table."""
+        key = (tokens, "layer", fold, compressed, tok_par, embed)
         if key not in self._kernels:
             no_capture(f"layer launch width {tokens}")
             self._kernels[key] = build_mono_layer(
@@ -956,6 +985,7 @@ class DSV41MonoRunner:
                     fault_after=self.fault_after,
                     timeline=self.timeline_on,
                     tok_par=tok_par,
+                    embed=embed,
                     **self.route_at(tokens),
                 )
             )
@@ -981,6 +1011,7 @@ class DSV41MonoRunner:
         outs: tuple | None = None,
         tok_par: bool = False,
         aux: torch.Tensor | None = None,
+        embed: tuple | None = None,
     ):
         """Run a reuse layer (not an index source) in one launch: ``k1``, then ``k2`` on
         its outputs, with their arguments; returns K2's outputs."""
@@ -988,14 +1019,14 @@ class DSV41MonoRunner:
             raise RuntimeError("the layer launch takes K1's rope table for K2's too")
         a1, M, fold, _ = self._k1_args(
             w, x, residual, post, comb, pre, pos, slot, swa, swa_block, keys, False,
-            tok_par, aux,
+            tok_par, aux, embed,
         )  # fmt: skip
         a2, outs, compressed = self._k2_args(
             aw, fw, M, pos, swa, swa_block, comp, comp_block, outs, tok_par=tok_par
         )
         k2_name = {v: k for k, v in K2_OF_LAYER.items()}
         _run_compiled(
-            self.layer_kernel(M, fold, compressed, tok_par),
+            self.layer_kernel(M, fold, compressed, embed is not None, tok_par),
             *(a1[n] for n in K1_ARGS),
             *(a2[k2_name.get(n, n)] for n in LAYER_ARGS[len(K1_ARGS) :]),
             torch.cuda.current_stream(),

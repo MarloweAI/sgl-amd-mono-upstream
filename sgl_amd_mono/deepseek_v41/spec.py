@@ -725,12 +725,14 @@ def _launch(
     prev_pre,
     capture=None,
     tok_par=False,
+    embed=None,
 ):
     """Layer ``L``: one launch (K1, then K2), or on an index source K1, the indexer and
     K2: the previous layer's pending post (x, residual, post, comb) and pre in; K2's
     (x, residual, post, comb, pre) out, this layer's post pending. With no post owed (x None) the residual arrives settled: the
     first layer's broadcast embedding (no pre: copy 0), an Engram layer's
-    residual, or a draft stage's input."""
+    residual, or a draft stage's input. ``embed`` (table, token ids): the first layer
+    reads each stream from the embedding table itself (residual None)."""
     from sglang.srt.model_executor.forward_context import (
         get_attn_backend,
         get_token_to_kv_pool,
@@ -746,7 +748,8 @@ def _launch(
             # SGLang types the compressed cache as e4m3; K2 addresses its records' bytes
             L.comp = pool.get_extra_key_buffer(L.i).view(torch.uint8)
             L.comp_block = pool.get_extra_key_page_size(L.i)
-    backend, M = get_attn_backend(), residual.shape[0]
+    backend = get_attn_backend()
+    M = residual.shape[0] if embed is None else embed[1].shape[0]
     if "k1" not in plan.state:
         # the forward's first K1 converts them where needed; a graph records the copies
         slot = backend.get_swa_out_cache_loc(forward_batch)[:M]
@@ -761,7 +764,8 @@ def _launch(
         topk = (runner.no_topk, runner.no_topk_lens)
     keys = (md.swa_page_indices, md.swa_topk_lengths, *topk)
     if x is None:
-        residual = residual.contiguous()  # the broadcast embedding may be a view
+        if embed is None:
+            residual = residual.contiguous()  # the broadcast embedding may be a view
         if prev_pre is None:
             prev_pre = runner.first_pre[:M]
     aux = None if capture is None else capture(L, M)
@@ -769,6 +773,7 @@ def _launch(
         return runner.layer(
             L.k1, L.k2, L.ffn, x, residual, post, comb, prev_pre, pos, slot, L.swa,
             L.swa_block, L.comp, L.comp_block, keys, tok_par=tok_par, aux=aux,
+            embed=embed,
         )  # fmt: skip
     runner.k1(
         L.k1, x, residual, post, comb, prev_pre, pos, slot, L.swa, L.swa_block,
@@ -983,11 +988,18 @@ class _Built:
 
         m = self.model
         self._warm_normal_moe()
-        x = (
-            input_embeds
-            if input_embeds is not None
-            else embed(m.embed_tokens, input_ids)
-        )
+        # the first layer's launch reads the embedding rows itself where it can (no
+        # Engram write before it, the whole table kept, not an index source)
+        table = m.embed_tokens.__dict__.get(FULL_EMBEDDING)
+        first = None
+        if self._embed_first(input_embeds, table):
+            first = (table, input_ids.contiguous())
+        if first is None:
+            x = (
+                input_embeds
+                if input_embeds is not None
+                else embed(m.embed_tokens, input_ids)
+            )
         # the compressor caches each step's rotary tables on the batch
         for attr in ("freqs_cis_c4", "freqs_cis_c128"):
             if hasattr(forward_batch, attr):
@@ -999,8 +1011,13 @@ class _Built:
             engram_rows = self._engram_rows(hash_ids)
         aux = None if m.dspark_layers_to_capture is None else []
         plan.state["dspark_aux"] = aux
-        pending, pre = (None, hc_broadcast(x, m.hc_mult), None, None), None
-        plan.state["tok_par"] = self.runner.tok_par(x.shape[0])
+        if first is None:
+            pending, pre = (None, hc_broadcast(x, m.hc_mult), None, None), None
+            rows = x.shape[0]
+        else:
+            pending, pre = (None, None, None, None), None
+            rows = first[1].shape[0]
+        plan.state["tok_par"] = self.runner.tok_par(rows)
         tok_par = plan.state["tok_par"]
         fuse = fused.enabled()
         for i in range(m.start_layer, m.end_layer):
@@ -1018,8 +1035,9 @@ class _Built:
             else:
                 defer = nxt.engram is None or fuse
             hidden, pre, post = self._layer(
-                self._layers[i], plan, positions, forward_batch, pending, pre, defer
-            )
+                self._layers[i], plan, positions, forward_batch, pending, pre, defer,
+                first if i == m.start_layer else None,
+            )  # fmt: skip
             pending = post if defer else (None, hidden, None, None)
         last = m.layers[m.end_layer - 1]
         if pending[0] is None:
@@ -1158,8 +1176,28 @@ class _Built:
             inplace_all_reduce(out.view(torch.int32), group_name=group.unique_name)
         return {e.layer_hash_index: out[k] for k, e in enumerate(engrams)}
 
+    def _embed_first(self, input_embeds, table) -> bool:
+        """Whether the first layer's launch reads the embedding table (``_launch``)."""
+        m = self.model
+        L = self._layers.get(m.start_layer)
+        return (
+            input_embeds is None
+            and table is not None
+            and L is not None
+            and not L.index
+            and m.layers[m.start_layer].engram is None
+        )
+
     def _layer(
-        self, L, plan, positions, forward_batch, pending_post, prev_pre, defer_post
+        self,
+        L,
+        plan,
+        positions,
+        forward_batch,
+        pending_post,
+        prev_pre,
+        defer_post,
+        embed=None,
     ):
         """One layer: the previous layer's pending post (x, residual, post, comb)
         and pre in; the fused boundary's outputs out."""
@@ -1167,7 +1205,7 @@ class _Built:
         out = _launch(
             self.runner, L, plan, positions, forward_batch, pending_post, prev_pre,
             capture=lambda L, M: self._capture(plan, L, M),
-            tok_par=plan.state["tok_par"],
+            tok_par=plan.state["tok_par"], embed=embed,
         )  # fmt: skip
         return _boundary_out(L.module, defer_post, *out)
 
@@ -1318,11 +1356,15 @@ def _build(model, hf_config, ctx) -> _Built:
     }
     k2 = {(L.ratio > 0, True) for L in layers.values() if L.index}
     one = {
-        (fold, L.ratio > 0)
+        (fold, L.ratio > 0, False)
         for L in layers.values()
         if not L.index
         for fold in (True, False)
     }
+    # the first layer on the embedding table (``_Built._embed_first``)
+    first = layers.get(model.model.start_layer)
+    if first is not None and not first.index:
+        one.add((False, first.ratio > 0, True))
     # ranks share FlyDSL's disk cache (a lock per kernel), so each starts at its own slice
     widths = list(ctx.widths)
     start = len(widths) * p.tp_rank // p.tp_size

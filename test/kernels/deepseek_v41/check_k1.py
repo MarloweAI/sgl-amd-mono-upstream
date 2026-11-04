@@ -316,6 +316,7 @@ def main():
                 iw_w.data_ptr(), iw_bits, cos_sin.shape[0], r.iq.data_ptr(),
                 r.iqs.data_ptr(), r.iw.data_ptr(), sc.data_ptr(),
                 r.peer.local, r.peer.addresses.data_ptr(), r.rank, r.epoch.data_ptr(),
+                0, 0,  # no token ids: not the first layer's embedding read
                 stream=torch.cuda.current_stream(),
             )  # fmt: skip
 
