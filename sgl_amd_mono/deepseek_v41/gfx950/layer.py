@@ -186,6 +186,8 @@ def scratch_layout(s: int, tp: int, timeline: bool = False, **route) -> dict:
             "grdy": (256 + q_flags + s * flag, s * flag),
         }
     )
+    # the router CTAs' x boxes (``moe.signal_xbox``): uncached scratch, scalar-polled
+    place({"xbox": (0, moe.xbox_bytes(s))})
     if timeline:
         place({"timeline": (0, BLOCKS * TL_POINTS * 8)})
     return out
@@ -1031,14 +1033,22 @@ def run_ffn(key: MonoBuild, lds, a: dict, amb, bases, own, rank, ep, part=None):
             # the row for every other rank's MoE (``gather_row``)
             push_bf_row(ca, bases, xg, plus(t0, t), col, ys, live)
 
+    xbox = scratch + fx.Int64(layout["xbox"][0])
+    cb["xbox"], cb["xtag"] = xbox, amb.tag
+
+    def x_ready(t):
+        # the flag (the drain first), then the router CTAs' box word
+        publish(cb["put"], cb["xrdy"], t, 1, tid == 0)
+        moe.signal_xbox(cb, xbox, t, amb.tag)
+
     for t in range(first_task(bid, NORM0), own_n, BLOCKS):
         seam.stage_norm(ca, t, store)
-        publish(cb["put"], cb["xrdy"], plus(t0, t), 1, tid == 0)
+        x_ready(plus(t0, t))
     if const_expr(key.tok_par):
         for t in range(first_task(bid, GATHER0), s, BLOCKS):
             if t // own_n != rank:
                 gather_row(ca, preg(own, xg, "xg"), t, normed)
-                publish(cb["put"], cb["xrdy"], t, 1, tid == 0)
+                x_ready(t)
     gpu.barrier()
     stamp(ca, 18)
 

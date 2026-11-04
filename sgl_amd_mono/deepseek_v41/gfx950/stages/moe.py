@@ -8,10 +8,11 @@
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu
 from flydsl.expr import math as fmath
 from flydsl.expr import range_constexpr, rocdl
-from flydsl.expr.typing import T
+from flydsl.expr.typing import T, as_ir_value
 
 from sgl_amd_mono.common.mx import (
     FP4,
@@ -55,6 +56,7 @@ from sgl_amd_mono.common.plan import (
 from sgl_amd_mono.common.stamps import stamp
 from sgl_amd_mono.common.sync import (
     FLAG_STRIDE,
+    _spin,
     preg,
     publish,
     sreg,
@@ -1373,7 +1375,8 @@ def run_moe(c, key, bid, before_ug=None):
     for task in range(first_task(bid, c["rs"].router0), router_tasks, BLOCKS):
         # the gate rows go out before x's wait: they do not depend on it
         wvs = router_weights(c, task)
-        await_x(c, list(range(s)))
+        # x's flags through this CTA's box: scalar loads, which wait behind no weight
+        await_xbox(c)
         stage_router(c, task, wvs)
     stamp(c, 20)
     for t in range(first_task(bid, route0), s, BLOCKS):
@@ -1444,6 +1447,62 @@ def run_moe(c, key, bid, before_ug=None):
 def await_x(c, tokens):
     """Wait for the FFN seam's normed rows of ``tokens``."""
     c["poll"]([(c["xrdy"], t, 1) for t in tokens])
+
+
+XBOX_LINE = 128  # bytes a line of a CTA's x box: 16 words (a token each) and a pad
+XBOX_WORDS = 16
+
+
+def xbox_bytes(s: int) -> int:
+    """The x box: a line a 16 tokens for each CTA (``signal_xbox``)."""
+    return BLOCKS * -(-s // XBOX_WORDS) * XBOX_LINE
+
+
+@flyc.jit
+def signal_xbox(c, box, t, tag):
+    """Token t's normed row landed (the caller drained its stores): its word of every
+    CTA's x box := ``tag``, a thread a CTA."""
+    lines = -(-c["S"] // XBOX_WORDS)
+    tid = c["tid"]
+    if tid < BLOCKS:
+        at = (tid * lines + t // XBOX_WORDS) * (XBOX_LINE // 4) + t % XBOX_WORDS
+        bo.buffer_store(tag, rsrc(box), at, cache_modifier=CM_DEV)
+
+
+def scalar_words(addr):
+    """``XBOX_WORDS`` words at a wave-uniform address of uncached memory, a scalar glc
+    load: it counts in lgkmcnt, so it returns behind none of the CU's vector loads."""
+    v = llvm.inline_asm(
+        T.vec(XBOX_WORDS, T.i32),
+        [as_ir_value(fx.Int64(addr))],
+        "s_nop 4\ns_load_dwordx16 $0, $1, 0x0 glc\ns_waitcnt lgkmcnt(0)",
+        "=&s,s",
+        has_side_effects=True,
+    )
+    v = fx.Vector(v)
+    return [v[e] for e in range(XBOX_WORDS)]
+
+
+@flyc.jit
+def await_xbox(c):
+    """Wait until this CTA's x box holds the launch's tag for every token (``signal_xbox``)."""
+    s, tag = c["S"], c["xtag"]
+    lines = -(-s // XBOX_WORDS)
+    base = c["xbox"] + fx.Int64(c["bid"] * lines * XBOX_LINE)
+
+    def load_all():
+        words = []
+        for k in range_constexpr(lines):
+            words += scalar_words(base + fx.Int64(k * XBOX_LINE))
+        return fx.Vector.from_elements(words, fx.Int32)
+
+    def pending(v):
+        bad = v[0] != tag
+        for t in range_constexpr(1, s):
+            bad = bad | (v[t] != tag)
+        return bad
+
+    _ = _spin(load_all, pending)
 
 
 def moe_args(*values) -> dict:
