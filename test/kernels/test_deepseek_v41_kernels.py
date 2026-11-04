@@ -1,8 +1,9 @@
 """The DeepSeek-V4.1 gfx950 monokernels against SGLang's ops (RFC #43949).
 
-Each ``deepseek_v41/check_*.py`` (K1, K2, the FFN launch on both routes, the sampled Markov block)
-under torchrun at TP2, TP4 and, with 8 GPUs, TP8: outputs within the spec's bound, bitwise graph
-replays with every rank agreeing; and ``check_glue.py`` (the step glue) on one GPU."""
+Each ``deepseek_v41/check_*.py`` (K1, K2, the layer launch, the FFN launch on both routes, the
+sampled Markov block) under torchrun at TP2, TP4 and, with 8 GPUs, TP8: outputs within the spec's
+bound, bitwise graph replays with every rank agreeing; and ``check_glue.py`` (the step glue) on
+one GPU."""
 
 import subprocess
 import sys
@@ -58,6 +59,9 @@ class TestMonoDeepseekV41Kernels(CustomTestCase):
 
     def test_k2_preshuffled(self):
         self._check("check_k2", "--replays", "100", "--shuffled")
+
+    def test_layer_launch(self):
+        self._check("check_layer", "--replays", "50")
 
     def test_sampled_markov_block(self):
         self._check("check_markov", "--replays", "20")

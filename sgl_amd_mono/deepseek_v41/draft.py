@@ -243,8 +243,8 @@ def _build(model, hf_config, ctx) -> _Draft:
     widths = list(ctx.widths)
     start = len(widths) * p.tp_rank // p.tp_size
     for m in widths[start:] + widths[:start]:
-        # K1 with and without an owed post; K2 on the window: no index source, no top-k
-        runner.precompile(m, k1={(False, False), (True, False)}, k2={(False, False)})
+        # with and without an owed post, on the window: no index source, no top-k
+        runner.precompile(m, layer={(False, False), (True, False)})
     draft_sampler.install(model, ctx.deadline_s)
     return _Draft(model, runner, stages)
 

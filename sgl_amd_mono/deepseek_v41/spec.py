@@ -726,9 +726,9 @@ def _launch(
     capture=None,
     tok_par=False,
 ):
-    """K1, then K2, of layer ``L``: the previous layer's pending post (x, residual,
-    post, comb) and pre in; K2's (x, residual, post, comb, pre) out, this layer's
-    post pending. With no post owed (x None) the residual arrives settled: the
+    """Layer ``L``: one launch (K1, then K2), or on an index source K1, the indexer and
+    K2: the previous layer's pending post (x, residual, post, comb) and pre in; K2's
+    (x, residual, post, comb, pre) out, this layer's post pending. With no post owed (x None) the residual arrives settled: the
     first layer's broadcast embedding (no pre: copy 0), an Engram layer's
     residual, or a draft stage's input."""
     from sglang.srt.model_executor.forward_context import (
@@ -764,20 +764,24 @@ def _launch(
         residual = residual.contiguous()  # the broadcast embedding may be a view
         if prev_pre is None:
             prev_pre = runner.first_pre[:M]
+    aux = None if capture is None else capture(L, M)
+    if not L.index:
+        return runner.layer(
+            L.k1, L.k2, L.ffn, x, residual, post, comb, prev_pre, pos, slot, L.swa,
+            L.swa_block, L.comp, L.comp_block, keys, tok_par=tok_par, aux=aux,
+        )  # fmt: skip
     runner.k1(
         L.k1, x, residual, post, comb, prev_pre, pos, slot, L.swa, L.swa_block,
-        keys, index=L.index, tok_par=tok_par,
-        aux=None if capture is None else capture(L, M),
+        keys, index=True, tok_par=tok_par, aux=aux,
     )  # fmt: skip
-    if L.index:
-        _select(
-            runner=runner, L=L, plan=plan, backend=backend, positions=positions,
-            pos=pos, forward_batch=forward_batch, M=M,
-        )  # fmt: skip
+    _select(
+        runner=runner, L=L, plan=plan, backend=backend, positions=positions,
+        pos=pos, forward_batch=forward_batch, M=M,
+    )  # fmt: skip
     # K2 reads K1's outputs from the runner's buffers
     return runner.k2(
         L.k2, L.ffn, M, pos, L.swa, L.swa_block, L.comp, L.comp_block,
-        slot=slot, keys=keys, index=L.index, tok_par=tok_par,
+        slot=slot, keys=keys, index=True, tok_par=tok_par,
     )  # fmt: skip
 
 
@@ -1304,18 +1308,28 @@ def _build(model, hf_config, ctx) -> _Built:
     if k2i:
         # the indexer's buffers, sized here: before SGLang sizes the KV cache
         runner.enable_k2i(_longest_context(hf_config))
-    # K1 with and without an owed post (none on the first layer and after an Engram write)
+    # with and without an owed post (none on the first layer and after an Engram write):
+    # an index source's K1 and K2, a reuse layer's one launch
     k1 = {
-        (fold, L.index, L.k1.iq_w is not None)
+        (fold, True, L.k1.iq_w is not None)
         for L in layers.values()
+        if L.index
         for fold in (True, False)
     }
-    k2 = {(L.ratio > 0, L.index) for L in layers.values()}
+    k2 = {(L.ratio > 0, True) for L in layers.values() if L.index}
+    one = {
+        (fold, L.ratio > 0)
+        for L in layers.values()
+        if not L.index
+        for fold in (True, False)
+    }
     # ranks share FlyDSL's disk cache (a lock per kernel), so each starts at its own slice
     widths = list(ctx.widths)
     start = len(widths) * p.tp_rank // p.tp_size
     for m in widths[start:] + widths[:start]:
-        runner.precompile(m, k1=k1, k2=k2, k2i=k2i, tok_par=runner.tok_par(m))
+        runner.precompile(
+            m, k1=k1, k2=k2, layer=one, k2i=k2i, tok_par=runner.tok_par(m)
+        )
     glue.prewarm(device)
     fused.prewarm(model)
     return _Built(model, runner, layers)
