@@ -2,8 +2,10 @@
 bit against its K1 then its K2 (two launches) on the same inputs, every row's window
 holding the step's own new records; with and without an owed post, with and without
 compressed keys, and token parallel where the width allows; the first layer on the
-embedding table bit for bit against the same launch on the broadcast rows; then every step
-in one graph, bit for bit under replay."""
+embedding table bit for bit against the same launch on the broadcast rows; with the next
+layer's Engram projection, its outputs bit for bit as without and every rank's kv the same,
+within the bf16 rounding of an fp64 product of the MXFP8 operands; then every step in one
+graph, bit for bit under replay."""
 
 import argparse
 import os
@@ -70,9 +72,11 @@ def main():
     from sgl_amd_mono.deepseek_v41.gfx950.attention.plan import Dims
     from sgl_amd_mono.deepseek_v41.gfx950.runner import (
         DSV41MonoRunner,
+        EngramWeights,
         K1Weights,
         K2Weights,
     )
+    from sgl_amd_mono.deepseek_v41.gfx950.stages import engram
     from sgl_amd_mono.deepseek_v41.gfx950.token_par import token_par
 
     d = Dims(tp)
@@ -111,8 +115,43 @@ def main():
     swa = swa0.clone()
 
     table = (torch.randn(VOCAB, HIDDEN, generator=g, device=dev) * 0.05).bfloat16()
+    # the next layer's Engram projection: one wkv on every rank, each with its rows
+    ge = torch.Generator(device=dev).manual_seed(23)
+    wkv = (torch.randn(engram.N, engram.K, generator=ge, device=dev) * 64).clamp(
+        -448, 448
+    )
+    wkv = wkv.to(torch.float8_e4m3fn)
+    wkv_s = torch.randint(
+        112, 120, (engram.N // 32, engram.K // 32), generator=ge, device=dev
+    ).to(torch.uint8)
+    n_eg = engram.rank_rows(tp)
+    ew = EngramWeights(
+        w=engram.tile_order(wkv[rank * n_eg : (rank + 1) * n_eg]),
+        ws=wkv_s[rank * n_eg // 32 : (rank + 1) * n_eg // 32].contiguous(),
+    )
+    ew.check(tp)
+    # the same projection shared by two launches (the reuse layers before an Engram layer)
+    halves = [
+        EngramWeights(w=ew.w[a:b], ws=ew.ws[a // 32 : b // 32].contiguous(), row0=a)
+        for a, b in ((0, n_eg // 64 * 32), (n_eg // 64 * 32, n_eg))
+    ]
+    # wkv in fp64: each 32 x 32 block times its scale
+    wkv64 = wkv.double() * torch.exp2(wkv_s.double() - 127).repeat_interleave(
+        32, 0
+    ).repeat_interleave(32, 1)
 
-    def launches(M, step, fold, compressed, tok_par, one, outs, embed=None):
+    def mx_rows(x):
+        """The MXFP8 linear's input quant of bf16 rows (vLLM's scale rule), in fp64."""
+        v = x.float().view(x.shape[0], -1, 32)
+        a = (
+            v.abs().amax(-1).clamp_min(torch.finfo(torch.float32).tiny) / 448.0
+        ).float()
+        code = (torch.ceil(torch.log2(a.double())) + 127).clamp(0, 254)
+        q = (v * torch.exp2(127 - code)[..., None].float()).clamp(-448, 448)
+        q = q.to(torch.float8_e4m3fn).double()
+        return (q * torch.exp2(code - 127)[..., None]).view(x.shape[0], -1)
+
+    def launches(M, step, fold, compressed, tok_par, one, outs, embed=None, eg=None):
         x, res, post, comb, pre, pos, slot, keys = step
         cc = comp if compressed else None
         if embed is not None:  # the first layer: the table at the step's ids
@@ -123,7 +162,7 @@ def main():
         if one:
             return runner.layer(
                 k1w, aw, mw, x, res, post, comb, pre, pos, slot, swa, SWA_BLOCK, cc,
-                COMP_BLOCK, keys, outs=outs, tok_par=tok_par, embed=embed,
+                COMP_BLOCK, keys, outs=outs, tok_par=tok_par, embed=embed, eg=eg,
             )  # fmt: skip
         runner.k1(
             k1w, x, res, post, comb, pre, pos, slot, swa, SWA_BLOCK, keys,
@@ -137,6 +176,48 @@ def main():
         """The launch's outputs, K1's outputs K2 read, and the SWA cache."""
         mid = (runner.q, runner.res_mid, runner.post_a, runner.comb_a, runner.pre_a)
         return [t.clone() for t in outs] + [t[:M].clone() for t in mid] + [swa.clone()]
+
+    def check_engram(M, step, fold, compressed, want):
+        """The launch with an Engram layer's rows, its projection in one launch, then in
+        two halves: its outputs as without; kv."""
+        gi = torch.Generator().manual_seed(500 + M)
+        rows = (torch.randn(M, engram.K, generator=gi) * 0.3).bfloat16().to(dev)
+        kvs, same = [], True
+        for shares in ([ew], halves):
+            runner.egkv.fill_(SENTINEL)
+            for share in shares:
+                outs = runner._outs(M, step[1])
+                swa.copy_(swa0)
+                launches(M, step, fold, compressed, False, True, outs, eg=(rows, share))
+                torch.cuda.synchronize()
+                same &= all(
+                    x.view(torch.uint8).equal(y.view(torch.uint8))
+                    for x, y in zip(state(M, outs), want)
+                )
+            kvs.append(runner.egkv[:M].clone())
+        same &= kvs[0].view(torch.uint8).equal(kvs[1].view(torch.uint8))
+        kv = kvs[0]
+        every = [torch.empty_like(kv) for _ in range(tp)]
+        dist.all_gather(every, kv)
+        alike = all(e.view(torch.uint8).equal(kv.view(torch.uint8)) for e in every)
+        xq = mx_rows(rows)
+        ref = xq @ wkv64.T
+        mag = xq.abs() @ wkv64.abs().T
+        err = (kv.double() - ref).abs()
+        # bf16 rounding of the f32 sum, and the f32 sum's own error (K terms)
+        ok = bool((err <= ref.abs() * 2.0**-8 + mag * engram.K * 2.0**-24).all())
+        rel = (err / mag.clamp_min(1e-30)).max().item()
+        name = f"M={M} fold={fold} compressed={compressed} engram"
+        if rank == 0:
+            print(
+                f"{name}: outputs {'bitwise' if same else 'DIFFER'} (kv in halves alike), kv "
+                f"{'alike' if alike else 'DIFFERS'} on every rank, "
+                f"{'within' if ok else 'PAST'} the bound (max |d| / sum |x w| {rel:.2e}, "
+                f"{(kv.double() != ref.bfloat16().double()).float().mean().item():.1%} "
+                "not the fp64 product's nearest bf16)",
+                flush=True,
+            )
+        return [] if same and alike and ok else [name]
 
     fails, steps = [], []
     for M in (int(v) for v in args.widths.split(",")):
@@ -174,6 +255,8 @@ def main():
                         fails.append(name)
                     outs = runner._outs(M, step[1])
                     steps.append((M, step, fold, compressed, tok_par, outs, got[1]))
+                    if not tok_par and runner.eg_fused(M, tok_par):
+                        fails += check_engram(M, step, fold, compressed, got[1])
                     if fold:
                         continue
                     # the first layer: on (table, ids) and on the rows hc_broadcast makes

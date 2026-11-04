@@ -53,7 +53,7 @@ from .attention.plan import (
     wqkv_split,
 )
 from .indexer import compress
-from .stages import moe, seam
+from .stages import engram, moe, seam
 from .stages.dims import Dims as StageDims
 from .stages.gemv import plus, token_tiles
 from .stages.moe_shape import EXPERTS, SORT_NETS, TOPK, MoeBuild, route_shape
@@ -113,6 +113,9 @@ class MonoBuild(msgspec.Struct, frozen=True):
     shuffled: bool = False
     # the first layer: K1 reads each stream from the embedding table at the token's id
     embed: bool = False
+    # a reuse layer's launch also projects this many 16-row tasks of a later Engram layer's
+    # rows (``stages.engram``)
+    eg: int = 0
 
 
 ROUTE = ("experts", "topk", "ug_groups", "swa_width")
@@ -133,6 +136,7 @@ def _variant(key: MonoBuild) -> dict:
         | ({"p": 1} if key.tok_par else {})
         | ({"sh": 1} if key.shuffled else {})
         | ({"em": 1} if key.embed else {})
+        | ({"eg": key.eg} if key.eg else {})
     )
 
 
@@ -1416,10 +1420,11 @@ K2_ARGS = (
 
 
 @flyc.jit
-def run_k2(key: MonoBuild, lds, a: dict, ep, one=False):
+def run_k2(key: MonoBuild, lds, a: dict, ep, one=False, eg=None):
     """K2 on this CTA: the attention back on K1's q, its wo_b partial pushed to every
     rank, then ``run_ffn`` (``lds``: a union with K2's members). ``one``: one launch per
-    layer, K1's half before it in the same launch (``build_mono_layer``)."""
+    layer, K1's half before it in the same launch (``build_mono_layer``). ``eg``: a later
+    Engram layer's projection's arguments (``EG_ARGS``, ``key.eg``)."""
     (
         q,
         swa,
@@ -1555,7 +1560,26 @@ def run_k2(key: MonoBuild, lds, a: dict, ep, one=False):
         for t in range(first_task(bid, BLOCKS - s), s, BLOCKS):
             mb_front.stage_kt(ckt, t)
             mb_back.publish(c, c["krdy"], t)
-    mb_back.run_back(c, bkey, bid)
+    idle = None
+    if const_expr(key.eg):
+        # a later Engram layer's projection on the CTAs without a wo_a unit
+        _, n_split, n_comb, _, woa0, _, _ = mb_back.back_plan(bkey)
+        ec = engram.eg_context(
+            eg, key.eg, bases, own, peer_offsets(s, tp)["eng"], tp, rank, amb,
+            lds.eg.peek(),
+        )  # fmt: skip
+        ec["first"], ec["ctas"] = engram.eg_plan(
+            woa0, mb_back.woa_units(s, Dims(tp)), n_split, n_comb
+        )
+        gc = {
+            "tid": c["tid"], "bid": bid, "lane": c["lane"], "wave": c["wave"],
+            "tl": c.get("tl"),
+        }  # fmt: skip
+
+        def idle():
+            engram.run_eg(gc, ec, s)
+
+    mb_back.run_back(c, bkey, bid, idle)
     if const_expr(not one):
         # the epoch moves on once every CTA marked it, off the launch's end: the last CTA
         # waits on its next stage's inputs (the FFN seam) a while
@@ -1591,6 +1615,9 @@ def run_k2(key: MonoBuild, lds, a: dict, ep, one=False):
     if const_expr(one):
         a["grdy"] = sreg(scratch, layout["grdy"][0], "grdy")
     run_ffn(key, lds, a, amb, bases, own, rank, ep)
+    if const_expr(key.eg):
+        # every rank's share of the projection in, long since: into ``eg_kv``
+        engram.unpack(gc, ec, s)
 
 
 def _k2_members(s, tp, rs):
@@ -1894,7 +1921,15 @@ LAYER_ARGS = K1_ARGS + (
     "sw2",
     "sw2_s",
     "out",
+    # a later Engram layer's projection (``MonoBuild.eg``): its rows, this launch's range
+    # of this rank's wkv rows and codes, kv out, the range's first row
+    "eg_x",
+    "eg_w",
+    "eg_ws",
+    "eg_kv",
+    "eg_row0",
 )
+EG_ARGS = LAYER_ARGS[-5:]
 # K2's arguments in the layer launch: its rows in are K1's out, and K1's rope table
 K2_OF_LAYER = {
     "res_in": "res_out",
@@ -1914,7 +1949,7 @@ K2_OF_LAYER = {
 # the layer launch's 32-bit arguments (the others are 64-bit)
 LAYER_I32 = frozenset(
     ("aux_stride", "slot_words", "swa_block", "iw_scale", "num_pos", "rank")
-    + ("ids_words", "comp_block", "qk_scale")
+    + ("ids_words", "comp_block", "qk_scale", "eg_row0")
 )
 
 
@@ -1983,6 +2018,9 @@ def build_mono_layer(key: MonoBuild):
     SplitLds, GemvLds, SeamLds, MoeLds = _k2_members(s, tp, rs)
     FrontLds = mb_front.front_lds(s, Dims(tp))
 
+    # the Engram projection's (``key.eg``), else one no larger than the others
+    EgLds = engram.eg_lds(mb_front.tile_rows(s) if key.eg else 1)
+
     # K1's seam takes K2's (a prefix of its members)
     @fx.union
     class LayerLds:
@@ -1991,6 +2029,7 @@ def build_mono_layer(key: MonoBuild):
         split: SplitLds  # type: ignore[valid-type]
         gemv: GemvLds  # type: ignore[valid-type]
         moe: MoeLds  # type: ignore[valid-type]
+        eg: EgLds  # type: ignore[valid-type]
 
     name = kernel_symbol(
         "dsv41_mono_layer", s=s, tp=tp, c=key.compressed, f=key.fold, **_variant(key)
@@ -2081,6 +2120,11 @@ def build_mono_layer(key: MonoBuild):
         sw2: Int64,
         sw2_s: Int64,
         out: Int64,
+        eg_x: Int64,
+        eg_w: Int64,
+        eg_ws: Int64,
+        eg_kv: Int64,
+        eg_row0: Int32,
     ):
         _ = keyed
         # every wait runs under the guard, so a timeout flags every peer and stops the launch
@@ -2179,6 +2223,11 @@ def build_mono_layer(key: MonoBuild):
                 "sw2": sw2,
                 "sw2_s": sw2_s,
                 "out": out,
+                "eg_x": eg_x,
+                "eg_w": eg_w,
+                "eg_ws": eg_ws,
+                "eg_kv": eg_kv,
+                "eg_row0": eg_row0,
             }
             # the epoch in a scalar register: it lives through K1 into K2
             ep = uniform(_epoch(epoch))
@@ -2188,8 +2237,12 @@ def build_mono_layer(key: MonoBuild):
             # the K1 half's LDS is free
             gpu.barrier()
             names = [K2_OF_LAYER.get(n, n) for n in K2_ARGS]
+            names += list(EG_ARGS) if key.eg else []
             a2 = reload_args(names, offsets, LAYER_I32)
-            run_k2(key, lds, {n: a2[K2_OF_LAYER.get(n, n)] for n in K2_ARGS}, ep, True)
+            eg = {n: a2[n] for n in EG_ARGS} if key.eg else None
+            run_k2(
+                key, lds, {n: a2[K2_OF_LAYER.get(n, n)] for n in K2_ARGS}, ep, True, eg
+            )
 
     @flyc.jit
     def launch(
@@ -2274,6 +2327,11 @@ def build_mono_layer(key: MonoBuild):
         sw2: Int64,
         sw2_s: Int64,
         out: Int64,
+        eg_x: Int64,
+        eg_w: Int64,
+        eg_ws: Int64,
+        eg_kv: Int64,
+        eg_row0: Int32,
         stream: fx.Stream = _STREAM,
     ):
         _ = keyed
@@ -2359,6 +2417,11 @@ def build_mono_layer(key: MonoBuild):
             sw2,
             sw2_s,
             out,
+            eg_x,
+            eg_w,
+            eg_ws,
+            eg_kv,
+            eg_row0,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 
     return launch

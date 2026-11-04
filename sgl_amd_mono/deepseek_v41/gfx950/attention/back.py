@@ -784,8 +784,10 @@ def back_context(key, lds, args: dict, scratch, tag, layout: dict) -> dict:
 
 
 @flyc.jit
-def run_back(c, key, bid):
-    """The attention back's stages on this CTA: split, combine, wo_a, wo_b."""
+def run_back(c, key, bid, idle=None):
+    """The attention back's stages on this CTA: split, combine, wo_a, wo_b.
+    ``idle``: work for the CTAs past their attention units, after the attention work and
+    before their GEMV weights load."""
     s = key.tokens
     dd = Dims(key.tp)
     # plain ints: a Python object read inside traced control flow is carried
@@ -802,6 +804,9 @@ def run_back(c, key, bid):
         stage_combine(c, unit)
     gpu.barrier()
     stamp(c, 2)
+    if const_expr(idle is not None):
+        # before any GEMV weights load, so none are live under it
+        idle()
     # the GEMV weights right after the attention work: the wo_a unit's (if any), then wo_b's
     nt = len(tiles)
     units = woa_units(s, dd)

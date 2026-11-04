@@ -21,6 +21,7 @@ from .attention.index_query import cp_cols
 from .attention.index_query import fused as iq_fused
 from .attention.plan import DATA, HEAD_DIM, KEYS, Q_RANK, TOPK, WINDOW, Dims
 from .layer import (
+    EG_ARGS,
     EPOCH_WORDS,
     HIDDEN,
     K1_ARGS,
@@ -39,6 +40,7 @@ from .layer import (
     scratch_bytes,
     scratch_layout,
 )
+from .stages import engram
 from .stages.dims import Dims as MoeDims
 from .stages.moe_shape import EXPERTS
 from .stages.moe_shape import TOPK as ROUTE_TOPK
@@ -51,6 +53,7 @@ __all__ = [
     "K1Weights",
     "K2Weights",
     "FFNWeights",
+    "EngramWeights",
 ]
 
 HC = 4
@@ -283,6 +286,34 @@ class K2Weights(msgspec.Struct):
             raise RuntimeError(f"K2 cos_sin: {tuple(cs.shape)} {cs.dtype}")
 
 
+class EngramWeights(msgspec.Struct):
+    """A launch's share of a later Engram layer's projection on this rank
+    (``stages.engram``): rows ``row0`` .. of this rank's rows of ``wkv`` (an N shard, all
+    of K)."""
+
+    w: torch.Tensor  # [rows, 6144] e4m3 in the GEMV's tile order (``tile_order``)
+    ws: torch.Tensor  # [rows / 32, 192] E8M0 (32 x 32 blocks)
+    row0: int = 0
+
+    @property
+    def tasks(self) -> int:
+        return self.w.shape[0] // 16
+
+    def check(self, tp: int) -> None:
+        n = self.w.shape[0]
+        if not (
+            n % 32 == 0 and 0 <= self.row0 and self.row0 + n <= engram.rank_rows(tp)
+        ):
+            raise RuntimeError(
+                f"Engram rows {self.row0} + {n} of {engram.rank_rows(tp)}"
+            )
+        want = {
+            "w": ((n, engram.K), torch.float8_e4m3fn),
+            "ws": ((n // 32, engram.K // 32), torch.uint8),
+        }
+        _check_tensors(self, "Engram", want)
+
+
 class DSV41MonoRunner:
     """The mono decode runner of one TP rank (``group``: gloo, for the peer handle exchange).
 
@@ -358,6 +389,8 @@ class DSV41MonoRunner:
         # an index KV source's compressor projection: [rows, 1024] f32 at compress ratio 2,
         # [rows, 512] bf16 at ratio 1 (``cproj``)
         self._cproj = torch.zeros(MAX_TOKENS, 1024, dtype=torch.float32, device=dev)
+        # an Engram layer's kv, where the layer launches before it project it (``layer(eg=)``)
+        self.egkv = torch.zeros(MAX_TOKENS, engram.N, dtype=torch.bfloat16, device=dev)
         # the record an absent key reads: zero data and scales, masked anyway
         self.zero_rec = torch.zeros(1024, dtype=torch.uint8, device=dev)
         self.qk_scale = (
@@ -444,6 +477,11 @@ class DSV41MonoRunner:
             return self._cproj[:rows]
         return self._cproj.view(torch.bfloat16).view(-1)[: rows * 512].view(rows, 512)
 
+    def eg_fused(self, tokens: int, tok_par: bool) -> bool:
+        """Whether a layer launch at this width projects its share of a later Engram layer's rows (all
+        of the step's rows: not token parallel); else SGLang's projection does."""
+        return self.supports(tokens) and not tok_par
+
     def cp_fused(self, tokens: int, tok_par: bool) -> bool:
         """Whether an index KV source's K1 at this width computes its compressor projection
         (with the index query, not token parallel); else SGLang's compressor does."""
@@ -506,7 +544,7 @@ class DSV41MonoRunner:
         """Allocate this width's scratch and compile its launches without running them.
 
         K1 for each (fold, index, iq, cp) in ``k1``, K2 for each (compressed, index) in
-        ``k2``, the layer launch for each (fold, compressed, embed) in ``layer``, the FFN
+        ``k2``, the layer launch for each (fold, compressed, embed, eg) in ``layer``, the FFN
         launch, and K2i (``enable_k2i`` first)."""
         self.scratch(tokens)
         kernels = [self.k1_kernel(tokens, *v, tok_par=tok_par) for v in sorted(k1)]
@@ -1008,11 +1046,14 @@ class DSV41MonoRunner:
         fold: bool = True,
         compressed: bool = True,
         embed: bool = False,
+        eg: int = 0,
         tok_par: bool = False,
     ):
         """A reuse layer's one launch at this width (``build_mono_layer``); ``embed``:
-        the first layer, on the embedding table."""
-        key = (tokens, "layer", fold, compressed, tok_par, embed)
+        the first layer, on the embedding table; ``eg``: with this many tasks of a later
+        Engram layer's projection, where ``eg_fused`` (else none)."""
+        eg = eg if self.eg_fused(tokens, tok_par) else 0
+        key = (tokens, "layer", fold, compressed, tok_par, embed, eg)
         if key not in self._kernels:
             no_capture(f"layer launch width {tokens}")
             self._kernels[key] = build_mono_layer(
@@ -1028,6 +1069,7 @@ class DSV41MonoRunner:
                     timeline=self.timeline_on,
                     tok_par=tok_par,
                     embed=embed,
+                    eg=eg,
                     **self.route_at(tokens),
                 )
             )
@@ -1054,9 +1096,12 @@ class DSV41MonoRunner:
         tok_par: bool = False,
         aux: torch.Tensor | None = None,
         embed: tuple | None = None,
+        eg: tuple | None = None,  # (rows [M, 6144] bf16, EngramWeights)
     ):
         """Run a reuse layer (not an index source) in one launch: ``k1``, then ``k2`` on
-        its outputs, with their arguments; returns K2's outputs."""
+        its outputs, with their arguments; returns K2's outputs. ``eg``: a later Engram
+        layer's rows and this launch's share of its projection, into ``egkv``
+        (``eg_fused``)."""
         if aw.cos_sin.data_ptr() != w.cos_sin.data_ptr():
             raise RuntimeError("the layer launch takes K1's rope table for K2's too")
         a1, M, fold, _, _ = self._k1_args(
@@ -1066,9 +1111,32 @@ class DSV41MonoRunner:
         a2, outs, compressed = self._k2_args(
             aw, fw, M, pos, swa, swa_block, comp, comp_block, outs, tok_par=tok_par
         )
+        a2 |= dict.fromkeys(EG_ARGS, 0)
+        if eg is not None:
+            rows, ew = eg
+            if not (
+                rows.dtype == torch.bfloat16
+                and tuple(rows.shape) == (M, engram.K)
+                and rows.is_contiguous()
+            ):
+                raise RuntimeError(f"Engram rows: {tuple(rows.shape)} {rows.dtype}")
+            a2 |= {
+                "eg_x": rows.data_ptr(),
+                "eg_w": ew.w.data_ptr(),
+                "eg_ws": ew.ws.data_ptr(),
+                "eg_kv": self.egkv.data_ptr(),
+                "eg_row0": ew.row0,
+            }
         k2_name = {v: k for k, v in K2_OF_LAYER.items()}
         _run_compiled(
-            self.layer_kernel(M, fold, compressed, embed is not None, tok_par),
+            self.layer_kernel(
+                M,
+                fold,
+                compressed,
+                embed is not None,
+                eg[1].tasks if eg else 0,
+                tok_par,
+            ),
             *(a1[n] for n in K1_ARGS),
             *(a2[k2_name.get(n, n)] for n in LAYER_ARGS[len(K1_ARGS) :]),
             torch.cuda.current_stream(),

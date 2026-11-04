@@ -612,6 +612,10 @@ class _Layer(msgspec.Struct):
     comp: Any = None  # the compressed cache, the same layout
     comp_block: int = 0
     plane: Any = None  # an indexer's FP4 index plane: (payload, scales)
+    # a reuse layer before an Engram layer: its share of that Engram's projection
+    # (EngramWeights), and that layer
+    eg: Any = None
+    eg_for: int = 0
 
 
 def _keep(copies: dict, t: torch.Tensor, *key) -> torch.Tensor:
@@ -770,13 +774,16 @@ def _launch(
     capture=None,
     tok_par=False,
     embed=None,
+    eg=None,
 ):
     """Layer ``L``: one launch (K1, then K2), or on an index source K1, the indexer and
     K2: the previous layer's pending post (x, residual, post, comb) and pre in; K2's
     (x, residual, post, comb, pre) out, this layer's post pending. With no post owed (x None) the residual arrives settled: the
     first layer's broadcast embedding (no pre: copy 0), an Engram layer's
     residual, or a draft stage's input. ``embed`` (table, token ids): the first layer
-    reads each stream from the embedding table itself (residual None)."""
+    reads each stream from the embedding table itself (residual None). ``eg``: a reuse
+    layer's launch projects its share of a later Engram layer's rows too
+    (``runner.layer(eg=)``)."""
     from sglang.srt.model_executor.forward_context import (
         get_attn_backend,
         get_token_to_kv_pool,
@@ -817,7 +824,7 @@ def _launch(
         return runner.layer(
             L.k1, L.k2, L.ffn, x, residual, post, comb, prev_pre, pos, slot, L.swa,
             L.swa_block, L.comp, L.comp_block, keys, tok_par=tok_par, aux=aux,
-            embed=embed,
+            embed=embed, eg=eg,
         )  # fmt: skip
     kc = None
     if _kc_fused(runner=runner, L=L, M=M, tok_par=tok_par):
@@ -1141,10 +1148,12 @@ class _Built:
         for i in range(m.start_layer, m.end_layer):
             engram = m.layers[i].engram
             if engram is not None:
+                # the previous layer's launch projected its rows, where it could
+                kv = self.runner.egkv[:rows] if plan.state.get(("eg kv", i)) else None
                 # image rows bypass Engram on every step, as in SGLang (its gate keeps
                 # them): a graph cannot branch on mm inputs
                 pending = (None, self._engram(i, engram, pending, hash_ids, engram_rows,
-                                              input_ids, forward_batch), None, None)  # fmt: skip
+                                              input_ids, forward_batch, kv), None, None)  # fmt: skip
             nxt = m.layers[i + 1] if i + 1 < m.end_layer else None
             # an Engram layer reads the settled residual: a post owed into it only where
             # its gate's launch takes the post; the last layer's owed to the head's combine
@@ -1155,6 +1164,7 @@ class _Built:
             hidden, pre, post = self._layer(
                 self._layers[i], plan, positions, forward_batch, pending, pre, defer,
                 first if i == m.start_layer else None,
+                self._engram_projection(plan, i, engram_rows, rows),
             )  # fmt: skip
             pending = post if defer else (None, hidden, None, None)
         last = m.layers[m.end_layer - 1]
@@ -1180,11 +1190,25 @@ class _Built:
         assert len(aux) == len(m.dspark_layers_to_capture)
         return (hidden, pre_hc_head), packed
 
+    def _engram_projection(self, plan, i, engram_rows, rows):
+        """(rows, EngramWeights) of a later Engram layer for layer i's launch to project its
+        share of (``runner.layer(eg=)``), where the step's launches can; else None."""
+        L = self._layers[i]
+        if L.eg is None or not self.runner.eg_fused(rows, plan.state["tok_par"]):
+            return None
+        staged = engram_rows.get(self.model.layers[L.eg_for].engram.layer_hash_index)
+        if staged is None:
+            return None
+        # every share's launch: the step's widths and staging are the same for each
+        plan.state["eg kv", L.eg_for] = True
+        return staged.flatten(-2), L.eg
+
     def _engram(
-        self, i, engram, pending, hash_ids, engram_rows, input_ids, forward_batch
+        self, i, engram, pending, hash_ids, engram_rows, input_ids, forward_batch, kv
     ):
         """Layer i's Engram write on the residual ``pending`` (x, residual, post, comb)
-        settles to: the previous layer's owed post (x not None) in the gate's launch."""
+        settles to: the previous layer's owed post (x not None) in the gate's launch.
+        ``kv``: its projection, where the previous layer's launch made it."""
         from sglang.srt.layers.engram import engram_gate
 
         m = self.model
@@ -1200,7 +1224,8 @@ class _Built:
                 input_ids=input_ids,
             )
         # Engram.forward on the staged rows; each rank projects its 1 / tp of K
-        kv = self._engram_kv(engram, rows.flatten(-2))
+        if kv is None:
+            kv = self._engram_kv(engram, rows.flatten(-2))
         if pending[0] is not None:
             return fused.post_gate(engram, m.layers[i - 1], pending, kv, input_ids)
         return engram_gate(
@@ -1316,14 +1341,16 @@ class _Built:
         prev_pre,
         defer_post,
         embed=None,
+        eg=None,
     ):
         """One layer: the previous layer's pending post (x, residual, post, comb)
-        and pre in; the fused boundary's outputs out."""
+        and pre in; the fused boundary's outputs out. ``eg``: a later Engram layer's
+        projection (``_engram_projection``)."""
         self._warm_normal_moe()
         out = _launch(
             self.runner, L, plan, positions, forward_batch, pending_post, prev_pre,
             capture=lambda L, M: self._capture(plan, L, M),
-            tok_par=plan.state["tok_par"], embed=embed,
+            tok_par=plan.state["tok_par"], embed=embed, eg=eg,
         )  # fmt: skip
         return _boundary_out(L.module, defer_post, *out)
 
@@ -1427,6 +1454,51 @@ def _k_shard(linear):
     return shard, k0, k0 + kk
 
 
+def _engram_weights(copies: dict, layers: dict, model, rank: int, tp: int) -> None:
+    """Each Engram layer's projection on the covered reuse layers since the Engram layer
+    before it (the first: since the first layer), split evenly by 32-row blocks: this
+    rank's rows of ``wkv`` (``stages.engram``), where the layout is the one known (block FP8
+    at 32 x 32, row-major, no bias)."""
+    from sgl_amd_mono.deepseek_v41.gfx950.runner import EngramWeights
+    from sgl_amd_mono.deepseek_v41.gfx950.stages import engram as eg
+
+    m = model.model
+    since = m.start_layer
+    for i in range(m.start_layer, m.end_layer):
+        e = m.layers[i].engram
+        if e is None:
+            continue
+        producers = [j for j in range(since, i) if j in layers and not layers[j].index]
+        since = i
+        lin = e.wkv
+        w = getattr(lin, "weight", None)
+        if (
+            not producers
+            or w is None
+            or w.dtype != torch.float8_e4m3fn
+            or tuple(w.shape) != (eg.N, eg.K)
+            or getattr(lin, "mxfp8_aiter_preshuffled", False)
+            or getattr(lin, "bias", None) is not None
+            or getattr(lin, "weight_scale_inv", None) is None
+        ):
+            continue
+        n = eg.rank_rows(tp)
+        w = eg.tile_order(w[rank * n : (rank + 1) * n])
+        codes = _codes(copies, i, "engram wkv", lin)[
+            rank * n // 32 : (rank + 1) * n // 32
+        ]
+        _keep(copies, w, "engram wkv rows", i)
+        _keep(copies, codes, "engram wkv row codes", i)
+        blocks = n // 32
+        for k, j in enumerate(producers):
+            b0, b1 = blocks * k // len(producers), blocks * (k + 1) // len(producers)
+            layers[j].eg = EngramWeights(
+                w=w[32 * b0 : 32 * b1], ws=codes[b0:b1].contiguous(), row0=32 * b0
+            )
+            layers[j].eg.check(tp)
+            layers[j].eg_for = i
+
+
 def _longest_context(hf_config) -> int:
     """The longest context a request can have, SGLang's ``context_len``; a ratio-1
     index source sees that many compressed rows (plus a verify step's draft rows)."""
@@ -1451,6 +1523,7 @@ def _build(model, hf_config, ctx) -> _Built:
         ctx.copies["rope table", n] = t
     # the peer handshake is collective: every rank gets here (attach agreed first)
     p = get_parallel()
+    _engram_weights(ctx.copies, layers, model, p.tp_rank, p.tp_size)
     device = model.model.layers[0].input_layernorm.weight.device
     runner = DSV41MonoRunner(
         p.tp_size,
@@ -1474,15 +1547,19 @@ def _build(model, hf_config, ctx) -> _Built:
     }
     k2 = {(L.ratio > 0, True) for L in layers.values() if L.index}
     one = {
-        (fold, L.ratio > 0, False)
+        (fold, L.ratio > 0, False, eg)
         for L in layers.values()
         if not L.index
         for fold in (True, False)
+        for eg in {0, L.eg.tasks if L.eg is not None else 0}
     }
     # the first layer on the embedding table (``_Built._embed_first``)
     first = layers.get(model.model.start_layer)
     if first is not None and not first.index:
-        one.add((False, first.ratio > 0, True))
+        one |= {
+            (False, first.ratio > 0, True, eg)
+            for eg in {0, first.eg.tasks if first.eg is not None else 0}
+        }
     # ranks share FlyDSL's disk cache (a lock per kernel), so each starts at its own slice
     widths = list(ctx.widths)
     start = len(widths) * p.tp_rank // p.tp_size
