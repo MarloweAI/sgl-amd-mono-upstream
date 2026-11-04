@@ -13,6 +13,8 @@ from sgl_amd_mono.common.epoch import gstore
 from sgl_amd_mono.common.mx import clamp_fp8
 from sgl_amd_mono.common.ops import (
     bf16_round,
+    bf_hi,
+    bf_lo,
     butterfly,
     fp8_pack4,
     fresh,
@@ -178,9 +180,10 @@ def stage_wqkv(c, ops, slots, n, halves):
 
 @flyc.jit
 def wqkv_publish(c, task, accs, slots, order, t0, n, live, part=None, s=0):
-    """Sum wqkv rows 16 task .. for tokens t0 .. t0 + n in SGLang's order into fp32 QKVP.
-    Split (``part``): part 0 sums the first half of ``order`` into QKVP's second region
-    (``s`` rows on), part 1 the rest onto that sum."""
+    """Sum wqkv rows 16 task .. for tokens t0 .. t0 + n in SGLang's order into QKVP, as
+    bf16 pairs (the qkv stage rounds the sums to bf16 first). Split (``part``): part 0
+    sums the first half of ``order`` into QKVP's second region (``s`` rows on, fp32),
+    part 1 the rest onto that sum."""
     tid, red = c["tid"], c["red"]
     chain_store(c, red, accs, slots)
     gpu.barrier()
@@ -189,15 +192,24 @@ def wqkv_publish(c, task, accs, slots, order, t0, n, live, part=None, s=0):
         tl = tid // ROWS
         at = plus(t0, tl) * QKV_ROWS + task * ROWS + r
         if const_expr(part is None):
-            c["mb"].put(c["qkvp"], at, chain_sum(red, r, tl, order))
+            qkv_put(c, at, r, chain_sum(red, r, tl, order))
         else:
             h, mid = len(order) // 2, s * QKV_ROWS + at
             if part == 0:
                 c["mb"].put(c["qkvp"], mid, chain_sum(red, r, tl, order[:h]))
             else:
                 tot = c["mb"].poll([(c["qkvp"], mid, 1)])[0][0].bitcast(fx.Float32)
-                c["mb"].put(c["qkvp"], at, chain_sum(red, r, tl, order[h:], tot))
+                qkv_put(c, at, r, chain_sum(red, r, tl, order[h:], tot))
     gpu.barrier()
+
+
+@flyc.jit
+def qkv_put(c, at, r, v):
+    """Row r's sum ``v`` (QKVP element ``at``) and its neighbour's as one bf16 pair, by the
+    even row's lane."""
+    nb = xshfl(v, 1)
+    if r % 2 == 0:
+        c["mb"].put_bf(c["qkvp"], at, [v, nb])
 
 
 # ---------------------------------------------------------------- q / kv norms
@@ -224,10 +236,13 @@ def stage_qkv(c, t):
     jj = fx.max(jr, 0)
     cs = is_rope.select(ld_f32(a["cos_sin"], pos * ROPE + jj), fx.Float32(1.0))
     sn = is_rope.select(ld_f32(a["cos_sin"], pos * ROPE + HALF + jj), fx.Float32(0.0))
-    specs = [(c["qkvp"], t * QKV_ROWS + qc[j], 1) for j in range(8)]
-    specs += [(c["qkvp"], t * QKV_ROWS + Q_RANK + tt * 2 + j, 1) for j in range(2)]
-    got = c["mb"].poll(specs)
-    vals = [bf16_round(got[j][0].bitcast(fx.Float32)) for j in range(10)]
+    # the sums as bf16 pairs (``qkv_put``): 8 q columns in 4 pairs (16 B loads), the kv
+    # pair in 1
+    q0 = fx.min(tt * 8, Q_RANK - 8)
+    specs = [(c["qkvp"], (t * QKV_ROWS + q0) // 2 + 2 * k, 2) for k in range(2)]
+    specs += [(c["qkvp"], (t * QKV_ROWS + Q_RANK + tt * 2) // 2, 1)]
+    pw = [w for g in c["mb"].poll(specs) for w in g]
+    vals = [(bf_lo if j % 2 == 0 else bf_hi)(pw[j // 2]) for j in range(10)]
     xq = [((tt * 8 + j) < Q_RANK).select(vals[j], fx.Float32(0.0)) for j in range(8)]
     xk = vals[8:10]
     ssq = xq[0] * xq[0]
