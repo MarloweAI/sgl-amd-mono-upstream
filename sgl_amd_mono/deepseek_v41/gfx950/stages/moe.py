@@ -253,9 +253,6 @@ def put_mxfp8_group_vllm(c, words_mb, codes_mb, t, g, v, amax):
 
 
 # ---------------------------------------------------------------- router
-ROUTER_EARLY_FROM = 12  # rows from which the router loads its gate rows early
-
-
 def router_weights(c, task):
     """The router task's gate rows, loaded (``stage_router`` takes them early)."""
     per_group = c["rs"].experts // ROWS * ROUTER_PARTS
@@ -266,8 +263,9 @@ def router_weights(c, task):
 
 
 @flyc.jit
-def stage_router(c, task, wvs=None):
-    """Router task: K part ``part`` of gate rows 16 ``tile`` .. times the group's tokens -> f32 sum."""
+def stage_router(c, task, wvs):
+    """Router task: K part ``part`` of gate rows 16 ``tile`` .. times the group's tokens -> f32 sum
+    (``wvs``: its gate rows, ``router_weights``, issued before x's wait)."""
     s, tid, red, lane, wave = c["S"], c["tid"], c["red"], c["lane"], c["wave"]
     a = c["args"]
     experts = c["rs"].experts
@@ -285,8 +283,6 @@ def stage_router(c, task, wvs=None):
         )
         for j0 in range(0, per, TILE)
     ]
-    if const_expr(wvs is None):
-        wvs = router_weights(c, task)
     xs = [router_x_loads(a["x"], part, n, lane, wave, CM_DEV, t0) for t0, n in tiles]
     for (t0, n), xvs in zip(tiles, xs):
         router_tile_mfma(wvs, xvs, lane, wave, red)
@@ -1375,8 +1371,8 @@ def run_moe(c, key, bid, before_ug=None):
     stamp(c, 19)
     multi = len(token_tiles(s)) > 1
     for task in range(first_task(bid, c["rs"].router0), router_tasks, BLOCKS):
-        # wide, the gate rows go out before x's wait (narrower it is slower: ROCm/ATOM)
-        wvs = router_weights(c, task) if const_expr(s >= ROUTER_EARLY_FROM) else None
+        # the gate rows go out before x's wait: they do not depend on it
+        wvs = router_weights(c, task)
         await_x(c, list(range(s)))
         stage_router(c, task, wvs)
     stamp(c, 20)
