@@ -674,7 +674,7 @@ def run_front(
     stamp(c, 35)
     poss = [wqb_pos(c, t0, n) for t0, n in tiles]
 
-    def x_loads(t0, n):
+    def x_loads(t0, n, parts=range(WQKV_KPARTS)):
         return [
             rows_loads(
                 c,
@@ -690,14 +690,14 @@ def run_front(
                 n,
                 pred=has_wqkv,
             )
-            for p in range(WQKV_KPARTS)
+            for p in parts
         ]
 
-    def x_store(regs, n):
-        for p in range_constexpr(WQKV_KPARTS):
+    def x_store(regs, n, parts=range(WQKV_KPARTS)):
+        for i, p in enumerate(parts):
             rows_store(
                 c,
-                regs[p],
+                regs[i],
                 KWORDS,
                 KGROUPS,
                 c["xl"] + p * KWORDS,
@@ -710,9 +710,19 @@ def run_front(
     if const_expr(len(wtiles) == 1):
         # wqkv_a: one row tile a CTA, all of K in LDS
         t0, n = wtiles[0]
-        await_flags(c, c["xrdy"], WQKV_KPARTS * own, lambda u: u)
-        regs = x_loads(t0, n)
-        x_store(regs, n)
+        # a split row tile's CTA waits on, loads and stores only its own K half of X8, where
+        # its chains' steps lie in that half (8 chains of 5 steps; not 16 of 3)
+        nsteps = HIDDEN // 128
+        own_half = split and chains * (-(-nsteps // waves)) * WQKV_KPARTS == nsteps
+        parts = [part] if own_half else range(WQKV_KPARTS)
+        nflags = own if own_half else WQKV_KPARTS * own
+
+        def kflag(u):
+            return WQKV_KPARTS * u + part if own_half else u
+
+        await_flags(c, c["xrdy"], nflags, kflag)
+        regs = x_loads(t0, n, parts)
+        x_store(regs, n, parts)
         accs = stage_wqkv(c, kops, slots, n, halves)
         wqkv_publish(
             c, task, accs, slots, order, t0, n, has_wqkv, part if split else None, s
