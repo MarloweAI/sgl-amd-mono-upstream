@@ -61,26 +61,30 @@ def _walk_case(*, rng, n):
 
 @pytest.mark.parametrize("seed", range(4))
 def test_walk_plan_device_equals_host(seed):
-    from sgl_amd_mono.deepseek_v41.gfx950.indexer.walk_plan import (
-        fill_walk_plan_device,
-        new_plan,
-    )
-
+    """The plan K2i lays out (``fill_plan``) equals the host plan, on ragged requests."""
     rng = np.random.default_rng(seed)
     dev = torch.device("cuda")
-    plan = new_plan(dev)
-    for _ in range(250):
+    k2i = _k2i()
+    # one page a request: a row's keys past it repeat its last page (the plan is checked)
+    case = fp4_case(ctxs=[64] * 8, seed=seed)
+    plan = k2i.plans[2]
+    for _ in range(60):
         n = int(rng.integers(1, 49))
         bounds, owners = _walk_case(rng=rng, n=n)
+        bounds = np.minimum(bounds, 1 << 16)  # bounded scoring time
         want = np.zeros((plan.shape[0], 4), dtype=np.int32)
         ip.fill_walk_plan(bounds=bounds, owners=owners, plan=want)
         plan.fill_(-7)
-        fill_walk_plan_device(
-            bounds=torch.from_numpy(bounds).to(dev),
-            owners=torch.from_numpy(owners).to(dev),
-            plan=plan,
-            rows=n,
-        )
+        q = case["q"][:1].expand(n, -1, -1).contiguous()
+        qs = case["qscale"][:1].expand(n, -1, -1, -1, -1).contiguous()
+        w = case["w"][:1].expand(n, -1).contiguous()
+        table = case["table"][:1].expand(n, -1).contiguous()
+        k2i._score(
+            rows=n, query=(q, qs, w), plane=(case["payload"], case["kscale"]), plan=plan,
+            itab=table, itab_stride=table.stride(0), itab_len=table.shape[1],
+            ibatch=torch.from_numpy(owners).to(dev), ishift=3,
+            ibound=torch.from_numpy(bounds).to(dev), lstride=64, reindex=0, fill_plan=1,
+        )  # fmt: skip
         got = plan.cpu().numpy()
         assert np.array_equal(got, want), (
             n,
@@ -185,15 +189,10 @@ def _inputs(case):
 
 
 def run_k2i(*, k2i, case, kind="full", outs=None, ratio=1, candidates=None):
-    """One index source's selection (FULL and producer: the step's walk plan
+    """One index source's selection (FULL and producer: laying out the step's walk plan
     first). -> (raw, page, the producer's candidate blocks)."""
     inputs = _inputs(case)
     raw, page = outs if outs is not None else _outs(inputs["rows"])
-    if kind != "reindex":
-        k2i.walk_plan(
-            ratio=ratio, bounds=case["bounds"], rows=inputs["rows"],
-            per_req=case["per_req"],
-        )  # fmt: skip
     published = k2i.select(
         kind=kind,
         ratio=ratio,
@@ -271,9 +270,6 @@ def test_logits(ctxs):
     """K2i's FULL logits of every scored row stay within ``k2i.logits.rel`` of SGLang's and fp64."""
     k2i = _k2i()
     case = fp4_case(ctxs=ctxs, seed=len(ctxs) + max(ctxs))
-    k2i.walk_plan(
-        ratio=1, bounds=case["bounds"], rows=case["q"].shape[0], per_req=PER_REQ
-    )
     got = k2i.score(ratio=1, **_inputs(case))
     torch.cuda.synchronize()
     want = sglang_logits(case)
@@ -302,11 +298,9 @@ def test_reindex_selects_sglangs_rows_within_the_candidates(ctxs):
     within the candidate blocks selects from the same layer's full logits."""
     k2i = _k2i()
     case = fp4_case(ctxs=ctxs, seed=21 + max(ctxs))
-    rows = case["q"].shape[0]
     _, _, cands = run_k2i(k2i=k2i, case=case, kind="producer")
     consumer = _other_query(case=case, seed=6)
     raw, page, _ = run_k2i(k2i=k2i, case=consumer, kind="reindex", candidates=cands)
-    k2i.walk_plan(ratio=1, bounds=case["bounds"], rows=rows, per_req=PER_REQ)
     full = k2i.score(ratio=1, **_inputs(consumer)).clone()
     want_raw, want_page, _ = sglang_select(case=consumer, logits=full, candidates=cands)
     torch.cuda.synchronize()

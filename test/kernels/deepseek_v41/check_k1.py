@@ -44,10 +44,25 @@ TOKEN_PAR_VARIANTS = ("fold", "settled", "index")
 # fold runs at every width, the other variants only at these
 VARIANT_WIDTHS = (1, 6, 12, 24, 48)
 QR_REL = NUMERICS.bound("k1.qr.rel")
+CP_REL, CP_BF16_REL = NUMERICS.bound("k1.cp.rel"), NUMERICS.bound("k1.cp_bf16.rel")
 # SGLang's wqkv_a configs K1 matches: the GEMV per M bucket up to 32 rows, the split-K tile above
 GEMV = {1: "w16s1r16t16k", 2: "w16s1r16t16k", 4: "w16s1r16t16k", 8: "w8s2r16t16k", 16: "w8s2r16t16k",
         32: "w8s1r16t32k"}  # fmt: skip
 LARGE_M = (64, 64, 256, 4, 5)
+
+
+def sglang_projection(x, w, ratio):
+    """SGLang's compressor projection of ``x``: ``project_fused`` (bf16 in, f32 out) at
+    compress ratio 2, the bf16 ``wkv`` linear at ratio 1."""
+    if ratio == 2:
+        from sglang.kernels.ops.gemm.bf16_fp32 import linear_bf16_fp32
+
+        return linear_bf16_fp32(x, w)
+    return torch.nn.functional.linear(x, w)
+
+
+def cp_vs(diff, n, rel):
+    return f" (SGLang's: {diff} of {n} differ, rel {rel:.1e})" if n else ""
 
 
 def attn_weights(heads, dev, g):
@@ -183,6 +198,7 @@ def main():
 
     from sgl_amd_mono.deepseek_v41.gfx950.attention.index_query import fused as iq_fused
     from sgl_amd_mono.deepseek_v41.gfx950.layer import (
+        K1_KC_ARGS,
         MonoBuild,
         build_mono_k1,
         scratch_layout,
@@ -224,6 +240,13 @@ def main():
         dtype=torch.uint8,
     )
     iw_w = (torch.randn(32, HIDDEN, generator=gi, device=dev) * 0.02).bfloat16()
+    # a KV source's compressor, replicated: wkv_gate (ratio 2) and wkv (ratio 1), bf16
+    cp_ws = {
+        ratio: (
+            torch.randn(512 * ratio, HIDDEN, generator=gi, device=dev) * 0.02
+        ).bfloat16()
+        for ratio in (1, 2)
+    }
     kw["iq_w"] = shuffle_weight(iq_w, (16, 16)) if args.shuffled else iq_w
     iw_scale = 128**-0.5 * 32**-0.5
     iw_bits = struct.unpack("<i", struct.pack("<f", iw_scale))[0]
@@ -274,10 +297,12 @@ def main():
         route = r.route_at(M)
         tl = r.timeline_on
         iq = index and iq_fused(M, tok_par)
+        # the compressor projection with the index query: ratio 2 or 1 by width
+        cp = (2 if M in (6, 24) else 1) if iq and not tok_par else 0
         k1 = build_mono_k1(
             MonoBuild(
                 M, tp, fold=fold, index=index, timeline=tl, tok_par=tok_par, iq=iq,
-                shuffled=args.shuffled,
+                cp=cp, shuffled=args.shuffled,
                 **route,
             )
         )  # fmt: skip
@@ -316,6 +341,9 @@ def main():
                 iw_w.data_ptr(), iw_bits, cos_sin.shape[0], r.iq.data_ptr(),
                 r.iqs.data_ptr(), r.iw.data_ptr(), sc.data_ptr(),
                 r.peer.local, r.peer.addresses.data_ptr(), r.rank, r.epoch.data_ptr(),
+                0, 0,  # no token ids: not the first layer's embedding read
+                cp_ws[cp].data_ptr() if cp else 0, r.cproj(M, 2).data_ptr(),
+                *(0,) * len(K1_KC_ARGS),  # no compressor past the projection
                 stream=torch.cuda.current_stream(),
             )  # fmt: skip
 
@@ -335,7 +363,8 @@ def main():
         )
         if iq:
             diff |= dict(iq=0, iqs=0, iw=0)
-        mix, q_cos, q_rel, qr_rel = 0.0, 1.0, 0.0, 0.0
+        mix, q_cos, q_rel, qr_rel, cp_rel = 0.0, 1.0, 0.0, 0.0, 0.0
+        cp_sgl, cp_diff, cp_n = 0.0, 0, 0
         for _ in range(args.trials):
             for t, v in zip(static, inputs(M)):
                 t.copy_(v)
@@ -475,6 +504,17 @@ def main():
                     diff[name] += int(
                         (got_t[:M].view(torch.uint8) != want_t.view(torch.uint8)).sum()
                     )
+            if cp:
+                # the compressor projection against fp64 on K1's normed rows
+                ref = r.normed[:M].double() @ cp_ws[cp].double().T
+                got = r.cproj(M, cp).double()
+                cp_rel = max(cp_rel, ((got - ref).abs().max() / ref.abs().max()).item())
+                # and against SGLang's own projection, whose GEMM sums in another order
+                sgl = sglang_projection(r.normed[:M], cp_ws[cp], cp)
+                cp_diff += int((r.cproj(M, cp) != sgl).sum())
+                cp_n += sgl.numel()
+                d = (got - sgl.double()).abs().max() / sgl.double().abs().max()
+                cp_sgl = max(cp_sgl, d.item())
             qr, qk = (
                 query_ref(qkv, a, cos_sin, pos.long()).flatten(),
                 eager[0].double().flatten(),
@@ -489,8 +529,11 @@ def main():
             ["q"] if q_cos < Q_COS or q_rel > Q_REL else []
         )
         bad += ["qr"] if qr_rel > QR_REL else []
+        if cp:
+            bound = CP_REL if cp == 2 else CP_BF16_REL
+            bad += ["cp"] if not cp_rel <= bound else []
         if rank == 0:
-            print(f"M={M:2d} {vname:7s} {'PASS' if not bad else 'FAIL ' + ','.join(bad)} | qr rel {qr_rel:.1e} | wqkv_a {route} | differing: "
+            print(f"M={M:2d} {vname:7s} {'PASS' if not bad else 'FAIL ' + ','.join(bad)} | qr rel {qr_rel:.1e} | cp{cp} rel {cp_rel:.1e}{cp_vs(cp_diff, cp_n, cp_sgl)} | wqkv_a {route} | differing: "
                   f"{diff} | pre/post/comb max|d| {mix:.2e} (bound {MIX_TOL:.0e}) | q cos {q_cos:.7f} "
                   f"rel {q_rel:.2e}", flush=True)  # fmt: skip
         fails += [f"M={M} {vname} {b}" for b in bad]

@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""A sampled DSpark draft's Markov block in two launches a step (``gfx950/markov``), offered
-through SGLang's draft sampler entry; checked against SGLang's ``draft_markov_block`` before
-capture on every rank. ``SGLANG_AMD_MONO_DSV41_MARKOV=0`` keeps SGLang's steps."""
+"""A sampled DSpark draft's Markov block in two launches a step and one more for its step
+logits (``gfx950/markov``), offered through SGLang's draft sampler entry; checked against
+SGLang's ``draft_markov_block`` before capture on every rank. The step logits are SGLang's
+whole rows: a sampled sequence's are gathered from every rank's shard, a temperature-0
+sequence's stay as SGLang's buffer holds them. ``SGLANG_AMD_MONO_DSV41_MARKOV=0`` keeps
+SGLang's steps."""
 
 from __future__ import annotations
 
@@ -30,10 +33,11 @@ SGLANG_READS = {
         "org_vocab_end",
         "_opt_markov_w2_bf16",
         "step_logits_dtype",
+        "vocab_size",
         "lm_head",
         "num_embeddings_per_partition",
     ),
-    "srt/models/dspark.py": ("vocab_shard",),
+    "srt/models/dspark.py": ("vocab_shard", "vocab_size"),
     "srt/speculative/dspark_components/dspark_draft.py": (
         "draft_markov_block",
         "draft_markov_block(markov_head)",
@@ -45,7 +49,6 @@ SGLANG_READS = {
         "draft_markov_block(tp_sync)",
         "draft_markov_block(logits_out)",
         "draft_markov_block(greedy_draft)",
-        "draft_markov_block(sharded_accept)",
         "DraftNoise",
         "key",
         "offset",
@@ -99,8 +102,10 @@ def _why_not(model, step_logits) -> str | None:
     part = int(model.lm_head.num_embeddings_per_partition)
     if step_logits is None or step_logits.dtype != torch.float32:
         return "no fp32 step logits"
-    if step_logits.shape[-1] != part:
-        return "step logits gathered whole, not on the shards"
+    if step_logits.shape[-1] != head.vocab_size:
+        return f"step logits {step_logits.shape[-1]} wide, not the vocab's {head.vocab_size}"
+    if shard.org_vocab_start != group.rank_in_group * part or part % 4:
+        return f"vocab shards of {part} not at the ranks' multiples of the partition"
     return None
 
 
@@ -120,30 +125,42 @@ class _Sampler:
         self.head = head.markov_w2.weight[shard.org_vocab_start : shard.org_vocab_end]
         assert self.head.is_contiguous()
         device = self.head.device
-        part = int(model.lm_head.num_embeddings_per_partition)
+        self.width = int(model.lm_head.num_embeddings_per_partition)
         self.part = torch.empty(
             markov.MAX_SEQUENCES,
-            markov.blocks(part),
+            markov.blocks(self.width),
             2,
             dtype=torch.float32,
             device=device,
         )
         self.exchange = markov.Exchange(
-            group.cpu_group, group.rank_in_group, group.world_size, device
+            group.cpu_group,
+            group.rank_in_group,
+            group.world_size,
+            device,
+            gamma,
+            self.width,
         )
         self.ops = markov.ops()
 
     def block(self, base_logits, anchor, temps, noise, out, step_logits):
         """Every step of a [bs, gamma, padded] base logits block: tokens to ``out``
-        ([bs * gamma]), the step logits to ``step_logits`` ([bs, gamma, padded])."""
-        x = self.exchange
+        ([bs * gamma]), the sampled sequences' step logits to ``step_logits``
+        ([bs, gamma, vocab])."""
+        from sgl_amd_mono.deepseek_v41.gfx950 import markov
+
+        x, bs = self.exchange, base_logits.shape[0]
         for s in range(self.gamma):
             self.ops.markov_sample_step(
-                base_logits[:, s], self.embed, self.head, anchor,
-                None if step_logits is None else step_logits[:, s], temps, noise.offset,
-                int(noise.key), self.vocab_start, s, self.part, out, self.gamma, x.tok,
-                x.calls, x.peers, x.rank, s == self.gamma - 1, self.deadline_s,
+                base_logits[:, s], self.embed, self.head, anchor, x.slab[:bs, s], temps,
+                noise.offset, int(noise.key), self.vocab_start, s, self.part, out,
+                self.gamma, x.tok, x.calls, x.peers, x.rank, s == self.gamma - 1,
+                self.deadline_s,
             )  # fmt: skip
+        # the last step's swap saw every rank's packet: their step logits are written
+        self.ops.markov_gather(
+            step_logits, temps, x.peers, markov.EXCHANGE_BYTES, self.width
+        )
 
     def step(self, hidden_states, anchor_tokens):
         """SGLang's base logits and Markov block of a bs-row draft block."""
@@ -168,9 +185,9 @@ class _Sampler:
             def sync(self, site, value):
                 return value
 
-        head, gamma = self.model.markov_head, self.gamma
+        head, gamma, width = self.model.markov_head, self.gamma, self.width
         device = self.head.device
-        width = int(self.model.lm_head.num_embeddings_per_partition)
+        tp = self.exchange.size
         g = torch.Generator(device=device).manual_seed(1234)
         for bs in range(1, max_bs + 1):
             base = (
@@ -182,26 +199,30 @@ class _Sampler:
             temps = torch.tensor([1.0, 0.0, 0.7, 1.3][:bs], device=device)
             offset = torch.randint(0, 1 << 30, (1,), generator=g, device=device)
             want_logits = torch.empty(
-                bs, gamma, width, dtype=torch.float32, device=device
+                bs, gamma, head.vocab_size, dtype=torch.float32, device=device
             )
+            # every rank draws the same base: its whole row is the shard's, repeated
             want, _ = draft_markov_block(
                 markov_head=head, base_logits=base, anchor_tokens=anchor,
                 draft_hidden=None, step_temperatures=temps,
                 noise=DraftNoise(key=int(self.noise.key), offset=offset.clone()),
                 tp_sync=_NoSync(), logits_out=want_logits, greedy_draft=False,
-                sharded_accept=True,
             )  # fmt: skip
-            got_logits = torch.empty_like(want_logits)
+            got_logits = torch.zeros_like(want_logits)
             got = torch.empty(bs * gamma, dtype=torch.int64, device=device)
             noise = DraftNoise(key=int(self.noise.key), offset=offset.clone())
             self.block(base, anchor, temps, noise, got, got_logits)
             if not torch.equal(got.view(bs, gamma), want.long()):
                 return f"{bs} rows: tokens {got.tolist()} vs SGLang's {want.tolist()}"
             # the bias GEMV sums in another order: a bf16 rounding flip of the bias now and then
-            bias = (want_logits - base.float()).abs()
-            apart = (got_logits - want_logits).abs()
+            whole = base.float().repeat(1, 1, tp)[..., : head.vocab_size]
+            sampled = temps != 0
+            bias = (want_logits - whole).abs()[sampled]
+            apart = (got_logits - want_logits).abs()[sampled]
             if not (apart <= bias * 2**-7 + 1e-6).all():
                 return f"{bs} rows: step logits apart by {apart.max().item():.3g}"
+            if got_logits[~sampled].any():
+                return f"{bs} rows: a temperature-0 row's step logits written"
             if int(noise.offset.item()) != int(offset.item()) + 1:
                 return "the noise counter did not advance once"
         return None

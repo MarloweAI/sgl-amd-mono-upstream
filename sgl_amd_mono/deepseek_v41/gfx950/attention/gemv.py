@@ -9,7 +9,7 @@ from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T
 
-from sgl_amd_mono.common.ops import CM_NT, mfma_bf16, rsrc
+from sgl_amd_mono.common.ops import CM_DEV, CM_NT, mfma_bf16, rsrc
 from sgl_amd_mono.deepseek_v41.gfx950.stages.gemv import lds_row
 
 from .device import THREADS, WAVES, fp8x8_bf16, mfma_scaled, pow2, tile_map
@@ -244,7 +244,8 @@ def rows_loads(
     n,
     pred=None,
 ):
-    """Issue loads of the published MXFP8 rows of tokens t0 .. t0 + n (masked when not ``pred``)."""
+    """Issue loads of the published MXFP8 rows of tokens t0 .. t0 + n (masked when not ``pred``),
+    device scope: rows another CTA of this launch wrote."""
     tid = c["tid"]
     nb = None if pred is None else pred.select(fx.Int64(0xFFFFFFFF), fx.Int64(0))
     out = []
@@ -263,7 +264,13 @@ def rows_loads(
                 row = fx.min(row, n - 1)
             regs.append(
                 fx.Vector(
-                    bo.buffer_load(r, row * stride + a0, vec_width=4, dtype=T.i32)
+                    bo.buffer_load(
+                        r,
+                        row * stride + a0,
+                        vec_width=4,
+                        dtype=T.i32,
+                        cache_modifier=CM_DEV,
+                    )
                 )
             )
         out.append(regs)
@@ -379,7 +386,8 @@ def bf16_gemv_mfmas(c, k, xl, ops, acc, h, rows):
 
 
 def words_loads(c, base, stride, off, words, t0, n):
-    """Issue loads of ``words`` 32-bit words of tokens t0 .. t0 + n's rows at ``off``."""
+    """Issue loads of ``words`` 32-bit words of tokens t0 .. t0 + n's rows at ``off``, device
+    scope: rows another CTA of this launch wrote."""
     tid = c["tid"]
     wq, rpr, rounds = span_items(words, n)
     row0, col = tile_map(tid, wq)
@@ -391,7 +399,15 @@ def words_loads(c, base, stride, off, words, t0, n):
         if (i + 1) * rpr > n or rpr * wq < THREADS:
             row = fx.min(row, n - 1)
         regs.append(
-            fx.Vector(bo.buffer_load(r, row * stride + a0, vec_width=4, dtype=T.i32))
+            fx.Vector(
+                bo.buffer_load(
+                    r,
+                    row * stride + a0,
+                    vec_width=4,
+                    dtype=T.i32,
+                    cache_modifier=CM_DEV,
+                )
+            )
         )
     return regs
 

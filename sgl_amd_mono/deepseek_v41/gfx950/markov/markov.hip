@@ -2,6 +2,7 @@
 // Adapted from AKLR (https://github.com/AMD-AGI/AKLR, MIT, Copyright (C) 2025-2026 Advanced Micro Devices, Inc.).
 // A sampled DSpark draft's Markov step on this rank's vocab shard as SGLang's MarkovSampleStep: the bias GEMV, the
 // Philox Gumbel-max scores and the shard's bests (step), then the ranks' bests swapped through peer buffers (finish).
+// After a block's last step, the sampled sequences' step logits of every rank's shard gathered whole (gather).
 #include <climits>
 #include <cstdint>
 
@@ -31,7 +32,9 @@ constexpr int FINISH        = 512;
 constexpr int MAX_SEQ       = 4;
 constexpr int MAX_TP        = 8;
 constexpr int SLOTS         = 16; // a sequence's packets: two halves by call parity, a rank's slot in each
-// the exchange buffer: every sequence's slots, 16 B each (markov.py's EXCHANGE_BYTES)
+constexpr int GATHER        = 256;
+constexpr int GATHER_SPLIT  = 8; // blocks a (sequence, step, rank) row of a gather
+// the exchange buffer: every sequence's slots, 16 B each (markov.py's EXCHANGE_BYTES), then the rank's step logits
 
 struct Params {
     const bfloat16 *logits; // this step's base logits, sequence s's row at logits + s * logits_stride
@@ -251,6 +254,31 @@ __global__ __launch_bounds__(FINISH) void markov_sample_finish_kernel(const Para
     }
 }
 
+struct GatherParams {
+    float       *whole; // sequence s's step t row at whole + s * seq_stride + t * step_stride, [vocab]
+    int64_t      seq_stride, step_stride;
+    const float *temps; // [nseq]
+    const void  *slab[MAX_TP]; // rank r's step logits [MAX_SEQ, gamma, part]
+    int          gamma, part, vocab, tp;
+};
+
+// a block an eighth of one rank's shard of a sampled sequence's step row; a temperature-0 row keeps no step logits
+__global__ __launch_bounds__(GATHER) void markov_gather_kernel(const GatherParams p) {
+    const int seq = blockIdx.z;
+    if (p.temps[seq] == 0.0f) {
+        return;
+    }
+    const int       step = blockIdx.y / p.tp, src = blockIdx.y % p.tp;
+    const int       start = src * p.part;
+    const int       quads = min(p.part, p.vocab - start) / 4;
+    const uint32x4 *from  = static_cast<const uint32x4 *>(p.slab[src]) +
+                           (static_cast<int64_t>(seq) * p.gamma + step) * (p.part / 4);
+    uint32x4 *to = reinterpret_cast<uint32x4 *>(p.whole + seq * p.seq_stride + step * p.step_stride + start);
+    for (int i = blockIdx.x * GATHER + threadIdx.x; i < quads; i += GATHER_SPLIT * GATHER) {
+        to[i] = load_nt(from + i);
+    }
+}
+
 void check(const at::Tensor &t, const at::Tensor &ref, at::ScalarType dtype, const char *name) {
     TORCH_CHECK(t.device() == ref.device() && t.scalar_type() == dtype, name, " must be ", dtype, " on ",
                 ref.device());
@@ -334,6 +362,40 @@ void markov_sample_step(const at::Tensor &logits, const at::Tensor &embed, const
     C10_HIP_KERNEL_LAUNCH_CHECK();
 }
 
+// whole [nseq, gamma, vocab] f32 (any outer strides): every rank's shard of the sampled sequences' step logits, from
+// each rank's [MAX_SEQ, gamma, part] f32 at its exchange buffer + slab_offset (peers: every rank's buffer, host)
+void markov_gather(at::Tensor &whole, const at::Tensor &temps, const at::Tensor &peers, int64_t slab_offset,
+                   int64_t part) {
+    TORCH_CHECK(whole.dim() == 3 && whole.size(0) >= 1 && whole.size(0) <= MAX_SEQ && whole.stride(2) == 1,
+                "whole [1 .. ", MAX_SEQ, " sequences, gamma, vocab], unit inner stride");
+    check(whole, whole, at::kFloat, "whole");
+    check(temps, whole, at::kFloat, "temps");
+    TORCH_CHECK(peers.device().is_cpu() && peers.scalar_type() == at::kLong && peers.numel() >= 1 &&
+                    peers.numel() <= MAX_TP,
+                "peers: every rank's exchange buffer (int64, host)");
+    const int64_t vocab = whole.size(2);
+    TORCH_CHECK(part % 4 == 0 && vocab % 4 == 0 && whole.stride(0) % 4 == 0 && whole.stride(1) % 4 == 0 &&
+                    reinterpret_cast<uintptr_t>(whole.data_ptr()) % 16 == 0 && slab_offset % 16 == 0,
+                "16 B aligned rows and shards");
+    TORCH_CHECK(peers.numel() * part >= vocab && (peers.numel() - 1) * part < vocab, "the shards tile the vocab");
+    GatherParams p{};
+    p.whole       = whole.data_ptr<float>();
+    p.seq_stride  = whole.stride(0);
+    p.step_stride = whole.stride(1);
+    p.temps       = temps.data_ptr<float>();
+    p.gamma       = static_cast<int>(whole.size(1));
+    p.part        = static_cast<int>(part);
+    p.vocab       = static_cast<int>(vocab);
+    p.tp          = static_cast<int>(peers.numel());
+    for (int r = 0; r < p.tp; ++r) {
+        p.slab[r] = reinterpret_cast<const char *>(peers.data_ptr<int64_t>()[r]) + slab_offset;
+    }
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA guard(whole.device());
+    const hipStream_t stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA(whole.device().index()).stream();
+    markov_gather_kernel<<<dim3(GATHER_SPLIT, p.gamma * p.tp, whole.size(0)), GATHER, 0, stream>>>(p);
+    C10_HIP_KERNEL_LAUNCH_CHECK();
+}
+
 } // namespace
 
 #ifndef TORCH_LIBRARY_EXPAND
@@ -346,4 +408,6 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
           "int out_stride, Tensor(c!) tok, Tensor(d!) calls, Tensor peers, int rank, bool bump_offset, "
           "float deadline_s) -> ()");
     m.impl("markov_sample_step", at::kCUDA, &markov_sample_step);
+    m.def("markov_gather(Tensor(a!) whole, Tensor temps, Tensor peers, int slab_offset, int part) -> ()");
+    m.impl("markov_gather", at::kCUDA, &markov_gather);
 }

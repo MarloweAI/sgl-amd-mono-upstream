@@ -141,6 +141,12 @@ def front_scratch(s: int, d: Dims) -> dict:
             # an index source's ``index_query``: bf16 IQ, a flag a (token tile, 16-column task)
             ("iq", s * 4096 * 2),
             ("iqrdy", cdiv(s, 16) * 256 * PAIR),
+            # its head weights' partials, a pair a (token, head, 512-K split)
+            ("iwp", cdiv(s, 16) * 32 * 16 * (HIDDEN // 512) * PAIR),
+            # its compressor projection's partials, a pair a (token, column, K quarter)
+            ("cpp", cdiv(s, 16) * 16 * 1024 * 4 * PAIR),
+            # a flag a (token tile, 16-column tile) of it, once its sums are stored
+            ("cprdy", cdiv(s, 16) * 64 * PAIR),
         ]
     )
 

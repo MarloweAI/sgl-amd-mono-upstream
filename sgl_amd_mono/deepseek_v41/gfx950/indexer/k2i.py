@@ -4,8 +4,8 @@
 # (MIT License, Copyright (C) 2026, Advanced Micro Devices, Inc.)
 """K2i: ATOM K2a's FP4 scorer (``score_fp4``) as its own launch between K1 and K2.
 
-Each CTA scores the task the step's walk plan (FULL) or its index (REINDEX) gives it, none waiting
-on another, into ``ilog`` [S, lstride] f32 for SGLang's top-k. ``itab`` is a FULL layer's page
+Each CTA scores the task the step's walk plan (FULL; ``fill_plan``: worked out here, the step's
+first launch of the ratio) or its index (REINDEX) gives it, none waiting on another, into ``ilog`` [S, lstride] f32 for SGLang's top-k. ``itab`` is a FULL layer's page
 table (an entry 2 ** ``ishift`` virtual 8-row pages, read at row ``ibatch[t]``, the request's
 first) or a REINDEX layer's candidate table (an entry one virtual page, ``ishift`` 0).
 """
@@ -43,7 +43,7 @@ def build_k2i(tokens: int):
     def k2i(
         iq: Int64, iqs: Int64, iw: Int64, plane: Int64, pscale: Int64, iplan: Int64, itab: Int64,
         itab_stride: Int32, itab_len: Int32, ibatch: Int64, ishift: Int32, ibound: Int64, ilog: Int64,
-        lstride: Int32, reindex: Int32,
+        lstride: Int32, reindex: Int32, fill_plan: Int32,
     ):  # fmt: skip
         _ = keyed
         tid = fx.thread_idx.x
@@ -52,6 +52,7 @@ def build_k2i(tokens: int):
             "iq": iq, "iqs": iqs, "iw": iw, "plane": plane, "pscale": pscale, "iplan": iplan,
             "itab": itab, "itab_stride": itab_stride, "itab_len": itab_len, "ibatch": ibatch,
             "ishift": ishift, "ibound": ibound, "ilog": ilog, "lstride": lstride, "reindex": reindex,
+            "fill_plan": fill_plan,
         }  # fmt: skip
         c = {
             "tid": tid, "lane": tid % 64, "wave": tid // 64, "args": args,
@@ -63,12 +64,12 @@ def build_k2i(tokens: int):
     def launch(
         iq: Int64, iqs: Int64, iw: Int64, plane: Int64, pscale: Int64, iplan: Int64, itab: Int64,
         itab_stride: Int32, itab_len: Int32, ibatch: Int64, ishift: Int32, ibound: Int64, ilog: Int64,
-        lstride: Int32, reindex: Int32, stream: fx.Stream = _STREAM,
+        lstride: Int32, reindex: Int32, fill_plan: Int32, stream: fx.Stream = _STREAM,
     ):  # fmt: skip
         _ = keyed
         k2i(
             iq, iqs, iw, plane, pscale, iplan, itab, itab_stride, itab_len, ibatch, ishift, ibound, ilog,
-            lstride, reindex,
+            lstride, reindex, fill_plan,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)  # fmt: skip
 
     return launch

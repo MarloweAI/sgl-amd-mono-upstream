@@ -31,6 +31,7 @@ from sgl_amd_mono.common.mx import FP4, mfma_scaled
 from sgl_amd_mono.common.ops import (
     CM_DEV,
     global_load,
+    global_ptr,
     ld_i32,
     permlane_swap,
     rsrc,
@@ -38,6 +39,7 @@ from sgl_amd_mono.common.ops import (
 from sgl_amd_mono.common.plan import BLOCKS, WAVES
 
 from . import index_plan as ip
+from .walk_plan import walk_task
 
 PAGE = ip.BLOCK_ROWS
 PAGE_BYTES = PAGE * ip.DIM // 2
@@ -394,9 +396,10 @@ def stage_iscore4(c, lead, span, ch0, ch1, rows):
 def run_scores4(c, s, bid):
     """The FP4 score stage: this CTA's task, if any.
 
-    A FULL layer's is its ``iplan`` row (lead, span, ch0, ch1; span 0 for none); a REINDEX
-    layer's comes from the CTA index alone (``index_plan.reindex_split``) and stops at the
-    token's bound, read with the first keys."""
+    A FULL layer's is its ``iplan`` row (lead, span, ch0, ch1; span 0 for none), which the
+    step's first launch of the ratio (``fill_plan``) works out and writes; a REINDEX layer's
+    comes from the CTA index alone (``index_plan.reindex_split``) and stops at the token's
+    bound, read with the first keys."""
     a = c["args"]
     _read_all(a.values())
     if a["reindex"] != 0:
@@ -406,5 +409,12 @@ def run_scores4(c, s, bid):
             stage_iscore4(c, bid // per, fx.Int32(1), ch0, ch1, 1)
     else:
         task = _sload4(a["iplan"] + fx.Int64(bid) * 16)
+        if a["fill_plan"] != 0:
+            task = walk_task(a, s, bid)
+            if c["tid"] == 0:
+                fx.ptr_store(
+                    fx.Vector.from_elements(task, fx.Int32),
+                    global_ptr(a["iplan"] + fx.Int64(bid) * 16, 4),
+                )
         if task[1] > 0:
             stage_iscore4(c, task[0], task[1], task[2], task[3], ip.WALK_ROWS)

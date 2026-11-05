@@ -157,6 +157,14 @@ SGLANG_READS = {
         "forward_low_ratio_sources(positions)",
         "forward_low_ratio_sources(forward_batch)",
         "forward_low_ratio_sources(run_indexer)",
+        # what its fused compression reads, which KC stands in for
+        "_low_ratio_compress_fused",
+        "tail_source_kv_layer_id",
+        "low_ratio_req_indices",
+        "low_ratio_pos_i64",
+        "c2_out_loc",
+        "c1_out_loc",
+        "raw_out_loc",
     ),
     "srt/layers/attention/deepseek_v4_backend_hip_radix.py": (
         "forward_low_ratio_sources",
@@ -198,6 +206,11 @@ SGLANG_READS = {
         "weights_proj_hip_max_tokens",
         "rope_head_dim",
         "head_weight_scale",
+        # the compressor's projection weights (``_compressor_weight``)
+        "use_fused_compress",
+        "wkv_gate",
+        "wk",
+        "k_norm",
     ),
     "srt/layers/quantization/fp8.py": (
         "aiter_bpreshuffled",
@@ -216,7 +229,14 @@ SGLANG_READS = {
         "maybe_input_scattered",
     ),
     "srt/layers/logits_processor.py": ("forward(hidden_states_before_norm)",),
+    # the compressor state KC reads and writes
+    "srt/mem_cache/deepseek_v4_compress_state.py": (
+        "kv_score_buffer",
+        "kv_score",
+        "ring_size",
+    ),
     "srt/mem_cache/deepseek_v4_memory_pool.py": (
+        "get_attention_compress_states",
         "get_swa_raw_buffer",
         "get_swa_key_page_size",
         "get_extra_key_buffer",
@@ -225,7 +245,10 @@ SGLANG_READS = {
         "get_index_k_fp4_scale_buffer",
         "low_ratio_index_k_is_split",
         "get_index_k_page_size",
+        "uniform_fp8",
+        "low_ratio_index_k_page8",
     ),
+    "srt/model_executor/forward_batch_info.py": ("encoder_swa_replay",),
     "srt/model_executor/forward_context.py": (
         "get_attn_backend",
         "get_token_to_kv_pool",
@@ -347,6 +370,10 @@ NUMERICS = Numerics(
         "k1.normed.max_abs": 0.0,
         # its qr: q_norm's sum of squares in another order, so bf16 flips
         "k1.qr.rel": 4e-3,
+        # a KV source's compressor projection (f32; bf16 at ratio 1) against fp64: summed in
+        # another order than SGLang's GEMM
+        "k1.cp.rel": 1e-5,
+        "k1.cp_bf16.rel": 8e-3,
         # K2: the attention core output, wo_a's MXFP8 output and wo_b's partial
         "k2.attn_out.cosine": 0.9998,
         "k2.wo_a.rel": 5e-3,
@@ -487,6 +514,17 @@ def _iq_readable(attn) -> bool:
     )
 
 
+def _compressor_weight(attn):
+    """A KV source's compressor projection as K1 computes it beside the index query: the
+    bf16 ``wkv_gate`` (ratio 2) or ``wkv`` (ratio 1) of SGLang's fused compressor, which
+    takes K1's projection (``_low_ratio_compress_fused(projected)``); else None."""
+    comp = getattr(attn, "compressor", None)
+    if comp is None or not comp.use_fused_compress or attn.compress_ratio not in (1, 2):
+        return None
+    w = (comp.wkv_gate if attn.compress_ratio == 2 else comp.wkv).weight
+    return w if w.dtype == torch.bfloat16 and w.is_contiguous() else None
+
+
 def shuffled_layout(attns) -> bool | None:
     """Whether wqkv / wq_b / wo_b of these attentions are in aiter's (16, 16)
     preshuffle; None when they mix layouts."""
@@ -574,6 +612,10 @@ class _Layer(msgspec.Struct):
     comp: Any = None  # the compressed cache, the same layout
     comp_block: int = 0
     plane: Any = None  # an indexer's FP4 index plane: (payload, scales)
+    # a reuse layer before an Engram layer: its share of that Engram's projection
+    # (EngramWeights), and that layer
+    eg: Any = None
+    eg_for: int = 0
 
 
 def _keep(copies: dict, t: torch.Tensor, *key) -> torch.Tensor:
@@ -678,6 +720,12 @@ def _weights(copies: dict, tables: list, layer, i: int) -> _Layer:
         L.k1.iq_ws = _codes(copies, i, "index wq_b", ix.wq_b)
         L.k1.iw_w = ix.weights_proj.weight
         L.k1.iw_scale = float(ix.head_weight_scale)
+        cp = _compressor_weight(a)
+        if cp is not None:
+            from sgl_amd_mono.deepseek_v41.gfx950.indexer.compress import wk_order
+
+            L.k1.cp_w, L.k1.cp_ratio = cp, a.compress_ratio
+            L.k1.kc_wk = _keep(copies, wk_order(ix.wk.weight), "kc wk", i)
     L.k1.check(d)
     if a.wo_a.weight.dtype == e4m3:
         woa, woa_s = a.wo_a.weight, _codes(copies, i, "wo_a", a.wo_a)
@@ -725,12 +773,17 @@ def _launch(
     prev_pre,
     capture=None,
     tok_par=False,
+    embed=None,
+    eg=None,
 ):
-    """K1, then K2, of layer ``L``: the previous layer's pending post (x, residual,
-    post, comb) and pre in; K2's (x, residual, post, comb, pre) out, this layer's
-    post pending. With no post owed (x None) the residual arrives settled: the
+    """Layer ``L``: one launch (K1, then K2), or on an index source K1, the indexer and
+    K2: the previous layer's pending post (x, residual, post, comb) and pre in; K2's
+    (x, residual, post, comb, pre) out, this layer's post pending. With no post owed (x None) the residual arrives settled: the
     first layer's broadcast embedding (no pre: copy 0), an Engram layer's
-    residual, or a draft stage's input."""
+    residual, or a draft stage's input. ``embed`` (table, token ids): the first layer
+    reads each stream from the embedding table itself (residual None). ``eg``: a reuse
+    layer's launch projects its share of a later Engram layer's rows too
+    (``runner.layer(eg=)``)."""
     from sglang.srt.model_executor.forward_context import (
         get_attn_backend,
         get_token_to_kv_pool,
@@ -746,7 +799,8 @@ def _launch(
             # SGLang types the compressed cache as e4m3; K2 addresses its records' bytes
             L.comp = pool.get_extra_key_buffer(L.i).view(torch.uint8)
             L.comp_block = pool.get_extra_key_page_size(L.i)
-    backend, M = get_attn_backend(), residual.shape[0]
+    backend = get_attn_backend()
+    M = residual.shape[0] if embed is None else embed[1].shape[0]
     if "k1" not in plan.state:
         # the forward's first K1 converts them where needed; a graph records the copies
         slot = backend.get_swa_out_cache_loc(forward_batch)[:M]
@@ -761,23 +815,36 @@ def _launch(
         topk = (runner.no_topk, runner.no_topk_lens)
     keys = (md.swa_page_indices, md.swa_topk_lengths, *topk)
     if x is None:
-        residual = residual.contiguous()  # the broadcast embedding may be a view
+        if embed is None:
+            residual = residual.contiguous()  # the broadcast embedding may be a view
         if prev_pre is None:
             prev_pre = runner.first_pre[:M]
+    aux = None if capture is None else capture(L, M)
+    if not L.index:
+        return runner.layer(
+            L.k1, L.k2, L.ffn, x, residual, post, comb, prev_pre, pos, slot, L.swa,
+            L.swa_block, L.comp, L.comp_block, keys, tok_par=tok_par, aux=aux,
+            embed=embed, eg=eg,
+        )  # fmt: skip
+    kc = None
+    if _kc_fused(runner=runner, L=L, M=M, tok_par=tok_par):
+        # K1 runs the source's compressor past its projection
+        kc = _kc_args(
+            runner=runner, L=L, backend=backend, forward_batch=forward_batch, M=M,
+            per_req=plan.key.tokens_per_request,
+        )  # fmt: skip
     runner.k1(
         L.k1, x, residual, post, comb, prev_pre, pos, slot, L.swa, L.swa_block,
-        keys, index=L.index, tok_par=tok_par,
-        aux=None if capture is None else capture(L, M),
+        keys, index=True, tok_par=tok_par, aux=aux, kc=kc,
     )  # fmt: skip
-    if L.index:
-        _select(
-            runner=runner, L=L, plan=plan, backend=backend, positions=positions,
-            pos=pos, forward_batch=forward_batch, M=M,
-        )  # fmt: skip
+    _select(
+        runner=runner, L=L, plan=plan, backend=backend, positions=positions,
+        pos=pos, forward_batch=forward_batch, M=M,
+    )  # fmt: skip
     # K2 reads K1's outputs from the runner's buffers
     return runner.k2(
         L.k2, L.ffn, M, pos, L.swa, L.swa_block, L.comp, L.comp_block,
-        slot=slot, keys=keys, index=L.index, tok_par=tok_par,
+        slot=slot, keys=keys, index=True, tok_par=tok_par,
     )  # fmt: skip
 
 
@@ -799,7 +866,9 @@ def _select(*, runner, L, plan, backend, positions, pos, forward_batch, M) -> No
     )
 
     attn, r = L.module.self_attn, L.ratio
-    if attn.compressor is not None:
+    if attn.compressor is not None and not _kc_fused(
+        runner=runner, L=L, M=M, tok_par=plan.state["tok_par"]
+    ):
         backend.forward_low_ratio_sources(
             layer=attn,
             x=runner.normed[:M],
@@ -847,9 +916,10 @@ def _select(*, runner, L, plan, backend, positions, pos, forward_batch, M) -> No
             bounds = bounds.to(torch.int32).contiguous()
         plan.state["k2i bounds", r] = bounds
     k2i, per_req = runner.k2i, plan.key.tokens_per_request
-    if kind != "reindex" and ("k2i plan", r) not in plan.state:
-        # the step's walk plan of this ratio: its FULL and producer layers share it
-        k2i.walk_plan(ratio=r, bounds=bounds, rows=M, per_req=per_req)
+    # the step's walk plan of this ratio: its first FULL or producer layer lays it out, the
+    # later ones read it
+    fill_plan = kind != "reindex" and ("k2i plan", r) not in plan.state
+    if fill_plan:
         plan.state["k2i plan", r] = True
     if L.k1.iq_w is not None and runner.iq_fused(M, plan.state["tok_par"]):
         query = (runner.iq[:M], runner.iqs[:M], runner.iw[:M])  # K1 computed it
@@ -872,11 +942,75 @@ def _select(*, runner, L, plan, backend, positions, pos, forward_batch, M) -> No
         candidates=plan.state["k2i candidates"] if kind == "reindex" else None,
         # the step's REINDEX layers share one table (same blocks, page table, bounds)
         reindex_table_built=kind == "reindex" and ("k2i reindex", r) in plan.state,
+        fill_plan=fill_plan,
     )
     if kind == "reindex":
         plan.state["k2i reindex", r] = True
     if kind == "producer":
         plan.state["k2i candidates"] = published
+
+
+def _kc_fused(*, runner, L, M, tok_par) -> bool:
+    """Whether K1 runs index KV source ``L``'s compressor: where it computes its projection."""
+    return (
+        L.module.self_attn.compressor is not None
+        and L.k1.cp_w is not None
+        and runner.cp_fused(M, tok_par)
+    )
+
+
+def _kc_args(*, runner, L, backend, forward_batch, M, per_req):
+    """KV source ``L``'s compressor past its projection, as SGLang's fused decode / verify
+    compression runs it (``_low_ratio_compress_fused``: its state ring, record and index-key
+    stores): K1's arguments for it (``K2iRunner.kc_args``), None on a step SGLang compresses
+    nothing (the replay tail's source, an encoder replay)."""
+    from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+
+    attn, ratio = L.module.self_attn, L.ratio
+
+    if (
+        forward_batch.encoder_swa_replay
+        or attn.layer_id == backend.tail_source_kv_layer_id
+    ):
+        return None
+    pool, i = get_token_to_kv_pool(), attn.layer_id
+    meta = backend.forward_metadata
+    core = meta.core_attn_metadata
+    out_loc = core.c2_out_loc if ratio == 2 else core.c1_out_loc
+    req, pos = meta.low_ratio_req_indices, meta.low_ratio_pos_i64
+    state = pool.get_attention_compress_states(i) if ratio == 2 else None
+    # SGLang compresses the step's live rows, as many as its hoisted positions
+    n = min(pos.shape[0], M) if pos is not None else 0
+    for name, t in (("raw_out_loc", core.raw_out_loc), ("out_loc", out_loc), ("req", req),
+                    ("positions", pos)):  # fmt: skip
+        if (
+            t is None
+            or t.dtype not in (torch.int32, torch.int64)
+            or t.shape[0] < n
+            or not t.is_contiguous()
+        ):
+            raise RuntimeError(
+                f"KC: {name} {None if t is None else (t.shape, t.dtype)} for {n} rows"
+            )
+    if pool.uniform_fp8 or pool.low_ratio_index_k_page8(i):
+        raise RuntimeError(
+            "KC: the compressed cache in V4 pages and the plain FP4 plane"
+        )
+    ix, comp = attn.indexer, attn.compressor
+    return runner.k2i.kc_args(
+        live=n, per_req=per_req, state=None if state is None else state.kv_score_buffer.kv_score,
+        ring_size=0 if state is None else state.ring_size,
+        norm=comp.norm.weight, eps=comp.norm.eps,
+        freqs=torch.view_as_real(attn.freqs_cis).flatten(-2), pos=pos, req=req,
+        raw_loc=core.raw_out_loc, index_loc=out_loc,
+        cache=pool.get_extra_key_buffer(i).view(torch.uint8),
+        page_size=pool.get_extra_key_page_size(i), wk=L.k1.kc_wk,
+        k_norm=ix.k_norm.weight, k_eps=ix.k_norm.eps,
+        plane=(
+            pool.get_index_k_fp4_payload_buffer(i).view(torch.uint8),
+            pool.get_index_k_fp4_scale_buffer(i),
+        ),
+    )  # fmt: skip
 
 
 def _index_query(*, attn, x, q_lora, positions) -> tuple:
@@ -979,11 +1113,18 @@ class _Built:
 
         m = self.model
         self._warm_normal_moe()
-        x = (
-            input_embeds
-            if input_embeds is not None
-            else embed(m.embed_tokens, input_ids)
-        )
+        # the first layer's launch reads the embedding rows itself where it can (no
+        # Engram write before it, the whole table kept, not an index source)
+        table = m.embed_tokens.__dict__.get(FULL_EMBEDDING)
+        first = None
+        if self._embed_first(input_embeds, table):
+            first = (table, input_ids.contiguous())
+        if first is None:
+            x = (
+                input_embeds
+                if input_embeds is not None
+                else embed(m.embed_tokens, input_ids)
+            )
         # the compressor caches each step's rotary tables on the batch
         for attr in ("freqs_cis_c4", "freqs_cis_c128"):
             if hasattr(forward_batch, attr):
@@ -995,17 +1136,24 @@ class _Built:
             engram_rows = self._engram_rows(hash_ids)
         aux = None if m.dspark_layers_to_capture is None else []
         plan.state["dspark_aux"] = aux
-        pending, pre = (None, hc_broadcast(x, m.hc_mult), None, None), None
-        plan.state["tok_par"] = self.runner.tok_par(x.shape[0])
+        if first is None:
+            pending, pre = (None, hc_broadcast(x, m.hc_mult), None, None), None
+            rows = x.shape[0]
+        else:
+            pending, pre = (None, None, None, None), None
+            rows = first[1].shape[0]
+        plan.state["tok_par"] = self.runner.tok_par(rows)
         tok_par = plan.state["tok_par"]
         fuse = fused.enabled()
         for i in range(m.start_layer, m.end_layer):
             engram = m.layers[i].engram
             if engram is not None:
+                # the previous layer's launch projected its rows, where it could
+                kv = self.runner.egkv[:rows] if plan.state.get(("eg kv", i)) else None
                 # image rows bypass Engram on every step, as in SGLang (its gate keeps
                 # them): a graph cannot branch on mm inputs
                 pending = (None, self._engram(i, engram, pending, hash_ids, engram_rows,
-                                              input_ids, forward_batch), None, None)  # fmt: skip
+                                              input_ids, forward_batch, kv), None, None)  # fmt: skip
             nxt = m.layers[i + 1] if i + 1 < m.end_layer else None
             # an Engram layer reads the settled residual: a post owed into it only where
             # its gate's launch takes the post; the last layer's owed to the head's combine
@@ -1014,8 +1162,10 @@ class _Built:
             else:
                 defer = nxt.engram is None or fuse
             hidden, pre, post = self._layer(
-                self._layers[i], plan, positions, forward_batch, pending, pre, defer
-            )
+                self._layers[i], plan, positions, forward_batch, pending, pre, defer,
+                first if i == m.start_layer else None,
+                self._engram_projection(plan, i, engram_rows, rows),
+            )  # fmt: skip
             pending = post if defer else (None, hidden, None, None)
         last = m.layers[m.end_layer - 1]
         if pending[0] is None:
@@ -1040,11 +1190,25 @@ class _Built:
         assert len(aux) == len(m.dspark_layers_to_capture)
         return (hidden, pre_hc_head), packed
 
+    def _engram_projection(self, plan, i, engram_rows, rows):
+        """(rows, EngramWeights) of a later Engram layer for layer i's launch to project its
+        share of (``runner.layer(eg=)``), where the step's launches can; else None."""
+        L = self._layers[i]
+        if L.eg is None or not self.runner.eg_fused(rows, plan.state["tok_par"]):
+            return None
+        staged = engram_rows.get(self.model.layers[L.eg_for].engram.layer_hash_index)
+        if staged is None:
+            return None
+        # every share's launch: the step's widths and staging are the same for each
+        plan.state["eg kv", L.eg_for] = True
+        return staged.flatten(-2), L.eg
+
     def _engram(
-        self, i, engram, pending, hash_ids, engram_rows, input_ids, forward_batch
+        self, i, engram, pending, hash_ids, engram_rows, input_ids, forward_batch, kv
     ):
         """Layer i's Engram write on the residual ``pending`` (x, residual, post, comb)
-        settles to: the previous layer's owed post (x not None) in the gate's launch."""
+        settles to: the previous layer's owed post (x not None) in the gate's launch.
+        ``kv``: its projection, where the previous layer's launch made it."""
         from sglang.srt.layers.engram import engram_gate
 
         m = self.model
@@ -1060,7 +1224,8 @@ class _Built:
                 input_ids=input_ids,
             )
         # Engram.forward on the staged rows; each rank projects its 1 / tp of K
-        kv = self._engram_kv(engram, rows.flatten(-2))
+        if kv is None:
+            kv = self._engram_kv(engram, rows.flatten(-2))
         if pending[0] is not None:
             return fused.post_gate(engram, m.layers[i - 1], pending, kv, input_ids)
         return engram_gate(
@@ -1154,16 +1319,38 @@ class _Built:
             inplace_all_reduce(out.view(torch.int32), group_name=group.unique_name)
         return {e.layer_hash_index: out[k] for k, e in enumerate(engrams)}
 
+    def _embed_first(self, input_embeds, table) -> bool:
+        """Whether the first layer's launch reads the embedding table (``_launch``)."""
+        m = self.model
+        L = self._layers.get(m.start_layer)
+        return (
+            input_embeds is None
+            and table is not None
+            and L is not None
+            and not L.index
+            and m.layers[m.start_layer].engram is None
+        )
+
     def _layer(
-        self, L, plan, positions, forward_batch, pending_post, prev_pre, defer_post
+        self,
+        L,
+        plan,
+        positions,
+        forward_batch,
+        pending_post,
+        prev_pre,
+        defer_post,
+        embed=None,
+        eg=None,
     ):
         """One layer: the previous layer's pending post (x, residual, post, comb)
-        and pre in; the fused boundary's outputs out."""
+        and pre in; the fused boundary's outputs out. ``eg``: a later Engram layer's
+        projection (``_engram_projection``)."""
         self._warm_normal_moe()
         out = _launch(
             self.runner, L, plan, positions, forward_batch, pending_post, prev_pre,
             capture=lambda L, M: self._capture(plan, L, M),
-            tok_par=plan.state["tok_par"],
+            tok_par=plan.state["tok_par"], embed=embed, eg=eg,
         )  # fmt: skip
         return _boundary_out(L.module, defer_post, *out)
 
@@ -1267,6 +1454,51 @@ def _k_shard(linear):
     return shard, k0, k0 + kk
 
 
+def _engram_weights(copies: dict, layers: dict, model, rank: int, tp: int) -> None:
+    """Each Engram layer's projection on the covered reuse layers since the Engram layer
+    before it (the first: since the first layer), split evenly by 32-row blocks: this
+    rank's rows of ``wkv`` (``stages.engram``), where the layout is the one known (block FP8
+    at 32 x 32, row-major, no bias)."""
+    from sgl_amd_mono.deepseek_v41.gfx950.runner import EngramWeights
+    from sgl_amd_mono.deepseek_v41.gfx950.stages import engram as eg
+
+    m = model.model
+    since = m.start_layer
+    for i in range(m.start_layer, m.end_layer):
+        e = m.layers[i].engram
+        if e is None:
+            continue
+        producers = [j for j in range(since, i) if j in layers and not layers[j].index]
+        since = i
+        lin = e.wkv
+        w = getattr(lin, "weight", None)
+        if (
+            not producers
+            or w is None
+            or w.dtype != torch.float8_e4m3fn
+            or tuple(w.shape) != (eg.N, eg.K)
+            or getattr(lin, "mxfp8_aiter_preshuffled", False)
+            or getattr(lin, "bias", None) is not None
+            or getattr(lin, "weight_scale_inv", None) is None
+        ):
+            continue
+        n = eg.rank_rows(tp)
+        w = eg.tile_order(w[rank * n : (rank + 1) * n])
+        codes = _codes(copies, i, "engram wkv", lin)[
+            rank * n // 32 : (rank + 1) * n // 32
+        ]
+        _keep(copies, w, "engram wkv rows", i)
+        _keep(copies, codes, "engram wkv row codes", i)
+        blocks = n // 32
+        for k, j in enumerate(producers):
+            b0, b1 = blocks * k // len(producers), blocks * (k + 1) // len(producers)
+            layers[j].eg = EngramWeights(
+                w=w[32 * b0 : 32 * b1], ws=codes[b0:b1].contiguous(), row0=32 * b0
+            )
+            layers[j].eg.check(tp)
+            layers[j].eg_for = i
+
+
 def _longest_context(hf_config) -> int:
     """The longest context a request can have, SGLang's ``context_len``; a ratio-1
     index source sees that many compressed rows (plus a verify step's draft rows)."""
@@ -1291,6 +1523,7 @@ def _build(model, hf_config, ctx) -> _Built:
         ctx.copies["rope table", n] = t
     # the peer handshake is collective: every rank gets here (attach agreed first)
     p = get_parallel()
+    _engram_weights(ctx.copies, layers, model, p.tp_rank, p.tp_size)
     device = model.model.layers[0].input_layernorm.weight.device
     runner = DSV41MonoRunner(
         p.tp_size,
@@ -1304,18 +1537,36 @@ def _build(model, hf_config, ctx) -> _Built:
     if k2i:
         # the indexer's buffers, sized here: before SGLang sizes the KV cache
         runner.enable_k2i(_longest_context(hf_config))
-    # K1 with and without an owed post (none on the first layer and after an Engram write)
+    # with and without an owed post (none on the first layer and after an Engram write):
+    # an index source's K1 and K2, a reuse layer's one launch
     k1 = {
-        (fold, L.index, L.k1.iq_w is not None)
+        (fold, True, L.k1.iq_w is not None, L.k1.cp_ratio)
         for L in layers.values()
+        if L.index
         for fold in (True, False)
     }
-    k2 = {(L.ratio > 0, L.index) for L in layers.values()}
+    k2 = {(L.ratio > 0, True) for L in layers.values() if L.index}
+    one = {
+        (fold, L.ratio > 0, False, eg)
+        for L in layers.values()
+        if not L.index
+        for fold in (True, False)
+        for eg in {0, L.eg.tasks if L.eg is not None else 0}
+    }
+    # the first layer on the embedding table (``_Built._embed_first``)
+    first = layers.get(model.model.start_layer)
+    if first is not None and not first.index:
+        one |= {
+            (False, first.ratio > 0, True, eg)
+            for eg in {0, first.eg.tasks if first.eg is not None else 0}
+        }
     # ranks share FlyDSL's disk cache (a lock per kernel), so each starts at its own slice
     widths = list(ctx.widths)
     start = len(widths) * p.tp_rank // p.tp_size
     for m in widths[start:] + widths[:start]:
-        runner.precompile(m, k1=k1, k2=k2, k2i=k2i, tok_par=runner.tok_par(m))
+        runner.precompile(
+            m, k1=k1, k2=k2, layer=one, k2i=k2i, tok_par=runner.tok_par(m)
+        )
     glue.prewarm(device)
     fused.prewarm(model)
     return _Built(model, runner, layers)

@@ -14,7 +14,7 @@ import numpy as np
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu
 from flydsl.expr import math as fmath
-from flydsl.expr import range_constexpr
+from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from sgl_amd_mono.common.ops import (
@@ -29,6 +29,7 @@ from sgl_amd_mono.common.ops import (
 from sgl_amd_mono.common.plan import first_task
 from sgl_amd_mono.deepseek_v41.gfx950.stages.gemv import ld_f32, plus
 
+from ..indexer import compress
 from .device import BLOCKS, WAVES, ld_i32
 from .gemv import _step_load, _step_mfma
 from .plan import HIDDEN, Q_RANK, ROPE, ROWS
@@ -42,7 +43,11 @@ IQ_BATCH = 5  # a chain's weight steps in flight together (registers)
 IW_SPLIT = 512
 IW_SPLITS = HIDDEN // IW_SPLIT  # 10
 IW_STEPS = IW_SPLIT // 32  # 16 MFMAs a partial
-IW_CHAINS = IW_SPLITS * (HEADS // 16)  # (split, 16-head tile)
+IW_PART_SPLITS = 2  # a CTA's splits of a head tile, a wave each
+IW_PARTS = IW_SPLITS // IW_PART_SPLITS  # CTAs a (token tile, head tile)
+CP_DIM = 512  # a compressor's kv (and score) columns: head_dim
+CP_PARTS = 4  # a compressor column tile's K parts, a CTA each
+CP_WAVE_K = HIDDEN // (CP_PARTS * WAVES)  # 160: a wave's K of a part
 FP4_AMAX_FLOOR = 6 * 2.0**-126
 INV6 = float(np.float32(1.0 / 6.0))  # Triton's fp32 constant
 E2M1_EDGES = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
@@ -70,28 +75,28 @@ def fused(s: int, tok_par: bool = False) -> bool:
 
 
 def iw_tasks(rows: int) -> int:
-    """The head weights' CTAs at rows rows: a (16-row tile, 16-head tile) each."""
-    return 2 * -(-rows // 16)
+    """The head weights' CTAs at rows rows: a (16-row tile, 16-head tile, part) each."""
+    return 2 * IW_PARTS * -(-rows // 16)
 
 
 # ---------------------------------------------------------------- iw
 
 
-def _iw_chains(c, x, w, t0, n, splits, ht, lds):
-    """Head-weight partials, a chain each, their steps interleaved (one load
-    trip for all): rows t0 .. t0 + n of x [T, HIDDEN] bf16 against heads 16 ht ..
-    of w [HEADS, HIDDEN], K 512 split .. in 32-K MFMA steps -> ``lds``
-    [split][16 rows][16 heads] f32."""
+def _iw_chain(c, x, w, t0, n, split, ht):
+    """One head-weight partial: rows t0 .. t0 + n of x [T, HIDDEN] bf16 against heads
+    16 ht .. of w [HEADS, HIDDEN], K 512 split .., in 32-K MFMA steps, every step's
+    loads issued before the first MFMA. Returns the accumulator: D[row 4 (lane / 16)
+    + q][head lane % 16]."""
     lane = c["lane"]
     row = lane % 16
     k8 = 8 * (lane // 16)
     live = row < n
     t = plus(t0, fx.min(row, n - 1))
-    accs = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in splits]
+    xs, ws = [], []
     for st in range_constexpr(IW_STEPS):
-        for j in range_constexpr(len(splits)):
-            k = splits[j] * IW_SPLIT + st * 32 + k8
-            xv = fx.Vector(
+        k = split * IW_SPLIT + st * 32 + k8
+        xs.append(
+            fx.Vector(
                 bo.buffer_load(
                     rsrc(x),
                     (t * HIDDEN + k) // 2,
@@ -100,8 +105,9 @@ def _iw_chains(c, x, w, t0, n, splits, ht, lds):
                     cache_modifier=CM_DEV,
                 )
             )
-            xv = live.select(xv, fx.Vector.filled(4, 0, fx.Int32))
-            wv = fx.Vector(
+        )
+        ws.append(
+            fx.Vector(
                 bo.buffer_load(
                     rsrc(w),
                     ((16 * ht + row) * HIDDEN + k) // 2,
@@ -109,39 +115,62 @@ def _iw_chains(c, x, w, t0, n, splits, ht, lds):
                     dtype=T.i32,
                 )
             )
-            accs[j] = mfma_bf16(
-                xv.bitcast(fx.BFloat16), wv.bitcast(fx.BFloat16), accs[j]
-            )
-    for j in range_constexpr(len(splits)):
-        # D[row 4 (lane / 16) + q][head lane % 16]
-        for q in range_constexpr(4):
-            r = 4 * (lane // 16) + q
-            at = (splits[j] * 16 + r) * 16 + lane % 16
-            fx.ptr_store(accs[j][q].bitcast(fx.Int32), lds + at)
+        )
+    acc = fx.Vector.filled(4, 0.0, fx.Float32)
+    zero = fx.Vector.filled(4, 0, fx.Int32)
+    for st in range_constexpr(IW_STEPS):
+        xv = live.select(xs[st], zero)
+        acc = mfma_bf16(xv.bitcast(fx.BFloat16), ws[st].bitcast(fx.BFloat16), acc)
+    return acc
+
+
+def iw_pair(tile, ht, split, r, h):
+    """Partial ``split``'s pair of row r, head h of token tile ``tile``, head tile ht in
+    IWP (a pair a row and head, f32)."""
+    return ((tile * 2 + ht) * IW_SPLITS + split) * 256 + r * 16 + h
 
 
 @flyc.jit
-def stage_iw(c, x, w, out, scale, t0, n, ht, lds, push=None):
-    """Head tile ht's head weights of rows t0 .. t0 + n -> ``out`` [T, HEADS]
-    bf16: its IW_SPLITS partials, split s on wave s % WAVES (waves 0 .. take two,
-    interleaved), summed in split order; ``lds`` holds them [split][16 rows][16
-    heads] f32. ``push(row, head, w0, w1)`` (token parallel) hands a head pair on
+def stage_iw(c, x, w, out, scale, t0, n, tile, ht, part, lds, iwp, push=None):
+    """Part ``part`` of head tile ht's head weights of rows t0 .. t0 + n (token tile
+    ``tile``): its IW_PART_SPLITS partials, a split a wave. Part 0 sums every split's
+    partial in split order -- its own from ``lds`` [split][16 rows][16 heads] f32, the
+    other parts' polled from IWP -- into ``out`` [T, HEADS] bf16; the other parts put
+    theirs in IWP. ``push(row, head, w0, w1)`` (token parallel) hands a head pair on
     to the other ranks."""
-    tid, wave = c["tid"], c["wave"]
-    twice = IW_SPLITS - WAVES  # the waves with a second split
-    if wave < twice:
-        _iw_chains(c, x, w, t0, n, [wave, wave + WAVES], ht, lds)
-    else:
-        _iw_chains(c, x, w, t0, n, [wave], ht, lds)
+    tid, lane, wave = c["tid"], c["lane"], c["wave"]
+    if wave < IW_PART_SPLITS:
+        acc = _iw_chain(c, x, w, t0, n, part * IW_PART_SPLITS + wave, ht)
+        for q in range_constexpr(4):
+            r = 4 * (lane // 16) + q
+            fx.ptr_store(
+                acc[q].bitcast(fx.Int32), lds + (wave * 16 + r) * 16 + lane % 16
+            )
     gpu.barrier()
-    if tid < n * 8:
+    if (part != 0) & (tid < n * 16):
+        r, h = tid // 16, tid % 16
+        for j in range_constexpr(IW_PART_SPLITS):
+            v = fx.ptr_load(lds + (j * 16 + r) * 16 + h).bitcast(fx.Float32)
+            c["mb"].put(iwp, iw_pair(tile, ht, part * IW_PART_SPLITS + j, r, h), v)
+    if (part == 0) & (tid < n * 8):
         r, h = tid // 8, 2 * (tid % 8)
+        theirs = c["mb"].poll(
+            [
+                (iwp, iw_pair(tile, ht, sp, r, h), 2)
+                for sp in range(IW_PART_SPLITS, IW_SPLITS)
+            ]
+        )
         ws = []
         for d in range_constexpr(2):
             acc = fx.ptr_load(lds + (r * 16 + h + d)).bitcast(fx.Float32)
             for sp in range_constexpr(1, IW_SPLITS):
-                at = (sp * 16 + r) * 16 + h + d
-                acc = acc + fx.ptr_load(lds + at).bitcast(fx.Float32)
+                if const_expr(sp < IW_PART_SPLITS):
+                    p = fx.ptr_load(lds + (sp * 16 + r) * 16 + h + d).bitcast(
+                        fx.Float32
+                    )
+                else:
+                    p = theirs[sp - IW_PART_SPLITS][d].bitcast(fx.Float32)
+                acc = acc + p
             ws.append(bf16_round(bf16_round(acc) * scale))
         word = (
             fx.Vector.from_elements(ws, fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)[0]
@@ -151,6 +180,173 @@ def stage_iw(c, x, w, out, scale, t0, n, ht, lds, push=None):
         if const_expr(push is not None):
             push(row, 16 * ht + h, ws[0], ws[1])
     gpu.barrier()
+
+
+# ---------------------------------------------------------------- the compressor
+
+
+def cp_cols(ratio: int) -> int:
+    """A compressor's projection columns: kv and score at ratio 2, kv at ratio 1."""
+    return CP_DIM * ratio
+
+
+def _cp_chain(c, x, w, t0, n, k0, ct):
+    """One wave's partial of columns 16 ct .. of x [T, HIDDEN] bf16 against w [cols,
+    HIDDEN] bf16, rows t0 .. t0 + n, K k0 .. k0 + CP_WAVE_K in 32-K MFMA steps, every
+    step's loads issued first. Returns the accumulator (``_iw_chain``'s layout)."""
+    lane = c["lane"]
+    row = lane % 16
+    k8 = 8 * (lane // 16)
+    live = row < n
+    t = plus(t0, fx.min(row, n - 1))
+    xs, ws = [], []
+    for st in range_constexpr(CP_WAVE_K // 32):
+        k = k0 + st * 32 + k8
+        xs.append(
+            fx.Vector(
+                bo.buffer_load(
+                    rsrc(x), (t * HIDDEN + k) // 2, vec_width=4, dtype=T.i32,
+                    cache_modifier=CM_DEV,
+                )
+            )
+        )  # fmt: skip
+        ws.append(
+            fx.Vector(
+                bo.buffer_load(
+                    rsrc(w),
+                    ((16 * ct + row) * HIDDEN + k) // 2,
+                    vec_width=4,
+                    dtype=T.i32,
+                )
+            )
+        )
+    acc = fx.Vector.filled(4, 0.0, fx.Float32)
+    zero = fx.Vector.filled(4, 0, fx.Int32)
+    for st in range_constexpr(CP_WAVE_K // 32):
+        xv = live.select(xs[st], zero)
+        acc = mfma_bf16(xv.bitcast(fx.BFloat16), ws[st].bitcast(fx.BFloat16), acc)
+    return acc
+
+
+def cp_pair(tile, ct, ctiles, part, r, h):
+    """Part ``part``'s pair of row r, column 16 ct + h of token tile ``tile`` in CPP."""
+    return ((tile * ctiles + ct) * CP_PARTS + part) * 256 + r * 16 + h
+
+
+@flyc.jit
+def stage_cp(c, a, t0, n, tile, ct, ctiles, part, lds, ratio):
+    """Part ``part`` (K quarter) of compressor columns 16 ct .. of rows t0 .. t0 + n: a
+    K range a wave, the waves' partials summed in wave order. The other parts put theirs
+    in CPP; part 0 adds them in part order and writes ``cp_out`` (f32 at ratio 2, bf16
+    at ratio 1)."""
+    tid, lane, wave = c["tid"], c["lane"], c["wave"]
+    k0 = part * (HIDDEN // CP_PARTS) + wave * CP_WAVE_K
+    acc = _cp_chain(c, a["normed_out"], a["cp_w"], t0, n, k0, ct)
+    for q in range_constexpr(4):
+        r = 4 * (lane // 16) + q
+        fx.ptr_store(acc[q].bitcast(fx.Int32), lds + (wave * 16 + r) * 16 + lane % 16)
+    gpu.barrier()
+    if tid < n * 8:
+        r, h = tid // 8, 2 * (tid % 8)
+        vs = []
+        for d in range_constexpr(2):
+            v = fx.ptr_load(lds + (r * 16 + h + d)).bitcast(fx.Float32)
+            for w_ in range_constexpr(1, WAVES):
+                v = v + fx.ptr_load(lds + (w_ * 16 + r) * 16 + h + d).bitcast(
+                    fx.Float32
+                )
+            vs.append(v)
+        if part != 0:
+            c["mb"].put_words(
+                c["cpp"],
+                cp_pair(tile, ct, ctiles, part, r, h),
+                [vs[0].bitcast(fx.Int32), vs[1].bitcast(fx.Int32)],
+            )
+        else:
+            theirs = c["mb"].poll(
+                [
+                    (c["cpp"], cp_pair(tile, ct, ctiles, p, r, h), 2)
+                    for p in range(1, CP_PARTS)
+                ]
+            )
+            for p in range_constexpr(CP_PARTS - 1):
+                for d in range_constexpr(2):
+                    vs[d] = vs[d] + theirs[p][d].bitcast(fx.Float32)
+            cols = cp_cols(ratio)
+            at = plus(t0, r) * cols + 16 * ct + h
+            if const_expr(ratio == 2):
+                bo.buffer_store(
+                    fx.Vector.from_elements(vs, fx.Float32).bitcast(fx.Int32),
+                    rsrc(a["cp_out"]),
+                    at,
+                    cache_modifier=CM_DEV,
+                )
+            else:
+                word = (
+                    fx.Vector.from_elements(vs, fx.Float32)
+                    .to(fx.BFloat16)
+                    .bitcast(fx.Int32)[0]
+                )
+                bo.buffer_store(word, rsrc(a["cp_out"]), at // 2, cache_modifier=CM_DEV)
+    # part 0: its columns visible device-wide, then their flag (``run_kc`` waits on it)
+    if part == 0:
+        rocdl.s_waitcnt(vmcnt=0)
+    gpu.barrier()
+    if (part == 0) & (tid == 0):
+        c["mb"].put(c["cprdy"], tile * ctiles + ct, fx.Int32(1))
+
+
+@flyc.jit
+def run_cp(c, a, rows, cp0, lds, ratio):
+    """An index KV source's compressor projection (SGLang's ``project_fused`` at ratio 2,
+    f32, ``wkv`` at ratio 1, rounded to bf16) of rows 0 .. rows -> ``cp_out``, a (token
+    tile, 16-column tile, K quarter) a CTA from CTA ``cp0``, once its rows' norms
+    published them."""
+    tiles = -(-rows // 16)
+    ctiles = cp_cols(ratio) // 16
+    for task in range(first_task(c["bid"], cp0), tiles * ctiles * CP_PARTS, BLOCKS):
+        tile = task // (ctiles * CP_PARTS)
+        t0 = tile * 16
+        n = fx.min(fx.Int32(16), rows - t0)
+        if c["tid"] < 2 * n:
+            c["mb"].poll([(c["xrdy"], 2 * t0 + fx.min(c["tid"], 2 * n - 1), 1)])
+        gpu.barrier()
+        stage_cp(
+            c, a, t0, n, tile, (task // CP_PARTS) % ctiles, ctiles, task % CP_PARTS, lds,
+            ratio,
+        )  # fmt: skip
+
+
+def kc_context(c, ratio):
+    """``compress``'s context on this K1 CTA: its LDS the front's X tile (free past the
+    front)."""
+    return {
+        "tid": c["tid"], "lane": c["lane"], "wave": c["wave"], "lds": c["xl"], "r": ratio,
+        "tl": c.get("tl"),
+    }  # fmt: skip
+
+
+@flyc.jit
+def run_kc(c, a, rows, ratio):
+    """The rest of an index KV source's compressor (``compress.run_row``, its arguments
+    ``a``) at the end of K1: row r on CTA BLOCKS - 1 - r (the grid's last CTAs finish their
+    front first), once the projection's column tiles of its token tile and those before (a
+    verify block's row pools with the row before) are in."""
+    rc = kc_context(c, ratio)
+    row = BLOCKS - 1 - c["bid"]
+    if row < fx.min(a["live"], fx.Int32(rows)):
+        _kc_row(c, rc, a, row, ratio)
+
+
+@flyc.jit
+def _kc_row(c, rc, a, row, ratio):
+    # what the row loads past the projection, out while the flags come in
+    inputs = compress.row_inputs(rc, a, row)
+    ws = compress.wk_loads(a, c["tid"])
+    if c["tid"] < (row // 16 + 1) * (cp_cols(ratio) // 16):
+        c["mb"].poll([(c["cprdy"], c["tid"], 1)])
+    gpu.barrier()
+    compress.run_row(rc, a, row, inputs, ws)
 
 
 # ---------------------------------------------------------------- iq
@@ -315,19 +511,19 @@ def stage_iquant(c, a, iq, t, h, num_pos):
 
 @flyc.jit
 def run_iw(c, a, rows, iw0, lds, row0=0, push=None):
-    """The head weights of rows row0 .. row0 + rows (the step's, or token
-    parallel this rank's), a (token tile, 16-head tile) a CTA from CTA ``iw0``,
-    once its rows' norms published them (``xrdy``: two flags a row, at its local
-    index)."""
+    """The head weights of rows row0 .. row0 + rows (the step's, or token parallel
+    this rank's), a (token tile, 16-head tile, part) a CTA from CTA ``iw0``, once its
+    rows' norms published them (``xrdy``: two flags a row, at its local index)."""
     for task in range(first_task(c["bid"], iw0), iw_tasks(rows), BLOCKS):
-        t0 = (task // 2) * 16
+        tile = task // (2 * IW_PARTS)
+        t0 = tile * 16
         n = fx.min(fx.Int32(16), rows - t0)
         if c["tid"] < 2 * n:
             c["mb"].poll([(c["xrdy"], 2 * t0 + fx.min(c["tid"], 2 * n - 1), 1)])
         gpu.barrier()
         stage_iw(
             c, a["normed_out"], a["iw_w"], a["iw_out"], a["iw_scale"], plus(row0, t0),
-            n, task % 2, lds, push,
+            n, tile, (task // IW_PARTS) % 2, task % IW_PARTS, lds, c["iwp"], push,
         )  # fmt: skip
 
 

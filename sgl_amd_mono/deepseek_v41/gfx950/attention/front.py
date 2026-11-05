@@ -123,6 +123,17 @@ def await_flags(c, region, n, index):
     gpu.barrier()
 
 
+@flyc.jit
+def hand_off(c, region, i):
+    """One launch per layer (``c["k2"]``): this CTA's stores visible device-wide, then
+    the layer's attention back's flag pair (``region``, i), with that half's tag."""
+    rocdl.s_waitcnt(vmcnt=0)
+    gpu.barrier()
+    if c["tid"] == 0:
+        h = c["k2"]
+        h["mb"].put(h[region], i, fx.Int32(1))
+
+
 # ---------------------------------------------------------------- kt
 
 
@@ -332,15 +343,20 @@ def stage_qkv(c, t):
     if mine & (tt % 32 == 0) & (tt < NOPE // 2):
         fx.ptr_store(rcode.bitcast(fx.Float32), red + 8 + tt // 32)
     gpu.barrier()
+    # one launch per layer: device scope, for the attention back of this launch (this
+    # CTA's q flag, past its wq_b, tells it the record landed)
+    dev = c.get("k2") is not None
     if mine & (slot >= 0):
         if tt < NOPE // 2:
             if tt % 2 == 0:
-                gstore(rec + fx.Int64(2 * tt), word, words=1)
+                rec_store(rec, 2 * tt, word, 1, dev)
         else:
-            gstore(rec + fx.Int64(NOPE + 4 * (tt - NOPE // 2)), rope_word, words=1)
+            rec_store(rec, NOPE + 4 * (tt - NOPE // 2), rope_word, 1, dev)
         if tt == 0:
             sc = base + fx.Int64(blk * DATA + soff * 8)
-            gstore(sc, fx.Vector.from_elements(record_scales(red), fx.Int32), words=2)
+            rec_store(
+                sc, 0, fx.Vector.from_elements(record_scales(red), fx.Int32), 2, dev
+            )
     if const_expr(tok_par):
         # the record to every other rank's KG (``record_from``), a pad row's too
         if mine:
@@ -360,6 +376,15 @@ def stage_qkv(c, t):
         gpu.barrier()
 
 
+def rec_store(base, off, value, words, dev):
+    """``words`` of a KV record at byte ``off`` of ``base`` (alike across the CTA);
+    ``dev``: device scope, for a record this launch reads (one launch per layer)."""
+    if const_expr(dev):
+        bo.buffer_store(value, rsrc(base), off // 4, cache_modifier=CM_DEV)
+    else:
+        gstore(base + fx.Int64(off), value, words=words)
+
+
 def record_scales(red):
     """The record's two scale words, from the 7 codes ``stage_qkv`` put in ``red``."""
     sb = [fx.ptr_load(red + 8 + b).bitcast(fx.Int32) for b in range(7)]
@@ -374,6 +399,7 @@ def record_from(c, kg, t):
     stores)."""
     tid = c["tid"]
     a = c["args"]
+    dev = c.get("k2") is not None
     if tid < KG_WORDS:
         (w,) = c["mb"].poll([(kg, t * KG_WORDS + tid, 1)])
         slot = ld_i32(a["slot"], a["slot_words"] * t)
@@ -385,7 +411,7 @@ def record_from(c, kg, t):
             off = data.select(
                 soff * DATA + 4 * tid, blk * DATA + soff * 8 + 4 * (tid - DATA // 4)
             )
-            gstore(base + fx.Int64(off), w[0], words=1)
+            rec_store(base, off, w[0], 1, dev)
 
 
 @flyc.jit
@@ -444,6 +470,8 @@ def stage_wqb(c, task0, bops, t0, n, rope):
     """Run the CTA's wq_b tasks: GEMV, bf16, GPT-J RoPE of dims 448.., store q."""
     tid, red, d = c["tid"], c["red"], c["d"]
     a = c["args"]
+    # one launch per layer: device scope, for the attention back of this launch
+    cm = CM_DEV if const_expr(c.get("k2") is not None) else 0
     nt = len(bops)
     for k in range_constexpr(nt):
         gemv_mfmas(c, Q_RANK, c["qxl"], c["qxsl"], red + k * RED, bops[k], rows=n)
@@ -468,7 +496,12 @@ def stage_wqb(c, task0, bops, t0, n, rope):
             .to(fx.BFloat16)
             .bitcast(fx.Int32)[0]
         )
-        bo.buffer_store(word, rsrc(a["q"]), (t * d.q_rows + r0) // 2)
+        bo.buffer_store(
+            word,
+            rsrc(a["q"]),
+            (t * d.q_rows + r0) // 2,
+            cache_modifier=cm,
+        )
     gpu.barrier()
 
 
@@ -546,6 +579,9 @@ def run_front(
     s = key.tokens
     # the wqkv GEMV takes all of K from X8, which the seam publishes
     assert x8_given
+    # one launch per layer: the attention back of this launch reads q, the records and
+    # the key table (read before the traced loops: a dict a loop reads becomes loop state)
+    one = c.get("k2") is not None
     wqb_tasks = Dims(key.tp).wqb_tasks
     a = c["args"]
     tiles = token_tiles(s)
@@ -618,6 +654,8 @@ def run_front(
         kt_first = bid - kt_from
         for t in range((kt_first >= 0).select(kt_first, fx.Int32(s)), s, kt_step):
             stage_kt(c, t)
+            if const_expr(one):
+                hand_off(c, "krdy", t)
     stamp(c, 35)
     poss = [wqb_pos(c, t0, n) for t0, n in tiles]
 
@@ -710,6 +748,11 @@ def run_front(
         def iq_batch(b0):
             return iq_ops[b0 // index_query.IQ_BATCH]
 
+    def q_flag(ti):
+        # one launch per layer: this CTA's q rows of tile ti, for the attention back
+        if const_expr(one):
+            hand_off(c, "qb", (ti * BLOCKS + bid) * FLAG_STRIDE)
+
     def index_tile(ti, t0, n):
         if const_expr(chains is not None):
             index_query.stage_iq(
@@ -746,6 +789,7 @@ def run_front(
             if const_expr(ti == 0):
                 stamp(c, 38)
             stage_wqb(c, wqb_task, bops, t0, n, ropes[ti])
+            q_flag(ti)
             index_tile(ti, t0, n)
     else:
         await_flags(c, c["qrdy"], s, lambda u: u * FLAG_STRIDE)
@@ -758,6 +802,7 @@ def run_front(
             if const_expr(ti + 1 < len(tiles)):
                 regs = rows_loads(c, *qx, *tiles[ti + 1])
             stage_wqb(c, wqb_task, bops, t0, n, ropes[ti])
+            q_flag(ti)
             index_tile(ti, t0, n)
     if const_expr(chains is not None):
         index_query.run_iquant(c, a, s)

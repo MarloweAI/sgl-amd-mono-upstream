@@ -18,6 +18,7 @@ from flydsl.expr.math import fma
 from flydsl.expr.typing import T
 
 from sgl_amd_mono.common.ops import (
+    CM_DEV,
     batched_rounds,
     bf16_round,
     bf_hi,
@@ -134,6 +135,12 @@ def slice_loads(c, c0, e):
     """Element e's loads of ``stage_slice`` (e clamped into the step's)."""
     a = c["args"]
     t, o, col = slice_at(c0, e)
+    if const_expr(c.get("embed", False)):
+        # the first layer: every stream is the token's embedding row (SGLang's hc_broadcast)
+        row = fx.Int32(
+            bo.buffer_load(rsrc(a["ids"]), a["ids_words"] * t, vec_width=1, dtype=T.i32)
+        )
+        return (ld_bf(a["emb"], row * HIDDEN + col),)
     if const_expr(not c.get("fold", True)):
         return (ld_bf(a["res_in"], (t * HC + o) * HIDDEN + col),)
     r = [ld_bf(a["res_in"], (t * HC + h) * HIDDEN + col) for h in range(HC)]
@@ -174,6 +181,12 @@ def slice_fn_loads(c, task):
         o = (e % KT) // COLS
         out.append(ld_f32(a["hc_fn"], j * K_MIX + o * HIDDEN + c0 + e % COLS))
     return out
+
+
+def slice_prefetch_fits(s: int) -> bool:
+    """Whether a slice's first loads fit in registers through the FFN seam's reduce: up to
+    32 rows, where the reduce takes one pass."""
+    return s * COLS // 2 <= THREADS
 
 
 def slice_prefetch(c, task):
@@ -272,10 +285,12 @@ def _row_max(v):
 
 @flyc.jit
 def stage_gate(c, t):
-    """Token t's slices, in slice order, -> post / comb / next pre."""
+    """Token t's slices, in slice order, -> post / comb / next pre (``dev``: device
+    scope, for mixes this launch reads)."""
     s, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
     red = c["red"]
     a = c["args"]
+    cm = CM_DEV if const_expr(c.get("dev", False)) else 0
     groups = SLICES // GATE_BLOCK
     if tid < groups * PART:
         g = tid // PART
@@ -307,11 +322,19 @@ def stage_gate(c, t):
         v = mix * hw_rsq(fma(sq, fx.Float32(1.0 / K_MIX), fx.Float32(EPS)))
         if lane < HC:
             pre = sigmoid(fma(v, sc[0], base))
-            bo.buffer_store(pre + fx.Float32(HC_EPS), rsrc(a["pre_out"]), t * HC + lane)
+            bo.buffer_store(
+                pre + fx.Float32(HC_EPS),
+                rsrc(a["pre_out"]),
+                t * HC + lane,
+                cache_modifier=cm,
+            )
         if (lane >= HC) & (lane < 2 * HC):
             post = sigmoid(fma(v, sc[1], base))
             bo.buffer_store(
-                post * fx.Float32(POST_MULT), rsrc(a["post_out"]), t * HC + lane - HC
+                post * fx.Float32(POST_MULT),
+                rsrc(a["post_out"]),
+                t * HC + lane - HC,
+                cache_modifier=cm,
             )
         cv = fma(v, sc[2], base)
         # Triton's exp: exp2 of (x - max) log2(e)
@@ -323,7 +346,9 @@ def stage_gate(c, t):
             cv = cv * hw_rcp(_row_sum(cv) + fx.Float32(HC_EPS))
             cv = cv * hw_rcp(_col_sum(cv) + fx.Float32(HC_EPS))
         if (lane >= COMB0) & (lane < COMB0 + HC * HC):
-            bo.buffer_store(cv, rsrc(a["comb_out"]), t * HC * HC + lane - COMB0)
+            bo.buffer_store(
+                cv, rsrc(a["comb_out"]), t * HC * HC + lane - COMB0, cache_modifier=cm
+            )
     gpu.barrier()
 
 
@@ -389,8 +414,13 @@ def stage_norm(c, t, store):
 def stage_reduce(c, task):
     """Sum the TP ranks' attention partials at this slice's 32 columns in rank order into ``pend_lds``."""
     s, tid = c["S"], c["tid"]
-    for pas in range_constexpr(0, s * COLS // 2, THREADS):
-        reduce_attn_pair(c, task, plus(pas, tid))
+    pairs = s * COLS // 2
+    if const_expr(pairs <= THREADS):
+        reduce_attn_pair(c, task, tid)
+    else:
+        # past one pass a traced loop: one pass's polls in flight at a time, not every pass's
+        for pas in range(0, pairs, THREADS):
+            reduce_attn_pair(c, task, pas + tid)
     gpu.barrier()
 
 

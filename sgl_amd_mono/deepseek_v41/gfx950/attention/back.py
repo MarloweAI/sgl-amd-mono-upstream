@@ -41,6 +41,7 @@ from sgl_amd_mono.common.plan import (
 )
 from sgl_amd_mono.common.stamps import stamp
 from sgl_amd_mono.deepseek_v41.gfx950.stages.gemv import (
+    TILE,
     ld_f32,
     lds_row,
 )
@@ -197,6 +198,27 @@ def _fp8_quad_bf16(word, scale):
 
 
 @flyc.jit
+def await_k1(c, unit, t):
+    """One launch per layer: wait for every CTA's q rows of token t's tile (``qb``; a CTA
+    flags them past its records, key table rows and mixes), t's key table (``krdy``)
+    and, token parallel, every row's record (``vrdy``: a row's keys hold the step's
+    earlier rows, the other ranks' copied late), each published by K1's half of the
+    launch. ``c["k1_seen"](unit)`` runs once they are: a flag of every CTA was seen."""
+    tid, s = c["tid"], c["S"]
+    if tid < BLOCKS:
+        c["mb"].poll([(c["qb"], ((t // TILE) * BLOCKS + tid) * FLAG_STRIDE, 1)])
+    else:
+        if tid == BLOCKS:
+            c["mb"].poll([(c["krdy"], t, 1)])
+        else:
+            if const_expr("vrdy" in c):
+                if tid < BLOCKS + 1 + s:
+                    c["mb"].poll([(c["vrdy"], (tid - BLOCKS - 1) * FLAG_STRIDE, 1)])
+    gpu.barrier()
+    c["k1_seen"](unit)
+
+
+@flyc.jit
 def stage_split(c, unit):
     """Flash-decoding over chunk ``unit % nchunk`` of token ``unit // nchunk``,
     every head of the rank -> the chunk's partial and (max, sum) per head.
@@ -218,6 +240,10 @@ def stage_split(c, unit):
     g = lane // 16
     r16 = lane % 16
     k0 = ch * ck
+    # one launch per layer: K1's half of this launch wrote q, the records and the table
+    one = "qb" in c
+    if const_expr(one):
+        await_k1(c, unit, t)
     # q does not depend on the key table: in flight before an index source's wait
     qrow = d.heads * HEAD_DIM // 8
     qpad = d.tile_heads * HEAD_DIM // 8  # with the head tile's padding rows
@@ -231,10 +257,11 @@ def stage_split(c, unit):
                     (t * d.q_rows) // 2 + fx.min(u, qrow - 1) * 4,
                     vec_width=4,
                     dtype=T.i32,
+                    cache_modifier=CM_DEV if const_expr(one) else 0,
                 )
             )
         )
-    if const_expr("krdy" in c):
+    if const_expr(("krdy" in c) and not one):
         # an index source's table: this launch builds it after the indexer ran
         await_flags(c, c["krdy"], 1, lambda u: t)
     # kv_len and this lane's key load together: the table holds -1 past a token's keys
@@ -516,6 +543,7 @@ def stage_combine(c, unit):
                 ((t * nchunk + cc) * d.heads + h) * 2,
                 vec_width=2,
                 dtype=T.f32,
+                cache_modifier=CM_DEV,
             )
         )
         pv = fx.Vector(
@@ -524,6 +552,7 @@ def stage_combine(c, unit):
                 (((t * nchunk + cc) * d.heads + h) * HEAD_DIM + d0) // 2,
                 vec_width=4,
                 dtype=T.i32,
+                cache_modifier=CM_DEV,
             )
         )
         mc = live.select(stv[0], fx.Float32(NEG))
@@ -755,8 +784,10 @@ def back_context(key, lds, args: dict, scratch, tag, layout: dict) -> dict:
 
 
 @flyc.jit
-def run_back(c, key, bid):
-    """The attention back's stages on this CTA: split, combine, wo_a, wo_b."""
+def run_back(c, key, bid, idle=None):
+    """The attention back's stages on this CTA: split, combine, wo_a, wo_b.
+    ``idle``: work for the CTAs past their attention units, after the attention work and
+    before their GEMV weights load."""
     s = key.tokens
     dd = Dims(key.tp)
     # plain ints: a Python object read inside traced control flow is carried
@@ -773,6 +804,9 @@ def run_back(c, key, bid):
         stage_combine(c, unit)
     gpu.barrier()
     stamp(c, 2)
+    if const_expr(idle is not None):
+        # before any GEMV weights load, so none are live under it
+        idle()
     # the GEMV weights right after the attention work: the wo_a unit's (if any), then wo_b's
     nt = len(tiles)
     units = woa_units(s, dd)

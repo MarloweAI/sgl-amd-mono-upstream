@@ -51,26 +51,30 @@ def epoch_begin(c, epoch, ep):
 
 
 @flyc.jit
-def epoch_end(c, epoch, ep, reset=None):
-    """CTA 0: once every CTA marked the epoch, run ``reset()`` and move the epoch on."""
-    if c["bid"] == 0:
+def epoch_end(c, epoch, ep, reset=None, who=0, marks=True):
+    """CTA ``who``: once every CTA marked the epoch, run ``reset()`` and move the epoch on.
+
+    ``marks=False``: the caller already saw a flag from every CTA of this launch,
+    stored after the CTA read the epoch, so no CTA can read the moved epoch."""
+    if c["bid"] == who:
         tid = c["tid"]
-        if tid < BLOCKS:
-            r = rsrc(epoch)
+        if const_expr(marks):
+            if tid < BLOCKS:
+                r = rsrc(epoch)
 
-            def load_mark():
-                return fx.Int32(
-                    bo.buffer_load(
-                        r,
-                        EPOCH_MARKS + tid,
-                        vec_width=1,
-                        dtype=T.i32,
-                        cache_modifier=CM_DEV,
+                def load_mark():
+                    return fx.Int32(
+                        bo.buffer_load(
+                            r,
+                            EPOCH_MARKS + tid,
+                            vec_width=1,
+                            dtype=T.i32,
+                            cache_modifier=CM_DEV,
+                        )
                     )
-                )
 
-            _ = spin_until(load_mark, lambda v: v != ep + 1)
-        gpu.barrier()
+                _ = spin_until(load_mark, lambda v: v != ep + 1)
+            gpu.barrier()
         if tid == 0:
             if const_expr(reset is not None):
                 reset()
