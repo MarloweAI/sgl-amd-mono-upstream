@@ -118,7 +118,8 @@ def chunk_keys(d: Dims, s: int) -> int:
 
 
 def key_tiles(d: Dims, s: int) -> int:
-    """A split unit's 16-key tiles: one a wave of a head group."""
+    """A split unit's 16-key tiles: one a wave of a head group; on one head tile's
+    64-key chunks, waves 4 .. load no keys and score none."""
     return chunk_keys(d, s) // 16
 
 
@@ -309,10 +310,16 @@ def await_k1(c, unit, t):
 
 
 def split_lane(d, s, nchunk, wave, lane, unit):
-    """Split unit ``unit``: its token, its first key and this lane's key."""
+    """Split unit ``unit``: its token, its first key, this lane's key and whether this
+    wave loads keys (``key_tiles``)."""
     nkt = key_tiles(d, s)
     k0 = (unit % nchunk) * chunk_keys(d, s)
-    return unit // nchunk, k0, k0 + (wave % nkt) * 16 + lane % 16
+    return (
+        unit // nchunk,
+        k0,
+        k0 + (wave % nkt) * 16 + lane % 16,
+        wave < (head_groups(d, s) * nkt),
+    )
 
 
 class EarlyKeys:
@@ -334,7 +341,7 @@ class EarlyKeys:
         self.nchunk = cdiv(KEYS, chunk_keys(d, self.s))
         tid = fx.thread_idx.x
         self.lane, self.wave = tid % 64, tid // 64
-        self.t, _, self.key = split_lane(
+        self.t, _, self.key, self.keyed = split_lane(
             d, self.s, self.nchunk, self.wave, self.lane, unit
         )
 
@@ -361,7 +368,7 @@ class EarlyKeys:
         data, sc, _ = key_addr(self.a, self.ratio, val)
         z, old = self.a["zrec"], new == 0
         data, sc = old.select(data, z), old.select(sc, z + fx.Int64(DATA))
-        loads = early_key_loads(self.has, data, sc, self.lane // 16)
+        loads = early_key_loads(self.has & self.keyed, data, sc, self.lane // 16)
         return {
             "val": val,
             "kv_len": self.nswa + self.ntopk,
@@ -392,13 +399,20 @@ def stage_split(c, unit):
     tid, lane, wave, d, s = c["tid"], c["lane"], c["wave"], c["d"], c["S"]
     a, sl = c["args"], c["sl"]
     nchunk = c["nchunk"]
-    t, k0, key = split_lane(d, s, nchunk, wave, lane, unit)
+    t, k0, key, _ = split_lane(d, s, nchunk, wave, lane, unit)
     ch = unit % nchunk
     ngrp = head_groups(d, s)
     nkt = key_tiles(d, s)
     nht = d.head_tiles // ngrp  # head tiles a wave
-    hgi = wave // nkt
+    # waves past the chunk's key tiles (one head tile's 64-key chunks) load and score no keys
+    idle = ngrp * nkt < WAVES
+    hgi = fx.min(wave // nkt, ngrp - 1) if idle else wave // nkt
     kt = wave % nkt
+
+    def keyed(cond):
+        # ``cond`` on a wave that loads keys
+        return cond & (wave < ngrp * nkt) if idle else cond
+
     g = lane // 16
     r16 = lane % 16
     # one launch per layer: K1's half of this launch wrote q and the records; the old
@@ -413,7 +427,7 @@ def stage_split(c, unit):
         sw, n0, n1, n2, n3, n4, n5, n6, r0, r1 = _flat(pre["loads"])
         # a key of this step's rows, device-coherent: a line of it may sit in this CU's
         # cache from another key's load
-        if pre["new"] != 0:
+        if keyed(pre["new"] != 0):
             sw, n0, n1, n2, n3, n4, n5, n6, r0, r1 = _flat(
                 coherent_key_loads(data, sc, g)
             )
@@ -445,6 +459,9 @@ def stage_split(c, unit):
     if k0 < kv_len:
         if const_expr(one):
             scw, nope, rope = keys
+        elif const_expr(idle):
+            got = early_key_loads(wave < ngrp * nkt, data, sc, g)
+            scw, nope, rope = got[0], list(got[1:8]), list(got[8:])
         else:
             scw, nope, rope = key_loads(data, sc, g)
         for i in range_constexpr(cdiv(qrow, THREADS)):
@@ -469,7 +486,7 @@ def stage_split(c, unit):
                         + (u % (HEAD_DIM // 8)) * 4,
                     )
         # the raw rows to LDS for the PV: every head group loaded the same keys, group 0 stores
-        if hgi == 0:
+        if keyed(hgi == 0):
             rawb = sl["raw"] + (kt * 16 + r16) * (REC // 4)
             for c4 in range_constexpr(NOPE // 64):
                 fx.ptr_store(nope[c4], rawb + (64 * c4 + 16 * g) // 4)
@@ -517,7 +534,7 @@ def stage_split(c, unit):
             mw = butterfly(
                 fx.max(fx.max(sv[0], sv[1]), fx.max(sv[2], sv[3])), (32, 16), fx.max
             )
-            if g == 0:
+            if keyed(g == 0):
                 fx.ptr_store(mw, st + ((hgi * nht + ht) * nkt + kt) * HEAD_TILE + r16)
             svs.append(sv)
         gpu.barrier()
@@ -538,8 +555,13 @@ def stage_split(c, unit):
             pbase = (
                 sl["p"] + (hti * HEAD_TILE + r16) * p_row(d, s) + (kt * 16 + 4 * g) // 2
             )
-            fx.ptr_store(fx.Vector.from_elements([pw[0], pw[1]], fx.Int32), pbase)
-            if g == 0:
+            pv2 = fx.Vector.from_elements([pw[0], pw[1]], fx.Int32)
+            if const_expr(idle):
+                if wave < ngrp * nkt:
+                    fx.ptr_store(pv2, pbase)
+            else:
+                fx.ptr_store(pv2, pbase)
+            if keyed(g == 0):
                 fx.ptr_store(lw, lst + (hti * nkt + kt) * HEAD_TILE + r16)
         gpu.barrier()
         if tid < d.heads:

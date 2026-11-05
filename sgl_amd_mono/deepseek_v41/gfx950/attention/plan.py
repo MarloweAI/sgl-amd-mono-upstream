@@ -155,9 +155,14 @@ def front_scratch(s: int, d: Dims) -> dict:
 
 
 def split_keys(d: Dims, s: int) -> int:
-    """A split unit's keys (K2's flash-decoding over a chunk of a token's keys): 64 on
-    two head tiles where both tiles' units of every chunk fit the grid, else 128."""
-    return 64 if d.head_tiles == 2 and s * cdiv(KEYS, 64) <= 256 else 128
+    """A split unit's keys (K2's flash-decoding over a chunk of a token's keys): 64
+    where the units fit, else 128. Two head tiles: both tiles' units of every chunk
+    fit the grid. One: every chunk's units and the combine's fit 112 CTAs; past that
+    the combine's twice as many partials cost more than the split's halved gather."""
+    if d.head_tiles == 2:
+        return 64 if s * cdiv(KEYS, 64) <= 256 else 128
+    units = s * (cdiv(KEYS, 64) + d.heads // 8 * COMB_PARTS)
+    return 64 if units <= 112 else 128
 
 
 def back_scratch(s: int, d: Dims, start: int = 0) -> dict:
