@@ -682,12 +682,14 @@ def run_front(
 
     if const_expr(before_wqkv is not None):
         before_wqkv()
+    # the seam norms (CTAs without a wqkv tile) poll ahead of the wqkv weight loads, which
+    # their CTAs issue masked off: those still queue ahead of a poll issued after them
+    if const_expr(after_wqkv is not None):
+        after_wqkv()
     slots = chain_slots(c, HIDDEN // 128, waves, part * chains if split else 0, chains)
     kops = chain_loads(
         c, a["wqkv"], a["wqkv_s"], HIDDEN, task * ROWS, slots, has_wqkv, c["shuffled"]
     )
-    if const_expr(after_wqkv is not None):
-        after_wqkv()
     # one token tile: the wq_b weights here on a CTA without a wqkv tile (the qkv stage's polls
     # behind them land by then); a wqkv CTA's past its GEMV, as its barriers wait on every load
     early_wqb = len(wtiles) == 1

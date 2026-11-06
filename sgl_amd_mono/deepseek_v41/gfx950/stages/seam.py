@@ -362,8 +362,14 @@ def stage_norm(c, t, store):
     mine = tid < 256
     cols = [tt * 8 + 2048 * ch for ch in range(3)]
     at = [fx.min(cols[ch], HIDDEN - 8) for ch in range(3)]
-    # the norm weights first: they do not wait on the LIN rows
-    wts = [[ld_bf(a["norm_w"], at[ch] + j) for j in range(8)] for ch in range(3)]
+    # the norm weights first: they do not wait on the LIN rows; a chunk's 8 in one 16 B load
+    wv = [
+        fx.Vector(
+            bo.buffer_load(rsrc(a["norm_w"]), at[ch] // 2, vec_width=4, dtype=T.i32)
+        )
+        for ch in range(3)
+    ]
+    wts = [[f(wv[ch][k]) for k in range(4) for f in (bf_lo, bf_hi)] for ch in range(3)]
     words = c["poll"](
         [
             (c["lin"], (t * HIDDEN + at[ch]) // 2 + k, 1)
