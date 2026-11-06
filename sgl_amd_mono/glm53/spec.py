@@ -582,7 +582,7 @@ def _build(model, hf_config, ctx) -> _Built:
         i: _Layer(
             i,
             model.model.layers[i],
-            layer_weights(model.model.layers[i], i, tp, copies),
+            layer_weights(model.model.layers[i], i, tp, rank, copies),
         )
         for i in covered
     }

@@ -519,7 +519,7 @@ def _build(model, hf_config, ctx):
     m = model.model
     decoder = m.decoder
     layer_id = decoder.self_attn.attn_mqa.layer_id
-    weights = layer_weights(decoder, layer_id, tp, ctx.copies)
+    weights = layer_weights(decoder, layer_id, tp, rank, ctx.copies)
     rows = HIDDEN // tp
     eh_w = m.eh_proj.weight
     if eh_w.dtype != torch.bfloat16 or tuple(eh_w.shape) != (HIDDEN, 2 * HIDDEN):

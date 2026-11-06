@@ -108,6 +108,9 @@ FRONT_K_BIG = 4096
 FRONT_SMALL_CTAS = BLOCKS - N_QKV_A
 N_ROW_TILES = HIDDEN // ROW_TILE
 N_ROUTER = N_EXPERTS // ROUTER_TILE
+# the router folded into o's pass: 8-expert tiles of the logits
+FOLD_TILE = 8
+N_FOLD = N_EXPERTS // FOLD_TILE
 XQ_BLOCKS = HIDDEN // 128
 XQ_GROUPS = HIDDEN // 32
 XQ_WAVES = (XQ_BLOCKS + N_ROUTER - 1) // N_ROUTER
@@ -199,9 +202,11 @@ def layout(
     (``xin``, two slots by launch parity). ``eh_tiles``: the NextN entry's rows of
     ``xin`` instead, which every rank pushes its ``eh_tiles`` 16-column tiles of, and
     the partial sums of every K part but a tile's first (``ehp``); with ``tokens``
-    the embedding rows go to ``ein`` (as ``xin``). ``head_vocab``: the tail launch's
-    buffers instead, the gathered bf16 logits of a ``head_vocab`` vocabulary (two
-    slots)."""
+    the embedding rows go to ``ein`` (as ``xin``). The router folded into o's pass
+    reads the reduced logits before the norm (``lraw``) and each o tile's sum of
+    squares of h (``hss``); its logits' TP partials sit at ``lmo`` in each attention
+    part. ``head_vocab``: the tail launch's buffers instead, the gathered bf16 logits
+    of a ``head_vocab`` vocabulary (two slots)."""
     from sgl_amd_mono.common.guard import FLAG_BYTES
 
     if head_vocab:
@@ -245,6 +250,8 @@ def layout(
         ("midqs", samples * MOE_SLOTS * inter // 128 * pair_bytes),
         ("ugp", BLOCKS * samples * 2 * UG_TILE * pair_bytes),
         ("xqd", samples * HIDDEN * 4),
+        ("lraw", samples * N_EXPERTS * pair_bytes),
+        ("hss", samples * N_ROW_TILES * pair_bytes),
     ]
     if with_indexer:
         items += [
@@ -297,7 +304,12 @@ def layout(
         "_part_stride": part,
         "_dcp_part_stride": dcp_part,
         "_bytes": 2 * region + 2 * dcp_part + FLAG_BYTES,
+        # the folded router's logits' TP partials: the upper half of each attention
+        # part (its bf16 pairs fill the lower half), source s's at the same offset as
+        # its o partials
+        "lmo": npes * samples * HIDDEN // 2 * pair_bytes,
     }
+    assert N_EXPERTS <= HIDDEN // 2
     if tokens or eh_tiles:
         symmetric["xin"] = symmetric["_bytes"]
         symmetric["_xin_stride"] = samples * HIDDEN * 4
@@ -319,11 +331,13 @@ def stage_tasks(
     tokens: bool = False,
     head_rows: int = 0,
     eh_tiles: int = 0,
+    router_fold: bool = False,
 ):
     """Return ``(stage name, task count)`` pairs in execution order; with ``tokens``
     led by the embedding rows' push, with ``eh_tiles`` by the NextN entry (each tile's
     K parts, ``eh_parts``). With ``head_rows`` (this rank's LM-head rows) the tail's
-    instead."""
+    instead. ``router_fold``: the router folded into o's pass (``mo``: the logits'
+    tiles, ``router``: the FP8 activation's 128-blocks)."""
 
     if head_rows:
         return [("lmhead", head_rows // HEAD_TILE), ("gather", BLOCKS)]
@@ -363,7 +377,12 @@ def stage_tasks(
         ),
         ("uv", samples * (heads * V_DIM // UV_TILE)),
         ("o", N_ROW_TILES),
-        ("router", samples * N_ROUTER),
+    ]
+    if router_fold:
+        tasks += [("mo", N_FOLD), ("router", XQ_BLOCKS // 2)]
+    else:
+        tasks += [("router", samples * N_ROUTER)]
+    tasks += [
         (
             "ug",
             (
@@ -395,9 +414,12 @@ def stage_bases(
     index_max_seq: int = 4096,
     expert_mxfp4: bool = False,
     inter: int = INTER,
+    router_fold: bool = False,
 ):
     """Return ``{stage name: base CTA}``: task ``t`` of a stage runs on CTA
-    ``(base + t) % BLOCKS``."""
+    ``(base + t) % BLOCKS``. ``router_fold``: the MoE stages keep their CTAs, and the
+    fold's tasks (the logits' tiles, the activation's blocks) run on the CTAs past
+    o's tiles."""
 
     tasks = dict(
         stage_tasks(
@@ -442,4 +464,8 @@ def stage_bases(
         base["index_score"] = 0
         # the selection's slices past uk's CTAs
         base["index_slice"] = (base["uk"] + tasks["uk"]) % BLOCKS
+    if router_fold:
+        assert N_ROW_TILES + N_FOLD + XQ_BLOCKS // 2 <= BLOCKS
+        base["mo"] = (base["o"] + N_ROW_TILES) % BLOCKS
+        base["router"] = (base["mo"] + N_FOLD) % BLOCKS
     return base
