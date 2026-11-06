@@ -44,6 +44,8 @@ from sgl_amd_mono.common.plan import (
 )
 from sgl_amd_mono.common.stamps import stamp
 from sgl_amd_mono.common.sync import _spin
+from sgl_amd_mono.deepseek_v41.gfx950.ids import bid as bid_
+from sgl_amd_mono.deepseek_v41.gfx950.ids import tid as tid_
 from sgl_amd_mono.deepseek_v41.gfx950.stages.gemv import (
     TILE,
     ld_f32,
@@ -340,7 +342,7 @@ class EarlyKeys:
             key.ratio,
         )
         self.nchunk = cdiv(KEYS, chunk_keys(d, self.s))
-        tid = fx.thread_idx.x
+        tid = tid_()
         self.lane, self.wave = tid % 64, tid // 64
         self.t, _, self.key, self.keyed = split_lane(
             d, self.s, self.nchunk, self.wave, self.lane, unit
@@ -1005,7 +1007,7 @@ def back_context(key, lds, args: dict, scratch, tag, layout: dict) -> dict:
     ``back_lds``, or a dict of the members' views), mailbox (tag ``tag``),
     scratch regions, arguments by name."""
     s, d = key.tokens, Dims(key.tp)
-    tid = fx.thread_idx.x
+    tid = tid_()
     if isinstance(lds, dict):
         spl, gml = lds["split"], lds["gemv"]
     else:
@@ -1013,7 +1015,7 @@ def back_context(key, lds, args: dict, scratch, tag, layout: dict) -> dict:
     c = {
         "S": s,
         "tid": tid,
-        "bid": fx.block_idx.x,
+        "bid": bid_(),
         "lane": tid % 64,
         "wave": tid // 64,
         "red": gml.red.ptr,

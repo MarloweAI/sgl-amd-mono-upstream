@@ -61,6 +61,8 @@ from sgl_amd_mono.common.sync import (
     publish,
     sreg,
 )
+from sgl_amd_mono.deepseek_v41.gfx950.ids import bid as bid_
+from sgl_amd_mono.deepseek_v41.gfx950.ids import tid as tid_
 from sgl_amd_mono.deepseek_v41.gfx950.stages import moe_plan as mplan
 from sgl_amd_mono.deepseek_v41.gfx950.stages.dims import UG_PART
 
@@ -1307,6 +1309,8 @@ def reduce_pair(c, task, idx):
     """Thread ``idx``'s column pair of token ``idx // (RED_COLS // 2)``."""
     s, tp = c["S"], c["d"].tp
     a = c["args"]
+    # read before the dynamic branch: a method call on c inside one carries c
+    pend_lds = c.get("pend_lds")
     if idx < s * RED_COLS // 2:
         t = idx // (RED_COLS // 2)
         col = task * RED_COLS + 2 * (idx % (RED_COLS // 2))
@@ -1316,6 +1320,11 @@ def reduce_pair(c, task, idx):
         )
         bo.buffer_store(acc0.to(fx.BFloat16), rsrc(a["out"]), t * HIDDEN + col)
         bo.buffer_store(acc1.to(fx.BFloat16), rsrc(a["out"]), t * HIDDEN + col + 1)
+        if const_expr(pend_lds is not None):
+            # the next layer's seam slice of these columns, on this CTA: the bf16 sums
+            lds = pend_lds + (t * RED_COLS + col - task * RED_COLS)
+            fx.ptr_store(bf16_round(acc0), lds)
+            fx.ptr_store(bf16_round(acc1), lds + 1)
 
 
 def moe_smem(s, rs):
@@ -1365,11 +1374,11 @@ def stage_lds(s, rs):
 
 def moe_context(s, rs, lds, mb, bases, layout, scratch, args, rank, sym):
     """Return the MoE stages' context: LDS, mailbox, scratch regions and arguments."""
-    tid = fresh(fx.thread_idx.x)
+    tid = fresh(tid_())
     c = {
         "S": s,
         "tid": tid,
-        "bid": fx.block_idx.x,
+        "bid": bid_(),
         "lane": tid % 64,
         "wave": tid // 64,
         "red": lds.red.ptr,
@@ -1400,9 +1409,11 @@ def moe_context(s, rs, lds, mb, bases, layout, scratch, args, rank, sym):
 
 
 @flyc.jit
-def run_moe(c, key, bid, before_ug=None):
+def run_moe(c, key, bid, before_ug=None, reduce=True):
     """The MoE stages, in order (``before_ug``: work for this CTA once its shared
-    expert's unit is done, off the routing's path)."""
+    expert's unit is done, off the routing's path). ``reduce=False``: the all-reduce
+    is the next layer's, in the same launch (``layer.chained_slice``); a traced value:
+    the all-reduce where it is true."""
     s, tid = key.tokens, c["tid"]
     router_tasks = c["rs"].router_tasks
     route0, shared0 = c["rs"].route0, c["rs"].shared0
@@ -1481,8 +1492,14 @@ def run_moe(c, key, bid, before_ug=None):
     stamp(c, 25)
     # token parallel: this rank's rows' sums alone, ``out`` from its first row
     cr = c if const_expr(c["own"] is None) else c["own_view"]
-    for task in range(first_task(bid, RED0), RED_TASKS, BLOCKS):
-        stage_reduce(cr, task)
+    if const_expr(reduce is True):
+        for task in range(first_task(bid, RED0), RED_TASKS, BLOCKS):
+            stage_reduce(cr, task)
+    elif const_expr(reduce is not False):
+        # a traced predicate: the last layer of a multi-layer launch's loop reduces
+        if reduce:
+            for rtask in range(first_task(bid, RED0), RED_TASKS, BLOCKS):
+                stage_reduce(cr, rtask)
     stamp(c, 26)
 
 

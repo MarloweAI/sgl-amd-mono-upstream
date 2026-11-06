@@ -26,6 +26,8 @@ from sgl_amd_mono.common.ops import (
 from sgl_amd_mono.common.plan import first_task
 from sgl_amd_mono.common.stamps import stamp
 from sgl_amd_mono.common.sync import FLAG_STRIDE, preg
+from sgl_amd_mono.deepseek_v41.gfx950.ids import bid as bid_
+from sgl_amd_mono.deepseek_v41.gfx950.ids import tid as tid_
 from sgl_amd_mono.deepseek_v41.gfx950.stages.gemv import (
     ld_f32,
     lds_row,
@@ -581,11 +583,11 @@ def front_lds(s: int, d: Dims):
 def front_context(key, lds, args: dict, scratch, tag, layout=None) -> dict:
     """Return the front stages' context: LDS views, mailbox, scratch regions and arguments."""
     s, d = key.tokens, Dims(key.tp)
-    tid = fx.thread_idx.x
+    tid = tid_()
     c = {
         "S": s,
         "tid": tid,
-        "bid": fx.block_idx.x,
+        "bid": bid_(),
         "lane": tid % 64,
         "wave": tid // 64,
         "red": lds.red.ptr,
