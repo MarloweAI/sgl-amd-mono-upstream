@@ -444,6 +444,11 @@ def build_glm5_monokernel(
         and not dense_experts
         and not (eh_entry and with_indexer)
     )
+    # Up to 4 rows, without the indexer, q_b normalizes the rows itself from the front's
+    # two K parts, which the front publishes as bf16: no q_a RMSNorm stage or its hand-off.
+    # Above 4 rows the consumers' poll of both parts of every row costs more, and with the
+    # indexer index_q's second set of consumers doubles that poll
+    QNORM_AT_USE = not attention_ptpc and S <= 4 and not with_indexer
     ROUTE_WORDS = TOP_K + 64
     STASH_WORDS = 10 * 64
     ROUTE_OFF = X_WORDS - (WAVES * ROUTE_WORDS + S * STASH_WORDS if EARLY_ISSUE else 0)
@@ -2649,7 +2654,15 @@ def build_glm5_monokernel(
                         row = tile * QKV_A_TILE + tid % QKV_A_TILE
                         v = lds_ld(outs, tid)
                         if row < Q_LORA:
-                            put(mb(boxes[0]), s * Q_LORA + row, v)
+                            if const_expr(QNORM_AT_USE):
+                                if tid % 2 == 0:
+                                    put_bf(
+                                        mb(boxes[0]),
+                                        s * Q_LORA + row,
+                                        [v, lds_ld(outs, tid + 1)],
+                                    )
+                            else:
+                                put(mb(boxes[0]), s * Q_LORA + row, v)
                         else:
                             put(mb(boxes[1]), s * (KV_LORA + PE_DIM) + row - Q_LORA, v)
 
@@ -2760,6 +2773,23 @@ def build_glm5_monokernel(
                     ss = ss + v[j] * v[j]
             return _rsq(block_sums([ss])[0] * (1.0 / HIDDEN) + EPS)
 
+        def ld_qa_parts(sks):
+            """q_a elements k .. k + 3 of rows s: the sum of its two bf16 K parts (the
+            input row's rstd cancels in q_a's RMSNorm)."""
+            v = poll(
+                [
+                    (mb(box), (s * Q_LORA + k) // 2, 2)
+                    for s, k in sks
+                    for box in ("q_a", "q_a2")
+                ]
+            )
+            out = []
+            for i in range_constexpr(len(sks)):
+                a = list(bf2_f32(v[2 * i][0])) + list(bf2_f32(v[2 * i][1]))
+                b = list(bf2_f32(v[2 * i + 1][0])) + list(bf2_f32(v[2 * i + 1][1]))
+                out.append([a[e] + b[e] for e in range(4)])
+            return out
+
         def ld_qa(sks, rstd):
             """q_a elements k .. k + 3 of rows s: its K parts' sum times the row's rstd."""
             v = get2_many(
@@ -2860,7 +2890,7 @@ def build_glm5_monokernel(
             # done
             if bid >= S:
                 plan_layout()
-        for s_norm in range(start("q_norm"), S, G):
+        for s_norm in range(start("q_norm"), 0 if QNORM_AT_USE else S, G):
             s_norm = fx.Int32(s_norm)
             stamp("q_norm", s_norm, 0)
             rstd_x = x_rstd(s_norm)
@@ -3299,6 +3329,8 @@ def build_glm5_monokernel(
             )
             if const_expr(attention_ptpc):
                 qb_scales = stage_x_pairs_ptpc("q_an", S, Q_LORA, lambda k: k)
+            elif const_expr(QNORM_AT_USE):
+                stage_x_rmsnorm(ld_qa_parts, Q_LORA, g_q)
             else:
                 stage_x_pairs("q_an", S * Q_LORA, lambda k: k)
             stamp("q_b", t, 2)
