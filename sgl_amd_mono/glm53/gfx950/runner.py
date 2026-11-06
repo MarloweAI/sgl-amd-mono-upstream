@@ -76,8 +76,8 @@ class Glm53Weights(msgspec.Struct, frozen=True):
     """One layer's tensors as the kernel reads them. Every FP8 weight carries f32
     block scales, 128 x 128 (W_UK's 128 x 64). q_a | kv_a, q_b, o_proj, the indexer's wq_b and wk and
     the experts are SGLang's tensors (``Glm53Build.fp8_shuffled``); W_UK, W_UV,
-    the router and the indexer's weights_proj are packed copies, the k LayerNorm
-    weight and bias f32 copies. ``index``: an indexer layer's pointer table.
+    the router (folded into o's pass, ``weights.fold_router``) and the indexer's
+    weights_proj are packed copies, the k LayerNorm weight and bias f32 copies. ``index``: an indexer layer's pointer table.
     ``dense``: a dense layer's MLP as that many expert-shaped slices (copies) in the
     expert tensors, its router tensors unread; a tokens layer's ``w_r`` is this
     rank's embedding rows."""

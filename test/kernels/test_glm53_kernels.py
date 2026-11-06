@@ -8,7 +8,9 @@ replays the eager step bitwise, for one request a row and for verify rows; every
 selected token of a row past 2048 keys is a pair tagged with its indexer launch's
 tag that holds the slot the launch publishes; a dense layer's MLP and the tail's
 logits are within the spec's bounds against f32 references, and fail them with a
-scale or the final norm off; layer 0 from the token ids equals the dense launch fed
+scale or the final norm off; the router folded into o's pass gives the logits and
+sums of squares of h of fp64 on the launch's own h, and fails them with one rank's
+folded weights off; layer 0 from the token ids equals the dense launch fed
 the gathered embedding rows; every indexer row's list is the exact top-k of the
 launch's scores in the selection's order (``glm53/check_topk.py``), on random, tied,
 zero and recency-heavy index caches, at about 8K and 300K keys (and for layer 0 and
@@ -95,6 +97,10 @@ class TestMonoGlm53Kernels(CustomTestCase):
         self._check(
             "--kind", "embed", "--launches", "1", "--rowsets", "p0,p1", "--check-embed"
         )
+
+    def test_folded_router_within_its_bounds(self):
+        for kind in ("shared", "index"):
+            self._check("--kind", kind, "--rowsets", "p0,p1", "--check-fold")
 
     def test_tail_logits_within_their_bounds(self):
         self._check("--kind", "head", "--launches", "0", "--check-head")
