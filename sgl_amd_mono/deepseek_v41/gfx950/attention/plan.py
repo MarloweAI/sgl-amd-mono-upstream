@@ -30,6 +30,9 @@ WOA_ROWS = 32  # a wo_a task's rows: one MX group of its output
 DATA = 576
 
 PAIR = 8  # a mailbox (value, tag) pair
+COMB_PARTS = (
+    2  # K2's combine units a (token, 8-head group): a part of the head dims each
+)
 KEYS = TOPK + WINDOW  # a token's attention keys at most
 
 
@@ -151,18 +154,22 @@ def front_scratch(s: int, d: Dims) -> dict:
     )
 
 
+def split_keys(d: Dims, s: int) -> int:
+    """A split unit's keys (K2's flash-decoding over a chunk of a token's keys): 64 on
+    two head tiles where both tiles' units of every chunk fit the grid, else 128."""
+    return 64 if d.head_tiles == 2 and s * cdiv(KEYS, 64) <= 256 else 128
+
+
 def back_scratch(s: int, d: Dims, start: int = 0) -> dict:
     """Return K2's scratch regions past ``start`` -> (byte offset, bytes)."""
-    # must match back.chunk_keys
-    ck = 64 if d.head_tiles == 2 and s * cdiv(KEYS, 64) <= 256 else 128
-    nchunk = cdiv(KEYS, ck)
+    nchunk = cdiv(KEYS, split_keys(d, s))
     return byte_layout(
         [
             ("part", s * nchunk * d.heads * HEAD_DIM * 2),  # bf16 partials
             ("pstat", s * nchunk * d.heads * 8),  # (max, sum) f32
             ("srdy", s * nchunk * PAIR * FLAG_STRIDE),
             ("xo", s * d.q_rows * 2),  # bf16: wo_a reads it unquantized
-            ("crdy", s * d.heads // 8 * PAIR * FLAG_STRIDE),
+            ("crdy", s * d.heads // 8 * COMB_PARTS * PAIR * FLAG_STRIDE),
             ("x8b", s * d.o_rows),
             ("x8bs", s * d.o_rows // 32 * 4),
             # a flag a wo_a unit, a line each (``FLAG_STRIDE``)

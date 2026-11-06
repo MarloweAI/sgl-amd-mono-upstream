@@ -26,6 +26,7 @@ from sgl_amd_mono.common.ops import (
     butterfly,
     fp8_pack4,
     peer_bases,
+    ptr64,
     rsrc,
     uniform,
 )
@@ -312,10 +313,11 @@ K1_KC_ARGS = tuple(f"kc_{n}" for n in compress.KC_ARGS[1:])
 
 
 @flyc.jit
-def run_k1(key: MonoBuild, sl, front, a: dict, ep, k2=None):
+def run_k1(key: MonoBuild, sl, front, a: dict, ep, k2=None, early=None):
     """K1 on this CTA: the pending post, the attention seam and the attention front
     (``sl``, ``front``: the seam's and the front's LDS views). ``k2``: one launch per
-    layer, the attention back's hand-off (``layer_handoff``)."""
+    layer, the attention back's hand-off (``layer_handoff``); ``early``: its split's keys
+    from the launch's inputs (``back.EarlyKeys``), loaded past the wqkv and wq_b weights."""
     (
         res_in,
         pend,
@@ -519,6 +521,8 @@ def run_k1(key: MonoBuild, sl, front, a: dict, ep, k2=None):
             publish_x8(c, t)
         gpu.barrier()
         stamp(c, 34)
+        if const_expr(early is not None):
+            early.inputs()
 
     def seam_gate():
         # only K2 reads the mixes, so they fill q's wait; the gate's LDS aliases the front's
@@ -539,6 +543,8 @@ def run_k1(key: MonoBuild, sl, front, a: dict, ep, k2=None):
         if const_expr(key.cp):
             # the compressor projection fills it too, on the CTAs past them
             index_query.run_cp(c, c["args"], own_n, CP0, c["xl"], key.cp)
+        if const_expr(early is not None):
+            early.entries()
 
     mb_front.run_front(
         c,
@@ -1420,10 +1426,22 @@ K2_ARGS = (
 
 
 @flyc.jit
-def run_k2(key: MonoBuild, lds, a: dict, ep, one=False, eg=None):
+def run_k2(
+    key: MonoBuild,
+    lds,
+    a: dict,
+    ep,
+    one=False,
+    eg=None,
+    k1_first=None,
+    pre=None,
+    pbases=None,
+):
     """K2 on this CTA: the attention back on K1's q, its wo_b partial pushed to every
     rank, then ``run_ffn`` (``lds``: a union with K2's members). ``one``: one launch per
-    layer, K1's half before it in the same launch (``build_mono_layer``). ``eg``: a later
+    layer, K1's half before it in the same launch (``build_mono_layer``; ``k1_first``: the
+    first loads of a split CTA's K1 flags, issued as K1's half ended; ``pre``: its keys,
+    ``back.EarlyKeys.loads``; ``pbases``: the peer bases, loaded at the launch's start). ``eg``: a later
     Engram layer's projection's arguments (``EG_ARGS``, ``key.eg``)."""
     (
         q,
@@ -1486,7 +1504,8 @@ def run_k2(key: MonoBuild, lds, a: dict, ep, one=False, eg=None):
     bid = fx.block_idx.x
     tag = (ep << 1) + 2
     par = fx.Int64(ep & 1) * fx.Int64(half)
-    bases = [b + par for b in peer_bases(peers, tp)]
+    pbs = peer_bases(peers, tp) if pbases is None else pbases
+    bases = [b + par for b in pbs]
     own = sym + par
     bargs = {
         "q": q,
@@ -1528,6 +1547,9 @@ def run_k2(key: MonoBuild, lds, a: dict, ep, one=False, eg=None):
         regions = ("krdy", "qb", "vrdy") if key.tok_par else ("krdy", "qb")
         for region in regions:
             c[region] = scratch + fx.Int64(layout[region][0])
+        c["k1_words"] = k1_words(layout, key.tok_par)
+        c["k1_first"] = k1_first
+        c["pre"] = pre
 
         def k1_seen(unit):
             # every CTA's q flag is in, each stored past its epoch read: move the epoch on
@@ -1989,6 +2011,13 @@ def reload_args(names, offsets: dict, i32) -> dict:
     return out
 
 
+def k1_words(layout: dict, tok_par: bool) -> dict:
+    """The split's K1 flag regions (``back.k1_flag_load``) as i32 offsets from the
+    key-table flags'."""
+    regions = ("qb", "vrdy") if tok_par else ("qb",)
+    return {r: (layout[r][0] - layout["krdy"][0]) // 4 for r in regions}
+
+
 def layer_handoff(scratch, layout: dict, ep) -> dict:
     """K1's hand-off to the attention back of the same launch: flags with K2's tag in
     regions of their own (``mb_front.hand_off``)."""
@@ -2036,6 +2065,9 @@ def build_mono_layer(key: MonoBuild):
     )
     keyed = key_tuple(key, SOURCES)
     offsets = kernarg_offsets(LAYER_ARGS, LAYER_I32)
+    nchunk, n_split = mb_back.back_plan(_back_key(key))[:2]
+    # a split unit a CTA (``back.run_back``), its keys loaded in K1's half
+    assert n_split <= BLOCKS
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def layer(
@@ -2229,19 +2261,54 @@ def build_mono_layer(key: MonoBuild):
                 "eg_kv": eg_kv,
                 "eg_row0": eg_row0,
             }
-            # the epoch in a scalar register: it lives through K1 into K2
+            # the peer table's words and the epoch together; the epoch in a scalar register,
+            # it lives through K1 into K2, and the peer bases too (K2 reads them, a load of
+            # them there would wait behind the split's early loads)
+            peer_words = [
+                fx.Vector(bo.buffer_load(rsrc(peers), 2 * p, vec_width=2, dtype=T.i32))
+                for p in range(tp)
+            ]
             ep = uniform(_epoch(epoch))
+            pbases = [ptr64(w) for w in peer_words]
             layout = scratch_layout(s, tp, key.timeline, **route_of(key))
             k2 = layer_handoff(scratch, layout, ep)
-            run_k1(key, lds.seam.peek(), lds.front.peek(), a, ep, k2)
+            bid = fx.block_idx.x
+            early = mb_back.EarlyKeys(
+                _back_key(key),
+                key.swa_width,
+                a,
+                fx.min(bid, n_split - 1),
+                bid < n_split,
+            )
+            run_k1(key, lds.seam.peek(), lds.front.peek(), a, ep, k2, early)
             # the K1 half's LDS is free
             gpu.barrier()
+            # a split CTA's K2 inputs in issue order, past the barrier (it would drain them):
+            # its K1 flags' first loads, then its old keys' records, in flight through the
+            # wait on q
+            first = mb_back.k1_flag_load(
+                k2["krdy"],
+                k1_words(layout, key.tok_par),
+                fx.thread_idx.x,
+                fx.min(bid, n_split - 1) // nchunk,
+                s,
+                pred=bid < n_split,
+            )()
+            pre = early.loads()
             names = [K2_OF_LAYER.get(n, n) for n in K2_ARGS]
             names += list(EG_ARGS) if key.eg else []
             a2 = reload_args(names, offsets, LAYER_I32)
             eg = {n: a2[n] for n in EG_ARGS} if key.eg else None
             run_k2(
-                key, lds, {n: a2[K2_OF_LAYER.get(n, n)] for n in K2_ARGS}, ep, True, eg
+                key,
+                lds,
+                {n: a2[K2_OF_LAYER.get(n, n)] for n in K2_ARGS},
+                ep,
+                True,
+                eg,
+                first,
+                pre,
+                pbases,
             )
 
     @flyc.jit

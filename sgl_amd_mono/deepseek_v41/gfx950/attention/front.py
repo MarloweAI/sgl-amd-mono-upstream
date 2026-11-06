@@ -139,28 +139,57 @@ def hand_off(c, region, i):
 # ---------------------------------------------------------------- kt
 
 
+def kt_inputs(a, t):
+    """Token t's key-table inputs as loaded: its slot word, window and top-k counts."""
+    return (
+        ld_i32(a["slot"], a["slot_words"] * t),
+        ld_i32(a["swa_lens"], t),
+        ld_i32(a["topk_lens"], t),
+    )
+
+
+def kt_lens(inputs, sw):
+    """(window keys, top-k keys) of a token's key table from its ``kt_inputs`` (0, 0 for
+    a pad row)."""
+    slot, swa_len, topk_len = inputs
+    live = slot >= 0
+    nswa = live.select(fx.min(swa_len, fx.Int32(sw)), fx.Int32(0))
+    ntopk = live.select(fx.min(topk_len, fx.Int32(TOPK)), fx.Int32(0))
+    return nswa, ntopk
+
+
+def kt_entry_loads(a, t, k, ntopk, sw):
+    """The input words key k's entry reads: its window slot and its top-k row."""
+    sidx = fx.min(fx.max(k - ntopk, 0), sw - 1)
+    s_slot = ld_i32(a["swa_idx"], t * sw + sidx)
+    local = ld_i32(a["topk"], t * TOPK + fx.min(k, TOPK - 1))
+    return s_slot, local
+
+
+def kt_entry(words, k, nswa, ntopk):
+    """``KT[t][k]`` from ``kt_entry_loads``: ``slot | 1 << 31`` for top-k compressed row k
+    (k < ntopk), the window slot of key k for k in [ntopk, ntopk + nswa), -1 past them or
+    for an invalid slot."""
+    s_slot, local = words
+    val = ((k < ntopk + nswa) & (s_slot >= 0)).select(s_slot, fx.Int32(-1))
+    c_val = (local >= 0).select(local | fx.Int32(-2147483648), fx.Int32(-1))
+    return (k < ntopk).select(c_val, val)
+
+
 @flyc.jit
 def stage_kt(c, t):
-    """Token t's keys for K2: ``KT[t][k] = slot | 1 << 31`` for its top-k compressed
-    rows (k < ntopk), its window slots for k in [ntopk, kv_len), -1 past them or
-    for an invalid slot; KLEN[t] = kv_len (0 for a pad row), KLEN[S + t] = ntopk.
-    ``dev``: device scope, for a table the same launch reads (K2's)."""
+    """Token t's keys for K2 (``kt_entry``): KT[t][k] for every k, KLEN[t] = kv_len (0 for
+    a pad row), KLEN[S + t] = ntopk. ``dev``: device scope, for a table the same launch
+    reads (K2's)."""
     tid = c["tid"]
     a = c["args"]
     cm = CM_DEV if const_expr(c.get("dev", False)) else 0
     sw = c.get("swa_width", WINDOW)
-    live = ld_i32(a["slot"], a["slot_words"] * t) >= 0
-    nswa = live.select(fx.min(ld_i32(a["swa_lens"], t), fx.Int32(sw)), fx.Int32(0))
-    ntopk = live.select(fx.min(ld_i32(a["topk_lens"], t), fx.Int32(TOPK)), fx.Int32(0))
+    nswa, ntopk = kt_lens(kt_inputs(a, t), sw)
     kv_len = ntopk + nswa
     for i in range_constexpr((KEYS + THREADS - 1) // THREADS):
         k = fresh(tid) + THREADS * i
-        sidx = fx.min(fx.max(k - ntopk, 0), sw - 1)
-        s_slot = ld_i32(a["swa_idx"], t * sw + sidx)
-        val = ((k < kv_len) & (s_slot >= 0)).select(s_slot, fx.Int32(-1))
-        local = ld_i32(a["topk"], t * TOPK + fx.min(k, TOPK - 1))
-        c_val = (local >= 0).select(local | fx.Int32(-2147483648), fx.Int32(-1))
-        val = (k < ntopk).select(c_val, val)
+        val = kt_entry(kt_entry_loads(a, t, k, ntopk, sw), k, nswa, ntopk)
         if k < KEYS:
             bo.buffer_store(val, rsrc(a["kt"]), t * KEYS + k, cache_modifier=cm)
     if tid == 0:
