@@ -5150,6 +5150,9 @@ def build_glm5_monokernel(
             if lane == 0:  # written last: the merge's readiness hint
                 put(mb("sp_m"), (s * N_SPLIT + t) * H + h, m)
                 put(mb("sp_l"), (s * N_SPLIT + t) * H + h, lsum)
+            # the partials and (m, l) are written before the CTA's next task (an o tile)
+            # issues its weights: those loads would otherwise hold the stores' drain
+            rocdl.s_waitcnt(vmcnt=0)
             stamp("split", tt, 4)
 
         # ========================== 6. split merge + W_UV: o = W_UV (softmax . KV)
