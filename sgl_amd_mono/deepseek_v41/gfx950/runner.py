@@ -32,6 +32,8 @@ from .layer import (
     LAYER_ARGS,
     MAX_TOKENS,
     MonoBuild,
+    acell_offset,
+    acell_region_bytes,
     build_mono_ffn,
     build_mono_k1,
     build_mono_k2,
@@ -402,6 +404,10 @@ class DSV41MonoRunner:
         half = peer_half_bytes(tp)
         self.peer = PeerBuffer(2 * half + guard.FLAG_BYTES, group, rank, tp, dev)
         self.peer.bytes.zero_()
+        # K2's cells start empty (``seam.attn_cell``)
+        cells, size = acell_offset(tp), acell_region_bytes(tp)
+        for h in range(2):
+            self.peer.bytes[h * half + cells : h * half + cells + size].fill_(0xFF)
         self._kernels: dict = {}
         # the index sources' indexer (``enable_k2i``): the target's runner only
         self.k2i = None

@@ -23,6 +23,8 @@ from sgl_amd_mono.common.epoch import (
 from sgl_amd_mono.common.mx import clamp_fp8
 from sgl_amd_mono.common.ops import (
     CM_DEV,
+    CM_SYS,
+    bf16_pair,
     butterfly,
     fp8_pack4,
     peer_bases,
@@ -59,10 +61,10 @@ from .stages.dims import Dims as StageDims
 from .stages.gemv import plus, token_tiles
 from .stages.moe_shape import EXPERTS, SORT_NETS, TOPK, MoeBuild, route_shape
 from .token_par import (
+    acell_region,
     chunk_pairs,
     half_pair,
     own_view,
-    peer_layout,
     peer_offsets,
 )
 
@@ -207,9 +209,19 @@ def scratch_bytes(
     return max(o + n for o, n in scratch_layout(s, tp, timeline, **route).values())
 
 
+def acell_offset(tp: int) -> int:
+    """ACELL's byte offset in a parity's half (``token_par.acell_region``)."""
+    return acell_region(tp, range(1, MAX_TOKENS + 1))[0]
+
+
+def acell_region_bytes(tp: int) -> int:
+    """ACELL's bytes in a parity's half (``token_par.acell_region``)."""
+    return acell_region(tp, range(1, MAX_TOKENS + 1))[1]
+
+
 def peer_half_bytes(tp: int) -> int:
-    """One parity's peer regions (``token_par.peer_layout``)."""
-    return max(o + n for o, n in peer_layout(MAX_TOKENS, tp).values())
+    """One parity's peer regions (``token_par.peer_layout``), then ACELL."""
+    return sum(acell_region(tp, range(1, MAX_TOKENS + 1)))
 
 
 def _epoch(epoch):
@@ -974,19 +986,32 @@ def store_normed(normed, t, col, ys, live):
 
 
 @flyc.jit
-def push_attn_pair(c, bases, own, s, t, col, vs):
-    """Push this rank's wo_b partial pair of row t at ``col`` to every rank's ATTN region.
-
-    The pairs are ``seam.stage_push``'s; token parallel (``own`` rows a rank), only the
-    row's owner gets it, at its row there."""
+def push_attn_pair(c, bases, own, t, col, vs):
+    """Push this rank's wo_b partial pair of row t at ``col`` to the row's owner (token
+    parallel, ``own`` rows a rank), at its row of the owner's ATTN region."""
     for p in range_constexpr(len(bases)):
-        dst = preg(bases[p], 0, "attn")
-        if const_expr(own is None):
-            c["put_bf"](dst, 2 * seam.attn_region_pair(c["rank"], t, s, col), vs)
-        else:
-            if t // own == p:
-                pair = seam.attn_region_pair(c["rank"], t - p * own, own, col)
-                c["put_bf"](dst, 2 * pair, vs)
+        if t // own == p:
+            pair = seam.attn_region_pair(c["rank"], t - p * own, own, col)
+            c["put_bf"](preg(bases[p], 0, "attn"), 2 * pair, vs)
+
+
+@flyc.jit
+def push_attn_cell(c, bases, off, s, task, t0, u, vs):
+    """Push this rank's wo_b cell u of ``task`` (the token tile from row t0) to every
+    rank's ACELL region at byte ``off`` (``seam.attn_cell``)."""
+    w0 = bf16_pair(vs[0], vs[1]).bitcast(fx.Int32)
+    w1 = bf16_pair(vs[2], vs[3]).bitcast(fx.Int32)
+    # never an empty word: a pair of bf16 0xFFFF NaNs goes out as 0xFFFE, 0xFFFF
+    w0 = (w0 == seam.CELL_EMPTY).select(fx.Int32(seam.CELL_EMPTY - 1), w0)
+    w1 = (w1 == seam.CELL_EMPTY).select(fx.Int32(seam.CELL_EMPTY - 1), w1)
+    at = seam.attn_cell(c["rank"], task, s, t0, u)
+    for p in range_constexpr(len(bases)):
+        bo.buffer_store(
+            fx.Vector.from_elements([w0, w1], fx.Int32),
+            rsrc(bases[p] + fx.Int64(off)),
+            at * 2,
+            cache_modifier=CM_SYS,
+        )
 
 
 @flyc.jit
@@ -1140,6 +1165,9 @@ def run_ffn(key: MonoBuild, lds, a: dict, amb, bases, own, rank, ep, part=None):
             if tid < own_n:
                 poll([(grdy, tid * FLAG_STRIDE, 1)])
             gpu.barrier()
+    if const_expr(part is None and not key.tok_par):
+        # K2's partials arrive as cells (``push_attn_cell``)
+        ca["acell"] = own + fx.Int64(acell_offset(tp))
     for task in range(first_task(bid, 0), SLICES, BLOCKS):
         # the slice's own loads go out ahead of the wait on the ranks' partials, where
         # they fit in registers beside the reduce
@@ -1535,9 +1563,15 @@ def run_k2(
     amb = Mailbox(tag)
 
     cp = {"put_bf": amb.put_bf, "rank": rank}
-    c["wob_out"] = lambda t, col, v0, v1: push_attn_pair(
-        cp, bases, s // tp if key.tok_par else None, s, t, col, [v0, v1]
-    )
+    if const_expr(key.tok_par):
+        c["wob_out"] = lambda t, col, v0, v1: push_attn_pair(
+            cp, bases, s // tp, t, col, [v0, v1]
+        )
+    else:
+        acell = acell_offset(tp)
+        c["wob_cell"] = lambda task, t0, u, vs: push_attn_cell(
+            cp, bases, acell, s, task, t0, u, vs
+        )
     ctx = {"bid": bid, "tid": fx.thread_idx.x}
     if const_expr(one):
         # K1's half wrote q, the records, the key table and the mixes: the split waits on

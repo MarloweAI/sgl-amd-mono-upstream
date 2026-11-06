@@ -1,9 +1,9 @@
 """Check K2, the attention back fused into the FFN launch, stage by stage (torchrun, TP2 or TP4).
 
-XO against a torch attention, X8B and the pushed wo_b partial against wo_a / wo_b of K2's own
-XO / X8B, the output bit for bit against the FFN launch fed that partial; the index-source,
-window-only and token-parallel (this rank's rows) K2 bit for bit against the K2 of the same keys;
-then a graph replay."""
+XO against a torch attention, X8B against wo_a of K2's own XO; the index-source, window-only and
+token-parallel (this rank's rows) K2 bit for bit against the K2 of the same keys; where the width
+runs token parallel, the wo_b partial that K2 pushed against wo_b of its X8B, and K2's output bit
+for bit against the FFN launch fed that partial; then a graph replay."""
 
 import argparse
 import os
@@ -138,20 +138,22 @@ def attention_xo(q, swa_keys, comp_keys, lists, sink, pos, cos_sin):
 
 
 def pushed_partials(runner, rows, tp):
-    """[tp, rows, 5120] bf16: every rank's wo_b partial as the last K2 pushed it into this
-    rank's ATTN region (bf16 pairs next to their tags, ``seam.attn_region_pair``)."""
-    from sgl_amd_mono.deepseek_v41.gfx950.layer import (
-        peer_half_bytes,
-    )
+    """[tp, rows, 5120] bf16: every rank's wo_b partial, as the last K2 (token parallel)
+    pushed this rank's rows of it into the ATTN region (bf16 pairs next to their tags,
+    ``seam.attn_region_pair``), gathered over the ranks. A K2 that is not token parallel
+    pushes cells, which its reduce empties once read (``seam.attn_cell``)."""
+    from sgl_amd_mono.deepseek_v41.gfx950.layer import peer_half_bytes
 
     ep = int(runner.epoch[0].item()) - 1  # the K2 launch's epoch (run_ffn moved it on)
     base = (ep & 1) * peer_half_bytes(tp)
-    words = runner.peer.bytes[base : base + tp * rows * HIDDEN // 2 * 8].view(
+    own = rows // tp
+    words = runner.peer.bytes[base : base + tp * own * HIDDEN // 2 * 8].view(
         torch.int32
     )
-    return (
-        words.view(tp, rows, HIDDEN // 2, 2)[..., 0].contiguous().view(torch.bfloat16)
-    )
+    mine = words.view(tp, own, HIDDEN // 2, 2)[..., 0].contiguous().view(torch.bfloat16)
+    gathered = [torch.empty_like(mine) for _ in range(tp)]
+    dist.all_gather(gathered, mine)
+    return torch.cat(gathered, dim=1)
 
 
 def mx_region(scratch, layout, name, rows, cols):
@@ -293,18 +295,7 @@ def main():
         wa = deq_fp8_block(*woa).reshape(d.groups, O_RANK, -1)
         ya = torch.einsum("tgk,grk->tgr", xo.view(M, d.groups, -1), wa)
         x8b_ref = mxfp8_qdq(ya.bfloat16().float().reshape(M, -1), "vllm")
-        # wo_b: the partial K2 pushed (before the FFN launch below overwrites the region)
-        pushed = pushed_partials(runner, M, tp)
-        own = pushed[rank]
         part_ref = (x8b @ deq_fp8_block(*wob).T).bfloat16()
-        part_ulps, part_share = bf16_ulps(own[live], part_ref[live])
-        gathered = [torch.empty_like(own) for _ in range(tp)]
-        dist.all_gather(gathered, own.contiguous())
-        # the output: bit for bit the FFN launch fed K2's own partial
-        ref = runner.ffn(mw, own.contiguous(), res, post, comb, pre)
-        same = all(
-            torch.equal(a, b) for a, b in zip(ref, (out, res_o, post_o, comb_o, pre_o))
-        )
         checks = {
             "finite": all(
                 torch.isfinite(x).all().item()
@@ -315,15 +306,8 @@ def main():
             and row_cos.min().item() > 0.999,
             "pad rows read nothing": bool((xo[~live] == 0).all()),
             "x8b": rel(x8b, x8b_ref) < NUMERICS.bound("k2.wo_a.rel"),
-            # the GEMV's summation order: few elements apart (a near-cancelling sum by more ulps)
-            "wo_b partial": rel(own[live], part_ref[live])
-            < NUMERICS.bound("k2.wo_b.rel")
-            and part_share <= 0.02,
-            "pushes arrive": all(
-                torch.equal(g, pushed[src]) for src, g in enumerate(gathered)
-            ),
-            "ffn stages": same,
         }
+        part_note = "n/a (not token parallel)"
         outs = (out, res_o, post_o, comb_o, pre_o)
         # an index source's K2 builds the table from K1's slots and top-k: same table and outputs
         slot, keys = source_keys(M, lists, dev)
@@ -364,6 +348,25 @@ def main():
                 checks[f"token parallel{' index' if index else ''}"] = all(
                     torch.equal(a[mine], b[mine]) for a, b in zip(tpo, outs)
                 )
+                if index:
+                    continue
+                # wo_b: the partials it pushed, before the FFN launch below overwrites them
+                own = pushed_partials(runner, M, tp)[rank]
+                part_ulps, part_share = bf16_ulps(own[live], part_ref[live])
+                # the GEMV's summation order: few elements apart (more ulps near cancelling)
+                checks["wo_b partial"] = (
+                    rel(own[live], part_ref[live]) < NUMERICS.bound("k2.wo_b.rel")
+                    and part_share <= 0.02
+                )
+                # K2's output (its cells' all-reduce): bit for bit the FFN launch fed K2's
+                # own partial (the tagged pairs' all-reduce)
+                ref = runner.ffn(mw, own.contiguous(), res, post, comb, pre)
+                checks["ffn stages"] = all(torch.equal(a, b) for a, b in zip(ref, outs))
+                part_note = (
+                    f"rel {rel(own[live], part_ref[live]):.2e}, {100 * part_share:.3f}% "
+                    f"differ (max {part_ulps:.0f} ulp), ffn stages bit for bit "
+                    f"{checks['ffn stages']}"
+                )
         ref0 = out.clone()
         dist.broadcast(ref0, 0)
         checks["ranks agree"] = torch.equal(ref0, out)
@@ -373,9 +376,7 @@ def main():
                 f"M={M:2d} {'PASS' if not bad else 'FAIL ' + ','.join(bad)} | "
                 f"xo cos {cos(xo[live], xo_ref[live]):.6f} rel {rel(xo[live], xo_ref[live]):.4f} "
                 f"min-row {row_cos.min().item():.5f} | x8b rel {rel(x8b, x8b_ref):.5f} | "
-                f"wo_b partial rel {rel(own[live], part_ref[live]):.2e}, {100 * part_share:.3f}% differ "
-                f"(max {part_ulps:.0f} ulp) | "
-                f"ffn stages bit for bit {same}",
+                f"wo_b partial {part_note}",
                 flush=True,
             )
         fails += [f"M={M} {k}" for k in bad]

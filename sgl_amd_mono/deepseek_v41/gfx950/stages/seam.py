@@ -19,6 +19,7 @@ from flydsl.expr.typing import T
 
 from sgl_amd_mono.common.ops import (
     CM_DEV,
+    CM_SYS,
     batched_rounds,
     bf16_round,
     bf_hi,
@@ -34,10 +35,13 @@ from sgl_amd_mono.common.ops import (
 from sgl_amd_mono.common.plan import (
     THREADS,
     WAVES,
+    cdiv,
     pair_layout,
 )
-from sgl_amd_mono.common.sync import preg
+from sgl_amd_mono.common.sync import _spin, preg
 from sgl_amd_mono.deepseek_v41.gfx950.stages.gemv import (
+    ROWS,
+    TILE,
     ld_bf,
     ld_f32,
     plus,
@@ -77,6 +81,40 @@ def attn_peer_bytes(tokens: int, tp: int) -> int:
 
 def attn_region_pair(src, t, s, col):
     return (src * s + t) * (HIDDEN // 2) + col // 2
+
+
+# ---------------------------------------------------------------- ATTN cells
+# K2's wo_b partials (not token parallel) cross as cells: 8 B, four bf16 values and no
+# tag, half a tagged pair's bytes. Each 4-B word is its own flag: a word not yet written
+# holds CELL_EMPTY (all ones), and a writer never stores it (a bf16 pair of 0xFFFF NaNs
+# goes out as 0xFFFE, 0xFFFF), so a cell is read only once both its words have landed,
+# whether its 8 B arrive at once or as two halves. The reduce stores both words back to
+# empty once read; the runner fills the region with it. Every cell a launch writes, its
+# reduce reads; every width's cells lie on one 8-B grid of a region of their own
+# (``token_par.acell_region``), so no other word reaches a cell.
+CELL_VALUES = 4
+CELL_EMPTY = -1  # each of a cell's two words
+WOB_TASKS = HIDDEN // ROWS
+
+
+def cells_tile(n: int) -> int:
+    """A wo_b task's cells over a token tile of n rows: [row][16 columns], 4 a cell."""
+    return cdiv(ROWS * n, CELL_VALUES)
+
+
+def cells_task(s: int) -> int:
+    """A wo_b task's cells over an s-row step, a token tile after another."""
+    return sum(cells_tile(n) for _, n in token_tiles(s))
+
+
+def acell_cells(s: int, tp: int) -> int:
+    """ACELL: ``[source rank][wo_b task][token tile][cell]``."""
+    return tp * WOB_TASKS * cells_task(s)
+
+
+def attn_cell(src, task, s, t0, u):
+    """Cell u of wo_b ``task`` on the token tile from row t0, from rank ``src``."""
+    return (src * WOB_TASKS + task) * cells_task(s) + t0 // TILE * cells_tile(TILE) + u
 
 
 def sigmoid(z):
@@ -418,15 +456,19 @@ def stage_norm(c, t, store):
 # ---------------------------------------------------------------- reduce
 @flyc.jit
 def stage_reduce(c, task):
-    """Sum the TP ranks' attention partials at this slice's 32 columns in rank order into ``pend_lds``."""
+    """Sum the TP ranks' attention partials at this slice's 32 columns in rank order into
+    ``pend_lds``: K2's cells (``c["acell"]``) or the tagged pairs."""
     s, tid = c["S"], c["tid"]
-    pairs = s * COLS // 2
-    if const_expr(pairs <= THREADS):
-        reduce_attn_pair(c, task, tid)
+    if const_expr(c.get("acell") is not None):
+        units, reduce_unit = 2 * cells_task(s), reduce_attn_cell
+    else:
+        units, reduce_unit = s * COLS // 2, reduce_attn_pair
+    if const_expr(units <= THREADS):
+        reduce_unit(c, task, tid)
     else:
         # past one pass a traced loop: one pass's polls in flight at a time, not every pass's
-        for pas in range(0, pairs, THREADS):
-            reduce_attn_pair(c, task, pas + tid)
+        for pas in range(0, units, THREADS):
+            reduce_unit(c, task, pas + tid)
     gpu.barrier()
 
 
@@ -448,6 +490,64 @@ def reduce_attn_pair(c, task, idx):
         lds = c["pend_lds"] + (t * COLS + col - c0)
         fx.ptr_store(bf16_round(acc0), lds)
         fx.ptr_store(bf16_round(acc1), lds + 1)
+
+
+@flyc.jit
+def reduce_attn_cell(c, task, idx):
+    """Thread ``idx``'s cell of the slice's two wo_b tasks: every rank's cell, once written,
+    summed value by value in rank order into ``pend_lds``; then the cells emptied."""
+    s, tp, pend, acell = c["S"], c["d"].tp, c["pend_lds"], c["acell"]
+    per = cells_task(s)
+    full = cells_tile(TILE)
+    if idx < 2 * per:
+        j = idx // per
+        at = idx % per  # the cell in the task's block: its tile, then the tile's cell
+        tile = at // full
+        u = at - tile * full
+        cells = [
+            attn_cell(src, COLS // ROWS * task + j, s, 0, 0) + at for src in range(tp)
+        ]
+        ws = poll_cells(acell, cells)
+        for i in range_constexpr(CELL_VALUES):
+            acc = cell_value(ws[0], i)
+            for src in range_constexpr(1, tp):
+                acc = acc + cell_value(ws[src], i)
+            v = CELL_VALUES * u + i
+            at_lds = pend + ((tile * TILE + v // ROWS) * COLS + j * ROWS + v % ROWS)
+            fx.ptr_store(bf16_round(acc), at_lds)
+        empty = fx.Vector.from_elements([fx.Int32(CELL_EMPTY)] * 2, fx.Int32)
+        for src in range_constexpr(tp):
+            bo.buffer_store(empty, rsrc(acell), cells[src] * 2, cache_modifier=CM_SYS)
+
+
+def cell_value(w, i):
+    """Value i of a cell's words (w0, w1): bf16 low then high, a word after the other."""
+    return (bf_lo(w[0]), bf_hi(w[0]), bf_lo(w[1]), bf_hi(w[1]))[i]
+
+
+def poll_cells(addr, cells):
+    """Load the cells at ``addr`` (system scope) until none is empty: [(w0, w1)]."""
+
+    def load_all():
+        words = []
+        for at in cells:
+            w = fx.Vector(
+                bo.buffer_load(
+                    rsrc(addr), at * 2, vec_width=2, dtype=T.i32, cache_modifier=CM_SYS
+                )
+            )
+            words += [w[0], w[1]]
+        return fx.Vector.from_elements(words, fx.Int32)
+
+    def pending(v):
+        # word by word: a cell whose 8 B land as two 4-B halves reads as pending until both do
+        bad = v[0] == CELL_EMPTY
+        for e in range_constexpr(1, 2 * len(cells)):
+            bad = bad | (v[e] == CELL_EMPTY)
+        return bad
+
+    v = _spin(load_all, pending)
+    return [(v[2 * k], v[2 * k + 1]) for k in range(len(cells))]
 
 
 @flyc.jit

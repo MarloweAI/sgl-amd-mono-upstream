@@ -6,6 +6,7 @@ from sgl_amd_mono.deepseek_v41.gfx950.attention.plan import Q_RANK
 from sgl_amd_mono.deepseek_v41.gfx950.stages.seam import HIDDEN
 from sgl_amd_mono.deepseek_v41.gfx950.token_par import (
     LINE,
+    acell_region,
     chunk_pairs,
     half_pair,
     peer_layout,
@@ -36,3 +37,12 @@ def test_peer_regions_start_on_a_line(tp):
     # the other parity's regions start a half (the widest layout) later
     widest = peer_layout(max(WIDTHS), tp)
     assert max(off + size for off, size in widest.values()) % LINE == 0
+
+
+@pytest.mark.parametrize("tp", [2, 4, 8])
+def test_cells_overlap_no_region(tp):
+    # K2's cells read any word in their region as a mark: no width's regions reach it
+    off, size = acell_region(tp, WIDTHS)
+    assert off % LINE == 0 and size > 0
+    for s in WIDTHS:
+        assert all(o + n <= off for o, n in peer_layout(s, tp).values())

@@ -49,6 +49,7 @@ from sgl_amd_mono.deepseek_v41.gfx950.stages.gemv import (
     ld_f32,
     lds_row,
 )
+from sgl_amd_mono.deepseek_v41.gfx950.stages.seam import CELL_VALUES, cells_tile
 
 from .device import Mailbox, fp8x8_bf16, ld_i32, mx_code, mx_mul, pow2
 from .front import kt_entry, kt_entry_loads, kt_inputs, kt_lens
@@ -901,19 +902,35 @@ def stage_wob(c, task, ops, task2, ops2, has2, t0, n, mark=False):
     gpu.barrier()
     if const_expr(mark):
         stamp(c, 15)
-    per = ROWS * n // 2  # bf16 pairs a task
-    k = tid // per
-    emit = c.get("wob_out") or (lambda t, col, v0, v1: _wob_store(a, t, col, v0, v1))
-    if (tid < 2 * per) & ((k == 0) | has2):
-        u = tid % per
-        rp = u % (ROWS // 2)
-        tl = u // (ROWS // 2)
-        t = plus(t0, tl)
-        rk = red + k * RED
-        col = (k == 0).select(task, task2) * ROWS + 2 * rp
-        v0 = row_sum(rk, 2 * rp, tl)
-        v1 = row_sum(rk, 2 * rp + 1, tl)
-        emit(t, col, v0, v1)
+    cell = c.get("wob_cell")
+    if const_expr(cell is not None):
+        # the mono layer's cells (``seam.attn_cell``): 4 values a thread, row-major
+        per = cells_tile(n)
+        k = tid // per
+        if (tid < 2 * per) & ((k == 0) | has2):
+            u = tid % per
+            rk = red + k * RED
+            vs = []
+            for i in range_constexpr(CELL_VALUES):
+                v = CELL_VALUES * u + i
+                vs.append(row_sum(rk, v % ROWS, v // ROWS))
+            cell((k == 0).select(task, task2), t0, u, vs)
+    else:
+        per = ROWS * n // 2  # bf16 pairs a task
+        k = tid // per
+        emit = c.get("wob_out") or (
+            lambda t, col, v0, v1: _wob_store(a, t, col, v0, v1)
+        )
+        if (tid < 2 * per) & ((k == 0) | has2):
+            u = tid % per
+            rp = u % (ROWS // 2)
+            tl = u // (ROWS // 2)
+            t = plus(t0, tl)
+            rk = red + k * RED
+            col = (k == 0).select(task, task2) * ROWS + 2 * rp
+            v0 = row_sum(rk, 2 * rp, tl)
+            v1 = row_sum(rk, 2 * rp + 1, tl)
+            emit(t, col, v0, v1)
     gpu.barrier()
 
 
