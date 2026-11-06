@@ -21,6 +21,7 @@ from sglang.kernels.ops.attention.dsv4.candidate_blocks_hip import (
 )
 
 from . import index_plan as ip
+from . import topk_one
 from .candidate_table import PLANE_ROWS
 from .compress import THREADS, build_kc
 from .k2i import MAX_ROWS, build_k2i
@@ -108,6 +109,7 @@ class K2iRunner:
         self.owners = torch.stack([t // p * p for p in range(1, MAX_ROWS + 1)]).to(
             **i32
         )
+        self.one = topk_one.TopKOne(device)
         self._kernels: dict = {}
 
     def kernel(self, rows: int, blocks: bool = False):
@@ -274,7 +276,7 @@ class K2iRunner:
                 "gl_ptab_stride": page_table.stride(0), "gl_bounds": bounds,
                 "gl_owners": self.owners[per_req - 1],
             }  # fmt: skip
-        topk_transform_paged_hip(
+        self._paged_topk(
             scores=logits,
             seq_lens=bounds,
             page_table=page_table,
@@ -283,6 +285,18 @@ class K2iRunner:
             raw_indices=raw_out,
         )
         return Selection(published, (index_glue.TABLE, glue) if producer else None)
+
+    def _paged_topk(self, **args) -> None:
+        """SGLang's paged top-k with both outputs: one launch up to ``topk_one.MAX_ROWS`` rows
+        (``topk_one``), SGLang's own launches past that."""
+        if not topk_one.TopKOne.fits(args["scores"].shape[0]):
+            topk_transform_paged_hip(**args)
+            return
+        if not topk_one.module.cache_info().currsize:
+            from ..runner import no_capture
+
+            no_capture("the one-launch top-k")
+        self.one.transform_paged(**args)
 
     def score(
         self, *, rows, per_req, ratio, query, plane, page_table, bounds, fill_plan=True,

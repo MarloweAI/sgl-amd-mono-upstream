@@ -21,4 +21,4 @@ include = ["sgl_amd_mono*"]
 
 # HIP sources a model's glue builds at first use (sgl_amd_mono.common.hip_ext)
 [tool.setuptools.package-data]
-"*" = ["*.hip", "*.h"]
+"*" = ["*.hip", "*.h", "*.cuh"]
