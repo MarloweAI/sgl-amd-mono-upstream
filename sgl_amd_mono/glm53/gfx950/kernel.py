@@ -5128,6 +5128,69 @@ def build_glm5_monokernel(
         UV_R = UV_TILE // 16
         UV_WPR = WAVES // UV_R
         UV_UNITS = UV_NKC // (attention_k_chunks_per_unit * UV_WPR)
+        O_NKC = O_K // 64
+        O_R = ROW_TILE // 16
+        O_WPR = WAVES // O_R
+        O_UNITS = O_NKC // (attention_k_chunks_per_unit * O_WPR)
+        # Up to 4 rows a CTA runs at most one uv task and one o tile, and on the CTAs that
+        # run both the o tile's weights went out only after uv: so both tasks' weights go
+        # out here, uv's first, and the o tile's are in flight during uv's input wait.
+        O_EARLY = (
+            S <= 4
+            and not (attention_bf16 or attention_ptpc)
+            and S * N_UV <= G
+            and N_ROW_TILES <= G
+        )
+        if const_expr(O_EARLY):
+
+            def gated(addr, live):
+                """A buffer of ``addr`` that loads nothing unless ``live``."""
+                return bo.create_buffer_resource_from_addr(
+                    addr,
+                    num_records_bytes=live.select(fx.Int64(0xFFFFFFFF), fx.Int64(0)),
+                )
+
+            uv_tt0 = fx.Int32(start("uv"))
+            r_wuv_e = gated(w_uv, uv_tt0 < S * N_UV)
+            r_suv_e = gated(s_uv, uv_tt0 < S * N_UV)
+            uv_lt0 = dcp_local_uv_tile(fx.min(uv_tt0, S * N_UV - 1) % N_UV, L)
+            uv_pre_e = []
+            for c in range_constexpr(UV_UNITS):
+                kc = ((wave % UV_WPR) * UV_UNITS + c) * attention_k_chunks_per_unit
+                uv_pre_e.append(
+                    unit_attention(
+                        r_wuv_e,
+                        r_suv_e,
+                        uv_lt0 * UV_R + wave // UV_WPR,
+                        kc,
+                        UV_NKC,
+                        KV_LORA,
+                        128,
+                        attention_b_word(kc * 64),
+                        scale_rows=uv_scale_rows,
+                    )
+                )
+            o_t0 = fx.Int32(start("o"))
+            o_tc = fx.min(o_t0, N_ROW_TILES - 1)
+            r_wo_e = gated(w_o, o_t0 < N_ROW_TILES)
+            r_so_e = gated(s_o, o_t0 < N_ROW_TILES)
+            o_pre_e = []
+            for c in range_constexpr(O_UNITS):
+                kc = ((wave % O_WPR) * O_UNITS + c) * attention_k_chunks_per_unit
+                o_pre_e.append(
+                    unit_attention(
+                        r_wo_e,
+                        r_so_e,
+                        o_tc * O_R + wave // O_WPR,
+                        kc,
+                        O_NKC,
+                        O_K,
+                        128,
+                        attention_b_word(n_sel() * O_K + kc * 64),
+                        shuffled=fp8_shuffled,
+                        cm=AT_CM,
+                    )
+                )
         for tt in range(start("uv"), S * N_UV, G):
             tt = fx.Int32(tt)
             stamp("uv", tt, 0)
@@ -5155,7 +5218,10 @@ def build_glm5_monokernel(
                     ),
                 )
 
-            pre = [u_uv(c) for c in range(UV_UNITS)]
+            if const_expr(O_EARLY):
+                pre = uv_pre_e
+            else:
+                pre = [u_uv(c) for c in range(UV_UNITS)]
             hint_wait(
                 N_SPLIT,
                 lambda k: (mb("sp_l"), (s * N_SPLIT + k) * H + head),
@@ -5276,10 +5342,6 @@ def build_glm5_monokernel(
         # 2 row groups x 32 chunks: 4 waves per row group, 8 chunks each
         reload_args()
         r_wo, r_so = _rsrc(w_o), _rsrc(s_o)
-        O_NKC = O_K // 64
-        O_R = ROW_TILE // 16
-        O_WPR = WAVES // O_R
-        O_UNITS = O_NKC // (attention_k_chunks_per_unit * O_WPR)
         for t in range(start("o"), N_ROW_TILES, G):
             t = fx.Int32(t)
             stamp("o", t, 0)
@@ -5299,7 +5361,10 @@ def build_glm5_monokernel(
                     cm=AT_CM,
                 )
 
-            pre = [u_o(c) for c in range(O_UNITS)]
+            if const_expr(O_EARLY):
+                pre = o_pre_e
+            else:
+                pre = [u_o(c) for c in range(O_UNITS)]
             hint_wait(
                 S * N_UV,
                 lambda k: (
