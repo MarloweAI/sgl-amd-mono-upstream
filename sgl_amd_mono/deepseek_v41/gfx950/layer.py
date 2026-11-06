@@ -56,7 +56,7 @@ from .attention.plan import (
     wqkv_split,
 )
 from .indexer import compress
-from .stages import engram, moe, seam
+from .stages import engram, index_glue, moe, seam
 from .stages.dims import Dims as StageDims
 from .stages.gemv import plus, token_tiles
 from .stages.moe_shape import EXPERTS, SORT_NETS, TOPK, MoeBuild, route_shape
@@ -119,6 +119,8 @@ class MonoBuild(msgspec.Struct, frozen=True):
     # a reuse layer's launch also projects this many 16-row tasks of a later Engram layer's
     # rows (``stages.engram``)
     eg: int = 0
+    # an index source's K2 also runs its selection's glue (``stages.index_glue``: TABLE, RAWS)
+    glue: int = 0
 
 
 ROUTE = ("experts", "topk", "ug_groups", "swa_width")
@@ -140,6 +142,7 @@ def _variant(key: MonoBuild) -> dict:
         | ({"sh": 1} if key.shuffled else {})
         | ({"em": 1} if key.embed else {})
         | ({"eg": key.eg} if key.eg else {})
+        | ({"gl": key.glue} if key.glue else {})
     )
 
 
@@ -1617,6 +1620,18 @@ def run_k2(
             mb_front.stage_kt(ckt, t)
             mb_back.publish(c, c["krdy"], t)
     idle = None
+    if const_expr(key.glue):
+        # the selection's glue on the CTAs without attention or wo_a work
+        assert not key.eg, key
+        _, n_split, n_comb, _, woa0, _, _ = mb_back.back_plan(bkey)
+        gfirst, gctas = engram.eg_plan(
+            woa0, mb_back.woa_units(s, Dims(tp)), n_split, n_comb
+        )
+        gc = {"bid": bid, "lane": c["lane"], "wave": c["wave"]}
+
+        def idle():
+            index_glue.run_glue(gc, a, key.glue, s, gfirst, gctas)
+
     if const_expr(key.eg):
         # a later Engram layer's projection on the CTAs without a wo_a unit
         _, n_split, n_comb, _, woa0, _, _ = mb_back.back_plan(bkey)
@@ -1679,6 +1694,10 @@ def run_k2(
 def _k2_members(s, tp, rs):
     back_m = mb_back.back_lds_members(s, Dims(tp))
     return back_m["split"], back_m["gemv"], _seam_lds(s), moe.moe_smem(s, rs)
+
+
+# K2's selection glue (``MonoBuild.glue``), past K2_ARGS in K2's own launch
+K2_GLUE_ARGS = index_glue.ARGS
 
 
 def build_mono_k2(key: MonoBuild):
@@ -1758,6 +1777,16 @@ def build_mono_k2(key: MonoBuild):
         peers: Int64,
         rank: Int32,
         epoch: Int64,
+        gl_ids: Int64,
+        gl_cols: Int64,
+        gl_ids_out: Int64,
+        gl_table: Int64,
+        gl_bound: Int64,
+        gl_ptab: Int64,
+        gl_ptab_stride: Int32,
+        gl_bounds: Int64,
+        gl_owners: Int64,
+        gl_raw: Int64,
     ):
         _ = keyed
         # every wait runs under the guard, so a timeout flags every peer and stops the launch
@@ -1827,6 +1856,16 @@ def build_mono_k2(key: MonoBuild):
                 "peers": peers,
                 "rank": rank,
                 "epoch": epoch,
+                "gl_ids": gl_ids,
+                "gl_cols": gl_cols,
+                "gl_ids_out": gl_ids_out,
+                "gl_table": gl_table,
+                "gl_bound": gl_bound,
+                "gl_ptab": gl_ptab,
+                "gl_ptab_stride": gl_ptab_stride,
+                "gl_bounds": gl_bounds,
+                "gl_owners": gl_owners,
+                "gl_raw": gl_raw,
             }
             run_k2(key, lds, a, _epoch(epoch))
 
@@ -1884,6 +1923,16 @@ def build_mono_k2(key: MonoBuild):
         peers: Int64,
         rank: Int32,
         epoch: Int64,
+        gl_ids: Int64,
+        gl_cols: Int64,
+        gl_ids_out: Int64,
+        gl_table: Int64,
+        gl_bound: Int64,
+        gl_ptab: Int64,
+        gl_ptab_stride: Int32,
+        gl_bounds: Int64,
+        gl_owners: Int64,
+        gl_raw: Int64,
         stream: fx.Stream = _STREAM,
     ):
         _ = keyed
@@ -1940,6 +1989,16 @@ def build_mono_k2(key: MonoBuild):
             peers,
             rank,
             epoch,
+            gl_ids,
+            gl_cols,
+            gl_ids_out,
+            gl_table,
+            gl_bound,
+            gl_ptab,
+            gl_ptab_stride,
+            gl_bounds,
+            gl_owners,
+            gl_raw,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 
     return launch

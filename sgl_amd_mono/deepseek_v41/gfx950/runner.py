@@ -28,6 +28,7 @@ from .layer import (
     K1_CP_ARGS,
     K1_KC_ARGS,
     K2_ARGS,
+    K2_GLUE_ARGS,
     K2_OF_LAYER,
     LAYER_ARGS,
     MAX_TOKENS,
@@ -549,19 +550,23 @@ class DSV41MonoRunner:
     ) -> None:
         """Allocate this width's scratch and compile its launches without running them.
 
-        K1 for each (fold, index, iq, cp) in ``k1``, K2 for each (compressed, index) in
+        K1 for each (fold, index, iq, cp) in ``k1``, K2 for each (compressed, index, glue) in
         ``k2``, the layer launch for each (fold, compressed, embed, eg) in ``layer``, the FFN
         launch, and K2i (``enable_k2i`` first)."""
         self.scratch(tokens)
         kernels = [self.k1_kernel(tokens, *v, tok_par=tok_par) for v in sorted(k1)]
-        kernels += [self.k2_kernel(tokens, *v, tok_par=tok_par) for v in sorted(k2)]
+        kernels += [
+            self.k2_kernel(tokens, c, i, tok_par=tok_par, glue=g)
+            for c, i, g in sorted(k2)
+        ]
         kernels += [
             self.layer_kernel(tokens, *v, tok_par=tok_par) for v in sorted(layer)
         ]
         if ffn:
             kernels.append(self.ffn_kernel(tokens))
         if k2i:
-            kernels.append(self.k2i.kernel(tokens))
+            # a producer's build keeps its block maxima too
+            kernels += [self.k2i.kernel(tokens), self.k2i.kernel(tokens, blocks=True)]
         for launch in kernels:
             compile_only(launch)
 
@@ -582,9 +587,10 @@ class DSV41MonoRunner:
         return self._kernels[key]
 
     def k2_kernel(
-        self, tokens: int, compressed: bool = True, index: bool = False, tok_par=False
-    ):
-        key = (tokens, "k2", compressed, index, tok_par)
+        self, tokens: int, compressed: bool = True, index: bool = False, tok_par=False,
+        glue: int = 0,
+    ):  # fmt: skip
+        key = (tokens, "k2", compressed, index, tok_par, glue)
         if key not in self._kernels:
             no_capture(f"K2 width {tokens}")
             self._kernels[key] = build_mono_k2(
@@ -599,6 +605,7 @@ class DSV41MonoRunner:
                     fault_after=self.fault_after,
                     timeline=self.timeline_on,
                     tok_par=tok_par,
+                    glue=glue,
                     **self.route_at(tokens),
                 )
             )
@@ -1019,11 +1026,14 @@ class DSV41MonoRunner:
         keys: tuple | None = None,
         index: bool = False,
         tok_par: bool = False,
+        glue: tuple | None = None,
     ):
         """Run K2 on K1's outputs: attention back, TP reduce, FFN seam, MoE and all-reduce.
 
         ``comp`` None: a window-only layer. ``index``: an index source; K2 first builds
-        the key table from ``keys``, whose top-k the indexer selected after K1."""
+        the key table from ``keys``, whose top-k the indexer selected after K1. ``glue``:
+        (kind, its tensors and ints by name), the selection's glue K2 also runs
+        (``K2iRunner.select``, ``stages.index_glue``)."""
         args, outs, compressed = self._k2_args(
             aw,
             w,
@@ -1039,9 +1049,15 @@ class DSV41MonoRunner:
             index,
             tok_par,
         )
+        kind, gl = glue if glue is not None else (0, {})
+        gargs = []
+        for n in K2_GLUE_ARGS:
+            v = gl.get(n, 0)
+            gargs.append(v.data_ptr() if isinstance(v, torch.Tensor) else int(v))
         _run_compiled(
-            self.k2_kernel(rows, compressed, index, tok_par),
+            self.k2_kernel(rows, compressed, index, tok_par, kind),
             *(args[n] for n in K2_ARGS),
+            *gargs,
             torch.cuda.current_stream(),
         )
         return outs

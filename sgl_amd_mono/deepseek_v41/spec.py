@@ -837,18 +837,30 @@ def _launch(
         L.k1, x, residual, post, comb, prev_pre, pos, slot, L.swa, L.swa_block,
         keys, index=True, tok_par=tok_par, aux=aux, kc=kc,
     )  # fmt: skip
-    _select(
+    glue = _select(
         runner=runner, L=L, plan=plan, backend=backend, positions=positions,
         pos=pos, forward_batch=forward_batch, M=M,
     )  # fmt: skip
     # K2 reads K1's outputs from the runner's buffers
     return runner.k2(
         L.k2, L.ffn, M, pos, L.swa, L.swa_block, L.comp, L.comp_block,
-        slot=slot, keys=keys, index=True, tok_par=tok_par,
+        slot=slot, keys=keys, index=True, tok_par=tok_par, glue=glue,
     )  # fmt: skip
 
 
-def _select(*, runner, L, plan, backend, positions, pos, forward_batch, M) -> None:
+def _glue_kind(ix) -> int:
+    """The selection glue a two-level step's K2 of an index source with indexer ``ix`` runs
+    (``stages.index_glue``): the producer's candidate table, a consumer's raw indices."""
+    from .gfx950.stages import index_glue
+
+    if ix is None:
+        return 0
+    if ix.uses_candidates:
+        return index_glue.RAWS
+    return index_glue.TABLE if ix.is_candidate_source else 0
+
+
+def _select(*, runner, L, plan, backend, positions, pos, forward_batch, M):
     """An index source between K1 and K2.
 
     A KV source's compressor runs on K1's normed input, as SGLang's low-ratio path
@@ -927,7 +939,7 @@ def _select(*, runner, L, plan, backend, positions, pos, forward_batch, M) -> No
         query = _index_query(
             attn=attn, x=runner.normed[:M], q_lora=runner.qr[:M], positions=pos
         )
-    published = k2i.select(
+    sel = k2i.select(
         kind=kind,
         rows=M,
         per_req=per_req,
@@ -940,14 +952,11 @@ def _select(*, runner, L, plan, backend, positions, pos, forward_batch, M) -> No
         page_out=page_idx,
         # the candidate source's blocks of this step, for the layers after it
         candidates=plan.state["k2i candidates"] if kind == "reindex" else None,
-        # the step's REINDEX layers share one table (same blocks, page table, bounds)
-        reindex_table_built=kind == "reindex" and ("k2i reindex", r) in plan.state,
         fill_plan=fill_plan,
     )
-    if kind == "reindex":
-        plan.state["k2i reindex", r] = True
     if kind == "producer":
-        plan.state["k2i candidates"] = published
+        plan.state["k2i candidates"] = sel.blocks
+    return sel.glue
 
 
 def _kc_fused(*, runner, L, M, tok_par) -> bool:
@@ -1545,7 +1554,13 @@ def _build(model, hf_config, ctx) -> _Built:
         if L.index
         for fold in (True, False)
     }
-    k2 = {(L.ratio > 0, True) for L in layers.values() if L.index}
+    # an index source's K2, and a two-level step's with its selection's glue
+    k2 = {
+        (L.ratio > 0, True, glue)
+        for L in layers.values()
+        if L.index
+        for glue in {0, _glue_kind(L.module.self_attn.indexer)}
+    }
     one = {
         (fold, L.ratio > 0, False, eg)
         for L in layers.values()
