@@ -21,7 +21,9 @@ inputs, within the spec's bounds, and one rank's down or gate | up scales x2 fai
 them; ``--check-embed``: layer 0 from the token ids equals the dense launch fed the
 gathered embedding rows (outputs, cache rows, top-k), and a changed token id differs;
 ``--check-head``: the tail's logits against a torch and an f32 tail, within the
-spec's bounds, and the final norm x1.01 fails them. ``--similar X``: the live rows of a
+spec's bounds, and the final norm x1.01 fails them; ``--check-fold``: the router
+folded into o's pass, its reduced logits and the o tiles' sums of squares of h
+against fp64 on the launch's own h, and one rank's folded M x2 fails them. ``--similar X``: the live rows of a
 request are one random row plus X times their own, so they route alike, as a verify
 step's rows do (with ``--rowsets v4``).
 
@@ -125,12 +127,16 @@ def head_weights(rank: int, tp: int, device):
 
 def layer_weights(layer: int, rank: int, tp: int, device, kind: str):
     """Layer ``layer``'s random tensors as this rank's shard (every rank draws the
-    same): block-FP8 projections and experts read in place, W_UK / W_UV, the router
-    and the indexer's weights_proj packed; the shared expert is slot 256. A dense
-    layer's MLP: its intermediates as expert-shaped slices, no router read; layer 0
-    (``embed``) reads this rank's embedding rows in the router's place."""
+    same): block-FP8 projections and experts read in place, W_UK / W_UV and the
+    indexer's weights_proj packed, the router folded into o's pass; the shared expert
+    is slot 256. A dense layer's MLP: its intermediates as expert-shaped slices, no
+    router read; layer 0 (``embed``) reads this rank's embedding rows in the router's
+    place."""
+    import msgspec
+
     from sgl_amd_mono.glm53.gfx950.packing import pack_bf16, pack_fp8
     from sgl_amd_mono.glm53.gfx950.runner import Glm53Weights
+    from sgl_amd_mono.glm53.gfx950.weights import fold_router
 
     g = _gen(1000 * layer + 7, device)
     index = has_index(kind)
@@ -176,7 +182,7 @@ def layer_weights(layer: int, rank: int, tp: int, device, kind: str):
         s_dn = _scales(g, (dense, HIDDEN // 128, inter // 128), DENSE_INTER, device)
     if kind == "embed":
         w_r = embedding(rank, tp, device)
-    return Glm53Weights(
+    w = Glm53Weights(
         g_in=_norm(g, HIDDEN, device),
         g_q=_norm(g, Q_LORA, device),
         g_kv=_norm(g, KV_LORA, device),
@@ -205,6 +211,11 @@ def layer_weights(layer: int, rank: int, tp: int, device, kind: str):
         index=table,
         keep=keep,
         dense=dense,
+    )
+    if dense:
+        return w
+    return msgspec.structs.replace(
+        w, w_r=fold_router(router.bfloat16(), w.g_post, w_o, s_o, True, rank, tp)
     )
 
 
@@ -652,6 +663,59 @@ def check_dense(model: Model, rank: int, group) -> bool:
     return ok
 
 
+def _unpack_bf16(p: torch.Tensor, rows: int, k: int) -> torch.Tensor:
+    """The [rows, k] bf16 matrix of ``pack_bf16`` output ``p``."""
+    w = p.view(torch.int16)[: rows * k].reshape(rows // 16, k // 64, 2, 4, 16, 8)
+    return w.permute(0, 4, 1, 2, 3, 5).reshape(rows, k).view(torch.bfloat16)
+
+
+# the folded router's bound (its logits and the sums of squares of h, against fp64)
+FOLD_REL = 1e-2
+
+
+def fold_values(model: Model, tp: int, group) -> dict:
+    """The last launch's folded router on its live rows: the reduced logits
+    (``lraw``) against fp64 logits of its h (mailbox ``a``, bf16) with the bf16
+    W_r * gamma (every rank's columns of ``w_r``, gathered), max error over max; the
+    o tiles' sums of squares (``hss``) against the h rows', the largest row's."""
+    from sgl_amd_mono.glm53 import check
+    from sgl_amd_mono.glm53.gfx950.layout import N_ROW_TILES
+
+    op = model.ops[-1]
+    rt, S = op.rt, _live(model)
+    E, O = N_EXPERTS, rt.key.heads * V_DIM
+    h = check.ffn_input(rt, rt.width)[:S].double()
+    wg = _gather_cols(_unpack_bf16(op.w.w_r[E * O :], E, HIDDEN // tp), group, tp)
+    want = h @ wg.double().t()
+    got = check._pairs_f32(rt, "lraw", rt.width * E).view(rt.width, E)[:S].double()
+    hss = check._pairs_f32(rt, "hss", rt.width * N_ROW_TILES).view(rt.width, -1)
+    ss = h.pow(2).sum(-1)
+    return {
+        "logits": ((got - want).abs().max() / want.abs().max()).item(),
+        "hss": ((hss[:S].double().sum(-1) - ss).abs() / ss).max().item(),
+    }
+
+
+def check_fold(model: Model, rank: int, tp: int, group) -> bool:
+    """The router folded into o's pass within ``FOLD_REL``; rank 0's M (the o part
+    of its ``w_r``) x2 must fail the logits' bound."""
+    w = model.ops[-1].w
+    model.step()
+    torch.cuda.synchronize()
+    v = fold_values(model, tp, group)
+    ok = all(x <= FOLD_REL for x in v.values())
+    m = w.w_r.view(torch.bfloat16)[: N_EXPERTS * model.ops[-1].rt.key.heads * V_DIM]
+    saved = m.clone()
+    if rank == 0:
+        m.mul_(2)
+    model.step()
+    torch.cuda.synchronize()
+    m.copy_(saved)
+    bad = fold_values(model, tp, group)
+    print(f"rank {rank} fold {v} within={ok}; rank 0's M x2: {bad}", flush=True)
+    return ok and bad["logits"] > FOLD_REL
+
+
 def _writes(model: Model, h=None):
     """One step's output, the MLA and index cache rows of its live rows and its
     top-k, the caches restored after."""
@@ -813,6 +877,7 @@ def main() -> int:
     ap.add_argument("--check-dense", action="store_true")
     ap.add_argument("--check-embed", action="store_true", help="with --launches 1")
     ap.add_argument("--check-head", action="store_true")
+    ap.add_argument("--check-fold", action="store_true")
     ap.add_argument("--dump", default="", help="write the digests into DIR")
     ap.add_argument("--perturb", action="store_true", help="negate one input value")
     ap.add_argument("--similar", type=float, default=0.0, help="rows routing alike")
@@ -867,6 +932,8 @@ def main() -> int:
             del dense
         if args.check_head:
             ok &= check_head(model, rank, tp, group)
+        if args.check_fold:
+            ok &= check_fold(model, rank, tp, group)
         torch.cuda.synchronize()
         if model.errors():
             print(f"rank {rank} {name}: error words set", flush=True)
