@@ -1916,17 +1916,27 @@ def build_glm5_monokernel(
             if lane < TOP_K:
                 lds_st(scr, lane, e)
 
-        def peer_reduce(region, t, residual, out_fn, tile=ROW_TILE):
+        def peer_reduce(region, t, residual, out_fn, tile=ROW_TILE, one=None):
             """Push BF16 partials to every peer, then sum them in rank order.
 
             One wave owns each destination, allowing the peer stores to progress
-            concurrently without retaining all peer pointers in every wave."""
+            concurrently without retaining all peer pointers in every wave. ``one``
+            (sample, first row): the task's tile is that sample's rows from there, held
+            at ``outs`` [0, tile); otherwise every sample's rows ``t * tile`` ..."""
             region_base = fx.Int64(SY[region]) + fx.Int64(peer_slot) * fx.Int64(
                 SY["_part_stride"]
             )
+            NS = S if one is None else 1
+
+            def sample_of(si):
+                return si if one is None else one[0]
+
+            def first_row():
+                return t * tile if one is None else one[1]
+
             if const_expr(W > 1):
                 if wave < W:
-                    pair_count = S * tile // 2
+                    pair_count = NS * tile // 2
                     for batch in range_constexpr((pair_count + 63) // 64):
                         pair = lane + batch * 64
                         if pair < pair_count:
@@ -1934,7 +1944,7 @@ def build_glm5_monokernel(
                             ri = (pair % (tile // 2)) * 2
                             put_bf(
                                 peer_dst + region_base,
-                                (rank * S + si) * HIDDEN + t * tile + ri,
+                                (rank * S + sample_of(si)) * HIDDEN + first_row() + ri,
                                 [
                                     lds_ld(outs, si * tile + ri),
                                     lds_ld(outs, si * tile + ri + 1),
@@ -1942,14 +1952,15 @@ def build_glm5_monokernel(
                                 CM_SYS,
                             )
                 gpu.barrier()
-            if tid < S * tile // 2:
-                s = tid // (tile // 2)
+            if tid < NS * tile // 2:
+                si = tid // (tile // 2)
+                s = sample_of(si)
                 r = (tid % (tile // 2)) * 2
-                row = t * tile + r
+                row = first_row() + r
                 if const_expr(callable(residual)):
                     r0, r1 = residual(s, row)
-                v0 = lds_ld(outs, s * tile + r)
-                v1 = lds_ld(outs, s * tile + r + 1)
+                v0 = lds_ld(outs, si * tile + r)
+                v1 = lds_ld(outs, si * tile + r + 1)
                 if const_expr(W == 1):  # no TP peers: the sum is the local value
                     parts = [(v0, v1)]
                     got = []
@@ -6524,6 +6535,27 @@ def build_glm5_monokernel(
             if expert_mxfp4
             else HIDDEN // SCALE_BM * (expert_inter // 128) * 4
         )
+        # At 4 rows (TP8, FP8 experts) a down task is one row's DN_RG row groups:
+        # task t is row t % S, hidden rows (t // S) * DN_RG * 16 ..; wave w < DN_RG
+        # streams row group w with the units a 24-row task's wave of that row streams,
+        # in the same order, so every sum is the same bits. The other waves poll the
+        # row's f32 mid blocks and quantize them as the quantizer does (no midq hand-off).
+        ROW_DN = (
+            S == 4
+            and not expert_mxfp4
+            and not dense_fp8
+            and W == 8
+            and not eh_entry
+            and DN_WPR == S
+            and expert_inter == 256
+        )
+        DN_RG = HIDDEN * S // N_DN_TILES // 16 if ROW_DN else 0
+        # one-row tasks: a weight wave's units issued before the input (its weight waves
+        # do not poll, so these loads hold no input wait); the rest go out at the input
+        DN_PRE = 11 if ROW_DN else 0
+        assert not ROW_DN or (
+            DN_RG * 16 * N_DN_TILES == HIDDEN * S and WAVES - DN_RG == 2
+        )
         for t in range(start("down"), N_DN_TILES, G):
             t = fx.Int32(t)
             stamp("down", t, 0)
@@ -6537,6 +6569,22 @@ def build_glm5_monokernel(
             # (same cache lines) and are dropped in the output
             dn_lr = gu * 16 + lane % 16 - dn_off
             dn_ln = ((dn_lr >= 0) & (dn_lr < DN_TILE)).select(lane, lane ^ 8)
+            # the wave's row (its units), row group and loaded lane; above DN_RG the
+            # waves of a one-row task poll and load no weights (their row group is
+            # the last weight wave's, so their scale loads stay in range)
+            if const_expr(ROW_DN):
+                rn, rk = t % S, t // S
+
+            def w_row():
+                return rn if const_expr(ROW_DN) else wave % DN_WPR
+
+            def w_rg():
+                if const_expr(ROW_DN):
+                    return rk * DN_RG + fx.min(wave, DN_RG - 1)
+                return dn_rg + gu
+
+            def w_ln():
+                return lane if const_expr(ROW_DN) else dn_ln
 
             DN_NU = (dense_experts if dense_fp8 else S * MOE_SLOTS) * DN_NKC // 2
             DN_UPW = (DN_NU + DN_WPR - 1) // DN_WPR
@@ -6584,19 +6632,26 @@ def build_glm5_monokernel(
             def u_dn(cc):  # cc: 128-k chunk of this wave
                 if const_expr(dense_fp8):
                     return u_dn_dense(cc)
-                qu = (wave % DN_WPR) * DN_UPW + cc
+                qu = w_row() * DN_UPW + cc
                 live = qu < DN_NU
+                if const_expr(ROW_DN):
+                    live = live & (wave < DN_RG)
                 unit = fx.min(qu, DN_NU - 1)
                 q = unit * 2  # 64-k chunk index over (s, slot, kc)
                 s_q = q // (MOE_SLOTS * DN_NKC)
                 slot_q = (q // DN_NKC) % MOE_SLOTS
                 kc = q % DN_NKC
-                e = _uniform(lds_ld(keys, s_q * MOE_SLOTS + slot_q))
+                if const_expr(ROW_DN):
+                    e = row_e[cc // DN_KU]
+                else:
+                    e = _uniform(lds_ld(keys, s_q * MOE_SLOTS + slot_q))
                 wb = bo.create_buffer_resource_from_addr(
                     w_dn + fx.Int64(e) * fx.Int64(DN_W_BYTES),
                     num_records_bytes=(
                         None
-                        if DN_NU % DN_WPR == 0
+                        if DN_NU % DN_WPR == 0 and not ROW_DN
+                        else _uniform(live.select(fx.Int32(DN_W_BYTES), fx.Int32(0)))
+                        if const_expr(ROW_DN)
                         else live.select(fx.Int32(DN_W_BYTES), fx.Int32(0))
                     ),
                 )
@@ -6604,7 +6659,9 @@ def build_glm5_monokernel(
                     s_dn + fx.Int64(e) * fx.Int64(DN_S_BYTES),
                     num_records_bytes=(
                         None
-                        if DN_NU % DN_WPR == 0
+                        if DN_NU % DN_WPR == 0 and not ROW_DN
+                        else _uniform(live.select(fx.Int32(DN_S_BYTES), fx.Int32(0)))
+                        if const_expr(ROW_DN)
                         else live.select(fx.Int32(DN_S_BYTES), fx.Int32(0))
                     ),
                 )
@@ -6647,13 +6704,13 @@ def build_glm5_monokernel(
                 return unit_f8f8(
                     wb,
                     sb,
-                    dn_rg + gu,
+                    w_rg(),
                     kc,
                     DN_NKC,
                     expert_inter,
                     q * 16,
                     coef,
-                    dn_ln,
+                    w_ln(),
                     shuffled=fp8_shuffled,
                     s_addr=s_dn + fx.Int64(e) * fx.Int64(DN_S_BYTES),
                     cm=DN_CM,
@@ -6750,7 +6807,7 @@ def build_glm5_monokernel(
             # FP8 experts: mid block b (a row's slot's 128 intermediates) is quantized
             # once, by wave k of down task t for b = t + k * N_DN_TILES, and every
             # task reads the FP8 blocks (a quarter of mid's bytes)
-            if const_expr(not expert_mxfp4):
+            if const_expr(not expert_mxfp4 and not ROW_DN):
                 assert DN_BLK <= WAVES * N_DN_TILES
                 qb = t + wave * N_DN_TILES
                 if qb < DN_BLK:
@@ -6768,10 +6825,35 @@ def build_glm5_monokernel(
                         put2(mb("midq"), qb * 32 + lane // 2, word, word_n)
                     if lane == 0:
                         put(mb("midqs"), qb, qs)
+            if const_expr(ROW_DN):
+                # The two waves past the row groups poll the row's 18 blocks (wave
+                # DN_RG + p its blocks p * 9 ..), each quantized as the quantizer does.
+                RB = MOE_SLOTS * DN_KU  # a row's blocks
+                assert RB == 18
+
+                def quant_blocks(blks):
+                    mids = get2_many([(mb("mid"), b * 128 + lane * 2) for b in blks])
+                    for i in range_constexpr(len(blks)):
+                        q0, q1, qs = quant_scaled(mids[i][0], mids[i][1])
+                        st_f8(blks[i] * 128 + lane * 2, q0, q1)
+                        if lane == 0:
+                            lds_st(misc, blks[i], qs * lds_ld(dnw, blks[i] // DN_KU))
+
+                if wave >= DN_RG:
+                    pw = wave - DN_RG
+                    quant_blocks([rn * RB + pw * (RB // 2) + i for i in range(RB // 2)])
+                # the row's experts, read before any unit issues: a unit's scalar scale
+                # load between two of these reads would make the later one wait for it
+                row_e = [
+                    _uniform(lds_ld(keys, rn * MOE_SLOTS + sl))
+                    for sl in range(MOE_SLOTS)
+                ]
             # the routing is known before up/gate: the first weight batch loads
             # before the mid wait (above 4 rows only with the expert groups)
             if const_expr(DEDUP):
                 pre = [u_dd(m) for m in range(min(DN_BATCH, DD_UPW))]
+            elif const_expr(ROW_DN):
+                pre = [u_dn(cc) for cc in range(min(DN_PRE, DN_UPW))]
             elif const_expr(S <= 4):
                 pre = [u_dn(cc) for cc in range(min(DN_BATCH, DN_UPW))]
             hint_wait(
@@ -6789,7 +6871,9 @@ def build_glm5_monokernel(
                 ),
                 mark=("down", t),
             )
-            if const_expr(expert_mxfp4):
+            if const_expr(ROW_DN):
+                stamp("down", t, 2)
+            elif const_expr(expert_mxfp4):
                 mids = get2_many(
                     [
                         (
@@ -6889,6 +6973,28 @@ def build_glm5_monokernel(
                 for i in range_constexpr((DN_R * 16 * S + THREADS - 1) // THREADS):
                     if tid + i * THREADS < DN_R * 16 * S:
                         dd_sum(tid + i * THREADS)
+            elif const_expr(ROW_DN):
+                rest = [u_dn(cc) for cc in range(min(DN_PRE, DN_UPW), DN_UPW)]
+                acc = mma_units([fx.Float32(0.0) for _ in range(4)], pre)
+                if const_expr(len(rest) > 0):
+                    acc = mma_units(acc, rest)
+                # a row group's sums are one wave's: its column rn (the other waves'
+                # columns of a 24-row task's sum held exact zeros there)
+                fx.ptr_store(
+                    fx.Vector.from_elements(acc, fx.Float32),
+                    red + (wave * 64 + lane) * 4,
+                )
+                gpu.barrier()
+                if tid < DN_RG * 16:
+                    r = tid % 16
+                    lds_st(
+                        outs,
+                        tid,
+                        fx.Float32(0.0)
+                        + lds_ld(
+                            red, ((tid // 16) * 64 + rn + 16 * (r // 4)) * 4 + r % 4
+                        ),
+                    )
             else:
                 if const_expr(S > 4):
                     pre = [u_dn(cc) for cc in range(min(DN_BATCH, DN_UPW))]
@@ -6907,7 +7013,17 @@ def build_glm5_monokernel(
             def residual_a(s, row):
                 return bf2_f32(get(mb("a"), (s * HIDDEN + row) // 2))
 
-            peer_reduce("ffn", t, residual_a, store_x, tile=DN_TILE)
+            if const_expr(ROW_DN):
+                peer_reduce(
+                    "ffn",
+                    t,
+                    residual_a,
+                    store_x,
+                    tile=DN_RG * 16,
+                    one=(rn, rk * (DN_RG * 16)),
+                )
+            else:
+                peer_reduce("ffn", t, residual_a, store_x, tile=DN_TILE)
             gpu.barrier()
             stamp("down", t, 4)
         guarded.__exit__(None, None, None)
