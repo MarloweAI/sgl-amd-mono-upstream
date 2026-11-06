@@ -1503,11 +1503,15 @@ def xbox_bytes(s: int) -> int:
 @flyc.jit
 def signal_xbox(c, box, t, tag):
     """Token t's normed row landed (the caller drained its stores): its word of every
-    CTA's x box := ``tag``, a thread a CTA."""
+    router CTA's x box := ``tag``, a thread a CTA, the threads spread over the waves."""
     lines = -(-c["S"] // XBOX_WORDS)
     tid = c["tid"]
-    if tid < BLOCKS:
-        at = (tid * lines + t // XBOX_WORDS) * (XBOX_LINE // 4) + t % XBOX_WORDS
+    n = c["rs"].router_tasks
+    # thread 64 w + l signals router CTA WAVES l + w
+    i = (tid % 64) * WAVES + tid // 64
+    if i < n:
+        cta = (c["rs"].router0 + i) % BLOCKS
+        at = (cta * lines + t // XBOX_WORDS) * (XBOX_LINE // 4) + t % XBOX_WORDS
         bo.buffer_store(tag, rsrc(box), at, cache_modifier=CM_DEV)
 
 
