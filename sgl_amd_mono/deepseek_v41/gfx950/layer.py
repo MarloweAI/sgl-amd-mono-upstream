@@ -1715,8 +1715,8 @@ def run_k2(
         # a later Engram layer's projection on the CTAs without a wo_a unit
         _, n_split, n_comb, _, woa0, _, _ = mb_back.back_plan(bkey)
         ec = engram.eg_context(
-            eg, key.eg, bases, own, peer_offsets(s, tp)["eng"], tp, rank, amb,
-            lds.eg.peek(),
+            eg, eg.get("eg_tasks", key.eg), bases, own, peer_offsets(s, tp)["eng"], tp,
+            rank, amb, lds.eg.peek(), key.eg,
         )  # fmt: skip
         ec["first"], ec["ctas"] = engram.eg_plan(
             woa0, mb_back.woa_units(s, Dims(tp)), n_split, n_comb
@@ -2677,7 +2677,9 @@ def build_mono_layer(key: MonoBuild):
     return launch
 
 
-_XL_OFFSETS = kernarg_offsets(LAYER_ARGS, LAYER_I32)
+# a row: ``LAYER_ARGS``, then the layer's Engram projection tasks (0: none)
+_XL_I32_ROW = LAYER_I32 | {"eg_tasks"}
+_XL_OFFSETS = kernarg_offsets(LAYER_ARGS + ("eg_tasks",), _XL_I32_ROW)
 # a multi-layer launch's own arguments, past the table: its step's (every layer's), then
 # its first layer's inputs (the others' are the layer before's outputs). The table
 # rows hold neither, so a table does not change with the step's buffers
@@ -2685,9 +2687,14 @@ _XL_OFFSETS = kernarg_offsets(LAYER_ARGS, LAYER_I32)
 EARLY_ARGS = ("comp", "comp_stride", "comp_block", "zrec")
 XL_STEP = ("pos", "slot", "slot_words", "swa_idx", "swa_lens", "topk", "topk_lens")
 XL_FIRST = ("res_in", "pend", "post_in", "comb_in", "pre_in")
+# the Engram rows a launch's layers project (one later Engram layer's), 0: none
+XL_EG = ("eg_x",)
 _XL_I32 = frozenset(("count", "rank", "slot_words"))
 _XL_KERNARG = kernarg_offsets(
-    ("table", "count", "scratch", "sym", "peers", "rank", "epoch") + XL_STEP + XL_FIRST,
+    ("table", "count", "scratch", "sym", "peers", "rank", "epoch")
+    + XL_STEP
+    + XL_FIRST
+    + XL_EG,
     _XL_I32,
 )
 # bytes a layer's row of the table: ``LAYER_ARGS`` at their kernarg offsets
@@ -2699,7 +2706,7 @@ def xl_row(values: dict) -> bytes:
     row = bytearray(XL_ROW)
     for n, off in _XL_OFFSETS.items():
         v = int(values[n])
-        if n in LAYER_I32:
+        if n in _XL_I32_ROW:
             struct.pack_into("<I", row, off, v & 0xFFFFFFFF)
         else:
             struct.pack_into("<Q", row, off, v & 0xFFFFFFFFFFFFFFFF)
@@ -2722,7 +2729,7 @@ def build_mono_layers(key: MonoBuild):
     mailbox or runner buffer is written while layer l reads it."""
     s, tp = key.tokens, key.tp
     assert key.kt and key.fold and not key.index, key
-    assert not (key.tok_par or key.embed or key.eg), key
+    assert not (key.tok_par or key.embed), key
     # a slice's columns are its CTA's reduce task's
     assert moe.RED_COLS == seam.COLS and moe.RED_TASKS == SLICES and moe.RED0 == 0
     rs = route_shape(_moe_key(key))
@@ -2758,6 +2765,7 @@ def build_mono_layers(key: MonoBuild):
         post_in: Int64,
         comb_in: Int64,
         pre_in: Int64,
+        eg_x: Int64,
     ):
         _ = keyed
         with guard.scope(
@@ -2813,13 +2821,20 @@ def build_mono_layers(key: MonoBuild):
                 a2 = reload_args(k2_names, _XL_OFFSETS, LAYER_I32, row)
                 # K2 reads the step's arguments under K1's names too
                 a2 |= reload_args(XL_STEP, _XL_KERNARG, _XL_I32)
+                eg = None
+                if const_expr(key.eg):
+                    # the layer's share of a later Engram layer's projection (none: 0 tasks)
+                    eg = reload_args(
+                        EG_ARGS[1:] + ("eg_tasks",), _XL_OFFSETS, _XL_I32_ROW, row
+                    )
+                    eg |= reload_args(XL_EG, _XL_KERNARG, _XL_I32)
                 run_k2(
                     key,
                     lds,
                     {n_: a2[K2_OF_LAYER.get(n_, n_)] for n_ in K2_ARGS},
                     ep,
                     True,
-                    None,
+                    eg,
                     first,
                     pre,
                     pbases,
@@ -2854,6 +2869,7 @@ def build_mono_layers(key: MonoBuild):
         post_in: Int64,
         comb_in: Int64,
         pre_in: Int64,
+        eg_x: Int64,
         stream: fx.Stream = _STREAM,
     ):
         _ = keyed
@@ -2877,6 +2893,7 @@ def build_mono_layers(key: MonoBuild):
             post_in,
             comb_in,
             pre_in,
+            eg_x,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 
     return launch

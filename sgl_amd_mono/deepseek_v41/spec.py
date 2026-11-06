@@ -830,15 +830,16 @@ def _launch(
 
 
 def _launch_group(
-    runner, Ls, plan, positions, forward_batch, pending_post, prev_pre, capture
+    runner, Ls, plan, positions, forward_batch, pending_post, prev_pre, capture, egs
 ):
     """Consecutive reuse layers ``Ls`` in one launch (``runner.layers``): the first owes
     a post, each later one takes the outputs of the one before (the runner's per-layer
-    outputs, the same memory every step); returns the last one's outputs."""
+    outputs, the same memory every step); returns the last one's outputs. ``egs``: each
+    layer's share of a later Engram layer's projection (``_engram_projection``) or None."""
     x, residual, post, comb = pending_post
     M = residual.shape[0]
     steps, outs, inp = [], [], (x, residual, post, comb, prev_pre)
-    for L in Ls:
+    for L, eg in zip(Ls, egs):
         pos, slot, keys = _layer_inputs(
             runner, L, plan, positions, forward_batch, residual, None
         )
@@ -860,6 +861,7 @@ def _launch_group(
                 comp_block=L.comp_block,
                 keys=keys,
                 aux=None if capture is None else capture(L, M),
+                eg=eg,
             )  # fmt: skip
         )
         inp = runner.layer_outs(M, L.i)
@@ -1173,8 +1175,8 @@ class _Built:
     def runs(self, tok_par: bool) -> dict:
         """The runs of reuse layers ``_backbone`` launches as one (``runner.layers``), first
         layer -> the layer past the run: from a layer owed a post (the layer before deferred
-        it), each later reuse layer owing a post, no Engram write or projection, the same
-        keys. They follow from the model alone, so ``_build`` builds their launches."""
+        it), each later reuse layer owing a post, no Engram write, the same keys. They
+        follow from the model alone, so ``_build`` builds their launches."""
         from sgl_amd_mono.deepseek_v41.gfx950.layer import XL_LAYERS
 
         m, fuse = self.model, fused.enabled()
@@ -1182,7 +1184,7 @@ class _Built:
         def joins(k, first):
             L = self._layers.get(k)
             return (
-                L is not None and not L.index and L.eg is None and not tok_par
+                L is not None and not L.index and not tok_par
                 and m.layers[k].engram is None and k != m.start_layer
                 and (L.ratio > 0) == (self._layers[first].ratio > 0)
                 and k - first < XL_LAYERS
@@ -1253,6 +1255,7 @@ class _Built:
                     self.runner, [self._layers[k] for k in range(i, j)], plan,
                     positions, forward_batch, pending, pre,
                     lambda L, M: self._capture(plan, L, M),
+                    [self._engram_projection(plan, k, engram_rows, rows) for k in range(i, j)],
                 )  # fmt: skip
                 nxt = m.layers[j] if j < m.end_layer else None
                 if nxt is None:
@@ -1692,8 +1695,16 @@ def _build(model, hf_config, ctx) -> _Built:
     built = _Built(model, runner, layers)
     for m in widths[start:] + widths[:start]:
         tok_par = runner.tok_par(m)
-        # the runs of reuse layers in one launch: their launches built with the rest
-        xl = {(built._layers[i].ratio > 0,) for i in built.runs(tok_par)}
+        # the runs of reuse layers in one launch: their launches built with the rest, for
+        # the most Engram projection tasks a layer of the run takes (_engram_projection)
+        eg = runner.eg_fused(m, tok_par)
+        xl = {
+            (layers[i].ratio > 0, max(
+                (layers[k].eg.tasks for k in range(i, j) if eg and layers[k].eg is not None),
+                default=0,
+            ))
+            for i, j in built.runs(tok_par).items()
+        }  # fmt: skip
         runner.precompile(
             m, k1=k1, k2=k2, layer=one, layers=xl, k2i=k2i, tok_par=tok_par
         )

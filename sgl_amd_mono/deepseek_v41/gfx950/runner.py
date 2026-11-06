@@ -562,7 +562,7 @@ class DSV41MonoRunner:
 
         K1 for each (fold, index, iq, cp) in ``k1``, K2 for each (compressed, index, glue) in
         ``k2``, the layer launch for each (fold, compressed, embed, eg) in ``layer``, the
-        multi-layer launch for each (compressed,) in ``layers``, the FFN launch, and K2i
+        multi-layer launch for each (compressed, eg) in ``layers``, the FFN launch, and K2i
         (``enable_k2i`` first)."""
         self.scratch(tokens)
         kernels = [self.k1_kernel(tokens, *v, tok_par=tok_par) for v in sorted(k1)]
@@ -1177,10 +1177,10 @@ class DSV41MonoRunner:
         )
         return outs
 
-    def layers_kernel(self, tokens: int, compressed: bool = True):
+    def layers_kernel(self, tokens: int, compressed: bool = True, eg: int = 0):
         """Up to ``XL_LAYERS`` consecutive reuse layers' one launch at this width
-        (``build_mono_layers``)."""
-        key = (tokens, "layers", compressed)
+        (``build_mono_layers``); ``eg``: the most Engram projection tasks a layer runs."""
+        key = (tokens, "layers", compressed, eg)
         if key not in self._kernels:
             no_capture(f"multi-layer launch width {tokens}")
             self._kernels[key] = build_mono_layers(
@@ -1193,6 +1193,7 @@ class DSV41MonoRunner:
                     fault_site=self.fault_site,
                     fault_after=self.fault_after,
                     timeline=self.timeline_on,
+                    eg=eg,
                     **self.route_at(tokens),
                 )
             )
@@ -1201,7 +1202,8 @@ class DSV41MonoRunner:
     def layers(self, steps: list, outs: list):
         """Run ``len(steps)`` consecutive reuse layers in one launch (``build_mono_layers``):
         ``steps[l]`` is ``layer``'s arguments of layer l as a dict (w, aw, fw, x, residual,
-        post, comb, pre, pos, slot, swa, swa_block, comp, comp_block, keys); a later layer's
+        post, comb, pre, pos, slot, swa, swa_block, comp, comp_block, keys, aux, and ``eg``:
+        (rows, EngramWeights) of a later Engram layer, the same rows a launch); a later layer's
         x, residual, post, comb and pre are the layer before's ``outs``. Every layer's outputs
         (``outs[l]``) come from the caller, allocated before graph capture: the launch's
         argument table is built once a distinct set, outside capture. Returns ``outs``."""
@@ -1210,7 +1212,7 @@ class DSV41MonoRunner:
             raise RuntimeError(
                 f"a multi-layer launch of {n} layers, {len(outs)} outputs"
             )
-        rows, M, compressed = [], None, None
+        rows, M, compressed, eg_x = [], None, None, 0
         for i, (st, out) in enumerate(zip(steps, outs)):
             if st["aw"].cos_sin.data_ptr() != st["w"].cos_sin.data_ptr():
                 raise RuntimeError(
@@ -1241,7 +1243,25 @@ class DSV41MonoRunner:
             vals = {n_: a1[n_] for n_ in K1_ARGS}
             vals |= {n_: a2[k2_name.get(n_, n_)] for n_ in LAYER_ARGS[len(K1_ARGS) :]
                      if n_ not in EG_ARGS}  # fmt: skip
-            vals |= dict.fromkeys(EG_ARGS, 0)
+            vals |= dict.fromkeys(EG_ARGS, 0) | {"eg_tasks": 0}
+            eg = st.get("eg")
+            if eg is not None:
+                ex, ew = eg
+                if not (
+                    ex.dtype == torch.bfloat16
+                    and tuple(ex.shape) == (m, engram.K)
+                    and ex.is_contiguous()
+                    and eg_x in (0, ex.data_ptr())
+                ):
+                    raise RuntimeError(f"Engram rows: {tuple(ex.shape)} {ex.dtype}")
+                eg_x = ex.data_ptr()
+                vals |= {
+                    "eg_w": ew.w.data_ptr(),
+                    "eg_ws": ew.ws.data_ptr(),
+                    "eg_kv": self.egkv.data_ptr(),
+                    "eg_row0": ew.row0,
+                    "eg_tasks": ew.tasks,
+                }
             if i == 0:
                 step = {n_: vals[n_] for n_ in XL_STEP + XL_FIRST}
             elif any(vals[n_] != step[n_] for n_ in XL_STEP):
@@ -1258,8 +1278,9 @@ class DSV41MonoRunner:
             no_capture("a multi-layer launch's argument table")
             table = torch.frombuffer(bytearray(blob), dtype=torch.uint8).to(self.device)
             self._xl_tables[blob] = table
+        eg_most = max((st["eg"][1].tasks for st in steps if st.get("eg")), default=0)
         _run_compiled(
-            self.layers_kernel(M, compressed),
+            self.layers_kernel(M, compressed, eg_most),
             table.data_ptr(),
             n,
             self.scratch(M).data_ptr(),
@@ -1268,6 +1289,7 @@ class DSV41MonoRunner:
             self.rank,
             self.epoch.data_ptr(),
             *(step[n_] for n_ in XL_STEP + XL_FIRST),
+            eg_x,
             torch.cuda.current_stream(),
         )
         return outs

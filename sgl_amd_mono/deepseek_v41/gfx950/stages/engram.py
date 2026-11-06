@@ -197,7 +197,11 @@ def run_eg(c, e, s):
     """This CTA's share of the projection (``eg_plan``'s CTAs), tile by tile: task k
     of CTA r is r + k CTAs, the next task's weights in flight through each."""
     rank = first_task(c["bid"], e["first"])
-    if rank < e["ctas"]:
+    mine = rank < e["ctas"]
+    if const_expr(not isinstance(e["tasks"], int)):
+        # a multi-layer launch's layer: its own task count, none where it projects nothing
+        mine = mine & (e["tasks"] > 0)
+    if mine:
         stamp(c, 41)
         tiles = token_tiles(s)
         for k in range_constexpr(len(tiles)):
@@ -207,7 +211,7 @@ def run_eg(c, e, s):
 
 @flyc.jit
 def _eg_tile(c, e, rank, t0, n):
-    per = -(-e["tasks"] // e["ctas"])
+    per = -(-e["most"] // e["ctas"])
     # the tile quantized before any weights load, so none are live under the quant
     quant_tile(c, e["x"], t0, n, e["xl"], e["xsl"])
     # as a later task's: its first AHEAD steps (the rest load as it starts)
@@ -246,9 +250,9 @@ def unpack(c, e, s):
             bo.buffer_store(word, rsrc(e["kv"]), at)
 
 
-def eg_context(args, tasks, bases, own, off, tp, rank, mb, lds):
-    """``run_eg`` / ``unpack``'s context: the arguments, the launch's tasks, ENG on every
-    rank, the LDS view."""
+def eg_context(args, tasks, bases, own, off, tp, rank, mb, lds, most=None):
+    """``run_eg`` / ``unpack``'s context: the arguments, the launch's tasks (a multi-layer
+    launch: the layer's, traced, at most ``most``), ENG on every rank, the LDS view."""
     return {
         "x": args["eg_x"],
         "w": args["eg_w"],
@@ -256,6 +260,8 @@ def eg_context(args, tasks, bases, own, off, tp, rank, mb, lds):
         "kv": args["eg_kv"],
         "row0": args["eg_row0"],
         "tasks": tasks,
+        # the most tasks a launch's layer runs (``tasks`` may be traced, at most this)
+        "most": tasks if most is None else most,
         "dst": [preg(b, off, "eng") for b in bases],
         "own": preg(own, off, "eng"),
         "tp": tp,
