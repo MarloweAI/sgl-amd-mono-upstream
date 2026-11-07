@@ -6,14 +6,13 @@ every tensor as SGLang writes it. ``SGLANG_AMD_MONO_DSV41_METADATA=0`` keeps SGL
 from __future__ import annotations
 
 import contextvars
-import dataclasses
 import sys
 
 import torch
 import triton
 import triton.language as tl
 
-from sgl_amd_mono.deepseek_v41.glue import agreed, flag, route
+from sgl_amd_mono.deepseek_v41.glue import chose, flag, route
 
 ENV = "SGLANG_AMD_MONO_DSV41_METADATA"
 HIP = "sglang.srt.layers.attention.deepseek_v4_backend_hip_radix"
@@ -65,8 +64,6 @@ SGLANG_READS = {
 
 # the backend whose init_forward_metadata_in_graph runs
 _IN_GRAPH = contextvars.ContextVar("mono_dsv41_in_graph", default=None)
-# scratch the top-k planner leaves unwritten: dtype and shape only
-_UNWRITTEN = ("topk_metadata", "topk_metadata_chunks")
 
 
 # the kernel's per-row outputs: a row of L32 / L64 each, by these indices
@@ -343,48 +340,9 @@ def _fused(backend, raw, inputs):
     )
 
 
-def disagrees(want, got, path="metadata") -> str | None:
-    """The first field where ``got`` differs from ``want`` (tensors by dtype, shape and
-    value; dataclasses, dicts and sequences by their members), or None."""
-    if isinstance(want, torch.Tensor) or isinstance(got, torch.Tensor):
-        if not (isinstance(want, torch.Tensor) and isinstance(got, torch.Tensor)):
-            return f"{path}: {type(got).__name__} vs SGLang's {type(want).__name__}"
-        if want.dtype != got.dtype or want.shape != got.shape:
-            return f"{path}: {got.dtype}{tuple(got.shape)} vs {want.dtype}{tuple(want.shape)}"
-        unwritten = any(f".{n}" in path for n in _UNWRITTEN)
-        return None if unwritten or torch.equal(want, got) else f"{path}: values differ"
-    if type(want) is not type(got):
-        return f"{path}: {type(got).__name__} vs SGLang's {type(want).__name__}"
-    if dataclasses.is_dataclass(want):
-        pairs = [
-            (f.name, getattr(want, f.name), getattr(got, f.name))
-            for f in dataclasses.fields(want)
-        ]
-    elif isinstance(want, dict):
-        if want.keys() != got.keys():
-            return f"{path}: keys differ"
-        pairs = [(f"[{k!r}]", want[k], got[k]) for k in want]
-    elif isinstance(want, (list, tuple)):
-        if len(want) != len(got):
-            return f"{path}: {len(got)} items vs {len(want)}"
-        pairs = [(f"[{i}]", a, b) for i, (a, b) in enumerate(zip(want, got))]
-    else:
-        same = want == got or not isinstance(want, (int, float, str, bool))
-        return None if same else f"{path}: {got!r} vs SGLang's {want!r}"
-    for name, a, b in pairs:
-        sub = f"{path}.{name}" if not name.startswith("[") else path + name
-        why = disagrees(a, b, sub)
-        if why:
-            return why
-    return None
-
-
 def _verify_metadata(orig, self, raw_metadata, *args, **kwargs):
     inputs = None if args or kwargs else _inputs(self, raw_metadata)
-    if inputs is not None and agreed(
-        "verify_meta",
-        lambda: disagrees(orig(self, raw_metadata), _fused(self, raw_metadata, inputs)),
-    ):
+    if chose("verify_meta", inputs is not None):
         return _fused(self, raw_metadata, inputs)
     return orig(self, raw_metadata, *args, **kwargs)
 
@@ -418,10 +376,7 @@ def _slots(kind: int, t: torch.Tensor):
 
 def _translate(orig, self, kv_indices, *args, **kwargs):
     got = None if args or kwargs else _slots(1, kv_indices)
-    if got is not None and agreed(
-        "swa_slots",
-        lambda: disagrees(orig(self, kv_indices).to(torch.int32), got),
-    ):
+    if got is not None and chose("swa_slots", True):
         return got
     return orig(self, kv_indices, *args, **kwargs)
 
@@ -437,9 +392,7 @@ def _token_req_indices(orig, forward_batch, *args, **kwargs):
         n = forward_batch.batch_size * int(forward_batch.spec_info.draft_token_num)
         if got is not None and got.numel() != n:
             got = None
-    if got is not None and agreed(
-        "verify_req_rows", lambda: disagrees(orig(forward_batch), got)
-    ):
+    if got is not None and chose("verify_req_rows", True):
         return got
     return orig(forward_batch, *args, **kwargs)
 
@@ -613,14 +566,9 @@ def _draft_fused(
 
 
 def _draft_block_metadata(orig, self, *args, **kwargs):
-    if args or not _draft_inputs_ok(self, **kwargs):
+    if not chose("draft_block_meta", not args and _draft_inputs_ok(self, **kwargs)):
         return orig(self, *args, **kwargs)
-    if agreed(
-        "draft_block_meta",
-        lambda: disagrees(orig(self, **kwargs), _draft_fused(self, **kwargs)),
-    ):
-        return _draft_fused(self, **kwargs)
-    return orig(self, **kwargs)
+    return _draft_fused(self, **kwargs)
 
 
 def install() -> None:

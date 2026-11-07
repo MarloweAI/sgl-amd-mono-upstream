@@ -12,7 +12,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sgl_amd_mono.deepseek_v41.glue import agreed, flag, route
+from sgl_amd_mono.deepseek_v41.glue import chose, flag, route
 
 ENV = "SGLANG_AMD_MONO_DSV41_DRAFT_HEAD_FP8"
 DSPARK = "sglang.srt.models.dspark"
@@ -59,20 +59,10 @@ def quant_rows(x: torch.Tensor):
     return q, s
 
 
-def _disagrees(x) -> str | None:
-    want_q, want_s = sys.modules[DSPARK]._fp8_quant_per_row(x)
-    got_q, got_s = quant_rows(x)
-    if not torch.equal(want_s, got_s):
-        return "scales differ"
-    if not torch.equal(want_q.view(torch.uint8), got_q.view(torch.uint8)):
-        return f"{(want_q.view(torch.uint8) != got_q.view(torch.uint8)).sum().item()} codes differ"
-    return None
-
-
 def _project(orig, hidden, lm_head):
     dspark = sys.modules[DSPARK]
     weight = getattr(lm_head, "weight", None)
-    if (
+    sglangs = (
         dspark.should_apply_lm_head_quant_method(lm_head, lm_head.quant_method)
         or weight is None
         or weight.dtype != torch.bfloat16
@@ -81,8 +71,8 @@ def _project(orig, hidden, lm_head):
         or hidden.stride(1) != 1
         or hidden.shape[0] == 0
         or weight.shape[-1] % 16
-        or not agreed("draft_head_fp8", lambda: _disagrees(hidden))
-    ):
+    )
+    if not chose("draft_head_fp8", not sglangs):
         return orig(hidden, lm_head)
     w_fp8 = getattr(lm_head, "_fp8_weight_cache", None)
     if w_fp8 is None or w_fp8.shape != weight.shape:

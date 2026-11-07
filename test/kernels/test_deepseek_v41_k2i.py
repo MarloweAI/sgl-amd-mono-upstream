@@ -193,7 +193,7 @@ def run_k2i(*, k2i, case, kind="full", outs=None, ratio=1, candidates=None):
     first). -> (raw, page, the producer's candidate blocks)."""
     inputs = _inputs(case)
     raw, page = outs if outs is not None else _outs(inputs["rows"])
-    published = k2i.select(
+    sel = k2i.select(
         kind=kind,
         ratio=ratio,
         raw_out=raw,
@@ -201,7 +201,9 @@ def run_k2i(*, k2i, case, kind="full", outs=None, ratio=1, candidates=None):
         candidates=candidates,
         **inputs,
     )
-    return raw, page, published
+    # the glue the source's K2 runs: the producer's candidate table, a consumer's raw indices
+    k2i.run_glue(inputs["rows"], sel)
+    return raw, page, sel.blocks
 
 
 def sglang_logits(case):
@@ -388,3 +390,65 @@ def test_graph_replay_selects_as_eager():
         eager = results()
         for i, (a, b) in enumerate(zip(replayed, eager)):
             assert torch.equal(_sorted_sets(a), _sorted_sets(b)), (ctxs, i)
+
+
+@pytest.mark.parametrize(
+    "ctxs", [[20000, 9000], [131072], [300, 524288]], ids=["20k9k", "128k", "512k"]
+)
+def test_two_level_equals_sglangs_launches(ctxs):
+    """A two-level step's selection equals the one through SGLang's level-one launches,
+    ``reindex_table`` and ``map_compact_selection`` (``indexer.candidate_table``): the producer's
+    blocks as sets, the REINDEX table entry for entry by block, its widths, and the consumer's
+    raw and page indices as sets."""
+    from sglang.kernels.ops.attention.dsv4.candidate_blocks_hip import (
+        select_candidate_blocks_hip,
+        topk_transform_paged_hip,
+    )
+
+    from sgl_amd_mono.deepseek_v41.gfx950.indexer.candidate_table import (
+        map_compact_selection,
+        reindex_table,
+    )
+
+    k2i = _k2i()
+    case = fp4_case(ctxs=ctxs, seed=51 + max(ctxs))
+    rows = case["q"].shape[0]
+    _, _, cands = run_k2i(k2i=k2i, case=case, kind="producer")
+    width = min(case["table"].shape[1] * 64, k2i.bound_max)
+    logits = k2i.ilog[: rows * width].view(rows, width).clone()
+    want = select_candidate_blocks_hip(
+        logits=logits, seq_lens=case["bounds"], topk_blocks=ip.TOPK_BLOCKS,
+        block_size=ip.BLOCK_ROWS,
+    )  # fmt: skip
+    torch.cuda.synchronize()
+    assert torch.equal(_sorted_sets(cands.ids), _sorted_sets(want.ids))
+    owners = torch.arange(rows, device="cuda", dtype=torch.int32) // PER_REQ * PER_REQ
+    ids, table = torch.empty_like(want.ids), torch.empty_like(want.ids)
+    lens = torch.empty(rows, dtype=torch.int32, device="cuda")
+    reindex_table(ids=want.ids, page_table=case["table"], owners=owners, bounds=case["bounds"],
+                  ids_out=ids, table=table, context=lens)  # fmt: skip
+    got_ids, got_table = k2i.cand_ids[:rows].clone(), k2i.cand_table[:rows].clone()
+    assert torch.equal(k2i.cand_bound[:rows], lens)
+    pairs = lambda i, tb: [sorted(zip(x, y)) for x, y in zip(i.tolist(), tb.tolist())]  # noqa: E731
+    assert pairs(got_ids, got_table) == pairs(ids, table)
+    # the newest block last, where a row keeps every slot
+    full = lens > 8 * (ip.TOPK_BLOCKS - 1)
+    assert torch.equal(got_ids[full, -1], ids[full, -1])
+    consumer = _other_query(case=case, seed=8)
+    raw, page, _ = run_k2i(k2i=k2i, case=consumer, kind="reindex", candidates=cands)
+    compact = k2i.ilog[: rows * 16384].view(rows, 16384).clone()
+    pos = torch.empty(rows, ip.TOPK, dtype=torch.int32, device="cuda")
+    topk_transform_paged_hip(
+        scores=compact, seq_lens=k2i.cand_bound[:rows], page_table=torch.zeros(rows, 1, dtype=torch.int32, device="cuda"),
+        page_indices=pos, page_size=16384, raw_indices=None,
+    )  # fmt: skip
+    want_raw = torch.empty_like(raw)
+    want_page = torch.empty_like(page)
+    map_compact_selection(compact_pos=pos, ids=got_ids, page_table=case["table"], raw_out=want_raw,
+                          page_out=want_page)  # fmt: skip
+    torch.cuda.synchronize()
+    assert torch.equal(_sorted_sets(raw), _sorted_sets(want_raw))
+    assert torch.equal(_sorted_sets(page), _sorted_sets(want_page))
+    # each slot's raw and page index name the same key
+    both = lambda r, p: [sorted(zip(x, y)) for x, y in zip(r.tolist(), p.tolist())]  # noqa: E731
+    assert both(raw, page) == both(want_raw, want_page)

@@ -13,6 +13,8 @@ from sgl_amd_mono.common.epoch import gstore
 from sgl_amd_mono.common.mx import clamp_fp8
 from sgl_amd_mono.common.ops import (
     bf16_round,
+    bf_hi,
+    bf_lo,
     butterfly,
     fp8_pack4,
     fresh,
@@ -137,28 +139,57 @@ def hand_off(c, region, i):
 # ---------------------------------------------------------------- kt
 
 
+def kt_inputs(a, t):
+    """Token t's key-table inputs as loaded: its slot word, window and top-k counts."""
+    return (
+        ld_i32(a["slot"], a["slot_words"] * t),
+        ld_i32(a["swa_lens"], t),
+        ld_i32(a["topk_lens"], t),
+    )
+
+
+def kt_lens(inputs, sw):
+    """(window keys, top-k keys) of a token's key table from its ``kt_inputs`` (0, 0 for
+    a pad row)."""
+    slot, swa_len, topk_len = inputs
+    live = slot >= 0
+    nswa = live.select(fx.min(swa_len, fx.Int32(sw)), fx.Int32(0))
+    ntopk = live.select(fx.min(topk_len, fx.Int32(TOPK)), fx.Int32(0))
+    return nswa, ntopk
+
+
+def kt_entry_loads(a, t, k, ntopk, sw):
+    """The input words key k's entry reads: its window slot and its top-k row."""
+    sidx = fx.min(fx.max(k - ntopk, 0), sw - 1)
+    s_slot = ld_i32(a["swa_idx"], t * sw + sidx)
+    local = ld_i32(a["topk"], t * TOPK + fx.min(k, TOPK - 1))
+    return s_slot, local
+
+
+def kt_entry(words, k, nswa, ntopk):
+    """``KT[t][k]`` from ``kt_entry_loads``: ``slot | 1 << 31`` for top-k compressed row k
+    (k < ntopk), the window slot of key k for k in [ntopk, ntopk + nswa), -1 past them or
+    for an invalid slot."""
+    s_slot, local = words
+    val = ((k < ntopk + nswa) & (s_slot >= 0)).select(s_slot, fx.Int32(-1))
+    c_val = (local >= 0).select(local | fx.Int32(-2147483648), fx.Int32(-1))
+    return (k < ntopk).select(c_val, val)
+
+
 @flyc.jit
 def stage_kt(c, t):
-    """Token t's keys for K2: ``KT[t][k] = slot | 1 << 31`` for its top-k compressed
-    rows (k < ntopk), its window slots for k in [ntopk, kv_len), -1 past them or
-    for an invalid slot; KLEN[t] = kv_len (0 for a pad row), KLEN[S + t] = ntopk.
-    ``dev``: device scope, for a table the same launch reads (K2's)."""
+    """Token t's keys for K2 (``kt_entry``): KT[t][k] for every k, KLEN[t] = kv_len (0 for
+    a pad row), KLEN[S + t] = ntopk. ``dev``: device scope, for a table the same launch
+    reads (K2's)."""
     tid = c["tid"]
     a = c["args"]
     cm = CM_DEV if const_expr(c.get("dev", False)) else 0
     sw = c.get("swa_width", WINDOW)
-    live = ld_i32(a["slot"], a["slot_words"] * t) >= 0
-    nswa = live.select(fx.min(ld_i32(a["swa_lens"], t), fx.Int32(sw)), fx.Int32(0))
-    ntopk = live.select(fx.min(ld_i32(a["topk_lens"], t), fx.Int32(TOPK)), fx.Int32(0))
+    nswa, ntopk = kt_lens(kt_inputs(a, t), sw)
     kv_len = ntopk + nswa
     for i in range_constexpr((KEYS + THREADS - 1) // THREADS):
         k = fresh(tid) + THREADS * i
-        sidx = fx.min(fx.max(k - ntopk, 0), sw - 1)
-        s_slot = ld_i32(a["swa_idx"], t * sw + sidx)
-        val = ((k < kv_len) & (s_slot >= 0)).select(s_slot, fx.Int32(-1))
-        local = ld_i32(a["topk"], t * TOPK + fx.min(k, TOPK - 1))
-        c_val = (local >= 0).select(local | fx.Int32(-2147483648), fx.Int32(-1))
-        val = (k < ntopk).select(c_val, val)
+        val = kt_entry(kt_entry_loads(a, t, k, ntopk, sw), k, nswa, ntopk)
         if k < KEYS:
             bo.buffer_store(val, rsrc(a["kt"]), t * KEYS + k, cache_modifier=cm)
     if tid == 0:
@@ -178,9 +209,10 @@ def stage_wqkv(c, ops, slots, n, halves):
 
 @flyc.jit
 def wqkv_publish(c, task, accs, slots, order, t0, n, live, part=None, s=0):
-    """Sum wqkv rows 16 task .. for tokens t0 .. t0 + n in SGLang's order into fp32 QKVP.
-    Split (``part``): part 0 sums the first half of ``order`` into QKVP's second region
-    (``s`` rows on), part 1 the rest onto that sum."""
+    """Sum wqkv rows 16 task .. for tokens t0 .. t0 + n in SGLang's order into QKVP, as
+    bf16 pairs (the qkv stage rounds the sums to bf16 first). Split (``part``): part 0
+    sums the first half of ``order`` into QKVP's second region (``s`` rows on, fp32),
+    part 1 the rest onto that sum."""
     tid, red = c["tid"], c["red"]
     chain_store(c, red, accs, slots)
     gpu.barrier()
@@ -189,15 +221,24 @@ def wqkv_publish(c, task, accs, slots, order, t0, n, live, part=None, s=0):
         tl = tid // ROWS
         at = plus(t0, tl) * QKV_ROWS + task * ROWS + r
         if const_expr(part is None):
-            c["mb"].put(c["qkvp"], at, chain_sum(red, r, tl, order))
+            qkv_put(c, at, r, chain_sum(red, r, tl, order))
         else:
             h, mid = len(order) // 2, s * QKV_ROWS + at
             if part == 0:
                 c["mb"].put(c["qkvp"], mid, chain_sum(red, r, tl, order[:h]))
             else:
                 tot = c["mb"].poll([(c["qkvp"], mid, 1)])[0][0].bitcast(fx.Float32)
-                c["mb"].put(c["qkvp"], at, chain_sum(red, r, tl, order[h:], tot))
+                qkv_put(c, at, r, chain_sum(red, r, tl, order[h:], tot))
     gpu.barrier()
+
+
+@flyc.jit
+def qkv_put(c, at, r, v):
+    """Row r's sum ``v`` (QKVP element ``at``) and its neighbour's as one bf16 pair, by the
+    even row's lane."""
+    nb = xshfl(v, 1)
+    if r % 2 == 0:
+        c["mb"].put_bf(c["qkvp"], at, [v, nb])
 
 
 # ---------------------------------------------------------------- q / kv norms
@@ -224,10 +265,13 @@ def stage_qkv(c, t):
     jj = fx.max(jr, 0)
     cs = is_rope.select(ld_f32(a["cos_sin"], pos * ROPE + jj), fx.Float32(1.0))
     sn = is_rope.select(ld_f32(a["cos_sin"], pos * ROPE + HALF + jj), fx.Float32(0.0))
-    specs = [(c["qkvp"], t * QKV_ROWS + qc[j], 1) for j in range(8)]
-    specs += [(c["qkvp"], t * QKV_ROWS + Q_RANK + tt * 2 + j, 1) for j in range(2)]
-    got = c["mb"].poll(specs)
-    vals = [bf16_round(got[j][0].bitcast(fx.Float32)) for j in range(10)]
+    # the sums as bf16 pairs (``qkv_put``): 8 q columns in 4 pairs (16 B loads), the kv
+    # pair in 1
+    q0 = fx.min(tt * 8, Q_RANK - 8)
+    specs = [(c["qkvp"], (t * QKV_ROWS + q0) // 2 + 2 * k, 2) for k in range(2)]
+    specs += [(c["qkvp"], (t * QKV_ROWS + Q_RANK + tt * 2) // 2, 1)]
+    pw = [w for g in c["mb"].poll(specs) for w in g]
+    vals = [(bf_lo if j % 2 == 0 else bf_hi)(pw[j // 2]) for j in range(10)]
     xq = [((tt * 8 + j) < Q_RANK).select(vals[j], fx.Float32(0.0)) for j in range(8)]
     xk = vals[8:10]
     ssq = xq[0] * xq[0]
@@ -638,12 +682,14 @@ def run_front(
 
     if const_expr(before_wqkv is not None):
         before_wqkv()
+    # the seam norms (CTAs without a wqkv tile) poll ahead of the wqkv weight loads, which
+    # their CTAs issue masked off: those still queue ahead of a poll issued after them
+    if const_expr(after_wqkv is not None):
+        after_wqkv()
     slots = chain_slots(c, HIDDEN // 128, waves, part * chains if split else 0, chains)
     kops = chain_loads(
         c, a["wqkv"], a["wqkv_s"], HIDDEN, task * ROWS, slots, has_wqkv, c["shuffled"]
     )
-    if const_expr(after_wqkv is not None):
-        after_wqkv()
     # one token tile: the wq_b weights here on a CTA without a wqkv tile (the qkv stage's polls
     # behind them land by then); a wqkv CTA's past its GEMV, as its barriers wait on every load
     early_wqb = len(wtiles) == 1
@@ -659,7 +705,7 @@ def run_front(
     stamp(c, 35)
     poss = [wqb_pos(c, t0, n) for t0, n in tiles]
 
-    def x_loads(t0, n):
+    def x_loads(t0, n, parts=range(WQKV_KPARTS)):
         return [
             rows_loads(
                 c,
@@ -675,14 +721,14 @@ def run_front(
                 n,
                 pred=has_wqkv,
             )
-            for p in range(WQKV_KPARTS)
+            for p in parts
         ]
 
-    def x_store(regs, n):
-        for p in range_constexpr(WQKV_KPARTS):
+    def x_store(regs, n, parts=range(WQKV_KPARTS)):
+        for i, p in enumerate(parts):
             rows_store(
                 c,
-                regs[p],
+                regs[i],
                 KWORDS,
                 KGROUPS,
                 c["xl"] + p * KWORDS,
@@ -695,9 +741,19 @@ def run_front(
     if const_expr(len(wtiles) == 1):
         # wqkv_a: one row tile a CTA, all of K in LDS
         t0, n = wtiles[0]
-        await_flags(c, c["xrdy"], WQKV_KPARTS * own, lambda u: u)
-        regs = x_loads(t0, n)
-        x_store(regs, n)
+        # a split row tile's CTA waits on, loads and stores only its own K half of X8, where
+        # its chains' steps lie in that half (8 chains of 5 steps; not 16 of 3)
+        nsteps = HIDDEN // 128
+        own_half = split and chains * (-(-nsteps // waves)) * WQKV_KPARTS == nsteps
+        parts = [part] if own_half else range(WQKV_KPARTS)
+        nflags = own if own_half else WQKV_KPARTS * own
+
+        def kflag(u):
+            return WQKV_KPARTS * u + part if own_half else u
+
+        await_flags(c, c["xrdy"], nflags, kflag)
+        regs = x_loads(t0, n, parts)
+        x_store(regs, n, parts)
         accs = stage_wqkv(c, kops, slots, n, halves)
         wqkv_publish(
             c, task, accs, slots, order, t0, n, has_wqkv, part if split else None, s
