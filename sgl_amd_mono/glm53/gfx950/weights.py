@@ -5,8 +5,9 @@
 """GLM-5.3's layer tensors as the kernel reads them, from SGLang's loaded modules
 (``Glm53Weights``), and the tail's (``Glm53HeadWeights``). Projections, experts,
 the embedding and the LM head are SGLang's tensors in place; W_UK and W_UV, the
-router, the indexer's weights_proj and its k LayerNorm, and the dense layers' MLPs
-in the experts' layout are copies, recorded in ``copies`` for the startup log."""
+router (folded into o's pass), the indexer's weights_proj and its k LayerNorm, and the
+dense layers' MLPs in the experts' layout are copies, recorded in ``copies`` for the
+startup log."""
 
 from __future__ import annotations
 
@@ -295,14 +296,45 @@ def _dense_mlp(mlp, idx: int, inter: int, copies: dict):
     return w_ug.contiguous(), s_ug, w_dn.contiguous(), s_dn, n, sh_dn
 
 
+def fold_router(
+    router: torch.Tensor,
+    g_post: torch.Tensor,
+    w_o: torch.Tensor,
+    s_o: torch.Tensor,
+    shuffled: bool,
+    rank: int,
+    tp: int,
+) -> torch.Tensor:
+    """An MoE layer's ``w_r``, the router folded into o's pass: this rank's
+    M = bf16((W_r * gamma) W_o) [N_EXPERTS, heads * V_DIM] packed (W_o dequantized
+    from its 128 x 128 block scales, ``shuffled``: in AITER's (16, 16) layout; the
+    product in f32), then this rank's HIDDEN / tp columns of bf16(W_r * gamma)
+    packed. ``router``: bf16 [N_EXPERTS, HIDDEN]; ``gamma``: the post-attention
+    norm's weight."""
+    from ..check import unshuffle
+
+    wg = router.float() * g_post.float()[None]
+    wo = (unshuffle(w_o) if shuffled else w_o).float()
+    wo = (
+        wo
+        * s_o.repeat_interleave(128, 0).repeat_interleave(128, 1)[
+            : wo.shape[0], : wo.shape[1]
+        ]
+    )
+    cols = HIDDEN // tp
+    x_part = wg.bfloat16()[:, rank * cols : (rank + 1) * cols].contiguous()
+    return torch.cat([pack_bf16((wg @ wo).bfloat16().contiguous()), pack_bf16(x_part)])
+
+
 def is_dense(layer) -> bool:
     """A dense layer: its MLP is SGLang's DeepseekV2MLP, not the MoE."""
     return hasattr(layer.mlp, "gate_up_proj")
 
 
-def layer_weights(layer, idx: int, tp: int, copies: dict):
-    """A covered layer's tensors (``Glm53Weights``); a dense layer's MLP as expert
-    slices, with no router."""
+def layer_weights(layer, idx: int, tp: int, rank: int, copies: dict):
+    """A covered layer's tensors (``Glm53Weights``) on TP rank ``rank``; a dense
+    layer's MLP as expert slices, with no router, an MoE layer's router folded into
+    o's pass (``fold_router``)."""
     from .runner import Glm53Weights
 
     attn, moe = layer.self_attn, layer.mlp
@@ -403,8 +435,8 @@ def layer_weights(layer, idx: int, tp: int, copies: dict):
     ):
         # SGLang routes an f32 gate (router_fp32) in f32; the kernel's router is bf16
         raise ValueError("needs router weights exactly representable in bf16")
-    w_r = pack_bf16(router.to(torch.bfloat16).contiguous())
-    copies["router packed", idx] = w_r
+    w_r = fold_router(router.to(torch.bfloat16), g_post, w_o, s_o, sh_o, rank, tp)
+    copies["router folded into o_proj", idx] = w_r
     bias = _need(
         "e_score_correction_bias",
         gate.e_score_correction_bias,
