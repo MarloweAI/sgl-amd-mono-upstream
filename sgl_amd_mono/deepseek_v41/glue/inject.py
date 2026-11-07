@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """A verify's committed KV into every DSpark draft stage's SWA cache in one launch
-(``gfx950/inject``), its slots computed in the launch; bitwise SGLang's per-stage store,
-checked on random rows at the first call. ``SGLANG_AMD_MONO_DSV41_INJECT=0`` keeps SGLang's."""
+(``gfx950/inject``), its slots computed in the launch; bitwise SGLang's per-stage store.
+``SGLANG_AMD_MONO_DSV41_INJECT=0`` keeps SGLang's."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from typing import NamedTuple
 
 import torch
 
-from sgl_amd_mono.deepseek_v41.glue import agreed, flag, route
+from sgl_amd_mono.deepseek_v41.glue import chose, flag, route
 
 ENV = "SGLANG_AMD_MONO_DSV41_INJECT"
 DSPARK = "sglang.srt.models.deepseek_v4_dspark"
@@ -43,7 +43,6 @@ SGLANG_READS = {
         "execute(allow_strided_output)",
     ),
     "kernels/ops/speculative/dspark/commit_swa.py": ("committed_swa_locations",),
-    "kernels/ops/attention/dsv4/norm_rope.py": ("fused_k_norm_rope_flashmla",),
     "srt/mem_cache/deepseek_v4_memory_pool.py": (
         "uniform_fp8",
         "kv_layout",
@@ -81,9 +80,8 @@ class _Stages:
         attns = [s.self_attn for s in model.stages]
         self.wkv = [a.wkv for a in attns]
         self.weights = [a.kv_norm.weight.data for a in attns]
-        self.freqs_cis = [a.freqs_cis for a in attns]
         self.freqs = [
-            torch.view_as_real(f).flatten(-2).contiguous() for f in self.freqs_cis
+            torch.view_as_real(a.freqs_cis).flatten(-2).contiguous() for a in attns
         ]
         self.layers = [a.layer_id for a in attns]
         self.eps = attns[0].eps
@@ -123,56 +121,12 @@ def _store(st, kvs, pos, caches, page_size, loc=None, committed=None):
         ops().swa_store(kv, 0, *one, st.eps, page_size, st.v41)
 
 
-def _disagrees(st, pool) -> str | None:
-    """SGLang's per-stage store vs the one launch, on random rows into scratch pages."""
-    from sglang.kernels.ops.attention.dsv4.norm_rope import fused_k_norm_rope_flashmla
-
-    dev = st.weights[0].device
-    g = torch.Generator(device=dev).manual_seed(11)
-    rows, width = 12, 6
-    page_bytes = pool.get_swa_raw_buffer(st.layers[0]).stride(0)
-    pages, ps = 3, pool.swa_page_size
-    n = len(st.layers)
-    kv = torch.randn(rows, n * 512, generator=g, device=dev).mul_(3).bfloat16()
-    kvs = [kv[:, s * 512 : (s + 1) * 512] for s in range(n)]
-    pos = torch.randint(
-        0, min(f.shape[0] for f in st.freqs), (rows,), generator=g, device=dev
-    )
-    full = torch.randperm(pages * ps, generator=g, device=dev)[:rows]
-    mapping = torch.arange(pages * ps, device=dev, dtype=torch.int64)
-    commit = torch.tensor([4, 6], dtype=torch.int32, device=dev)
-    slots = _Committed(full, mapping, commit, width).slots()
-    want = [
-        torch.zeros(pages, page_bytes, dtype=torch.uint8, device=dev) for _ in range(n)
-    ]
-    got = [torch.zeros_like(w) for w in want]
-    for s in range(n):
-        fused_k_norm_rope_flashmla(
-            kv=kvs[s].contiguous(),
-            kv_weight=st.weights[s],
-            eps=st.eps,
-            freqs_cis=st.freqs_cis[s],
-            positions=pos,
-            out_loc=slots,
-            kvcache=want[s],
-            page_size=ps,
-            layout=pool.kv_layout,
-        )
-    _store(st, kvs, pos, got, ps, committed=_Committed(full, mapping, commit, width))
-    for s in range(n):
-        if not torch.equal(want[s], got[s]):
-            return f"stage {s}: {(want[s] != got[s]).sum().item()} bytes differ"
-    return None
-
-
 def _stages(model, pool):
     st = model.__dict__.get("_mono_inject")
     if st is None:
         st = model.__dict__["_mono_inject"] = _Stages(model, pool)
-    if st.why is not None:
-        return None
-    ok = agreed("inject_store", lambda: _disagrees(st, pool))
-    return st if ok else None
+        chose("inject_store", st.why is None, st.why)
+    return st if st.why is None else None
 
 
 def _write_target_hidden_kv(

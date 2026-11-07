@@ -43,6 +43,7 @@ the reserved dummy slot, as the normal path does.
 
 from __future__ import annotations
 
+import datetime
 import importlib.util
 import re
 from typing import Any
@@ -75,6 +76,8 @@ from sgl_amd_mono.common.plan import BLOCKS
 from sgl_amd_mono.deepseek_v41 import CANDIDATES, HF_CONFIG, fused
 
 MAX_ROWS = 48  # the rows a launch takes at most (``layer.MAX_TOKENS``)
+# the ranks' meet after the build: a cold build of every launch on one rank
+BUILD_MEET_S = 3600
 
 _SHARED = ("gate_proj", "up_proj", "down_proj")
 # the checkpoint's shared expert tensors, as the model loader reads them
@@ -1583,8 +1586,16 @@ def _build(model, hf_config, ctx) -> _Built:
             m, k1=k1, k2=k2, layer=one, k2i=k2i, tok_par=runner.tok_par(m)
         )
     glue.prewarm(device)
-    fused.prewarm(model)
-    return _Built(model, runner, layers)
+    built = _Built(model, runner, layers)
+    # the ranks meet once every launch is built: a rank still building (a cold cache, a
+    # test's fault-injected keys) would hold the others' first cross-rank waits and SGLang's
+    # load barrier (480 s) past their deadlines
+    torch.distributed.monitored_barrier(
+        group=p.tp_group.cpu_group,
+        timeout=datetime.timedelta(seconds=BUILD_MEET_S),
+        wait_all_ranks=True,
+    )
+    return built
 
 
 SPEC = MonoSpec(

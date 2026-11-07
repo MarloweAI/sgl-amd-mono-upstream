@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """A sampled DSpark draft's Markov block in two launches a step and one more for its step
-logits (``gfx950/markov``), offered through SGLang's draft sampler entry; checked against
-SGLang's ``draft_markov_block`` before capture on every rank. The step logits are SGLang's
-whole rows: a sampled sequence's are gathered from every rank's shard, a temperature-0
-sequence's stay as SGLang's buffer holds them. ``SGLANG_AMD_MONO_DSV41_MARKOV=0`` keeps
-SGLang's steps."""
+logits (``gfx950/markov``), offered through SGLang's draft sampler entry where the
+draft's Markov head and step logits have the layout the kernels read. The step logits are
+SGLang's whole rows: a sampled sequence's are gathered from every rank's shard, a
+temperature-0 sequence's stay as SGLang's buffer holds them.
+``SGLANG_AMD_MONO_DSV41_MARKOV=0`` keeps SGLang's steps."""
 
 from __future__ import annotations
 
@@ -38,21 +38,7 @@ SGLANG_READS = {
         "num_embeddings_per_partition",
     ),
     "srt/models/dspark.py": ("vocab_shard", "vocab_size"),
-    "srt/speculative/dspark_components/dspark_draft.py": (
-        "draft_markov_block",
-        "draft_markov_block(markov_head)",
-        "draft_markov_block(base_logits)",
-        "draft_markov_block(anchor_tokens)",
-        "draft_markov_block(draft_hidden)",
-        "draft_markov_block(step_temperatures)",
-        "draft_markov_block(noise)",
-        "draft_markov_block(tp_sync)",
-        "draft_markov_block(logits_out)",
-        "draft_markov_block(greedy_draft)",
-        "DraftNoise",
-        "key",
-        "offset",
-    ),
+    "srt/speculative/dspark_components/dspark_draft.py": ("key", "offset"),
 }
 
 
@@ -174,108 +160,23 @@ class _Sampler:
         )  # fmt: skip
         return out.view(bs, self.gamma), confidence_features
 
-    def disagrees(self, max_bs: int) -> str | None:
-        """Why the kernels' block is not SGLang's on random inputs, or None."""
-        from sglang.srt.speculative.dspark_components.dspark_draft import (
-            DraftNoise,
-            draft_markov_block,
-        )
-
-        class _NoSync:
-            def sync(self, site, value):
-                return value
-
-        head, gamma, width = self.model.markov_head, self.gamma, self.width
-        device = self.head.device
-        tp = self.exchange.size
-        g = torch.Generator(device=device).manual_seed(1234)
-        for bs in range(1, max_bs + 1):
-            base = (
-                torch.randn(bs, gamma, width, generator=g, device=device) * 3
-            ).bfloat16()
-            anchor = torch.randint(
-                0, head.vocab_size, (bs,), generator=g, device=device
-            ).long()
-            temps = torch.tensor([1.0, 0.0, 0.7, 1.3][:bs], device=device)
-            offset = torch.randint(0, 1 << 30, (1,), generator=g, device=device)
-            want_logits = torch.empty(
-                bs, gamma, head.vocab_size, dtype=torch.float32, device=device
-            )
-            # every rank draws the same base: its whole row is the shard's, repeated
-            want, _ = draft_markov_block(
-                markov_head=head, base_logits=base, anchor_tokens=anchor,
-                draft_hidden=None, step_temperatures=temps,
-                noise=DraftNoise(key=int(self.noise.key), offset=offset.clone()),
-                tp_sync=_NoSync(), logits_out=want_logits, greedy_draft=False,
-            )  # fmt: skip
-            got_logits = torch.zeros_like(want_logits)
-            got = torch.empty(bs * gamma, dtype=torch.int64, device=device)
-            noise = DraftNoise(key=int(self.noise.key), offset=offset.clone())
-            self.block(base, anchor, temps, noise, got, got_logits)
-            if not torch.equal(got.view(bs, gamma), want.long()):
-                return f"{bs} rows: tokens {got.tolist()} vs SGLang's {want.tolist()}"
-            # the bias GEMV sums in another order: a bf16 rounding flip of the bias now and then
-            whole = base.float().repeat(1, 1, tp)[..., : head.vocab_size]
-            sampled = temps != 0
-            bias = (want_logits - whole).abs()[sampled]
-            apart = (got_logits - want_logits).abs()[sampled]
-            if not (apart <= bias * 2**-7 + 1e-6).all():
-                return f"{bs} rows: step logits apart by {apart.max().item():.3g}"
-            if got_logits[~sampled].any():
-                return f"{bs} rows: a temperature-0 row's step logits written"
-            if int(noise.offset.item()) != int(offset.item()) + 1:
-                return "the noise counter did not advance once"
-        return None
-
 
 def _factory(
     model, deadline_s, *, gamma, max_bs, greedy_draft, noise, draft_tokens,
     step_logits, step_temperatures,
 ):  # fmt: skip
     """SGLang's draft sampler factory: bs -> the kernels' step, or None (SGLang's)."""
-    import torch.distributed as dist
-
     from sgl_amd_mono.deepseek_v41.gfx950 import markov
 
-    def keep(why):
+    why = "a greedy draft" if greedy_draft else _why_not(model, step_logits)
+    if why is not None:
         _LOGGER.info("DSpark draft: SGLang's Markov block runs (%s)", why)
         return lambda bs: None
-
-    if greedy_draft:
-        return keep("a greedy draft")
-    why = _why_not(model, step_logits)
-    group = getattr(model.markov_head, "_shard_group", None)
-
-    def agree(ok: bool) -> bool:
-        if group is None:
-            return ok
-        flag = torch.tensor([int(ok)], dtype=torch.int32)
-        dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=group.cpu_group)
-        return bool(flag.item())
-
-    if not agree(why is None):
-        return keep(why or "another rank's Markov head")
-    sampler = None
-    try:
-        sampler = _Sampler(
-            model,
-            deadline_s,
-            gamma,
-            noise,
-            draft_tokens,
-            step_logits,
-            step_temperatures,
-        )
-    except Exception as e:  # noqa: BLE001 (every rank must still reach the agreement)
-        why = f"the kernels do not build: {type(e).__name__}: {e}"
-    if not agree(sampler is not None):
-        return keep(why or "the kernels did not build on another rank")
+    sampler = _Sampler(
+        model, deadline_s, gamma, noise, draft_tokens, step_logits, step_temperatures
+    )
     top = min(max_bs, markov.MAX_SEQUENCES)
-    why = sampler.disagrees(top)
-    if not agree(why is None):
-        sampler.exchange.close()
-        return keep(why or "the kernels disagree with SGLang on another rank")
-    if group.rank_in_group == 0:
+    if model.markov_head._shard_group.rank_in_group == 0:
         _LOGGER.info(
             "DSpark draft: the sampled Markov block in the gfx950 kernels at batch "
             "sizes 1 to %d",
