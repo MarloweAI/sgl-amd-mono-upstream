@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""A verify's committed KV into every DSpark draft stage's SWA cache in one launch
-(``gfx950/inject``), its slots computed in the launch; bitwise SGLang's per-stage store.
+"""A verify's committed KV into every DSpark draft stage's SWA cache: after main_proj, the
+main norm, the MXFP8 quant, the stacked wkv GEMM and every stage's store in one launch
+(``gfx950/inject/kv``) where aiter runs the stacked wkv as 5 fused splits of K 1024 (5 to 8
+rows); otherwise SGLang's projection, then the stages' stores in one launch (``gfx950/inject``).
+The slots are computed in the launch. Bitwise SGLang's chain.
 ``SGLANG_AMD_MONO_DSV41_INJECT=0`` keeps SGLang's."""
 
 from __future__ import annotations
@@ -14,12 +17,15 @@ from sgl_amd_mono.deepseek_v41.glue import chose, flag, route
 
 ENV = "SGLANG_AMD_MONO_DSV41_INJECT"
 DSPARK = "sglang.srt.models.deepseek_v4_dspark"
+DRAFT_MODEL = "sglang.kernels.ops.speculative.dspark.dspark_draft_model"
 INJECTOR = "sglang.srt.speculative.dspark_components.dspark_kv_inject"
 
 # by file under sglang/ (test_contract.py pins them)
 SGLANG_READS = {
     "srt/models/deepseek_v4_dspark.py": (
         "DeepseekV4ForCausalLMDSpark",
+        "main_proj",
+        "main_norm",
         "write_target_hidden_kv(main_hidden)",
         "write_target_hidden_kv(swa_loc)",
         "write_target_hidden_kv(positions)",
@@ -41,7 +47,14 @@ SGLANG_READS = {
         "execute(main_x)",
         "execute(wkv_linears)",
         "execute(allow_strided_output)",
+        "_stacked_wkv_weight",
+        "mxfp8_scale",
+        '"mxfp8_dense_backend"',
+        '"mxfp8_aiter_preshuffled"',
     ),
+    "srt/layers/quantization/fp8_utils.py": ("is_gfx95_mxfp8_aiter",),
+    "srt/layers/quantization/fp8_hip.py": ("mxfp8_aiter_preshuffled",),
+    "srt/layers/layernorm.py": ("variance_epsilon",),
     "kernels/ops/speculative/dspark/commit_swa.py": ("committed_swa_locations",),
     "srt/mem_cache/deepseek_v4_memory_pool.py": (
         "uniform_fp8",
@@ -99,6 +112,59 @@ class _Stages:
             self.why = "kv_norm weights not [512] bf16"
         elif any(f.dim() != 2 or f.shape[1] != 64 for f in self.freqs):
             self.why = "rope tables not [positions, 64]"
+        # the one launch: aiter's MXFP8 route of the stacked wkv, plain rows, SGLang's RMSNorm
+        self.fused = None
+        if self.why is None:
+            self.fused = _fused_why(model, self.wkv)
+            if self.fused is None:
+                from sgl_amd_mono.deepseek_v41.gfx950.inject import kv
+
+                stacked = sys.modules[DRAFT_MODEL]._stacked_wkv_weight(
+                    wkv_linears=self.wkv
+                )
+                stage0 = model.stages[0]
+                device = stacked.weight.device
+                self.w = stacked.weight.view(torch.uint8)
+                self.ws = stacked.mxfp8_scale.view(torch.uint8)
+                self.norm_w, self.norm_eps = (
+                    stage0.main_norm.weight,
+                    stage0.main_norm.variance_epsilon,
+                )
+                self.scratch = kv.buffers(device, len(self.wkv))
+
+
+def _fused_why(model, wkv) -> str | None:
+    """Why the stacked wkv does not take the one launch (None: it does)."""
+    from sgl_amd_mono.deepseek_v41.gfx950.inject import kv
+
+    if len(wkv) > kv.MAX_STAGES:
+        return f"{len(wkv)} stages"
+    method = getattr(wkv[0], "quant_method", None)
+    backend = getattr(method, "mxfp8_dense_backend", None)
+    if backend is None or not backend.is_gfx95_mxfp8_aiter():
+        return "not aiter's MXFP8 route"
+    if getattr(wkv[0], "mxfp8_aiter_preshuffled", False):
+        return "preshuffled wkv"
+    stacked = sys.modules[DRAFT_MODEL]._stacked_wkv_weight(wkv_linears=wkv)
+    if stacked.mxfp8_scale is None:
+        return "no MXFP8 scales"
+    if (
+        tuple(stacked.weight.shape) != (512 * len(wkv), 5120)
+        or stacked.weight.element_size() != 1
+    ):
+        return f"stacked wkv {tuple(stacked.weight.shape)}"
+    if tuple(stacked.mxfp8_scale.shape) != (16 * len(wkv), 160):
+        return f"wkv scales {tuple(stacked.mxfp8_scale.shape)}, not 32 x 32 blocks"
+    norm = getattr(model.stages[0], "main_norm", None)
+    w = getattr(norm, "weight", None)
+    if (
+        w is None
+        or w.dtype != torch.bfloat16
+        or w.numel() != 5120
+        or not hasattr(norm, "variance_epsilon")
+    ):
+        return "main_norm not a [5120] bf16 RMSNorm"
+    return None
 
 
 def _store(st, kvs, pos, caches, page_size, loc=None, committed=None):
@@ -145,13 +211,26 @@ def _write_target_hidden_kv(
             pool=pool,
             **kwargs,
         )
+    from sgl_amd_mono.deepseek_v41.gfx950.inject import kv
+
+    caches = [pool.get_swa_raw_buffer(layer) for layer in st.layers]
+    loc = None if committed is not None else swa_loc.to(torch.int32).contiguous()
+    rows = main_hidden.shape[0]
+    why = st.fused or (None if kv.MIN_ROWS <= rows <= kv.MAX_ROWS else f"{rows} rows")
+    if chose("inject_kv", why is None, why):
+        projected, _ = self.stages[0].main_proj(main_hidden)
+        slots = {} if committed is None else committed._asdict()
+        kv.ops().inject_kv(
+            projected, st.norm_w, st.norm_eps, st.w, st.ws, *st.scratch, st.weights,
+            st.freqs, positions.contiguous(), loc, caches, st.eps, pool.swa_page_size,
+            st.v41, **slots,
+        )  # fmt: skip
+        return
     kvs = sys.modules[DSPARK].CommitKvProj.execute(
         main_x=self.project_target_hidden(main_hidden),
         wkv_linears=st.wkv,
         allow_strided_output=True,
     )
-    caches = [pool.get_swa_raw_buffer(layer) for layer in st.layers]
-    loc = None if committed is not None else swa_loc.to(torch.int32).contiguous()
     _store(st, kvs, positions.contiguous(), caches, pool.swa_page_size, loc, committed)
 
 
