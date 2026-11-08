@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """A layer's owed mHC post fused into the launch that reads its streams next: the head's
-``mhc_combine``, or the next layer's Engram gate; aiter's ``mhc_post`` bits.
+``mhc_combine`` (and the head's RMSNorm after it, ``gfx950/norm``), or the next layer's
+Engram gate; aiter's ``mhc_post`` and RMSNorm bits.
 ``SGLANG_AMD_MONO_DSV41_FUSED_POST=0`` keeps the separate launches."""
 
 from __future__ import annotations
@@ -15,6 +16,8 @@ ENV = "SGLANG_AMD_MONO_DSV41_FUSED_POST"
 # by file under sglang/ (test_contract.py pins them)
 SGLANG_READS = {
     "kernels/ops/layernorm/mhc.py": ("mhc_combine",),
+    # the head's RMSNorm, which _post_combine_norm reproduces
+    "srt/layers/layernorm.py": ("RMSNorm", "variance_epsilon"),
     # the gate _post_gate_kernel reproduces
     "kernels/ops/embeddings/engram_gate.py": ("_engram_gate_kernel",),
     "srt/layers/engram.py": (
@@ -177,6 +180,51 @@ def post_combine(layer, pending, pre, hc: int):
         return _post_combine(x, residual, post, comb, pre)
     out = layer.hc_post(x, residual, post, comb)
     return out, mhc_combine(out.flatten(1), pre, hc, out.dtype)
+
+
+def _post_combine_norm(x, residual, post, comb, pre, norm):
+    from sgl_amd_mono.deepseek_v41.gfx950.norm import ops
+
+    out = torch.empty_like(residual)
+    normed = torch.empty_like(x)
+    ops().combine_norm(
+        x,
+        residual,
+        post,
+        comb,
+        pre,
+        norm.weight.data,
+        norm.variance_epsilon,
+        out,
+        normed,
+    )
+    return out, normed
+
+
+def post_combine_norm(layer, pending, pre, hc: int, norm):
+    """(the streams the owed post (x, residual, post, comb) of ``layer`` settles, SGLang's
+    RMSNorm ``norm`` of their ``mhc_combine`` by ``pre``), in one launch where the tensors
+    fit (4 streams, rows 4096 to 6144 wide)."""
+    from sgl_amd_mono.deepseek_v41.glue import chose
+
+    x, residual, post, comb = pending
+    width = residual.shape[-1] if residual.dim() == 3 else 0
+    if chose(
+        "post_combine_norm",
+        enabled()
+        and _fits(x, residual, post, comb)
+        and residual.shape[1] == 4
+        and 4096 < width <= 6144
+        and width % 8 == 0
+        and pre.dtype == torch.float32
+        and pre.is_contiguous()
+        and type(norm).__name__ == "RMSNorm"
+        and norm.weight.dtype == torch.bfloat16
+        and norm.weight.is_contiguous(),
+    ):
+        return _post_combine_norm(x, residual, post, comb, pre, norm)
+    out, combined = post_combine(layer, pending, pre, hc)
+    return out, norm(combined)
 
 
 def post_gate(engram, layer, pending, kv, input_ids):

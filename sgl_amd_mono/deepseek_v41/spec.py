@@ -1220,10 +1220,12 @@ class _Built:
                 residual, pre = self._gather_rows([residual, pre])
             # mhc_combine widens x on load: no f32 copy first
             combined = mhc_combine(residual.flatten(1), pre, m.hc_mult, residual.dtype)
+            hidden = m.norm(combined)
         else:
-            residual, combined = fused.post_combine(last, pending, pre, m.hc_mult)
+            residual, hidden = fused.post_combine_norm(
+                last, pending, pre, m.hc_mult, m.norm
+            )
         pre_hc_head = residual.flatten(1)
-        hidden = m.norm(combined)
         if aux is None:
             return hidden, pre_hc_head
         packed = self._packed[: hidden.shape[0]]
