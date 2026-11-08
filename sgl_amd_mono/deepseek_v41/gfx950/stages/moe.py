@@ -509,8 +509,9 @@ def _silu_mul(g, u):
 
 
 @flyc.jit
-def stage_shared(c, task, gops, t0, n):
-    """Shared expert gate / up rows 16 task .. for tokens t0 .. t0 + n -> silu x up -> SMID."""
+def stage_shared(c, task, gops, uops, t0, n):
+    """Shared expert gate / up rows 16 task .. for tokens t0 .. t0 + n -> silu x up -> SMID
+    (``gops``, ``uops``: the gate's and the up's weight loads, both in flight from the start)."""
     tid, red, d = c["tid"], c["red"], c["d"]
     a = c["args"]
     rows = None if isinstance(n, int) else n
@@ -520,9 +521,6 @@ def stage_shared(c, task, gops, t0, n):
     if tid < ROWS * n:
         gate = row_sum(red, tid % ROWS, tid // ROWS)
     gpu.barrier()
-    uops = gemv_fp8_loads(
-        c, a["sgu"], a["sgu_s"], HIDDEN, d.shared_tasks + task, row_major=True
-    )
     gemv_fp8_mfmas(c, HIDDEN, c["xl"], c["xsl"], red, uops, rows=rows)
     gpu.barrier()
     if tid < ROWS * n:
@@ -1429,19 +1427,27 @@ def run_moe(c, key, bid, before_ug=None):
     assert c["rs"].shared_units <= BLOCKS
     unit = first_task(bid, shared0)
     if unit < c["rs"].shared_units:
-        # the gate weights in flight before x's wait
+        # the gate's and the up's weights in flight before x's wait: one CTA streams both
         a = c["args"]
         gops = gemv_fp8_loads(
             c, a["sgu"], a["sgu_s"], HIDDEN, unit % shared_tasks, row_major=True
         )
+        uops = gemv_fp8_loads(
+            c,
+            a["sgu"],
+            a["sgu_s"],
+            HIDDEN,
+            shared_tasks + unit % shared_tasks,
+            row_major=True,
+        )
         if const_expr(not multi):
             load_x8_rows(c, "x8", "x8s", c["x8l"], c["x8sl"], lambda j: j, s)
-            stage_shared(c, unit, gops, 0, s)
+            stage_shared(c, unit, gops, uops, 0, s)
         else:
             t0 = unit // shared_tasks * TILE
             n = fx.min(fx.Int32(TILE), s - t0)
             load_x8_rows(c, "x8", "x8s", c["x8l"], c["x8sl"], lambda j: t0 + j, n)
-            stage_shared(c, unit % shared_tasks, gops, t0, n)
+            stage_shared(c, unit % shared_tasks, gops, uops, t0, n)
     stamp(c, 22)
     if const_expr(before_ug is not None):
         before_ug()
