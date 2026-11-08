@@ -52,9 +52,10 @@ def install() -> None:
         inject,
         metadata,
         prefill,
+        verify_tail,
     )
 
-    for piece in (metadata, accept, inject, draft_head, prefill):
+    for piece in (metadata, accept, inject, draft_head, prefill, verify_tail):
         piece.install()
 
 
