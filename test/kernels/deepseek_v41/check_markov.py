@@ -1,4 +1,4 @@
-"""Check the sampled DSpark Markov block (gfx950/markov) against SGLang's arithmetic (torchrun,
+"""Check the sampled DSpark Markov block (gfx950/markov, one launch) against SGLang's arithmetic (torchrun,
 TP2 to TP8): the tokens on every rank alike, the whole step logits of the sampled rows (a
 temperature-0 row's left unwritten) and the noise counter, eager and under graph replay; and
 the draft sampler's block (draft_sampler) against SGLang's ``draft_markov_block`` on a TP-sharded
@@ -188,9 +188,6 @@ def main():
     vocab_start = rank * part
     w2s = w2[vocab_start : vocab_start + part]
     ops, x = markov.ops(), markov.Exchange(cpu, rank, tp, dev, gamma, part)
-    scratch = torch.empty(
-        markov.MAX_SEQUENCES, markov.blocks(padded), 2, dtype=torch.float32, device=dev
-    )
     for bs in range(1, markov.MAX_SEQUENCES + 1):
         gr = torch.Generator(device=dev).manual_seed(100 + 13 * rank + bs)
         base = (torch.randn(bs, gamma, padded, generator=gr, device=dev) * 3).bfloat16()
@@ -218,13 +215,10 @@ def main():
         logits = torch.zeros(bs, gamma, VOCAB, dtype=torch.float32, device=dev)
 
         def block():
-            for s in range(gamma):
-                ops.markov_sample_step(
-                    base[:, s], w1, w2s, anchor, x.slab[:bs, s], temps, offset, key,
-                    vocab_start, s, scratch, out, gamma, x.tok, x.calls, x.peers, rank,
-                    s == gamma - 1, 20.0,
-                )  # fmt: skip
-            ops.markov_gather(logits, temps, x.peers, markov.EXCHANGE_BYTES, part)
+            ops.markov_block(
+                base, w1, w2s, anchor, temps, offset, key, vocab_start, out, gamma,
+                x.tok, x.control, x.peers, rank, logits, part, 20.0,
+            )  # fmt: skip
 
         block()
         torch.cuda.synchronize()
