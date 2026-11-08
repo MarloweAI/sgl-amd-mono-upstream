@@ -1072,10 +1072,16 @@ def run_back(c, key, bid, idle=None):
         c, a["woa"], a["woa_s"], group_k, woa_t * WOA_ROWS, WOA_SPLIT_K, pred=has_woa
     )
     wob_unit = first_task(bid, WOB0)
+    # wo_b's CTAs: one tile, the CTAs without a wo_a unit where two tasks each cover it
+    # (a wo_a CTA sees the last wo_a flag a poll later than one already waiting), else all
+    wob_ctas = (
+        BLOCKS - units if nt == 1 and 2 * (BLOCKS - units) >= wob_tasks else BLOCKS
+    )
+    has_wob = True if wob_ctas == BLOCKS else wob_unit < wob_ctas
     if const_expr(nt == 1):
         # one or two wo_b tasks a CTA, every one on the step's rows
         wob_tile = 0
-        wob_ts = [wob_unit, wob_unit + BLOCKS]
+        wob_ts = [wob_unit, wob_unit + wob_ctas]
     else:
         # a tile a CTA (ROCm/ATOM's tile tasks): rows read once, every task's weights in flight
         wob_tile = wob_unit % nt
@@ -1084,11 +1090,15 @@ def run_back(c, key, bid, idle=None):
         wob_ts = [wob_unit // nt + k * per_tile for k in range(most)]
 
     def wob_weights():
-        # one tile: the first task is every CTA's (BLOCKS < wob_tasks), unmasked
+        # one tile on every CTA: the first task is every CTA's (BLOCKS < wob_tasks), unmasked
         return [
             wob_loads(c, t)
-            if nt == 1 and k == 0
-            else wob_loads(c, fx.min(t, wob_tasks - 1), pred=t < wob_tasks)
+            if nt == 1 and k == 0 and wob_ctas == BLOCKS
+            else wob_loads(
+                c,
+                fx.min(t, wob_tasks - 1),
+                pred=has_wob if k == 0 and wob_ctas < BLOCKS else t < wob_tasks,
+            )
             for k, t in enumerate(wob_ts)
         ]
 
@@ -1149,7 +1159,8 @@ def run_back(c, key, bid, idle=None):
             c, c["ardy"], woa_tasks, lambda u: (wob_tile * woa_tasks + u) * FLAG_STRIDE
         )
     else:
-        await_flags(c, c["ardy"], woa_tasks, lambda u: u * FLAG_STRIDE)
+        if has_wob:
+            await_flags(c, c["ardy"], woa_tasks, lambda u: u * FLAG_STRIDE)
     stamp(c, 12)
     x8b = (
         c["x8b"],
@@ -1198,5 +1209,6 @@ def run_back(c, key, bid, idle=None):
 
     for ti in range_constexpr(nt):
         if wob_tile == ti:
-            wob_tile_run(ti)
+            if has_wob:
+                wob_tile_run(ti)
     stamp(c, 4)
