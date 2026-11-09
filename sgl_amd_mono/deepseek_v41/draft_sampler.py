@@ -39,6 +39,10 @@ SGLANG_READS = {
     ),
     "srt/models/dspark.py": ("vocab_shard", "vocab_size"),
     "srt/speculative/dspark_components/dspark_draft.py": ("key", "offset"),
+    "srt/speculative/dspark_components/dspark_draft_sampler.py": (
+        '"verify_ids"',
+        '"writes_verify_ids"',
+    ),
 }
 
 
@@ -99,14 +103,17 @@ def _why_not(model, step_logits) -> str | None:
 
 class _Sampler:
     def __init__(
-        self, model, deadline_s, gamma, noise, draft_tokens, step_logits, temps
-    ):
+        self, model, deadline_s, gamma, noise, draft_tokens, step_logits, temps,
+        verify_ids=None,
+    ):  # fmt: skip
         from sgl_amd_mono.deepseek_v41.gfx950 import markov
 
         head = model.markov_head
         shard, group = head._tp_shard, head._shard_group
         self.model, self.gamma, self.noise = model, gamma, noise
         self.out, self.step_logits, self.temps = draft_tokens, step_logits, temps
+        # [max_bs, gamma + 1] the verify's ids ([anchor | tokens]), written by the launch, or None
+        self.verify_ids = verify_ids
         self.deadline_s = float(deadline_s)
         self.vocab_start = int(shard.org_vocab_start)
         self.embed = head.markov_w1.weight.contiguous()
@@ -124,7 +131,9 @@ class _Sampler:
         )
         self.ops = markov.ops()
 
-    def block(self, base_logits, anchor, temps, noise, out, step_logits):
+    def block(
+        self, base_logits, anchor, temps, noise, out, step_logits, verify_ids=None
+    ):
         """Every step of a [bs, gamma, padded] base logits block: tokens to ``out``
         ([bs * gamma]), the sampled sequences' step logits to ``step_logits``
         ([bs, gamma, vocab])."""
@@ -132,7 +141,7 @@ class _Sampler:
         self.ops.markov_block(
             base_logits, self.embed, self.head, anchor, temps, noise.offset,
             int(noise.key), self.vocab_start, out, self.gamma, x.tok, x.control, x.peers,
-            x.rank, step_logits, self.width, self.deadline_s,
+            x.rank, step_logits, self.width, self.deadline_s, verify_ids,
         )  # fmt: skip
 
     def step(self, hidden_states, anchor_tokens):
@@ -141,18 +150,21 @@ class _Sampler:
         bs = anchor_tokens.shape[0]
         base = base_logits.view(bs, self.gamma, -1)
         out = self.out[: bs * self.gamma]
+        verify = None if self.verify_ids is None else self.verify_ids[:bs]
         self.block(
             base, anchor_tokens.long(), self.temps[:bs], self.noise, out,
-            self.step_logits[:bs],
+            self.step_logits[:bs], verify,
         )  # fmt: skip
         return out.view(bs, self.gamma), confidence_features
 
 
 def _factory(
     model, deadline_s, *, gamma, max_bs, greedy_draft, noise, draft_tokens,
-    step_logits, step_temperatures,
+    step_logits, step_temperatures, verify_ids=None,
 ):  # fmt: skip
-    """SGLang's draft sampler factory: bs -> the kernels' step, or None (SGLang's)."""
+    """SGLang's draft sampler factory: bs -> the kernels' step, or None (SGLang's).
+    ``verify_ids`` ([max_bs, gamma + 1] int64): the step also writes the verify's ids
+    ([anchor | tokens]) there, and the steps say so (``writes_verify_ids``)."""
     from sgl_amd_mono.deepseek_v41.gfx950 import markov
 
     why = "a greedy draft" if greedy_draft else _why_not(model, step_logits)
@@ -160,8 +172,9 @@ def _factory(
         _LOGGER.info("DSpark draft: SGLang's Markov block runs (%s)", why)
         return lambda bs: None
     sampler = _Sampler(
-        model, deadline_s, gamma, noise, draft_tokens, step_logits, step_temperatures
-    )
+        model, deadline_s, gamma, noise, draft_tokens, step_logits, step_temperatures,
+        verify_ids,
+    )  # fmt: skip
     top = min(max_bs, markov.MAX_SEQUENCES)
     if model.markov_head._shard_group.rank_in_group == 0:
         _LOGGER.info(
@@ -169,4 +182,9 @@ def _factory(
             "sizes 1 to %d",
             top,
         )
-    return lambda bs: sampler.step if 1 <= bs <= top else None
+
+    def steps(bs):
+        return sampler.step if 1 <= bs <= top else None
+
+    steps.writes_verify_ids = verify_ids is not None
+    return steps

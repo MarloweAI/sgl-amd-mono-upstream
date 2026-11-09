@@ -213,16 +213,21 @@ def main():
         offset = torch.tensor([offset0], dtype=torch.int64, device=dev)
         out = torch.zeros(bs * gamma, dtype=torch.int64, device=dev)
         logits = torch.zeros(bs, gamma, VOCAB, dtype=torch.float32, device=dev)
+        # the verify's ids, [anchor | tokens], in a wider buffer's rows (as the runner's slot)
+        verify = torch.full((bs, gamma + 3), -1, dtype=torch.int64, device=dev)[
+            :, : gamma + 1
+        ]
 
         def block():
             ops.markov_block(
                 base, w1, w2s, anchor, temps, offset, key, vocab_start, out, gamma,
-                x.tok, x.control, x.peers, rank, logits, part, 20.0,
+                x.tok, x.control, x.peers, rank, logits, part, 20.0, verify,
             )  # fmt: skip
 
         block()
         torch.cuda.synchronize()
         bad_tok = int((out.view(bs, gamma) != want).sum())
+        bad_tok += int((verify != torch.cat([anchor.view(bs, 1), want], 1)).sum())
         bias = (want_logits - whole_base).abs()[sampled]
         apart = (logits - want_logits).abs()[sampled]
         bad_logit = int((apart > bias * 2**-7 + 1e-6).sum()) + int(
