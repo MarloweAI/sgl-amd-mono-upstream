@@ -1545,6 +1545,10 @@ def _build(model, hf_config, ctx) -> _Built:
         shuffled=bool(shuffled_layout(L.module.self_attn for L in layers.values())),
     )
     runner.set_deadline(ctx.deadline_s)
+    # the draft's split main_proj exchange: collective, after the runner's peer buffers
+    from sgl_amd_mono.deepseek_v41.glue import inject
+
+    inject.prepare(p.tp_group.cpu_group, p.tp_rank, p.tp_size, device, ctx.deadline_s)
     k2i = any(L.module.self_attn.indexer is not None for L in layers.values())
     if k2i:
         # the indexer's buffers, sized here: before SGLang sizes the KV cache
