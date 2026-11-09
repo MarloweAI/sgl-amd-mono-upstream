@@ -103,7 +103,7 @@ __device__ inline void combine8(const float (&xv)[CHUNK], const float (&r)[HC][C
 __global__ __launch_bounds__(THREADS) void combine_norm_kernel(
     const bfloat16 *__restrict__ x, const bfloat16 *__restrict__ residual, const float *__restrict__ post,
     const float *__restrict__ comb, const float *__restrict__ pre, const bfloat16 *__restrict__ weight, double eps,
-    int n, bfloat16 *__restrict__ streams, bfloat16 *__restrict__ normed) {
+    int n, bfloat16 *__restrict__ streams, bfloat16 *__restrict__ normed, bfloat16 *__restrict__ combined) {
     __shared__ float partial[WAVES];
     const int m = blockIdx.x, lane = threadIdx.x % WAVE, wave = threadIdx.x / WAVE;
     const int64_t row = static_cast<int64_t>(m) * n;
@@ -130,6 +130,7 @@ __global__ __launch_bounds__(THREADS) void combine_norm_kernel(
             for (int i = 0; i < HC; ++i) *reinterpret_cast<uint32x4 *>(streams + row * HC + i * n + h) = pack(s[i]);
 #pragma unroll
             for (int k = 0; k < CHUNK; ++k) y[c * CHUNK + k] = static_cast<float>(static_cast<bfloat16>(acc[k]));
+            if (combined != nullptr) *reinterpret_cast<uint32x4 *>(combined + row + h) = pack(acc);
         } else {
 #pragma unroll
             for (int k = 0; k < CHUNK; ++k) y[c * CHUNK + k] = 0.0f;
@@ -158,10 +159,11 @@ __global__ __launch_bounds__(THREADS) void combine_norm_kernel(
 }
 
 // x [rows, n] and residual [rows, HC, n] bf16, post [rows, HC], comb [rows, HC, HC] and pre [rows, HC] f32,
-// weight [n] bf16; streams [rows, HC, n] and normed [rows, n] bf16 out
+// weight [n] bf16; streams [rows, HC, n] and normed [rows, n] bf16 out, and the combined rows before the norm
+// [rows, n] bf16 (_post_combine_kernel's y) where given
 void combine_norm_op(const at::Tensor &x, const at::Tensor &residual, const at::Tensor &post, const at::Tensor &comb,
                      const at::Tensor &pre, const at::Tensor &weight, double eps, const at::Tensor &streams,
-                     const at::Tensor &normed) {
+                     const at::Tensor &normed, const c10::optional<at::Tensor> &combined) {
     const int64_t rows = residual.size(0), n = residual.size(2);
     TORCH_CHECK(residual.dim() == 3 && residual.size(1) == HC && 4096 < n && n <= MAX_N && n % CHUNK == 0);
     for (const at::Tensor *t : {&x, &residual, &weight, &streams, &normed}) {
@@ -173,6 +175,10 @@ void combine_norm_op(const at::Tensor &x, const at::Tensor &residual, const at::
     TORCH_CHECK(x.numel() == rows * n && weight.numel() == n && streams.numel() == rows * HC * n &&
                 normed.numel() == rows * n && post.numel() == rows * HC && pre.numel() == rows * HC &&
                 comb.numel() == rows * HC * HC);
+    if (combined.has_value()) {
+        TORCH_CHECK(combined->scalar_type() == at::kBFloat16 && combined->is_contiguous() &&
+                    combined->numel() == rows * n);
+    }
     if (rows == 0) return;
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA guard(x.device());
     hipStream_t stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA(x.device().index()).stream();
@@ -180,7 +186,8 @@ void combine_norm_op(const at::Tensor &x, const at::Tensor &residual, const at::
                        static_cast<const bfloat16 *>(x.data_ptr()), static_cast<const bfloat16 *>(residual.data_ptr()),
                        post.data_ptr<float>(), comb.data_ptr<float>(), pre.data_ptr<float>(),
                        static_cast<const bfloat16 *>(weight.data_ptr()), eps, static_cast<int>(n),
-                       static_cast<bfloat16 *>(streams.data_ptr()), static_cast<bfloat16 *>(normed.data_ptr()));
+                       static_cast<bfloat16 *>(streams.data_ptr()), static_cast<bfloat16 *>(normed.data_ptr()),
+                       combined.has_value() ? static_cast<bfloat16 *>(combined->data_ptr()) : nullptr);
     C10_HIP_KERNEL_LAUNCH_CHECK();
 }
 
@@ -192,6 +199,6 @@ void combine_norm_op(const at::Tensor &x, const at::Tensor &residual, const at::
 
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
     m.def("combine_norm(Tensor x, Tensor residual, Tensor post, Tensor comb, Tensor pre, Tensor weight, float eps, "
-          "Tensor(a!) streams, Tensor(b!) normed) -> ()");
+          "Tensor(a!) streams, Tensor(b!) normed, Tensor(c!)? combined=None) -> ()");
     m.impl("combine_norm", at::kCUDA, &combine_norm_op);
 }

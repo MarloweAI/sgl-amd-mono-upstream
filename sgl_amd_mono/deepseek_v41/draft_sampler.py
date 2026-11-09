@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import functools
 import logging
+import sys
 
 import torch
 
 _LOGGER = logging.getLogger(__name__)
 
 ENV = "SGLANG_AMD_MONO_DSV41_MARKOV"
+DRAFT = "sglang.srt.models.deepseek_v4_dspark"
 
 # by file under sglang/ (test_contract.py pins them)
 SGLANG_READS = {
@@ -36,6 +38,11 @@ SGLANG_READS = {
         "vocab_size",
         "lm_head",
         "num_embeddings_per_partition",
+        "project_through_lm_head",
+        "hc_pre_from_prev_sublayer",
+        "_opt_markov_w2_tp_shard",
+        "_use_fp32_lm_head",
+        "_logits_from_x_post_hc",
     ),
     "srt/models/dspark.py": ("vocab_shard", "vocab_size"),
     "srt/speculative/dspark_components/dspark_draft.py": ("key", "offset"),
@@ -44,6 +51,29 @@ SGLANG_READS = {
         '"writes_verify_ids"',
     ),
 }
+
+
+# the draft forward's last (combined rows, their norm by the last stage's RMSNorm) from one launch
+# (``fused.combine_and_norm``): the sampler's base logits skip the norm for those rows. The reference
+# keeps the rows' memory from being reused by another tensor while it is held.
+_HEAD_INPUT: list = []
+
+
+def keep_head_input(combined: torch.Tensor, normed: torch.Tensor) -> None:
+    _HEAD_INPUT[:] = [combined, normed]
+
+
+def head_input_folds(model) -> bool:
+    """Whether the draft's base logits are the last stage's norm then the head on the forward's
+    output (V4.1's collapsed hidden, a TP-sharded bf16 head), so the norm can come with the combine."""
+    from sgl_amd_mono.deepseek_v41.glue import flag
+
+    return (
+        flag(ENV)
+        and getattr(model, "hc_pre_from_prev_sublayer", False)
+        and getattr(model, "_opt_markov_w2_tp_shard", False)
+        and not getattr(model, "_use_fp32_lm_head", True)
+    )
 
 
 class _Entries:
@@ -146,7 +176,23 @@ class _Sampler:
 
     def step(self, hidden_states, anchor_tokens):
         """SGLang's base logits and Markov block of a bs-row draft block."""
-        base_logits, confidence_features = self.model.compute_base_logits(hidden_states)
+        held = _HEAD_INPUT
+        if (
+            held
+            and held[0].data_ptr() == hidden_states.data_ptr()
+            and held[0].shape == hidden_states.shape
+            and head_input_folds(self.model)
+        ):
+            # _logits_from_x_post_hc on the rows normed in the combine's launch
+            project = sys.modules[DRAFT].project_through_lm_head
+            base_logits, confidence_features = (
+                project(held[1], self.model.lm_head),
+                hidden_states,
+            )
+        else:
+            base_logits, confidence_features = self.model.compute_base_logits(
+                hidden_states
+            )
         bs = anchor_tokens.shape[0]
         base = base_logits.view(bs, self.gamma, -1)
         out = self.out[: bs * self.gamma]

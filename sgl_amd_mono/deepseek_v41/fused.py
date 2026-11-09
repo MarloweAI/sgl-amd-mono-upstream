@@ -201,16 +201,26 @@ def _post_combine_norm(x, residual, post, comb, pre, norm):
     return out, normed
 
 
-def post_combine_norm(layer, pending, pre, hc: int, norm):
-    """(the streams the owed post (x, residual, post, comb) of ``layer`` settles, SGLang's
-    RMSNorm ``norm`` of their ``mhc_combine`` by ``pre``), in one launch where the tensors
-    fit (4 streams, rows 4096 to 6144 wide)."""
-    from sgl_amd_mono.deepseek_v41.glue import chose
+def combine_and_norm(x, residual, post, comb, pre, norm):
+    """(``_post_combine``'s combined rows, SGLang's RMSNorm ``norm`` of them) in one launch: the
+    draft head's input, where its owed post is settled only to be combined."""
+    from sgl_amd_mono.deepseek_v41.gfx950.norm import ops
 
+    streams = torch.empty_like(residual)
+    combined, normed = torch.empty_like(x), torch.empty_like(x)
+    ops().combine_norm(
+        x, residual, post, comb, pre, norm.weight.data, norm.variance_epsilon, streams, normed,
+        combined,
+    )  # fmt: skip
+    return combined, normed
+
+
+def post_combine_norm_fits(pending, pre, norm) -> bool:
+    """Whether ``combine_norm`` takes the owed post ``pending`` (x, residual, post, comb), its pre
+    mix and the RMSNorm ``norm`` (4 streams, rows 4096 to 6144 wide)."""
     x, residual, post, comb = pending
     width = residual.shape[-1] if residual.dim() == 3 else 0
-    if chose(
-        "post_combine_norm",
+    return (
         enabled()
         and _fits(x, residual, post, comb)
         and residual.shape[1] == 4
@@ -220,8 +230,18 @@ def post_combine_norm(layer, pending, pre, hc: int, norm):
         and pre.is_contiguous()
         and type(norm).__name__ == "RMSNorm"
         and norm.weight.dtype == torch.bfloat16
-        and norm.weight.is_contiguous(),
-    ):
+        and norm.weight.is_contiguous()
+    )
+
+
+def post_combine_norm(layer, pending, pre, hc: int, norm):
+    """(the streams the owed post (x, residual, post, comb) of ``layer`` settles, SGLang's
+    RMSNorm ``norm`` of their ``mhc_combine`` by ``pre``), in one launch where the tensors
+    fit (4 streams, rows 4096 to 6144 wide)."""
+    from sgl_amd_mono.deepseek_v41.glue import chose
+
+    x, residual, post, comb = pending
+    if chose("post_combine_norm", post_combine_norm_fits(pending, pre, norm)):
         return _post_combine_norm(x, residual, post, comb, pre, norm)
     out, combined = post_combine(layer, pending, pre, hc)
     return out, norm(combined)
