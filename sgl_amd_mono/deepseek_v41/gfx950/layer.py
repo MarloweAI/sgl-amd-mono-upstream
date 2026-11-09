@@ -715,6 +715,7 @@ def build_mono_k1(key: MonoBuild):
         kc_live: Int32,
     ):
         _ = keyed
+        warm_kernargs(K1_KERNARG_BYTES)
         # every wait runs under the guard, so a timeout flags every peer and stops the launch
         with guard.scope(
             guard.Guard(
@@ -1789,6 +1790,7 @@ def build_mono_k2(key: MonoBuild):
         gl_raw: Int64,
     ):
         _ = keyed
+        warm_kernargs(K2_KERNARG_BYTES)
         # every wait runs under the guard, so a timeout flags every peer and stops the launch
         with guard.scope(
             guard.Guard(
@@ -2079,6 +2081,52 @@ def kernarg_offsets(names, i32) -> dict:
     return out
 
 
+def warm_kernargs(nbytes: int):
+    """Load a word of every 64-byte line of the kernarg segment at the launch's start, in
+    the entry's wait: the arguments LLVM loads again later (it rematerializes them under
+    SGPR pressure) then hit the scalar cache instead of waiting on L2 where they are used."""
+    seg_ptr = ir.Type.parse("!llvm.ptr<4>")
+    seg = llvm.PtrToIntOp(
+        T.i64,
+        llvm.call_intrinsic(seg_ptr, "llvm.amdgcn.kernarg.segment.ptr", [], [], []),
+    ).result
+    words = []
+    for off in range(0, nbytes, 64):
+        ptr = llvm.IntToPtrOp(
+            seg_ptr, as_ir_value(fx.Int64(seg) + fx.Int64(off))
+        ).result
+        words.append(llvm.LoadOp(T.i32, ptr, alignment=4, invariant=True).result)
+    llvm.InlineAsmOp(
+        None, words, "", ",".join(["s"] * len(words)), has_side_effects=True
+    )
+
+
+def kernarg_bytes(names, i32) -> int:
+    """The kernarg segment's size: its last argument's offset plus its size."""
+    off = kernarg_offsets(names, i32)[names[-1]]
+    return off + (4 if names[-1] in i32 else 8)
+
+
+# the index K1's and K2's 32-bit arguments past the layer launch's
+K1_KC_I32 = frozenset(
+    f"kc_{n}"
+    for n in (
+        "per_req",
+        "ring",
+        "eps",
+        "page_bits",
+        "page_bytes",
+        "keps",
+        "wide",
+        "live",
+    )
+)
+K1_KERNARG_BYTES = kernarg_bytes(
+    K1_ARGS + K1_CP_ARGS + K1_KC_ARGS, LAYER_I32 | K1_KC_I32
+)
+K2_KERNARG_BYTES = kernarg_bytes(K2_ARGS + K2_GLUE_ARGS, LAYER_I32 | {"gl_ptab_stride"})
+
+
 def reload_args(names, offsets: dict, i32) -> dict:
     """Arguments ``names`` loaded again from the kernarg segment, its address through an
     empty asm first so LLVM keeps these loads apart from the entry's: an argument a
@@ -2252,6 +2300,7 @@ def build_mono_layer(key: MonoBuild):
         eg_row0: Int32,
     ):
         _ = keyed
+        warm_kernargs(max(offsets.values()) + 8)
         # every wait runs under the guard, so a timeout flags every peer and stops the launch
         with guard.scope(
             guard.Guard(
