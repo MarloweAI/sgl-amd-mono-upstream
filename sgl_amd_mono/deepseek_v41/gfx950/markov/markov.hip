@@ -56,6 +56,8 @@ struct Params {
     int             vocab_start, width, padded, gamma, nseq, blocks, rank, tp, part, vocab;
     int64_t        *out; // sequence s's token of step t at out[s * out_stride + t]
     int64_t         out_stride;
+    int64_t        *verify; // or null: sequence s's [anchor | tokens] at verify[s * verify_stride ...] (the verify's ids)
+    int64_t         verify_stride;
     int64_t        *tok;      // [nseq] the last step's tokens
     uint32_t       *counts; // [blocks] each block's launches
     float          *whole; // sequence s's step t row at whole + s * whole_seq_stride + t * whole_step_stride, [vocab]
@@ -268,6 +270,7 @@ markov_block_kernel(const Params p) {
     if (threadIdx.x < nseq) {
         prev[threadIdx.x]  = p.anchor[threadIdx.x * p.anchor_stride];
         stemp[threadIdx.x] = p.temps[threadIdx.x];
+        if (blockIdx.x == 0 && p.verify != nullptr) p.verify[threadIdx.x * p.verify_stride] = prev[threadIdx.x];
     }
     if (ONE && threadIdx.x < WAVE) { // a lane 4 values of the anchor's embedding row
         reinterpret_cast<uint2 *>(erow)[threadIdx.x] =
@@ -453,6 +456,7 @@ markov_block_kernel(const Params p) {
                     prev[0]           = tok;
                     if (blockIdx.x == 0) {
                         p.out[step] = tok;
+                        if (p.verify != nullptr) p.verify[1 + step] = tok;
                     }
                 }
             }
@@ -539,6 +543,7 @@ markov_block_kernel(const Params p) {
                 prev[threadIdx.x] = tok;
                 if (blockIdx.x == 0) {
                     p.out[threadIdx.x * p.out_stride + step] = tok;
+                    if (p.verify != nullptr) p.verify[threadIdx.x * p.verify_stride + 1 + step] = tok;
                 }
             }
             __syncthreads();
@@ -590,7 +595,8 @@ void check(const at::Tensor &t, const at::Tensor &ref, at::ScalarType dtype, con
 void markov_block(const at::Tensor &base, const at::Tensor &embed, const at::Tensor &head, const at::Tensor &anchor,
                   const at::Tensor &temps, at::Tensor &offset, int64_t key, int64_t vocab_start, at::Tensor &out,
                   int64_t out_stride, at::Tensor &tok, at::Tensor &control, const at::Tensor &peers, int64_t rank,
-                  at::Tensor &whole, int64_t part, double deadline_s) {
+                  at::Tensor &whole, int64_t part, double deadline_s,
+                  const c10::optional<at::Tensor> &verify) {
     const int64_t nseq  = base.size(0);
     const int64_t width = head.size(0);
     TORCH_CHECK(base.dim() == 3 && nseq >= 1 && nseq <= MAX_SEQ && base.size(1) >= 1 && base.size(1) <= MAX_STEPS,
@@ -647,6 +653,13 @@ void markov_block(const at::Tensor &base, const at::Tensor &embed, const at::Ten
     p.vocab            = static_cast<int>(vocab);
     p.out              = out.data_ptr<int64_t>();
     p.out_stride       = out_stride;
+    if (verify.has_value()) {
+        check(*verify, base, at::kLong, "verify");
+        TORCH_CHECK(verify->dim() == 2 && verify->size(0) >= nseq && verify->size(1) == gamma + 1,
+                    "verify [nseq, gamma + 1] int64: [anchor | tokens]");
+        p.verify        = verify->data_ptr<int64_t>();
+        p.verify_stride = verify->stride(0);
+    }
     p.tok              = tok.data_ptr<int64_t>();
     p.counts           = reinterpret_cast<uint32_t *>(control.data_ptr<int>());
     p.whole            = whole.data_ptr<float>();
@@ -675,6 +688,6 @@ void markov_block(const at::Tensor &base, const at::Tensor &embed, const at::Ten
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
     m.def("markov_block(Tensor base, Tensor embed, Tensor head, Tensor anchor, Tensor temps, Tensor(a!) offset, "
           "int key, int vocab_start, Tensor(b!) out, int out_stride, Tensor(c!) tok, Tensor(d!) control, "
-          "Tensor peers, int rank, Tensor(e!) whole, int part, float deadline_s) -> ()");
+          "Tensor peers, int rank, Tensor(e!) whole, int part, float deadline_s, Tensor(f!)? verify=None) -> ()");
     m.impl("markov_block", at::kCUDA, &markov_block);
 }
