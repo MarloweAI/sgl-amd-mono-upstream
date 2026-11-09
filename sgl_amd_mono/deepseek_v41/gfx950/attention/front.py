@@ -620,11 +620,14 @@ def run_front(
     before_wqb=None,
     qkv_first=0,
     row_halves=False,
+    before_wqb_weights=None,
 ):
     """Run the front's stages on this CTA; the seam publishes X8 before them.
     ``qkv_first``: the first CTA of the q / kv norms; ``row_halves``: where ``wqkv_split``
     holds, each of a row tile's two CTAs takes 8 of its rows over all of K instead of half
-    of K, so no sum crosses CTAs."""
+    of K, so no sum crosses CTAs. ``before_wqb_weights(seen)`` (one token tile): loads
+    issued past the wqkv GEMV, ahead of a wqkv CTA's wq_b weights; ``seen``: whether this
+    CTA waited on X8 (None: every CTA did)."""
     s = key.tokens
     # the wqkv GEMV takes all of K from X8, which the seam publishes
     assert x8_given
@@ -774,9 +777,15 @@ def run_front(
             # a CTA without a tile (the norms', gates', qkv's) goes on to its next stage
             if has_wqkv:
                 wqkv_tile()
+            if const_expr(before_wqb_weights is not None):
+                # only a CTA that waited on X8 has seen its rows' flags
+                before_wqb_weights(has_wqkv)
+            if has_wqkv:
                 bops = wqb_weights()
         else:
             wqkv_tile()
+            if const_expr(before_wqb_weights is not None):
+                before_wqb_weights(None)
             if has_wqkv:
                 bops = wqb_weights()
     else:

@@ -601,11 +601,21 @@ def run_k1(key: MonoBuild, sl, front, a: dict, ep, k2=None, early=None):
                 )
             index_query.run_iw(c, c["args"], own_n, IW0, c["xl"], t0, push)
         if const_expr(key.cp):
-            # the compressor projection fills it too, on the CTAs past them
-            index_query.run_cp(c, c["args"], own_n, CP0, c["xl"], key.cp)
+            # the compressor projection fills it too, on the CTAs past them (one token
+            # tile: its operands issued past the wqkv GEMV)
+            index_query.run_cp(
+                c, c["args"], own_n, CP0, c["xl"], key.cp, cp_ops if cp_ops else None
+            )
         if const_expr(early is not None):
             early.entries()
             early.touch()
+
+    # one token tile: the compressor projection's operands go out past the wqkv GEMV, ahead
+    # of the wq_b weights (they return in issue order), not behind them in q's wait
+    cp_ops = {}
+
+    def cp_issue(seen):
+        cp_ops.update(index_query.cp_issue(c, c["args"], own_n, CP0, key.cp, seen))
 
     def early_keys():
         early.entries()
@@ -641,6 +651,9 @@ def run_k1(key: MonoBuild, sl, front, a: dict, ep, k2=None, early=None):
             before_wqkv=seam_slice,
             after_wqkv=seam_norm,
             before_wqb=seam_gate,
+            before_wqb_weights=cp_issue
+            if key.cp and len(token_tiles(own_n)) == 1
+            else None,
             # past the slices, norms and gates where the grid has room: a slice CTA
             # issues its weights after its slice, and the norms' publish (vmcnt(0))
             # waited for them to land
