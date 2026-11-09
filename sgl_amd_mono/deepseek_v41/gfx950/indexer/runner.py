@@ -247,44 +247,59 @@ class K2iRunner:
             return Selection(None, (index_glue.RAWS, glue))
         producer = kind == "producer"
         logits = self.score(ratio=ratio, fill_plan=fill_plan, blocks=producer, **inputs)
-        published = None
-        if producer:
-            # SGLang's level one on K2i's block maxima: the top TOPK_BLOCKS of each row's
-            # first ceil(bound / 8), as ``select_candidate_blocks_hip`` takes them
-            nb = -(-logits.shape[1] // ip.BLOCK_ROWS)
-            ids = self.block_ids[:rows]
+        cols = dict(
+            scores=logits, seq_lens=bounds, page_table=page_table, page_indices=page_out,
+            page_size=PLANE_ROWS, raw_indices=raw_out,
+        )  # fmt: skip
+        if not producer:
+            self._paged_topk(**cols)
+            return Selection(None, None)
+        # SGLang's level one on K2i's block maxima: the top TOPK_BLOCKS of each row's first
+        # ceil(bound / 8), as ``select_candidate_blocks_hip`` takes them
+        nb = -(-logits.shape[1] // ip.BLOCK_ROWS)
+        ids = self.block_ids[:rows]
+        blocks = dict(
+            scores=self.bmax[: rows * self.bstride].view(rows, self.bstride)[:, :nb],
+            seq_lens=self.blens[:rows],
+        )
+        if topk_one.TopKOne.fits(rows):
+            self._one_launch()
+            self.one.transform_paged_pair(
+                **cols,
+                block_scores=blocks["scores"],
+                block_lens=blocks["seq_lens"],
+                block_ids=ids,
+            )
+        else:
             topk_transform_paged_hip(
-                scores=self.bmax[: rows * self.bstride].view(rows, self.bstride)[
-                    :, :nb
-                ],
-                seq_lens=self.blens[:rows],
+                **blocks,
                 page_table=None,
                 page_indices=ids,
                 page_size=1,
                 raw_indices=None,
             )
-            published = CandidateBlocks(
-                ids=ids,
-                compact_lens=self.blens[LENS_ROWS : LENS_ROWS + rows],
-                compact_page_table=self.block_pages[:rows],
-                compact_page_size=COMPACT,
-                block_size=ip.BLOCK_ROWS,
-            )
-            glue = {
-                "gl_ids": ids, "gl_ids_out": self.cand_ids, "gl_table": self.cand_table,
-                "gl_bound": self.cand_bound, "gl_ptab": page_table,
-                "gl_ptab_stride": page_table.stride(0), "gl_bounds": bounds,
-                "gl_owners": self.owners[per_req - 1],
-            }  # fmt: skip
-        self._paged_topk(
-            scores=logits,
-            seq_lens=bounds,
-            page_table=page_table,
-            page_indices=page_out,
-            page_size=PLANE_ROWS,
-            raw_indices=raw_out,
+            topk_transform_paged_hip(**cols)
+        published = CandidateBlocks(
+            ids=ids,
+            compact_lens=self.blens[LENS_ROWS : LENS_ROWS + rows],
+            compact_page_table=self.block_pages[:rows],
+            compact_page_size=COMPACT,
+            block_size=ip.BLOCK_ROWS,
         )
-        return Selection(published, (index_glue.TABLE, glue) if producer else None)
+        glue = {
+            "gl_ids": ids, "gl_ids_out": self.cand_ids, "gl_table": self.cand_table,
+            "gl_bound": self.cand_bound, "gl_ptab": page_table,
+            "gl_ptab_stride": page_table.stride(0), "gl_bounds": bounds,
+            "gl_owners": self.owners[per_req - 1],
+        }  # fmt: skip
+        return Selection(published, (index_glue.TABLE, glue))
+
+    def _one_launch(self) -> None:
+        """The one-launch top-k's module, built outside graph capture."""
+        if not topk_one.module.cache_info().currsize:
+            from ..runner import no_capture
+
+            no_capture("the one-launch top-k")
 
     def _paged_topk(self, **args) -> None:
         """SGLang's paged top-k with both outputs: one launch up to ``topk_one.MAX_ROWS`` rows
@@ -292,10 +307,7 @@ class K2iRunner:
         if not topk_one.TopKOne.fits(args["scores"].shape[0]):
             topk_transform_paged_hip(**args)
             return
-        if not topk_one.module.cache_info().currsize:
-            from ..runner import no_capture
-
-            no_capture("the one-launch top-k")
+        self._one_launch()
         self.one.transform_paged(**args)
 
     def score(
