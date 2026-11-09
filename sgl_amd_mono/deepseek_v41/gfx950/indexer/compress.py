@@ -214,17 +214,17 @@ def stage_key(c, a, slot, ws, wb, f):
         for j in range_constexpr(4):
             lo = (w[j] << 16).bitcast(fx.Float32)
             hi = (w[j] & fx.Int32(-65536)).bitcast(fx.Float32)
-            acc = (
-                acc
-                + fx.ptr_load(lds + LAT_AT + k0 + 8 * k8 + 2 * j).bitcast(fx.Float32)
-                * lo
+            # a bf16 latent times a bf16 weight is exact in f32: the fused step rounds
+            # as the product then the sum did
+            acc = fmath.fma(
+                fx.ptr_load(lds + LAT_AT + k0 + 8 * k8 + 2 * j).bitcast(fx.Float32),
+                lo,
+                acc,
             )
-            acc = (
-                acc
-                + fx.ptr_load(lds + LAT_AT + k0 + 8 * k8 + 2 * j + 1).bitcast(
-                    fx.Float32
-                )
-                * hi
+            acc = fmath.fma(
+                fx.ptr_load(lds + LAT_AT + k0 + 8 * k8 + 2 * j + 1).bitcast(fx.Float32),
+                hi,
+                acc,
             )
     fx.ptr_store(acc.bitcast(fx.Int32), lds + PART_AT + part * KEY + o)
     gpu.barrier()
