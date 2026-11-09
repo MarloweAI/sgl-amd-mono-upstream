@@ -33,6 +33,7 @@ constexpr int MAX_SEQ       = 4;
 constexpr int MAX_TP        = 8;
 constexpr int MAX_STEPS     = 8;
 constexpr int MAX_BLOCKS    = 256; // a block a CU at most: a TP2 shard's 64640 rows are 253
+constexpr int POLL_ONE      = 8;   // a step's records a lane of wave 0, one sequence (every rank's blocks: at most 512)
 // the exchange buffer: every block's step record, 8 B each [launch parity 2][step][sequence][source rank][block]
 // (markov.py's EXCHANGE_BYTES), then the rank's step logits [MAX_SEQ, gamma, part] f32
 constexpr int EXCHANGE_BYTES = 2 * MAX_STEPS * MAX_SEQ * MAX_TP * MAX_BLOCKS * 8;
@@ -218,16 +219,23 @@ __device__ inline float bf16_hi(uint32_t w) { return __builtin_bit_cast(float, w
 // the whole block in one launch, the grid co-resident (a block a CU at most, two waves an EU):
 // a block keeps BLOCK_ROWS rows of the shard in registers (bf16) for every step; each step every block stores its
 // best key into its slot of every rank's records and reads every rank's blocks' records from its own buffer: the
-// grid barrier and the ranks' swap at once, one cross-GPU trip a step, no atomics
+// grid barrier and the ranks' swap at once, one cross-GPU trip a step, no atomics. ONE: one sequence, its own build
+// (the batched sequences' registers are not held through its steps): each step's dots and scores without a barrier
+// between them, the token's embedding row read by wave 0 and handed to the block through LDS
+template <bool ONE>
 __global__ __launch_bounds__(THREADS) __attribute__((amdgpu_waves_per_eu(2))) void
 markov_block_kernel(const Params p) {
+    const int nseq = ONE ? 1 : p.nseq;
     __shared__ float    sv[MAX_SEQ][BLOCK_ROWS]; // the bias GEMV of each sequence
-    __shared__ float    sbase[MAX_SEQ][BLOCK_ROWS]; // the block's rows' base logits of this step
+    __shared__ float    sbase[MAX_STEPS][MAX_SEQ][BLOCK_ROWS]; // the block's rows' base logits of every step
     __shared__ float    snoise[MAX_SEQ][BLOCK_ROWS]; // the sampled sequences' noise of this step
     __shared__ float    wave_bestv[MAX_SEQ][BLOCK_ROWS / WAVE];
     __shared__ int      wave_bi[MAX_SEQ][BLOCK_ROWS / WAVE];
+    __shared__ uint64_t wave_key[THREADS / WAVE]; // one sequence: each wave's best candidate key
+    __shared__ __attribute__((aligned(16))) bfloat16 erow[DIM]; // one sequence: the step's token's embedding row
     __shared__ uint64_t top_key[MAX_SEQ][THREADS / WAVE];
     __shared__ int64_t  prev[MAX_SEQ];
+    __shared__ float    stemp[MAX_SEQ]; // the sequences' temperatures, read once
     __shared__ uint32_t s_count;
     const int           lane = threadIdx.x % ROW_LANES, grp = threadIdx.x / ROW_LANES;
     const int           row  = blockIdx.x * BLOCK_ROWS + threadIdx.x; // scoring: a row a thread of the first 256
@@ -245,40 +253,52 @@ markov_block_kernel(const Params p) {
             h[ps][4] = hi.x, h[ps][5] = hi.y, h[ps][6] = hi.z, h[ps][7] = hi.w;
         }
     }
+    // every step's base logits at the start: no step waits for a load of them
     if (scorer && row < p.padded) {
-        for (int seq = 0; seq < p.nseq; ++seq) {
-            sbase[seq][threadIdx.x] = static_cast<float>(p.logits[seq * p.logits_stride + row]);
+        for (int step = 0; step < p.gamma; ++step) {
+            for (int seq = 0; seq < nseq; ++seq) {
+                sbase[step][seq][threadIdx.x] =
+                    static_cast<float>(p.logits[seq * p.logits_stride + step * p.step_stride + row]);
+            }
         }
     }
     if (threadIdx.x == 0) {
         s_count = p.counts[blockIdx.x];
     }
-    if (threadIdx.x < p.nseq) {
-        prev[threadIdx.x] = p.anchor[threadIdx.x * p.anchor_stride];
+    if (threadIdx.x < nseq) {
+        prev[threadIdx.x]  = p.anchor[threadIdx.x * p.anchor_stride];
+        stemp[threadIdx.x] = p.temps[threadIdx.x];
+    }
+    if (ONE && threadIdx.x < WAVE) { // a lane 4 values of the anchor's embedding row
+        reinterpret_cast<uint2 *>(erow)[threadIdx.x] =
+            *reinterpret_cast<const uint2 *>(p.embed + p.anchor[0] * DIM + threadIdx.x * 4);
     }
     const int64_t offset = p.offset[0];
-    // a step's noise: every row of every sampled sequence, two a thread at most
-    const auto noise_of = [&](int step) {
-        for (int i = threadIdx.x; i < p.nseq * BLOCK_ROWS; i += THREADS) {
+    // a step's noise: every row of every sampled sequence, two a thread at most (temps: the step's reads of the
+    // temperatures, p.temps before the first barrier, stemp after it)
+    const auto noise_of = [&](int step, const float *temps) {
+        for (int i = threadIdx.x; i < nseq * BLOCK_ROWS; i += THREADS) {
             const int seq = i / BLOCK_ROWS, r = i % BLOCK_ROWS, v = blockIdx.x * BLOCK_ROWS + r;
-            if (p.temps[seq] != 0.0f && v < p.width) {
+            if (temps[seq] != 0.0f && v < p.width) {
                 snoise[seq][r] = gumbel(p, seq, step, offset, v);
             }
         }
     };
-    noise_of(0);
+    noise_of(0, p.temps);
     __syncthreads();
     const uint32_t count  = s_count;
     const uint64_t tag    = 1 + count % static_cast<uint32_t>(TAG_MASK); // never 0; the launch two back differs
     const int      parity = static_cast<int>(count & 1u);
     float         *slab   = reinterpret_cast<float *>(static_cast<char *>(p.recv[p.rank]) + EXCHANGE_BYTES);
     uint64_t      *mine   = static_cast<uint64_t *>(p.recv[p.rank]);
-    const int      polls  = p.nseq * p.tp * p.blocks; // records a step, at most 4 a thread
+    const int      polls  = nseq * p.tp * p.blocks; // records a step, at most 4 a thread
     MARKOV_STAMP(1);
     for (int step = 0; step < p.gamma; ++step) {
-        // every sequence's bias rows, then one barrier
-        for (int seq = 0; seq < p.nseq; ++seq) {
-            load16f(p.embed + prev[seq] * DIM + lane * 16, e);
+        if constexpr (ONE) {
+            // the dots, then the scores without a barrier: a pass's row dot lands in all 16 lanes of its group,
+            // lane ps of the group keeps pass ps's, and lanes 0-7 then score their rows (row lane * 32 + group)
+            load16f(erow + lane * 16, e);
+            float own = 0.0f;
 #pragma unroll
             for (int ps = 0; ps < PASSES; ++ps) {
                 const int v   = blockIdx.x * BLOCK_ROWS + ps * ROWS_PER_PASS + grp;
@@ -290,35 +310,74 @@ markov_block_kernel(const Params p) {
                         dot += e[2 * i + 1] * bf16_hi(h[ps][i]);
                     }
                 }
-                dot = row_sum16(dot);
-                if (lane == 0) {
-                    sv[seq][ps * ROWS_PER_PASS + grp] = dot;
-                }
+                dot  = row_sum16(dot);
+                own = lane == ps ? dot : own;
             }
-        }
-        MARKOV_STAMP(5 + 5 * step);
-        __syncthreads();
-        // the scores: two sequences at a time, the first four waves one and the last four the next
-        for (int pair = 0; pair < p.nseq; pair += THREADS / BLOCK_ROWS) {
-            const int seq = pair + threadIdx.x / BLOCK_ROWS, r = threadIdx.x % BLOCK_ROWS;
-            const int v   = blockIdx.x * BLOCK_ROWS + r;
-            if (seq < p.nseq) {
-                float best = -INFINITY;
-                int   bi   = INT_MAX;
+            float best = -INFINITY;
+            int   bi   = INT_MAX;
+            if (lane < PASSES) {
+                const int r = lane * ROWS_PER_PASS + grp, v = blockIdx.x * BLOCK_ROWS + r;
                 if (v < p.padded) {
-                    const float bias  = v < p.width ? round_bf16(sv[seq][r]) : 0.0f;
-                    const float value = sbase[seq][r] + bias;
-                    if (p.temps[seq] != 0.0f) { // a sampled sequence's step logits, for the gather
-                        slab[(static_cast<int64_t>(seq) * p.gamma + step) * p.part + v] = value;
+                    const float value = sbase[step][0][r] + (v < p.width ? round_bf16(own) : 0.0f);
+                    if (stemp[0] != 0.0f) { // a sampled sequence's step logits, for the gather
+                        slab[static_cast<int64_t>(step) * p.part + v] = value;
                     }
                     if (v < p.width) {
-                        best = select_key(p.temps[seq], snoise[seq][r], value);
+                        best = select_key(stemp[0], snoise[0][r], value);
                         bi   = v;
                     }
                 }
-                wave_best(best, bi);
-                if (r % WAVE == 0) {
-                    wave_bestv[seq][r / WAVE] = best, wave_bi[seq][r / WAVE] = bi;
+            }
+            wave_best(best, bi);
+            if (threadIdx.x % WAVE == 0) {
+                wave_key[threadIdx.x / WAVE] = bi == INT_MAX ? 0ull : candidate_key(best, bi + p.vocab_start);
+            }
+            MARKOV_STAMP(5 + 5 * step);
+        } else {
+            // every sequence's bias rows, then one barrier
+            for (int seq = 0; seq < nseq; ++seq) {
+                load16f(p.embed + prev[seq] * DIM + lane * 16, e);
+#pragma unroll
+                for (int ps = 0; ps < PASSES; ++ps) {
+                    const int v   = blockIdx.x * BLOCK_ROWS + ps * ROWS_PER_PASS + grp;
+                    float     dot = 0.0f;
+                    if (v < p.width) {
+#pragma unroll
+                        for (int i = 0; i < 8; ++i) {
+                            dot += e[2 * i] * bf16_lo(h[ps][i]);
+                            dot += e[2 * i + 1] * bf16_hi(h[ps][i]);
+                        }
+                    }
+                    dot = row_sum16(dot);
+                    if (lane == 0) {
+                        sv[seq][ps * ROWS_PER_PASS + grp] = dot;
+                    }
+                }
+            }
+            MARKOV_STAMP(5 + 5 * step);
+            __syncthreads();
+            // the scores: two sequences at a time, the first four waves one and the last four the next
+            for (int pair = 0; pair < nseq; pair += THREADS / BLOCK_ROWS) {
+                const int seq = pair + threadIdx.x / BLOCK_ROWS, r = threadIdx.x % BLOCK_ROWS;
+                const int v   = blockIdx.x * BLOCK_ROWS + r;
+                if (seq < nseq) {
+                    float best = -INFINITY;
+                    int   bi   = INT_MAX;
+                    if (v < p.padded) {
+                        const float bias  = v < p.width ? round_bf16(sv[seq][r]) : 0.0f;
+                        const float value = sbase[step][seq][r] + bias;
+                        if (stemp[seq] != 0.0f) { // a sampled sequence's step logits, for the gather
+                            slab[(static_cast<int64_t>(seq) * p.gamma + step) * p.part + v] = value;
+                        }
+                        if (v < p.width) {
+                            best = select_key(stemp[seq], snoise[seq][r], value);
+                            bi   = v;
+                        }
+                    }
+                    wave_best(best, bi);
+                    if (r % WAVE == 0) {
+                        wave_bestv[seq][r / WAVE] = best, wave_bi[seq][r / WAVE] = bi;
+                    }
                 }
             }
         }
@@ -326,111 +385,177 @@ markov_block_kernel(const Params p) {
             asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
         }
         __syncthreads();
-        // the next step's base logits while the step's bests are swapped (sbase's reads are behind the last barrier)
-        if (step + 1 < p.gamma && scorer && row < p.padded) {
-            for (int seq = 0; seq < p.nseq; ++seq) {
-                sbase[seq][threadIdx.x] =
-                    static_cast<float>(p.logits[seq * p.logits_stride + (step + 1) * p.step_stride + row]);
-            }
-        }
         MARKOV_STAMP(2 + 5 * step);
-        // this block's record of each sequence into every rank's slot
-        if (threadIdx.x < p.nseq * p.tp) {
-            const int seq = threadIdx.x / p.tp, r = threadIdx.x % p.tp;
-            float     best = wave_bestv[seq][0];
-            int       bi   = wave_bi[seq][0];
-#pragma unroll
-            for (int w = 1; w < BLOCK_ROWS / WAVE; ++w) {
-                keep_best(best, bi, wave_bestv[seq][w], wave_bi[seq][w]);
+        if constexpr (ONE) {
+            // one sequence: the exchange on wave 0 alone; waves 1-4 the next step's noise meanwhile
+            if (step + 1 < p.gamma && threadIdx.x >= WAVE && stemp[0] != 0.0f) {
+                const int r = threadIdx.x - WAVE, v = blockIdx.x * BLOCK_ROWS + r;
+                if (r < BLOCK_ROWS && v < p.width) {
+                    snoise[0][r] = gumbel(p, 0, step + 1, offset, v);
+                }
             }
-            const uint64_t key = bi == INT_MAX ? 0ull : candidate_key(best, bi + p.vocab_start);
-            __hip_atomic_store(static_cast<uint64_t *>(p.recv[r]) + record_slot(parity, step, seq, p.rank, blockIdx.x),
-                               (key << TAG_BITS) | tag, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-        }
-        if (step + 1 < p.gamma) { // the next step's noise while the records cross (snoise's reads are behind a barrier)
-            noise_of(step + 1);
-        }
-        MARKOV_STAMP(3 + 5 * step);
-        // every rank's blocks' records of the step: each thread's (at most 4) in flight together until all carry the tag
-        uint64_t got[4] = {0, 0, 0, 0};
-        uint32_t pending = 0;
+            if (threadIdx.x < WAVE) {
+                const int l = threadIdx.x;
+                // the block's key: the waves' keys, lane l holding wave l % 8's, maximum over each 16-lane row
+                uint64_t key = wave_key[l % (THREADS / WAVE)];
+                const auto take = [&](uint64_t y) { key = y > key ? y : key; };
+#define MK_DPP64(C) (static_cast<uint64_t>(dpp<C>(static_cast<uint32_t>(key >> 32))) << 32 | dpp<C>(static_cast<uint32_t>(key)))
+                take(MK_DPP64(ROR4));
+                take(MK_DPP64(XOR2));
+                take(MK_DPP64(XOR1));
+#undef MK_DPP64
+                // the block's record into every rank's slot, then every rank's blocks' records (one trip), up to
+                // POLL_ONE a lane in flight together until each carries the tag
+                if (l < p.tp) {
+                    __hip_atomic_store(static_cast<uint64_t *>(p.recv[l]) + record_slot(parity, step, 0, p.rank, blockIdx.x),
+                                       (key << TAG_BITS) | tag, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+                }
+                MARKOV_STAMP(3 + 5 * step);
+                uint64_t top = 0, t0 = 0;
+                uint32_t pending = 0;
 #pragma unroll
-        for (int k = 0; k < 4; ++k) {
-            pending |= (threadIdx.x + k * THREADS < polls ? 1u : 0u) << k;
-        }
-        const auto slot_of = [&](int i) {
-            const int b = i % p.blocks, src = (i / p.blocks) % p.tp, seq = i / (p.blocks * p.tp);
-            return mine + record_slot(parity, step, seq, src, b);
-        };
-        uint64_t t0 = 0;
-        for (int n = 1; pending; ++n) {
-            uint64_t v[4];
+                for (int k = 0; k < POLL_ONE; ++k) {
+                    pending |= (l + k * WAVE < p.tp * p.blocks ? 1u : 0u) << k;
+                }
+                for (int n = 1; pending; ++n) {
+                    uint64_t v[POLL_ONE];
 #pragma unroll
+                    for (int k = 0; k < POLL_ONE; ++k) {
+                        const int i = l + k * WAVE;
+                        if ((pending >> k) & 1u) {
+                            v[k] = __hip_atomic_load(mine + record_slot(parity, step, 0, i / p.blocks, i % p.blocks),
+                                                     __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+                        }
+                    }
+#pragma unroll
+                    for (int k = 0; k < POLL_ONE; ++k) {
+                        if (((pending >> k) & 1u) && (v[k] & TAG_MASK) == tag) {
+                            top = v[k] >> TAG_BITS > top ? v[k] >> TAG_BITS : top;
+                            pending &= ~(1u << k);
+                        }
+                    }
+                    if (pending && n % 1024 == 0) { // past the deadline the launch traps, stopping this rank's step
+                        const uint64_t now = __builtin_amdgcn_s_memrealtime();
+                        if (t0 == 0) {
+                            t0 = now;
+                        } else if (now - t0 > p.deadline_ticks) {
+                            __builtin_trap();
+                        }
+                    }
+                }
+                top = wave_max(top);
+                MARKOV_STAMP(6 + 5 * step);
+                const int64_t tok = key_index(top);
+                if (step + 1 < p.gamma) {
+                    reinterpret_cast<uint2 *>(erow)[l] = *reinterpret_cast<const uint2 *>(p.embed + tok * DIM + l * 4);
+                }
+                if (l == 0) {
+                    prev[0]           = tok;
+                    if (blockIdx.x == 0) {
+                        p.out[step] = tok;
+                    }
+                }
+            }
+            __syncthreads();
+        } else {
+            // this block's record of each sequence into every rank's slot
+            if (threadIdx.x < nseq * p.tp) {
+                const int seq = threadIdx.x / p.tp, r = threadIdx.x % p.tp;
+                float     best = wave_bestv[seq][0];
+                int       bi   = wave_bi[seq][0];
+    #pragma unroll
+                for (int w = 1; w < BLOCK_ROWS / WAVE; ++w) {
+                    keep_best(best, bi, wave_bestv[seq][w], wave_bi[seq][w]);
+                }
+                const uint64_t key = bi == INT_MAX ? 0ull : candidate_key(best, bi + p.vocab_start);
+                __hip_atomic_store(static_cast<uint64_t *>(p.recv[r]) + record_slot(parity, step, seq, p.rank, blockIdx.x),
+                                   (key << TAG_BITS) | tag, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+            }
+            if (step + 1 < p.gamma) { // the next step's noise while the records cross (snoise's reads are behind a barrier)
+                noise_of(step + 1, stemp);
+            }
+            MARKOV_STAMP(3 + 5 * step);
+            // every rank's blocks' records of the step: each thread's (at most 4) in flight together until all carry the tag
+            uint64_t got[4] = {0, 0, 0, 0};
+            uint32_t pending = 0;
+    #pragma unroll
             for (int k = 0; k < 4; ++k) {
-                if ((pending >> k) & 1u) {
-                    v[k] = __hip_atomic_load(slot_of(threadIdx.x + k * THREADS), __ATOMIC_RELAXED,
-                                             __HIP_MEMORY_SCOPE_SYSTEM);
+                pending |= (threadIdx.x + k * THREADS < polls ? 1u : 0u) << k;
+            }
+            const auto slot_of = [&](int i) {
+                const int b = i % p.blocks, src = (i / p.blocks) % p.tp, seq = i / (p.blocks * p.tp);
+                return mine + record_slot(parity, step, seq, src, b);
+            };
+            uint64_t t0 = 0;
+            for (int n = 1; pending; ++n) {
+                uint64_t v[4];
+    #pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    if ((pending >> k) & 1u) {
+                        v[k] = __hip_atomic_load(slot_of(threadIdx.x + k * THREADS), __ATOMIC_RELAXED,
+                                                 __HIP_MEMORY_SCOPE_SYSTEM);
+                    }
+                }
+    #pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    if (((pending >> k) & 1u) && (v[k] & TAG_MASK) == tag) {
+                        got[k] = v[k] >> TAG_BITS;
+                        pending &= ~(1u << k);
+                    }
+                }
+                if (pending && n % 1024 == 0) { // past the deadline the launch traps, stopping this rank's step
+                    const uint64_t now = __builtin_amdgcn_s_memrealtime();
+                    if (t0 == 0) {
+                        t0 = now;
+                    } else if (now - t0 > p.deadline_ticks) {
+                        __builtin_trap();
+                    }
                 }
             }
-#pragma unroll
-            for (int k = 0; k < 4; ++k) {
-                if (((pending >> k) & 1u) && (v[k] & TAG_MASK) == tag) {
-                    got[k] = v[k] >> TAG_BITS;
-                    pending &= ~(1u << k);
+            MARKOV_STAMP(6 + 5 * step);
+            // the best record of each sequence: a wave's maximum, then the waves'
+            for (int s = 0; s < nseq; ++s) {
+                uint64_t x = 0;
+    #pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    const int i = threadIdx.x + k * THREADS;
+                    if (i < polls && i / (p.blocks * p.tp) == s) {
+                        x = got[k] > x ? got[k] : x;
+                    }
+                }
+                x = wave_max(x);
+                if (threadIdx.x % WAVE == 0) {
+                    top_key[s][threadIdx.x / WAVE] = x;
                 }
             }
-            if (pending && n % 1024 == 0) { // past the deadline the launch traps, stopping this rank's step
-                const uint64_t now = __builtin_amdgcn_s_memrealtime();
-                if (t0 == 0) {
-                    t0 = now;
-                } else if (now - t0 > p.deadline_ticks) {
-                    __builtin_trap();
+            __syncthreads();
+            if (threadIdx.x < nseq) {
+                uint64_t top = 0;
+    #pragma unroll
+                for (int w = 0; w < THREADS / WAVE; ++w) {
+                    top = top_key[threadIdx.x][w] > top ? top_key[threadIdx.x][w] : top;
+                }
+                const int64_t tok = key_index(top);
+                prev[threadIdx.x] = tok;
+                if (blockIdx.x == 0) {
+                    p.out[threadIdx.x * p.out_stride + step] = tok;
                 }
             }
+            __syncthreads();
         }
-        MARKOV_STAMP(6 + 5 * step);
-        // the best record of each sequence: a wave's maximum, then the waves'
-        for (int s = 0; s < p.nseq; ++s) {
-            uint64_t x = 0;
-#pragma unroll
-            for (int k = 0; k < 4; ++k) {
-                const int i = threadIdx.x + k * THREADS;
-                if (i < polls && i / (p.blocks * p.tp) == s) {
-                    x = got[k] > x ? got[k] : x;
-                }
-            }
-            x = wave_max(x);
-            if (threadIdx.x % WAVE == 0) {
-                top_key[s][threadIdx.x / WAVE] = x;
-            }
-        }
-        __syncthreads();
-        if (threadIdx.x < p.nseq) {
-            uint64_t top = 0;
-#pragma unroll
-            for (int w = 0; w < THREADS / WAVE; ++w) {
-                top = top_key[threadIdx.x][w] > top ? top_key[threadIdx.x][w] : top;
-            }
-            const int64_t tok = key_index(top);
-            prev[threadIdx.x] = tok;
-            if (blockIdx.x == 0) {
-                p.out[threadIdx.x * p.out_stride + step] = tok;
-            }
-        }
-        __syncthreads();
         MARKOV_STAMP(4 + 5 * step);
     }
     if (threadIdx.x == 0) {
         p.counts[blockIdx.x] = count + 1;
     }
-    if (blockIdx.x == 0 && threadIdx.x < p.nseq) {
+    if (blockIdx.x == 0 && threadIdx.x < nseq) {
         p.tok[threadIdx.x] = prev[threadIdx.x];
         if (threadIdx.x == 0) { // every block read the counter before its first record
             p.offset[0] = offset + 1;
         }
     }
     // the last step's records came after every rank's step logits: gather the sampled sequences' rows
-    for (int seq = 0; seq < p.nseq; ++seq) {
+    for (int seq = 0; seq < nseq; ++seq) {
         if (p.temps[seq] == 0.0f) {
             continue;
         }
@@ -515,6 +640,7 @@ void markov_block(const at::Tensor &base, const at::Tensor &embed, const at::Ten
     TORCH_CHECK(p.blocks <= MAX_BLOCKS && control.numel() >= p.blocks, "control [blocks] int32, at most ",
                 MAX_BLOCKS, " blocks");
     TORCH_CHECK(nseq * peers.numel() * p.blocks <= 4 * THREADS, "a step's records at most 4 a thread");
+    TORCH_CHECK(nseq > 1 || peers.numel() * p.blocks <= POLL_ONE * WAVE, "one sequence's records on wave 0");
     p.rank             = static_cast<int>(rank);
     p.tp               = static_cast<int>(peers.numel());
     p.part             = static_cast<int>(part);
@@ -532,7 +658,11 @@ void markov_block(const at::Tensor &base, const at::Tensor &embed, const at::Ten
     }
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA guard(base.device());
     const hipStream_t stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA(base.device().index()).stream();
-    markov_block_kernel<<<p.blocks, THREADS, 0, stream>>>(p);
+    if (nseq == 1) {
+        markov_block_kernel<true><<<p.blocks, THREADS, 0, stream>>>(p);
+    } else {
+        markov_block_kernel<false><<<p.blocks, THREADS, 0, stream>>>(p);
+    }
     C10_HIP_KERNEL_LAUNCH_CHECK();
 }
 
