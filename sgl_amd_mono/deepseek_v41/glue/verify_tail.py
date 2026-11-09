@@ -17,7 +17,7 @@ import weakref
 
 import torch
 
-from sgl_amd_mono.deepseek_v41.glue import chose, flag, route
+from sgl_amd_mono.deepseek_v41.glue import chose, flag, inject, route
 
 ENV = "SGLANG_AMD_MONO_DSV41_VERIFY_TAIL"
 VERIFY = "sglang.srt.speculative.dspark_components.dspark_verify"
@@ -49,6 +49,9 @@ SGLANG_READS = {
         "_serves_accept_tail",
         "folds_commit",
         "verify_lens_buf",
+        "run_static",
+        "run_static(kv_projected)",
+        "hidden",
     ),
     "srt/layers/logits_processor.py": (
         "LogitsProcessor",
@@ -79,6 +82,8 @@ _EPILOGUES: weakref.WeakSet = weakref.WeakSet()  # every DsparkVerifyEpilogue bu
 # head output (per processor) and the epilogue's accept (per epilogue)
 _HEADS: dict = {}
 _ACCEPTS: dict = {}
+# per epilogue: the commit rows of the static verify being run or captured (``run_static``)
+_COMMITS: dict = {}
 
 
 def _why_not(epi, shard, logits, candidates) -> str | None:
@@ -283,6 +288,9 @@ def _static_accept_tail(
     # simulate_fold, else takes that row's argmax
     temps = (self.sim_temperatures_buf if self.simulate_fold else zeros)[:bs]
     self._log_accept_tail(bs, bonus_in=None, shard=shard)
+    # the commit that follows in this forward: its main_proj in this launch
+    hidden = _COMMITS.get(id(self))
+    proj = inject.projection(self, hidden) if gated and hidden is not None else None
     launch(
         logits, candidates, seq_lens, verify_lens, self.inject_gate_buf,
         sim=sim, temps=temps if sim is not None else None,
@@ -290,9 +298,18 @@ def _static_accept_tail(
         correct_out=self.correct_len_buf, bonus_out=self.bonus_buf,
         cap_trim_out=self.cap_trim_lens_buf, commit_out=self.commit_lens_buf,
         new_seq_out=self.new_seq_lens_buf, out_tokens=self.out_tokens_buf,
-        gated_out=self.gated_commit_lens_buf if gated else None,
+        gated_out=self.gated_commit_lens_buf if gated else None, proj=proj,
     )  # fmt: skip
     return self.gated_commit_lens_buf[:bs] if gated else None
+
+
+def _run_static(orig, self, io, *, accept, gate, kv_projected=False):
+    _COMMITS[id(self)] = None if kv_projected else io.hidden
+    try:
+        return orig(self, io, accept=accept, gate=gate, kv_projected=kv_projected)
+    finally:
+        _COMMITS.pop(id(self), None)
+        inject.check_projected()
 
 
 def _epilogue_init(orig, self, *args, **kwargs):
@@ -308,6 +325,7 @@ def install() -> None:
         return
     route(verify.DsparkVerifyEpilogue, "__init__", _epilogue_init)
     route(verify.DsparkVerifyEpilogue, "_static_accept_tail", _static_accept_tail)
+    route(verify.DsparkVerifyEpilogue, "run_static", _run_static)
     route(
         importlib.import_module(LOGITS).LogitsProcessor,
         "_compute_lm_head",
