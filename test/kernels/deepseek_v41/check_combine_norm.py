@@ -72,8 +72,12 @@ def main():
             want_s, want_c = fused._post_combine(x, res, post, comb, pre)
             want = norm(want_c)
             got_s, got = fused._post_combine_norm(x, res, post, comb, pre, norm)
+            got_c, got_n2 = fused.combine_and_norm(x, res, post, comb, pre, norm)
             torch.cuda.synchronize()
-            ok_s, ok_n = same(want_s, got_s), same(want, got)
+            ok_s, ok_n = (
+                same(want_s, got_s),
+                same(want, got) and same(want, got_n2) and same(want_c, got_c),
+            )
             if rows == 48 and n < 2:
                 # the norm alone: an identity combine of Triton's combined rows
                 e0 = torch.zeros(rows, HC, device=dev)
