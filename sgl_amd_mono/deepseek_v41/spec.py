@@ -1150,6 +1150,8 @@ class _Built:
         SGLang's Engram writes, then the head's combine and norm."""
         from sglang.kernels.ops.layernorm.mhc import hc_broadcast, mhc_combine
 
+        from sgl_amd_mono.deepseek_v41.glue import verify_tail
+
         m = self.model
         self._warm_normal_moe()
         # the first layer's launch reads the embedding rows itself where it can (no
@@ -1225,6 +1227,9 @@ class _Built:
             residual, hidden = fused.post_combine_norm(
                 last, pending, pre, m.hc_mult, m.norm
             )
+            if not tok_par:
+                # a greedy-variant verify's projection and accept in one launch, where it fits
+                verify_tail.fused_head(self.lm, forward_batch, hidden)
         pre_hc_head = residual.flatten(1)
         if aux is None:
             return hidden, pre_hc_head
