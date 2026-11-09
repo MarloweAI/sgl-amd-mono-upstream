@@ -15,6 +15,8 @@
 #include <hip/hip_runtime.h>
 #include <torch/library.h>
 
+#include "main_proj.h"
+
 #ifndef C10_HIP_KERNEL_LAUNCH_CHECK
 #define C10_HIP_KERNEL_LAUNCH_CHECK() C10_CUDA_KERNEL_LAUNCH_CHECK()
 #endif
@@ -107,7 +109,7 @@ __device__ inline int64_t record_slot(int parity, int row, int src, int block) {
 }
 
 // a block a chunk of the shard's columns, a wave a key row at a time; block 0 then reduces and accepts
-__global__ __launch_bounds__(THREADS) void verify_tail_kernel(const Params p) {
+__device__ inline void verify_tail_body(const Params &p) {
     __shared__ uint32_t s_count;
     __shared__ int64_t  s_sim;
     __shared__ uint64_t s_top[MAX_ROWS];
@@ -257,6 +259,19 @@ __global__ __launch_bounds__(THREADS) void verify_tail_kernel(const Params p) {
     }
 }
 
+__global__ __launch_bounds__(THREADS) void verify_tail_kernel(const Params p) { verify_tail_body(p); }
+
+// the accept's blocks first, then the draft's main_proj CTAs (main_proj.h), whose input rows are ready before the
+// head: its exchange waits overlap the accept's
+static_assert(THREADS == main_proj::THREADS);
+__global__ __launch_bounds__(THREADS) void verify_tail_proj_kernel(const Params p, const main_proj::Params q) {
+    if (static_cast<int>(blockIdx.x) < p.blocks) {
+        verify_tail_body(p);
+    } else {
+        main_proj::run(q, static_cast<int>(blockIdx.x) - p.blocks, static_cast<int>(gridDim.x) - p.blocks);
+    }
+}
+
 void check(const at::Tensor &t, const at::Tensor &ref, at::ScalarType dtype, const char *name) {
     TORCH_CHECK(t.device() == ref.device() && t.scalar_type() == dtype, name, " must be ", dtype, " on ",
                 ref.device());
@@ -270,13 +285,13 @@ template <typename T> T *ptr(const c10::optional<at::Tensor> &t) {
 // local [bs * T, part] bf16 (16 B aligned rows; the first width columns valid), candidates [bs, T] int64; the
 // outputs as static_accept_tail's (rows [:bs]); sim [1] int64 with temps [bs] f32 and seed [1] int32, or none;
 // counts [blocks] int32 (zeroed once), peers [tp] int64 on the host: every rank's zeroed records
-void verify_tail(const at::Tensor &local, const at::Tensor &candidates, const at::Tensor &seq_lens,
-                 const at::Tensor &verify_lens, const at::Tensor &gate, const c10::optional<at::Tensor> &sim,
-                 const c10::optional<at::Tensor> &temps, const c10::optional<at::Tensor> &seed,
-                 at::Tensor &correct_out, at::Tensor &bonus_out, at::Tensor &cap_trim_out, at::Tensor &commit_out,
-                 at::Tensor &new_seq_out, at::Tensor &out_tokens, const c10::optional<at::Tensor> &gated_out,
-                 const c10::optional<at::Tensor> &target_out, at::Tensor &counts, const at::Tensor &peers,
-                 int64_t rank, int64_t vocab_start, int64_t width, int64_t vocab, int64_t chunk, double deadline_s) {
+Params make_params(const at::Tensor &local, const at::Tensor &candidates, const at::Tensor &seq_lens,
+                   const at::Tensor &verify_lens, const at::Tensor &gate, const c10::optional<at::Tensor> &sim,
+                   const c10::optional<at::Tensor> &temps, const c10::optional<at::Tensor> &seed,
+                   at::Tensor &correct_out, at::Tensor &bonus_out, at::Tensor &cap_trim_out, at::Tensor &commit_out,
+                   at::Tensor &new_seq_out, at::Tensor &out_tokens, const c10::optional<at::Tensor> &gated_out,
+                   const c10::optional<at::Tensor> &target_out, at::Tensor &counts, const at::Tensor &peers,
+                   int64_t rank, int64_t vocab_start, int64_t width, int64_t vocab, int64_t chunk, double deadline_s) {
     const int64_t bs = candidates.size(0), T = candidates.size(1), tp = peers.numel();
     // the blocks tile the shard's columns, the same on every rank; the last rank's may run past the vocab
     const int64_t blocks = (local.size(1) + chunk - 1) / chunk;
@@ -355,9 +370,46 @@ void verify_tail(const at::Tensor &local, const at::Tensor &candidates, const at
     for (int r = 0; r < p.tp; ++r) {
         p.recv[r] = reinterpret_cast<void *>(peers.data_ptr<int64_t>()[r]);
     }
+    return p;
+}
+
+void verify_tail(const at::Tensor &local, const at::Tensor &candidates, const at::Tensor &seq_lens,
+                 const at::Tensor &verify_lens, const at::Tensor &gate, const c10::optional<at::Tensor> &sim,
+                 const c10::optional<at::Tensor> &temps, const c10::optional<at::Tensor> &seed,
+                 at::Tensor &correct_out, at::Tensor &bonus_out, at::Tensor &cap_trim_out, at::Tensor &commit_out,
+                 at::Tensor &new_seq_out, at::Tensor &out_tokens, const c10::optional<at::Tensor> &gated_out,
+                 const c10::optional<at::Tensor> &target_out, at::Tensor &counts, const at::Tensor &peers,
+                 int64_t rank, int64_t vocab_start, int64_t width, int64_t vocab, int64_t chunk, double deadline_s) {
+    const Params p = make_params(local, candidates, seq_lens, verify_lens, gate, sim, temps, seed, correct_out,
+                                 bonus_out, cap_trim_out, commit_out, new_seq_out, out_tokens, gated_out, target_out,
+                                 counts, peers, rank, vocab_start, width, vocab, chunk, deadline_s);
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA guard(local.device());
     const hipStream_t stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA(local.device().index()).stream();
     verify_tail_kernel<<<p.blocks, THREADS, 0, stream>>>(p);
+    C10_HIP_KERNEL_LAUNCH_CHECK();
+}
+
+// verify_tail's accept and, in the same launch, main_proj of x [rows, 15360] bf16 on this rank's columns w, ws into
+// proj_out (main_proj.h's arguments: proj_state, proj_work and proj_peers its exchange's)
+void verify_tail_proj(const at::Tensor &local, const at::Tensor &candidates, const at::Tensor &seq_lens,
+                      const at::Tensor &verify_lens, const at::Tensor &gate, const c10::optional<at::Tensor> &sim,
+                      const c10::optional<at::Tensor> &temps, const c10::optional<at::Tensor> &seed,
+                      at::Tensor &correct_out, at::Tensor &bonus_out, at::Tensor &cap_trim_out,
+                      at::Tensor &commit_out, at::Tensor &new_seq_out, at::Tensor &out_tokens,
+                      const c10::optional<at::Tensor> &gated_out, const c10::optional<at::Tensor> &target_out,
+                      at::Tensor &counts, const at::Tensor &peers, int64_t rank, int64_t vocab_start, int64_t width,
+                      int64_t vocab, int64_t chunk, double deadline_s, const at::Tensor &x, const at::Tensor &w,
+                      const at::Tensor &ws, at::Tensor &proj_out, at::Tensor &proj_state, at::Tensor &proj_work,
+                      const at::Tensor &proj_peers, double proj_deadline_s) {
+    const Params p = make_params(local, candidates, seq_lens, verify_lens, gate, sim, temps, seed, correct_out,
+                                 bonus_out, cap_trim_out, commit_out, new_seq_out, out_tokens, gated_out, target_out,
+                                 counts, peers, rank, vocab_start, width, vocab, chunk, deadline_s);
+    TORCH_CHECK(x.device() == local.device() && proj_peers.numel() == peers.numel(), "main_proj on the same group");
+    const main_proj::Params q =
+        main_proj::params(x, w, ws, proj_out, proj_state, proj_work, proj_peers, rank, proj_deadline_s);
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA guard(local.device());
+    const hipStream_t stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA(local.device().index()).stream();
+    verify_tail_proj_kernel<<<p.blocks + main_proj::grid(q), THREADS, 0, stream>>>(p, q);
     C10_HIP_KERNEL_LAUNCH_CHECK();
 }
 
@@ -396,7 +448,15 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
           "Tensor(c!) cap_trim_out, Tensor(d!) commit_out, Tensor(e!) new_seq_out, Tensor(f!) out_tokens, "
           "Tensor(g!)? gated_out, Tensor(h!)? target_out, Tensor(i!) counts, Tensor peers, int rank, "
           "int vocab_start, int width, int vocab, int chunk, float deadline_s) -> ()");
+    m.def("verify_tail_proj(Tensor local, Tensor candidates, Tensor seq_lens, Tensor verify_lens, Tensor gate, "
+          "Tensor? sim, Tensor? temps, Tensor? seed, Tensor(a!) correct_out, Tensor(b!) bonus_out, "
+          "Tensor(c!) cap_trim_out, Tensor(d!) commit_out, Tensor(e!) new_seq_out, Tensor(f!) out_tokens, "
+          "Tensor(g!)? gated_out, Tensor(h!)? target_out, Tensor(i!) counts, Tensor peers, int rank, "
+          "int vocab_start, int width, int vocab, int chunk, float deadline_s, Tensor x, Tensor w, Tensor ws, "
+          "Tensor(j!) proj_out, Tensor(k!) proj_state, Tensor(l!) proj_work, Tensor proj_peers, "
+          "float proj_deadline_s) -> ()");
     m.def("noisy_values(Tensor values, Tensor(a!) out, float t, int seed, int start) -> ()");
     m.impl("verify_tail", at::kCUDA, &verify_tail);
+    m.impl("verify_tail_proj", at::kCUDA, &verify_tail_proj);
     m.impl("noisy_values", at::kCUDA, &noisy_values);
 }

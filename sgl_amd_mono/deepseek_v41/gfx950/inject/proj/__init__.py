@@ -31,7 +31,10 @@ def ops(stamps: bool = False):
     """``torch.ops`` of ``main_proj.hip``, built at first use (``stamps``: the timing build)."""
     from sgl_amd_mono.common.hip_ext import load
 
-    sources = {p.name: p.read_text() for p in sorted(_HERE.glob("*.hip"))}
+    sources = {
+        p.name: p.read_text()
+        for p in sorted([*_HERE.glob("*.hip"), *_HERE.glob("*.h")])
+    }
     if stamps:
         return load(
             "sgl_amd_mono_dsv41_main_proj_st",

@@ -74,12 +74,24 @@ SGLANG_READS = {
         "TargetHiddenKvInjector",
         "_inject_mla",
         "draft_model",
+        "draft_model_runner",
+        '"set_swa_key_buffer_radix_fused_norm_rope"',
+        '"swa_req_ring_size"',
+        "inject_target_hidden",
+    ),
+    "srt/speculative/dspark_components/dspark_verify.py": (
+        "deferred_commit",
+        "commit_ctx",
+        "kv_injector",
     ),
 }
 
 
 # the TP group's main_proj exchange (``prepare``), None where SGLang's replicated main_proj runs
 _EXCHANGE: list = []
+# commit rows whose main_proj the verify accept's launch ran in the forward being run or captured
+# (``projection``): their address -> rows
+_PROJECTED: dict = {}
 
 
 def prepare(group, rank: int, size: int, device, deadline_s: float) -> None:
@@ -129,6 +141,52 @@ def _main_proj_why(model) -> str | None:
     ):
         return "main_proj scales not [160, 480] E8M0"
     return None
+
+
+def _projection_why(epilogue, hidden) -> str | None:
+    """Why a static verify's commit inject does not take main_proj's rows from the accept's
+    launch (None: it does)."""
+    from sgl_amd_mono.deepseek_v41.gfx950.inject import kv
+
+    if not flag(ENV) or not _EXCHANGE:
+        return "no split main_proj"
+    if epilogue.deferred_commit is not None:
+        return "the commit's KV is deferred"
+    injector = epilogue.commit_ctx.kv_injector
+    pool = injector.draft_model_runner.token_to_kv_pool
+    if not hasattr(pool, "set_swa_key_buffer_radix_fused_norm_rope"):
+        return "not the MLA inject"
+    if getattr(pool, "swa_req_ring_size", None) is not None:
+        return "a SWA ring"
+    st = _stages(injector.draft_model, pool)
+    if st is None or st.fused is not None or st.proj is None:
+        return "the inject's main_proj is not the split one"
+    if not _rows_ok(hidden) or not kv.MIN_ROWS <= hidden.shape[0] <= kv.MAX_ROWS:
+        return f"{tuple(hidden.shape)} commit rows"
+    return None
+
+
+def projection(epilogue, hidden):
+    """A static verify's commit rows ``hidden``: (x, w, ws, exchange) for the verify accept's
+    launch (``glue/verify_tail``) to run the split main_proj in, the commit's inject later in
+    the same forward taking its rows; None where the inject runs main_proj itself."""
+    why = _projection_why(epilogue, hidden)
+    if not chose("accept_main_proj", why is None, why):
+        return None
+    injector = epilogue.commit_ctx.kv_injector
+    st = _stages(injector.draft_model, injector.draft_model_runner.token_to_kv_pool)
+    _PROJECTED[hidden.data_ptr()] = hidden.shape[0]
+    return (hidden, *st.proj, _EXCHANGE[0])
+
+
+def check_projected() -> None:
+    """After a static verify's commits: every main_proj the accept's launch ran was taken."""
+    if _PROJECTED:
+        _PROJECTED.clear()
+        raise RuntimeError(
+            "DSV4.1 inject: main_proj ran in the verify accept's launch but the commit's "
+            "inject did not take its rows"
+        )
 
 
 class _Committed(NamedTuple):
@@ -285,7 +343,14 @@ def _write_target_hidden_kv(
     rows = main_hidden.shape[0]
     why = st.fused or (None if kv.MIN_ROWS <= rows <= kv.MAX_ROWS else f"{rows} rows")
     if chose("inject_kv", why is None, why):
-        if st.proj is not None and _rows_ok(main_hidden):
+        done = _PROJECTED.pop(main_hidden.data_ptr(), None)
+        if done is not None:  # the verify accept's launch ran it
+            if done != rows:
+                raise RuntimeError(
+                    f"DSV4.1 inject: the accept's launch projected {done} rows, the commit has {rows}"
+                )
+            projected = _EXCHANGE[0].out[:rows]
+        elif st.proj is not None and _rows_ok(main_hidden):
             projected = _EXCHANGE[0].run(main_hidden, *st.proj)
         else:
             projected, _ = self.stages[0].main_proj(main_hidden)
