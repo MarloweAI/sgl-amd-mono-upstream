@@ -151,11 +151,22 @@ def store_partial(part, words, off):
 
 
 @flyc.jit
-def await_flags(c, region, n, index):
-    """Thread u < n polls flag ``index(u)``; then the CTA proceeds."""
+def await_flags(c, region, n, index, also=None):
+    """Thread u < n polls flag ``index(u)``; then the CTA proceeds. ``also``: (on, n2,
+    index2): where ``on``, threads n + v (v < n2) poll flag ``index2(v)`` of the same
+    buffer in the same wait."""
     tid = c["tid"]
-    if tid < n:
-        c["mb"].poll([(region, index(fx.min(tid, n - 1)), 1)])
+    if const_expr(also is None):
+        if tid < n:
+            c["mb"].poll([(region, index(fx.min(tid, n - 1)), 1)])
+    else:
+        on, n2, index2 = also
+        assert n + n2 <= THREADS, (n, n2)
+        if (tid < n) | (on & (tid < n + n2)):
+            i = (tid < n).select(
+                index(fx.min(tid, n - 1)), index2(fx.min(fx.max(tid, n) - n, n2 - 1))
+            )
+            c["mb"].poll([(region, i, 1)])
     gpu.barrier()
 
 
@@ -965,6 +976,24 @@ def back_plan(key):
     return nchunk, n_split, n_comb, COMB0, WOA0, WOB0, early_wob
 
 
+def wob_cta_count(key) -> int:
+    """wo_b's CTAs from WOB0: on one token tile the CTAs without a wo_a unit where two
+    tasks each cover it (a wo_a CTA sees the last wo_a flag a poll later than one already
+    waiting), else all."""
+    s, d = key.tokens, Dims(key.tp)
+    units = woa_units(s, d)
+    one = len(token_tiles(s)) == 1
+    return BLOCKS - units if one and 2 * (BLOCKS - units) >= d.wob_tasks else BLOCKS
+
+
+def ardy_waiters(key) -> int:
+    """CTAs ``first_task(bid, WOB0) < ardy_waiters(key)`` wait on wo_a's flags in
+    ``run_back`` (and poll ``c["ardy_also"]`` there): every CTA when wo_a's units span
+    the token tiles, else wo_b's."""
+    s, d = key.tokens, Dims(key.tp)
+    return BLOCKS if woa_units(s, d) > d.woa_tasks else wob_cta_count(key)
+
+
 def back_lds_members(s: int, d: Dims) -> dict:
     """K2's attention LDS structs: the split stage's and the GEMVs' (a union's
     members: one at a time)."""
@@ -1072,11 +1101,7 @@ def run_back(c, key, bid, idle=None):
         c, a["woa"], a["woa_s"], group_k, woa_t * WOA_ROWS, WOA_SPLIT_K, pred=has_woa
     )
     wob_unit = first_task(bid, WOB0)
-    # wo_b's CTAs: one tile, the CTAs without a wo_a unit where two tasks each cover it
-    # (a wo_a CTA sees the last wo_a flag a poll later than one already waiting), else all
-    wob_ctas = (
-        BLOCKS - units if nt == 1 and 2 * (BLOCKS - units) >= wob_tasks else BLOCKS
-    )
+    wob_ctas = wob_cta_count(key)
     has_wob = True if wob_ctas == BLOCKS else wob_unit < wob_ctas
     if const_expr(nt == 1):
         # one or two wo_b tasks a CTA, every one on the step's rows
@@ -1153,14 +1178,24 @@ def run_back(c, key, bid, idle=None):
     if const_expr(not early_wob):
         wops = wob_weights()
     stamp(c, 11)
+    also = c.get("ardy_also")
     if const_expr(woa_spread):
         # this tile's wo_a units
         await_flags(
-            c, c["ardy"], woa_tasks, lambda u: (wob_tile * woa_tasks + u) * FLAG_STRIDE
+            c,
+            c["ardy"],
+            woa_tasks,
+            lambda u: (wob_tile * woa_tasks + u) * FLAG_STRIDE,
+            also,
         )
     else:
+        if const_expr(early_wob and wob_ctas < BLOCKS):
+            # every CTA's wo_b loads (masked where it has none) landed long before wo_a's
+            # flags: drained here, else the wo_b CTAs' path past their push meets a join
+            # whose wait holds their next loads behind the pushed cells' stores
+            rocdl.s_waitcnt(vmcnt=0)
         if has_wob:
-            await_flags(c, c["ardy"], woa_tasks, lambda u: u * FLAG_STRIDE)
+            await_flags(c, c["ardy"], woa_tasks, lambda u: u * FLAG_STRIDE, also)
     stamp(c, 12)
     x8b = (
         c["x8b"],

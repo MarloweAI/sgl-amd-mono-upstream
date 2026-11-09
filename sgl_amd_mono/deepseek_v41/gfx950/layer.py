@@ -1163,9 +1163,10 @@ def run_ffn(key: MonoBuild, lds, a: dict, amb, bases, own, rank, ep, part=None):
         cb["own_view"] = {**cb, "S": own_n, "args": {**margs, "out": out_own}}
     grdy = a.get("grdy")
     if const_expr(grdy is not None):
-        # one launch per layer: the slices read the mixes K1's gates wrote
+        # one launch per layer: the slices read the mixes K1's gates wrote (the CTAs that
+        # waited on wo_a's flags polled them there)
         poll = amb.poll
-        if bid < SLICES:
+        if (bid < SLICES) & a["grdy_late"]:
             if tid < own_n:
                 poll([(grdy, tid * FLAG_STRIDE, 1)])
             gpu.barrier()
@@ -1597,6 +1598,12 @@ def run_k2(
                 )
 
         c["k1_seen"] = k1_seen
+        # the slice CTAs that wait on wo_a's flags poll the gates' flags in the same wait:
+        # in ``run_ffn`` the poll would queue behind their wo_b push's peer stores
+        gap = layout["grdy"][0] - layout["ardy"][0]
+        assert gap >= 0 and gap % 8 == 0, gap
+        own_n = s // tp if const_expr(key.tok_par) else s
+        c["ardy_also"] = (bid < SLICES, own_n, lambda u: gap // 8 + u * FLAG_STRIDE)
     else:
         epoch_begin(ctx, epoch, ep)
     if const_expr(key.index):
@@ -1686,6 +1693,8 @@ def run_k2(
     )
     if const_expr(one):
         a["grdy"] = sreg(scratch, layout["grdy"][0], "grdy")
+        wob0 = mb_back.back_plan(bkey)[5]
+        a["grdy_late"] = first_task(bid, wob0) >= mb_back.ardy_waiters(bkey)
     run_ffn(key, lds, a, amb, bases, own, rank, ep)
     if const_expr(key.eg):
         # every rank's share of the projection in, long since: into ``eg_kv``
