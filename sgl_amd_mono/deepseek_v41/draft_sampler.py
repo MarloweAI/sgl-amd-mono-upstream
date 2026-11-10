@@ -160,6 +160,16 @@ class _Sampler:
             self.width,
         )
         self.ops = markov.ops()
+        # one sequence's head and Markov block in one launch: its own exchange, launch counts and base logits
+        self.fused = None
+        if _head_folds(model, gamma, group.world_size):
+            self.fused = markov.Exchange(
+                group.cpu_group, group.rank_in_group, group.world_size, device, gamma, self.width,
+                control=markov.MAX_BLOCKS,
+            )  # fmt: skip
+            self.base = torch.zeros(
+                gamma * self.width, dtype=torch.int64, device=device
+            )
 
     def block(
         self, base_logits, anchor, temps, noise, out, step_logits, verify_ids=None
@@ -176,13 +186,33 @@ class _Sampler:
 
     def step(self, hidden_states, anchor_tokens):
         """SGLang's base logits and Markov block of a bs-row draft block."""
+        from sgl_amd_mono.deepseek_v41.glue import chose
+
         held = _HEAD_INPUT
-        if (
+        normed = (
             held
             and held[0].data_ptr() == hidden_states.data_ptr()
             and held[0].shape == hidden_states.shape
             and head_input_folds(self.model)
+        )
+        bs = anchor_tokens.shape[0]
+        if chose(
+            "draft_head",
+            self.fused is not None and normed and bs == 1 and held[1].is_contiguous(),
         ):
+            # the head's projection of the normed rows and the Markov block in one launch
+            x = self.fused
+            out, verify = (
+                self.out[: self.gamma],
+                None if self.verify_ids is None else self.verify_ids[:1],
+            )
+            self.ops.draft_head(
+                held[1], self.model.lm_head.weight, self.base, self.embed, self.head, anchor_tokens.long(),
+                self.temps[:1], self.noise.offset, int(self.noise.key), self.vocab_start, out, self.gamma,
+                x.tok, x.control, x.peers, x.rank, self.step_logits[:1], self.width, self.deadline_s, verify,
+            )  # fmt: skip
+            return out.view(1, self.gamma), hidden_states
+        if normed:
             # _logits_from_x_post_hc on the rows normed in the combine's launch
             project = sys.modules[DRAFT].project_through_lm_head
             base_logits, confidence_features = (
@@ -193,7 +223,6 @@ class _Sampler:
             base_logits, confidence_features = self.model.compute_base_logits(
                 hidden_states
             )
-        bs = anchor_tokens.shape[0]
         base = base_logits.view(bs, self.gamma, -1)
         out = self.out[: bs * self.gamma]
         verify = None if self.verify_ids is None else self.verify_ids[:bs]
@@ -202,6 +231,24 @@ class _Sampler:
             self.step_logits[:bs], verify,
         )  # fmt: skip
         return out.view(bs, self.gamma), confidence_features
+
+
+def _head_folds(model, gamma: int, tp: int) -> bool:
+    """Whether one sequence's base logits run in the Markov block's launch: TP8 (at TP4 the
+    launch measured level with hipBLASLt + the Markov block), the head input folds
+    (``head_input_folds``), a bf16 head shard [width, 5120] of the kernel's shapes, at most 6 steps."""
+    w = getattr(model.lm_head, "weight", None)
+    return (
+        tp == 8
+        and head_input_folds(model)
+        and w is not None
+        and w.dtype == torch.bfloat16
+        and w.dim() == 2
+        and w.shape[1] == 5120
+        and w.stride(1) == 1
+        and w.shape[0] == int(model.lm_head.num_embeddings_per_partition)
+        and gamma <= 6
+    )
 
 
 def _factory(
