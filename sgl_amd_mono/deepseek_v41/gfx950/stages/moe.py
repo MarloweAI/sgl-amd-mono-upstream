@@ -1853,14 +1853,16 @@ def stage_row_down(c, bid):
             dst = preg(c["peer_addr"](p), c["ffn_off"], "ffn")
             put_ffn(c, dst, p, r, s, col, v0, v1)
     stamp(c, 25)
-    if tid < width // 2:
-        own = preg(c["sym"], c["ffn_off"], "ffn")
-        acc0, acc1 = sum_partials(
-            c["poll"], own, lambda src: region_pair(src, r, s, col), d.tp
-        )
-        out = rsrc(c["args"]["out"])
-        bo.buffer_store(acc0.to(fx.BFloat16), out, r * HIDDEN + col)
-        bo.buffer_store(acc1.to(fx.BFloat16), out, r * HIDDEN + col + 1)
+    # ``seam_next``: the next layer's seam slices sum the partials (``layer.seam_tail``)
+    if const_expr(not c.get("seam_next", False)):
+        if tid < width // 2:
+            own = preg(c["sym"], c["ffn_off"], "ffn")
+            acc0, acc1 = sum_partials(
+                c["poll"], own, lambda src: region_pair(src, r, s, col), d.tp
+            )
+            out = rsrc(c["args"]["out"])
+            bo.buffer_store(acc0.to(fx.BFloat16), out, r * HIDDEN + col)
+            bo.buffer_store(acc1.to(fx.BFloat16), out, r * HIDDEN + col + 1)
 
 
 @flyc.jit
@@ -2098,8 +2100,10 @@ def run_moe(c, key, bid, before_ug=None):
         stamp(c, 25)
         # token parallel: this rank's rows' sums alone, ``out`` from its first row
         cr = c if const_expr(c["own"] is None) else c["own_view"]
-        for task in range(first_task(bid, RED0), RED_TASKS, BLOCKS):
-            stage_reduce(cr, task)
+        # ``seam_next``: the next layer's seam slices sum the partials (``layer.seam_tail``)
+        if const_expr(not c.get("seam_next", False)):
+            for task in range(first_task(bid, RED0), RED_TASKS, BLOCKS):
+                stage_reduce(cr, task)
         stamp(c, 26)
 
 

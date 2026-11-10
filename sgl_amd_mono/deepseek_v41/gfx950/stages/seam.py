@@ -21,6 +21,7 @@ from sgl_amd_mono.common.ops import (
     CM_DEV,
     CM_SYS,
     batched_rounds,
+    bf16_pair,
     bf16_round,
     bf_hi,
     bf_lo,
@@ -72,6 +73,51 @@ def scratch_layout(tokens: int) -> dict[str, tuple[int, int]]:
         "pmix": SLICES * tokens * PART,
     }
     return pair_layout(pairs.items())
+
+
+# ---------------------------------------------------------------- seam state
+# A launch can run the next layer's attention seam slice past its MoE reduce
+# (``MonoBuild.seam_next``): the next launch then reads that seam's R_new, its layer input
+# (LIN, bf16) and the mixes' partials (f32) as plain rows (``MonoBuild.seamed``).
+SEAM_MAX_TOKENS = (
+    8  # widths the slice's first loads fit in registers beside the MoE reduce's
+)
+
+
+def seam_state_layout(tokens: int) -> dict[str, tuple[int, int]]:
+    """A seam state's regions -> (byte offset, bytes)."""
+    out, off = {}, 0
+    for name, n in (
+        ("res", tokens * HC * HIDDEN * 2),
+        ("lin", tokens * HIDDEN * 2),
+        ("pmix", SLICES * tokens * PART * 4),
+    ):
+        out[name] = (off, n)
+        off = -(-(off + n) // 256) * 256
+    return out
+
+
+def seam_state_bytes(tokens: int) -> int:
+    return max(o + n for o, n in seam_state_layout(tokens).values())
+
+
+def plain_put(base, i, v):
+    """Word i := ``v`` (f32 or i32), a plain store the next launch reads."""
+    bits = v.bitcast(fx.Int32) if isinstance(v, fx.Float32) else fx.Int32(v)
+    bo.buffer_store(bits, rsrc(base), i)
+
+
+def plain_put_bf(base, i, vs):
+    """Elements i, i + 1 (i even) as one bf16 pair, a plain store the next launch reads."""
+    bo.buffer_store(bf16_pair(vs[0], vs[1]).bitcast(fx.Int32), rsrc(base), i // 2)
+
+
+def plain_loads(specs):
+    """``Mailbox.poll``'s result for words the previous launch stored (``plain_put``)."""
+    return [
+        [fx.Int32(bo.buffer_load(rsrc(b), fx.Int32(i), vec_width=1, dtype=T.i32))]
+        for b, i, _ in specs
+    ]
 
 
 def attn_peer_bytes(tokens: int, tp: int) -> int:

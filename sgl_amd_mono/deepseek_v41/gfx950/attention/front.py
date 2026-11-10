@@ -208,14 +208,16 @@ def stage_wqkv(c, ops, slots, n, halves):
 
 
 @flyc.jit
-def wqkv_publish(c, task, accs, slots, order, t0, n, live, part=None, s=0):
+def wqkv_publish(c, task, accs, slots, order, t0, n, live, part=None, s=0, half=None):
     """Sum wqkv rows 16 task .. for tokens t0 .. t0 + n in SGLang's order into QKVP, as
     bf16 pairs (the qkv stage rounds the sums to bf16 first). Split (``part``): part 0
     sums the first half of ``order`` into QKVP's second region (``s`` rows on, fp32),
-    part 1 the rest onto that sum."""
+    part 1 the rest onto that sum. ``half``: rows 8 half .. + 8 of the tile alone."""
     tid, red = c["tid"], c["red"]
     chain_store(c, red, accs, slots)
     gpu.barrier()
+    if const_expr(half is not None):
+        live = live & ((tid % ROWS) // 8 == half)
     if (tid < ROWS * n) & live:
         r = tid % ROWS
         tl = tid // ROWS
@@ -617,9 +619,12 @@ def run_front(
     after_wqkv=None,
     before_wqb=None,
     qkv_first=0,
+    row_halves=False,
 ):
     """Run the front's stages on this CTA; the seam publishes X8 before them.
-    ``qkv_first``: the first CTA of the q / kv norms."""
+    ``qkv_first``: the first CTA of the q / kv norms; ``row_halves``: where ``wqkv_split``
+    holds, each of a row tile's two CTAs takes 8 of its rows over all of K instead of half
+    of K, so no sum crosses CTAs."""
     s = key.tokens
     # the wqkv GEMV takes all of K from X8, which the seam publishes
     assert x8_given
@@ -640,6 +645,9 @@ def run_front(
     waves, halves, order = wqkv_order(s)
     # a row tile's chains on two CTAs (``wqkv_split``): half its weights each land sooner
     split = len(wtiles) == 1 and wqkv_split(s, own)
+    # row halves: two CTAs a row tile as the split's, each with every chain
+    halved = split and row_halves
+    split = split and not row_halves
     chains = waves // 2 if split else waves
     dead = -(-chains // WAVES) * WAVES - chains
     # the chains' partials, and a dead wave's, fit ``red``
@@ -648,13 +656,13 @@ def run_front(
     # loads complete in issue order: each CTA issues its latency-critical loads first
     wqb_task = first_task(bid, WQB0)
     if const_expr(len(wtiles) == 1):
-        units = 2 * n_wqkv if split else n_wqkv
+        units = 2 * n_wqkv if split or halved else n_wqkv
         wqkv_unit = first_task(bid, 0)
         has_wqkv = wqkv_unit < units
         unit = fx.min(wqkv_unit, units - 1)
         task, part = unit % n_wqkv, unit // n_wqkv
         # split: the key table past the norms', gates' and qkv's CTAs (``build_mono_k1``)
-        kt_from = QKV0 + own if split else n_wqkv
+        kt_from = QKV0 + own if split or halved else n_wqkv
         kt_step = BLOCKS - kt_from
     else:
         # a row tile's token tiles on CTAs task, task + n_wqkv, .. (ROCm/ATOM), not one in turn
@@ -688,8 +696,9 @@ def run_front(
         after_wqkv()
     slots = chain_slots(c, HIDDEN // 128, waves, part * chains if split else 0, chains)
     kops = chain_loads(
-        c, a["wqkv"], a["wqkv_s"], HIDDEN, task * ROWS, slots, has_wqkv, c["shuffled"]
-    )
+        c, a["wqkv"], a["wqkv_s"], HIDDEN, task * ROWS, slots, has_wqkv, c["shuffled"],
+        *((part, QKV_ROWS) if halved else ()),
+    )  # fmt: skip
     # one token tile: the wq_b weights here on a CTA without a wqkv tile (the qkv stage's polls
     # behind them land by then); a wqkv CTA's past its GEMV, as its barriers wait on every load
     early_wqb = len(wtiles) == 1
@@ -756,8 +765,9 @@ def run_front(
         x_store(regs, n, parts)
         accs = stage_wqkv(c, kops, slots, n, halves)
         wqkv_publish(
-            c, task, accs, slots, order, t0, n, has_wqkv, part if split else None, s
-        )
+            c, task, accs, slots, order, t0, n, has_wqkv, part if split else None, s,
+            part if halved else None,
+        )  # fmt: skip
         if has_wqkv:
             bops = wqb_weights()
     else:

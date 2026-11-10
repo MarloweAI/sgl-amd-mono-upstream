@@ -25,11 +25,13 @@ from sgl_amd_mono.common.ops import (
     CM_DEV,
     CM_SYS,
     bf16_pair,
+    bf16_round,
     butterfly,
     fp8_pack4,
     peer_bases,
     ptr64,
     rsrc,
+    sum_partials,
     uniform,
 )
 from sgl_amd_mono.common.plan import (
@@ -121,6 +123,12 @@ class MonoBuild(msgspec.Struct, frozen=True):
     eg: int = 0
     # an index source's K2 also runs its selection's glue (``stages.index_glue``: TABLE, RAWS)
     glue: int = 0
+    # one launch per layer: the previous launch ran this layer's attention seam slice
+    # (``seam_next``); the front reads its seam state, each wqkv CTA norms the rows itself
+    seamed: bool = False
+    # one launch per layer: the MoE reduce runs the next layer's attention seam slice into
+    # the seam state the next launch reads (``seamed``)
+    seam_next: bool = False
 
 
 ROUTE = ("experts", "topk", "ug_groups", "swa_width")
@@ -143,6 +151,8 @@ def _variant(key: MonoBuild) -> dict:
         | ({"em": 1} if key.embed else {})
         | ({"eg": key.eg} if key.eg else {})
         | ({"gl": key.glue} if key.glue else {})
+        | ({"sd": 1} if key.seamed else {})
+        | ({"sn": 1} if key.seam_next else {})
     )
 
 
@@ -197,6 +207,8 @@ def scratch_layout(s: int, tp: int, timeline: bool = False, **route) -> dict:
             "qb": (256, q_flags),
             "vrdy": (256 + q_flags, s * flag),
             "grdy": (256 + q_flags + s * flag, s * flag),
+            # the FFN gates' mixes a token, for the next layer's seam slice (``seam_next``)
+            "frdy": (256 + q_flags + 2 * s * flag, s * flag),
         }
     )
     # the router CTAs' x boxes (``moe.signal_xbox``): uncached scratch, scalar-polled
@@ -395,6 +407,8 @@ def run_k1(key: MonoBuild, sl, front, a: dict, ep, k2=None, early=None):
     # the norms past the slices' CTAs (the wqkv waits on them), and past a split wqkv's
     NORM0 = 2 * WQKV_TASKS if wqkv_split(s, own_n) else SLICES
     GATE0 = NORM0 + own_n
+    # seamed: no slice; the norms and gates run at entry
+    assert not key.seamed or not (key.tok_par or key.index or k2 is None), key
     assert GATE0 + own_n <= BLOCKS
     # the index query here (``index_query``) only where it is reproduced
     assert not key.iq or (key.index and index_query.fused(s, key.tok_par)), key
@@ -498,6 +512,12 @@ def run_k1(key: MonoBuild, sl, front, a: dict, ep, k2=None, early=None):
     }
     for region in ("lin", "pmix"):
         ca[region] = sreg(scratch, layout[region][0], region)
+    if const_expr(key.seamed):
+        # the seam state the previous launch's tail stored: plain rows
+        st = seam.seam_state_layout(s)
+        for region in ("lin", "pmix"):
+            ca[region] = a["seam_in"] + fx.Int64(st[region][0])
+        ca["poll"] = seam.plain_loads
     if const_expr(k2 is not None):
         ca["dev"] = True
     if const_expr(key.embed):
@@ -517,10 +537,12 @@ def run_k1(key: MonoBuild, sl, front, a: dict, ep, k2=None, early=None):
 
     def seam_slice():
         stamp(c, 32)
-        for task in range(first_task(bid, 0), SLICES, BLOCKS):
-            seam.stage_slice(ca, task)
-        gpu.barrier()
-        stamp(c, 33)
+        # seamed: the previous launch ran the slice
+        if not key.seamed:
+            for task in range(first_task(bid, 0), SLICES, BLOCKS):
+                seam.stage_slice(ca, task)
+            gpu.barrier()
+            stamp(c, 33)
 
     def store(t, col, ys, live):
         store_x8(c, t, col, ys, live)
@@ -561,19 +583,41 @@ def run_k1(key: MonoBuild, sl, front, a: dict, ep, k2=None, early=None):
         if const_expr(early is not None):
             early.entries()
 
-    mb_front.run_front(
-        c,
-        fkey,
-        bid,
-        x8_given=True,
-        before_wqkv=seam_slice,
-        after_wqkv=seam_norm,
-        before_wqb=seam_gate,
-        # past the slices, norms and gates where the grid has room: a slice CTA
-        # issues its weights after its slice, and the norms' publish (vmcnt(0))
-        # waited for them to land
-        qkv_first=QKV0,
-    )
+    if const_expr(key.seamed):
+
+        def entry_norm():
+            # LIN and the mixes are in: the norms and the gates run at the launch's entry
+            seam_norm()
+            for t in range(first_task(bid, GATE0), own_n, BLOCKS):
+                seam.stage_gate(ca, t)
+                mb_front.hand_off(c, "grdy", t * FLAG_STRIDE)
+
+        mb_front.run_front(
+            c,
+            fkey,
+            bid,
+            x8_given=True,
+            before_wqkv=seam_slice,
+            after_wqkv=entry_norm,
+            before_wqb=early.entries,
+            qkv_first=QKV0,
+            # a row tile's sums each on one CTA: no partner hand-off
+            row_halves=True,
+        )
+    else:
+        mb_front.run_front(
+            c,
+            fkey,
+            bid,
+            x8_given=True,
+            before_wqkv=seam_slice,
+            after_wqkv=seam_norm,
+            before_wqb=seam_gate,
+            # past the slices, norms and gates where the grid has room: a slice CTA
+            # issues its weights after its slice, and the norms' publish (vmcnt(0))
+            # waited for them to land
+            qkv_first=QKV0,
+        )
     if const_expr(key.tok_par):
         # K1's outputs hold every row: copy in the rows the other ranks computed
         own = sym + par
@@ -1066,8 +1110,14 @@ def _seam_lds(s):
 
 
 @flyc.jit
-def run_ffn(key: MonoBuild, lds, a: dict, amb, bases, own, rank, ep, part=None):
-    """Run the FFN seam, the MoE and its all-reduce into ``a["out"]``."""
+def run_ffn(
+    key: MonoBuild, lds, a: dict, amb, bases, own, rank, ep, part=None, sn=None
+):
+    """Run the FFN seam, the MoE and its all-reduce into ``a["out"]``; ``sn``
+    (``key.seam_next``, ``SEAM_ARGS``): the all-reduce into the next layer's attention seam
+    slice instead, whose outputs go to the seam state ``sn["seam_out"]``."""
+    assert (sn is not None) == key.seam_next, key
+    assert not key.seam_next or not key.tok_par, key
     s, tp = key.tokens, key.tp
     layout = scratch_layout(s, tp, key.timeline, **route_of(key))
     mkey = _moe_key(key)
@@ -1156,6 +1206,9 @@ def run_ffn(key: MonoBuild, lds, a: dict, amb, bases, own, rank, ep, part=None):
         cb["tl"] = ca["tl"]
     for i, region in enumerate(COUNTERS):
         cb[region] = sreg(a["epoch"], 4 * (EPOCH_COUNTERS + i * moe.TAGS), region)
+    # the next layer's seam slice sums the down partials itself (``seam_next``)
+    cb["seam_next"] = key.seam_next
+    frdy = sreg(scratch, layout["frdy"][0], "frdy")
     if const_expr(key.tok_par):
         # the down sums reduce-scattered: each rank sums its own rows into ``out``
         cb["own"] = own_n
@@ -1208,15 +1261,101 @@ def run_ffn(key: MonoBuild, lds, a: dict, amb, bases, own, rank, ep, part=None):
     gpu.barrier()
     stamp(ca, 18)
 
+    # the next layer's seam slice reads the mixes in this launch: device scope, flagged
+    cg = {**ca, "dev": True} if const_expr(key.seam_next) else ca
+
     def gates():
-        # only the next launch reads the mixes; later MoE stages reload the LDS the gate clobbers
+        # only the next layer's seam reads the mixes; later MoE stages reload the LDS the
+        # gate clobbers
         gpu.barrier()
         for t in range(first_task(bid, GATE0), own_n, BLOCKS):
-            seam.stage_gate(ca, t)
+            seam.stage_gate(cg, t)
+            if const_expr(key.seam_next):
+                publish(amb.put, frdy, t * FLAG_STRIDE, 1, tid == 0)
         stamp(ca, 23)
 
     moe.run_moe(cb, mkey, bid, before_ug=gates)
     stamp(ca, 27)
+    if const_expr(key.seam_next):
+        # the next layer's seam slice past the MoE: its loads issued after the down's, which
+        # they would delay, and in flight through the wait on the ranks' partials
+        loads, run = seam_tail(key, ca, cb, a, sn, frdy)
+        gpu.barrier()
+        for task in range(first_task(bid, 0), SLICES, BLOCKS):
+            run(task, loads(task))
+
+
+TAIL_SUM0 = 128  # the seam tail's first summing thread
+
+
+def seam_tail(key: MonoBuild, ca, cb, a, sn, frdy):
+    """The next layer's attention seam slice, task k on CTA k past its MoE work, as
+    (``loads``, ``run``): ``loads(task)`` waits on the FFN gates' mixes and issues the
+    slice's own loads; ``run(task, pre)`` sums the ranks' down partials of columns 32 k ..
+    in rank order (the MoE reduce's sum, bf16) into the pend LDS, then folds them into the
+    next layer's R_new and computes its layer input and mixes' partials, all stored plain
+    into the seam state ``seam_out``."""
+    s, tp = key.tokens, key.tp
+    assert TAIL_SUM0 + s * seam.COLS // 2 <= THREADS, s
+    st = seam.seam_state_layout(s)
+    out = sn["seam_out"]
+    cn = {
+        **ca,
+        "put": seam.plain_put,
+        "put_bf": seam.plain_put_bf,
+        "lin": out + fx.Int64(st["lin"][0]),
+        "pmix": out + fx.Int64(st["pmix"][0]),
+        "args": {
+            "res_in": a["res_out"],
+            "post_in": a["post_out"],
+            "comb_in": a["comb_out"],
+            "pre_in": a["pre_out"],
+            "hc_fn": sn["nx_fn"],
+            "res_out": out + fx.Int64(st["res"][0]),
+            "aux_out": sn["nx_aux"],
+            "aux_stride": sn["nx_aux_stride"],
+        },
+        "fold": True,
+        "aux_on": sn["nx_aux"] != 0,
+    }
+    own = preg(cb["sym"], cb["ffn_off"], "ffn")
+    return (
+        lambda task: tail_loads(ca, cn, frdy, s, task),
+        lambda task, pre: tail_run(ca, cn, own, s, tp, task, pre),
+    )
+
+
+@flyc.jit
+def tail_loads(ca, cn, frdy, s, task):
+    """``seam_tail``'s loads: the FFN gates' mixes (post, comb, next pre) waited on first,
+    the slice's rows read them; then the slice's own loads."""
+    stamp(ca, 29)
+    if ca["tid"] < s:
+        ca["poll"]([(frdy, ca["tid"] * FLAG_STRIDE, 1)])
+    gpu.barrier()
+    return seam.slice_prefetch(cn, task)
+
+
+@flyc.jit
+def tail_run(ca, cn, own, s, tp, task, pre):
+    """``seam_tail``'s sums and slice."""
+    gpu.barrier()
+    # the sums on waves 2 .. : wave 0 pushed the down partials, and a wave's first wait
+    # also waits on its own pushes' acks
+    u = ca["tid"] - TAIL_SUM0
+    if (u >= 0) & (u < s * seam.COLS // 2):
+        t = u // (seam.COLS // 2)
+        cc = 2 * (u % (seam.COLS // 2))
+        col = task * seam.COLS + cc
+        acc0, acc1 = sum_partials(
+            ca["poll"], own, lambda src: moe.region_pair(src, t, s, col), tp
+        )
+        fx.ptr_store(bf16_round(acc0), ca["pend_lds"] + (t * seam.COLS + cc))
+        fx.ptr_store(bf16_round(acc1), ca["pend_lds"] + (t * seam.COLS + cc + 1))
+    gpu.barrier()
+    stamp(ca, 31)
+    seam.stage_slice(cn, task, pre)
+    stamp(ca, 124)
 
 
 def reset_counters(epoch, ep):
@@ -1469,13 +1608,15 @@ def run_k2(
     k1_first=None,
     pre=None,
     pbases=None,
+    sn=None,
 ):
     """K2 on this CTA: the attention back on K1's q, its wo_b partial pushed to every
     rank, then ``run_ffn`` (``lds``: a union with K2's members). ``one``: one launch per
     layer, K1's half before it in the same launch (``build_mono_layer``; ``k1_first``: the
     first loads of a split CTA's K1 flags, issued as K1's half ended; ``pre``: its keys,
     ``back.EarlyKeys.loads``; ``pbases``: the peer bases, loaded at the launch's start). ``eg``: a later
-    Engram layer's projection's arguments (``EG_ARGS``, ``key.eg``)."""
+    Engram layer's projection's arguments (``EG_ARGS``, ``key.eg``); ``sn``: the next
+    layer's attention seam's (``SEAM_ARGS``, ``key.seam_next``)."""
     (
         q,
         swa,
@@ -1695,7 +1836,7 @@ def run_k2(
         a["grdy"] = sreg(scratch, layout["grdy"][0], "grdy")
         wob0 = mb_back.back_plan(bkey)[5]
         a["grdy_late"] = first_task(bid, wob0) >= mb_back.ardy_waiters(bkey)
-    run_ffn(key, lds, a, amb, bases, own, rank, ep)
+    run_ffn(key, lds, a, amb, bases, own, rank, ep, sn=sn)
     if const_expr(key.eg):
         # every rank's share of the projection in, long since: into ``eg_kv``
         engram.unpack(gc, ec, s)
@@ -2054,8 +2195,17 @@ LAYER_ARGS = K1_ARGS + (
     "eg_ws",
     "eg_kv",
     "eg_row0",
+    # the next layer's attention seam (``MonoBuild.seam_next``): its mix weights, its DSpark
+    # capture (0: none) and the capture's row stride; the seam state this launch reads
+    # (``MonoBuild.seamed``) and the one it writes
+    "nx_fn",
+    "nx_aux",
+    "nx_aux_stride",
+    "seam_in",
+    "seam_out",
 )
-EG_ARGS = LAYER_ARGS[-5:]
+EG_ARGS = ("eg_x", "eg_w", "eg_ws", "eg_kv", "eg_row0")
+SEAM_ARGS = ("nx_fn", "nx_aux", "nx_aux_stride", "seam_out")
 # K2's arguments in the layer launch: its rows in are K1's out, and K1's rope table
 K2_OF_LAYER = {
     "res_in": "res_out",
@@ -2075,7 +2225,7 @@ K2_OF_LAYER = {
 # the layer launch's 32-bit arguments (the others are 64-bit)
 LAYER_I32 = frozenset(
     ("aux_stride", "slot_words", "swa_block", "iw_scale", "num_pos", "rank")
-    + ("ids_words", "comp_block", "qk_scale", "eg_row0")
+    + ("ids_words", "comp_block", "qk_scale", "eg_row0", "nx_aux_stride")
 )
 
 
@@ -2307,6 +2457,11 @@ def build_mono_layer(key: MonoBuild):
         eg_ws: Int64,
         eg_kv: Int64,
         eg_row0: Int32,
+        nx_fn: Int64,
+        nx_aux: Int64,
+        nx_aux_stride: Int32,
+        seam_in: Int64,
+        seam_out: Int64,
     ):
         _ = keyed
         warm_kernargs(max(offsets.values()) + 8)
@@ -2411,6 +2566,7 @@ def build_mono_layer(key: MonoBuild):
                 "eg_ws": eg_ws,
                 "eg_kv": eg_kv,
                 "eg_row0": eg_row0,
+                "seam_in": seam_in,
             }
             # the peer table's words and the epoch together; the epoch in a scalar register,
             # it lives through K1 into K2, and the peer bases too (K2 reads them, a load of
@@ -2448,8 +2604,10 @@ def build_mono_layer(key: MonoBuild):
             pre = early.loads()
             names = [K2_OF_LAYER.get(n, n) for n in K2_ARGS]
             names += list(EG_ARGS) if key.eg else []
+            names += list(SEAM_ARGS) if key.seam_next else []
             a2 = reload_args(names, offsets, LAYER_I32)
             eg = {n: a2[n] for n in EG_ARGS} if key.eg else None
+            sn = {n: a2[n] for n in SEAM_ARGS} if key.seam_next else None
             run_k2(
                 key,
                 lds,
@@ -2460,6 +2618,7 @@ def build_mono_layer(key: MonoBuild):
                 first,
                 pre,
                 pbases,
+                sn,
             )
 
     @flyc.jit
@@ -2550,6 +2709,11 @@ def build_mono_layer(key: MonoBuild):
         eg_ws: Int64,
         eg_kv: Int64,
         eg_row0: Int32,
+        nx_fn: Int64,
+        nx_aux: Int64,
+        nx_aux_stride: Int32,
+        seam_in: Int64,
+        seam_out: Int64,
         stream: fx.Stream = _STREAM,
     ):
         _ = keyed
@@ -2640,6 +2804,11 @@ def build_mono_layer(key: MonoBuild):
             eg_ws,
             eg_kv,
             eg_row0,
+            nx_fn,
+            nx_aux,
+            nx_aux_stride,
+            seam_in,
+            seam_out,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 
     return launch
