@@ -65,7 +65,6 @@ from .gemv import (
     words_store,
 )
 from .plan import (
-    COMB_PARTS,
     DATA,
     FLAG_STRIDE,
     HALF,
@@ -78,6 +77,7 @@ from .plan import (
     WOA_ROWS,
     Dims,
     cdiv,
+    comb_parts,
     split_keys,
     tile_rows,
     token_tiles,
@@ -733,32 +733,33 @@ def scalar_words(addr, n):
 
 
 COMB_HEADS = WAVES  # heads a combine unit: a wave each
-COMB_DIMS = HEAD_DIM // (64 * COMB_PARTS)  # dims a lane
 
 
-def comb_flag(t, hg, part, hg_n):
-    """The combine flag (a pair index) of token t's head group hg, dims part ``part``."""
-    return ((t * hg_n + hg) * COMB_PARTS + part) * FLAG_STRIDE
+def comb_flag(t, hg, part, hg_n, parts):
+    """The combine flag (a pair index) of token t's head group hg, dims part ``part`` of ``parts``."""
+    return ((t * hg_n + hg) * parts + part) * FLAG_STRIDE
 
 
 @flyc.jit
 def stage_combine(c, unit):
-    """(token, 8 heads, part of the dims) ``unit``, a wave a head, ``COMB_DIMS`` dims a
-    lane: the chunks merged with the sink folded in, bf16, inverse RoPE, bf16 -> XO (the
-    normal path's wo_a reads it unquantized), published (a flag a unit)."""
+    """(token, 8 heads, part of the dims) ``unit``, a wave a head, ``HEAD_DIM // (64 parts)``
+    dims a lane: the chunks merged with the sink folded in, bf16, inverse RoPE, bf16 -> XO
+    (the normal path's wo_a reads it unquantized), published (a flag a unit)."""
     lane, wave, d, s = c["lane"], c["wave"], c["d"], c["S"]
     a = c["args"]
+    parts = comb_parts(d, s)
+    dims = HEAD_DIM // (64 * parts)  # a lane's
     hg_n = d.heads // COMB_HEADS
-    t = unit // (hg_n * COMB_PARTS)
-    hg = unit // COMB_PARTS % hg_n
-    part = unit % COMB_PARTS
+    t = unit // (hg_n * parts)
+    hg = unit // parts % hg_n
+    part = unit % parts
     h = hg * COMB_HEADS + wave
     nchunk = c["nchunk"]
     ck = chunk_keys(d, s)
-    npair = COMB_DIMS // 2
+    npair = dims // 2
     pos = ld_i32(a["pos"], 2 * t)
     sink = ld_f32(a["sink"], h) * fx.Float32(LOG2E)
-    d0 = part * (HEAD_DIM // COMB_PARTS) + lane * COMB_DIMS
+    d0 = part * (HEAD_DIM // parts) + lane * dims
     rope_lane = d0 >= NOPE
     jj = fx.max((d0 - NOPE) // 2, 0)  # npair pairs from here
     cs = [
@@ -781,14 +782,12 @@ def stage_combine(c, unit):
     m = fx.Float32(NEG)
     ms, ls, vs = [], [], []
     pvs = [
-        fx.Vector(
-            bo.buffer_load(
-                rsrc(c["part"]),
-                (((t * nchunk + cc) * d.heads + h) * HEAD_DIM + d0) // 2,
-                vec_width=npair,
-                dtype=T.i32,
-                cache_modifier=CM_DEV,
-            )
+        bo.buffer_load(
+            rsrc(c["part"]),
+            (((t * nchunk + cc) * d.heads + h) * HEAD_DIM + d0) // 2,
+            vec_width=npair,
+            dtype=T.i32,
+            cache_modifier=CM_DEV,
         )
         for cc in range(nchunk)
     ]
@@ -798,7 +797,7 @@ def stage_combine(c, unit):
     for cc in range_constexpr(nchunk):
         live = cc < nlive
         stv = [stw[2 * cc].bitcast(fx.Float32), stw[2 * cc + 1].bitcast(fx.Float32)]
-        pv = pvs[cc]
+        pv = [fx.Int32(pvs[cc])] if npair == 1 else fx.Vector(pvs[cc])
         mc = live.select(stv[0], fx.Float32(NEG))
         ms.append(mc)
         ls.append(live.select(stv[1], fx.Float32(0.0)))
@@ -809,13 +808,13 @@ def stage_combine(c, unit):
         m = fx.max(m, mc)
     m_final = fx.max(m, sink)
     lsum = hw_exp2(sink - m_final)
-    tot = [fx.Float32(0.0)] * COMB_DIMS
+    tot = [fx.Float32(0.0)] * dims
     for cc in range_constexpr(nchunk):
         wgt = hw_exp2(ms[cc] - m_final)
         lsum = lsum + ls[cc] * wgt
-        tot = [tot[e] + vs[cc][e] * wgt for e in range(COMB_DIMS)]
+        tot = [tot[e] + vs[cc][e] * wgt for e in range(dims)]
     inv = fx.Float32(1.0) / lsum
-    o = [bf16_round(tot[e] * inv) for e in range(COMB_DIMS)]
+    o = [bf16_round(tot[e] * inv) for e in range(dims)]
     # inverse GPT-J RoPE of each pair: e' = e cos + o sin, o' = o cos - e sin
     y = []
     for i in range_constexpr(npair):
@@ -828,12 +827,12 @@ def stage_combine(c, unit):
         for i in range(npair)
     ]
     bo.buffer_store(
-        fx.Vector.from_elements(words, fx.Int32),
+        words[0] if npair == 1 else fx.Vector.from_elements(words, fx.Int32),
         rsrc(c["xo"]),
         t * (d.q_rows // 2) + (h * HEAD_DIM + d0) // 2,
         cache_modifier=CM_DEV,
     )
-    publish(c, c["crdy"], comb_flag(t, hg, part, hg_n))
+    publish(c, c["crdy"], comb_flag(t, hg, part, hg_n, parts))
 
 
 # ---------------------------------------------------------------- wo_a / wo_b
@@ -964,7 +963,7 @@ def back_plan(key):
     ck = chunk_keys(d, s)
     nchunk = cdiv(KEYS, ck)
     n_split = s * nchunk
-    n_comb = s * (d.heads // COMB_HEADS) * COMB_PARTS
+    n_comb = s * (d.heads // COMB_HEADS) * comb_parts(d, s)
     COMB0 = n_split % BLOCKS
     assert d.woa_tasks <= BLOCKS
     assert BLOCKS < d.wob_tasks <= 2 * BLOCKS
@@ -1070,6 +1069,7 @@ def run_back(c, key, bid, idle=None):
     dd = Dims(key.tp)
     # plain ints: a Python object read inside traced control flow is carried
     woa_tasks, groups, heads, group_k = dd.woa_tasks, dd.groups, dd.heads, dd.group_k
+    parts = comb_parts(dd, s)
     q_rows, o_rows, wob_tasks = dd.q_rows, dd.o_rows, dd.wob_tasks
     a = c["args"]
     tiles = token_tiles(s)
@@ -1142,9 +1142,9 @@ def run_back(c, key, bid, idle=None):
         await_flags(
             c,
             c["crdy"],
-            n_tokens * COMB_PARTS,
+            n_tokens * parts,
             lambda u: comb_flag(
-                t0 + u // COMB_PARTS, grp, u % COMB_PARTS, heads // COMB_HEADS
+                t0 + u // parts, grp, u % parts, heads // COMB_HEADS, parts
             ),
         )
         stamp(c, 9)

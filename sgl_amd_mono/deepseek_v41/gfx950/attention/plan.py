@@ -30,9 +30,7 @@ WOA_ROWS = 32  # a wo_a task's rows: one MX group of its output
 DATA = 576
 
 PAIR = 8  # a mailbox (value, tag) pair
-COMB_PARTS = (
-    2  # K2's combine units a (token, 8-head group): a part of the head dims each
-)
+COMB_PARTS = 2  # K2's combine units a (token, 8-head group) by default (``comb_parts``)
 KEYS = TOPK + WINDOW  # a token's attention keys at most
 
 
@@ -154,6 +152,12 @@ def front_scratch(s: int, d: Dims) -> dict:
     )
 
 
+def comb_parts(d: Dims, s: int) -> int:
+    """K2's combine units a (token, 8-head group), a part of the head dims each: four on TP8 at
+    one token tile, where a unit's chunk partials then stream in half the bytes."""
+    return 4 if d.tp == 8 and s <= TILE else COMB_PARTS
+
+
 def split_keys(d: Dims, s: int) -> int:
     """A split unit's keys (K2's flash-decoding over a chunk of a token's keys): 64
     where the units fit, else 128. Two head tiles: both tiles' units of every chunk
@@ -174,7 +178,7 @@ def back_scratch(s: int, d: Dims, start: int = 0) -> dict:
             ("pstat", s * nchunk * d.heads * 8),  # (max, sum) f32
             ("srdy", s * nchunk * PAIR * FLAG_STRIDE),
             ("xo", s * d.q_rows * 2),  # bf16: wo_a reads it unquantized
-            ("crdy", s * d.heads // 8 * COMB_PARTS * PAIR * FLAG_STRIDE),
+            ("crdy", s * d.heads // 8 * comb_parts(d, s) * PAIR * FLAG_STRIDE),
             ("x8b", s * d.o_rows),
             ("x8bs", s * d.o_rows // 32 * 4),
             # a flag a wo_a unit, a line each (``FLAG_STRIDE``)
