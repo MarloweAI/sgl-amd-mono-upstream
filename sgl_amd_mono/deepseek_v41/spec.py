@@ -276,8 +276,20 @@ SGLANG_READS = {
         "rows",
         "tp_size",
         "dim",
+        # the verify step's Engram rows in one launch (``gfx950/engram``)
+        "host_table",
+        "peer",
+        "history",
+        "token_map",
+        "multipliers",
+        "primes",
+        "offsets",
+        "pad_id",
     ),
     "kernels/ops/embeddings/engram_gather.py": ("engram_gather",),
+    # the hash and gather ``gfx950/engram`` reproduces
+    "kernels/ops/embeddings/engram_hash.py": ("_engram_hash_kernel",),
+    "srt/managers/schedule_batch.py": ("MM_PAD_SHIFT_VALUE",),
     "kernels/ops/quantization/fp4_fake_quant.py": ("FP8_BLOCK_SIZE",),
     "srt/models/deepseek_common/amd/deepseek_v4_hip.py": ("hc_boundary_fused",),
     "srt/models/deepseek_v2.py": (
@@ -1144,8 +1156,10 @@ class _Built:
         hash_ids = None
         engram_rows = {}
         if m.engram_hasher is not None:
-            hash_ids = m.engram_hasher(input_ids, forward_batch)
-            engram_rows = self._engram_rows(hash_ids)
+            engram_rows = self._engram_rows_one_launch(input_ids, forward_batch)
+            if engram_rows is None:
+                hash_ids = m.engram_hasher(input_ids, forward_batch)
+                engram_rows = self._engram_rows(hash_ids)
         aux = None if m.dspark_layers_to_capture is None else []
         plan.state["dspark_aux"] = aux
         if first is None:
@@ -1268,6 +1282,42 @@ class _Built:
         linear, k0, k1 = shard
         part, _ = linear(x[:, k0:k1].contiguous())
         return tensor_model_parallel_all_reduce(part)
+
+    def _engram_rows_one_launch(self, input_ids, forward_batch) -> dict | None:
+        """``_engram_rows`` of a verify step's hash ids, the hash, gathers and all-reduce in one
+        launch (``gfx950/engram``), where the exchange was built and the step fits; else None."""
+        from sgl_amd_mono.deepseek_v41.gfx950 import engram as eg
+        from sgl_amd_mono.deepseek_v41.glue import chose
+
+        if not _ENGRAM_ROWS:
+            return None
+        mode = forward_batch.forward_mode
+        tokens = input_ids.shape[0]
+        slots = forward_batch.req_pool_indices
+        block = (
+            int(forward_batch.spec_info.draft_token_num)
+            if mode.is_target_verify()
+            else 0
+        )
+        if not chose(
+            "engram_rows",
+            mode.is_target_verify()
+            and 1 <= tokens <= eg.MAX_TOKENS
+            and slots is not None
+            and tokens == slots.shape[0] * block
+            and input_ids.is_contiguous()
+            and forward_batch.positions.is_contiguous(),
+        ):
+            return None
+        from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
+
+        x, tables = _ENGRAM_ROWS[0]
+        rows = x.run(
+            input_ids, forward_batch.positions, slots.contiguous(), self.model.engram_hasher,
+            tables, block, MM_PAD_SHIFT_VALUE,
+        )  # fmt: skip
+        engrams = _engram_layers(self.model)
+        return {e.layer_hash_index: r for e, r in zip(engrams, rows)}
 
     def _engram_rows(self, hash_ids) -> dict:
         """Every Engram layer's rows of the step by hash layer, staged ahead of the
@@ -1511,6 +1561,72 @@ def _engram_weights(copies: dict, layers: dict, model, rank: int, tp: int) -> No
             layers[j].eg_for = i
 
 
+# the verify step's Engram rows in one launch (``_prepare_engram_rows``): (exchange, tables)
+_ENGRAM_ROWS: list = []
+
+
+def _engram_layers(m) -> list:
+    """The Engram modules of DeepseekV4Model ``m``'s layers, in layer order."""
+    return [
+        m.layers[i].engram
+        for i in range(m.start_layer, m.end_layer)
+        if m.layers[i].engram is not None
+    ]
+
+
+def _engram_rows_why(m, tp: int) -> str | None:
+    """Why the verify step's Engram rows do not run in one launch (None: they do), DeepseekV4Model
+    ``m``'s. The same on every rank: the model's shapes and the server's Engram layout."""
+    from sgl_amd_mono.deepseek_v41.gfx950 import engram as eg
+
+    hasher = m.engram_hasher
+    engrams = _engram_layers(m)
+    if hasher is None or not engrams:
+        return "no Engram layers"
+    if not 1 < tp <= eg.MAX_TP or len(engrams) > eg.MAX_LAYERS:
+        return f"TP {tp}, {len(engrams)} Engram layers"
+    if (
+        tuple(hasher.multipliers.shape)[1:] != (eg.N,)
+        or hasher.primes.shape[-1] != eg.HEADS
+    ):
+        return "not 4-gram, 8 heads"
+    for e in engrams:
+        t = e.embed
+        if (
+            t.tp_size != tp
+            or t.host_table is not None
+            or t.peer is not None
+            or t.dim != eg.DIM
+        ):
+            return "not a row-sharded device table of 256-wide rows"
+        if t.rows and (
+            not t.weight.is_contiguous() or t.scale.shape[-1] != eg.DIM // eg.BLOCK
+        ):
+            return "table layout"
+    return None
+
+
+def _prepare_engram_rows(
+    model, group, rank: int, size: int, device, deadline_s: float
+) -> None:
+    """Collective, once a process, before the graphs: the Engram row exchange."""
+    from sgl_amd_mono.deepseek_v41.gfx950 import engram as eg
+    from sgl_amd_mono.deepseek_v41.glue import chose
+
+    if _ENGRAM_ROWS:
+        return
+    why = _engram_rows_why(model.model, size)
+    if not chose("engram_rows setup", why is None, why):
+        return
+    tables = []
+    for e in _engram_layers(model.model):
+        t = e.embed
+        w, s = t._table_ptrs()
+        tables.append((e.layer_hash_index, w, s, t.row_start, t.row_start + t.rows))
+    x = eg.Rows(group, rank, size, device, deadline_s, len(tables))
+    _ENGRAM_ROWS.append((x, tables))
+
+
 def _longest_context(hf_config) -> int:
     """The longest context a request can have, SGLang's ``context_len``; a ratio-1
     index source sees that many compressed rows (plus a verify step's draft rows)."""
@@ -1549,6 +1665,9 @@ def _build(model, hf_config, ctx) -> _Built:
     from sgl_amd_mono.deepseek_v41.glue import inject
 
     inject.prepare(p.tp_group.cpu_group, p.tp_rank, p.tp_size, device, ctx.deadline_s)
+    _prepare_engram_rows(
+        model, p.tp_group.cpu_group, p.tp_rank, p.tp_size, device, ctx.deadline_s
+    )
     k2i = any(L.module.self_attn.indexer is not None for L in layers.values())
     if k2i:
         # the indexer's buffers, sized here: before SGLang sizes the KV cache
