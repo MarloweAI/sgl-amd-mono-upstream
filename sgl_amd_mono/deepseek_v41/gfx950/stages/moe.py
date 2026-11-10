@@ -1402,14 +1402,45 @@ def row_inputs(c, bid):
     gpu.barrier()
 
 
-def row_unit(c, bid, i):
-    """This CTA's ug unit i of its row (slot, half, live): unit slice + i x the row's ug CTAs."""
-    rs = c["rs"]
+# a row's ug units by CTA class (CTA % 8, one XCD in every row): unit (slot k, half h < 16) of expert e
+# goes to class (h + 3 e) % 8, so every row's copy of a (expert, half) shares one L2; half 17 of slots
+# x, x + 2, x + 4 to class x < 2, half 16 of slots x - 2, x + 2 to class x in 2..5 (5 CTAs a class in
+# every row, 4 in classes 6 and 7 of a 38-CTA row: 3 units a CTA at most)
+def row_units(c, bid):
+    """This CTA's ug units of its row, [(slot, half, live)] x ``ROW_UNITS``: entries q, q + n, q + 2 n of
+    its class's list, the CTA the q-th of the row's n CTAs of its class. The list: each slot's two halves
+    below 16 in slot order, then the class's halves 16 or 17."""
+    rs, tab = c["rs"], c["tab"]
     r, sl = row_of(bid)
-    n = fx.min(fx.Int32(ROW_SLICES), rs.row_ug_ctas - r * ROW_SLICES)
-    halves = row_halves(c["d"])
-    j = sl + n * i
-    return fx.min(j // halves, rs.topk - 1), j % halves, j < rs.topk * halves
+    assert rs.topk == 6 and row_halves(c["d"]) == 18
+    ctas = fx.min(fx.Int32(ROW_SLICES), rs.row_ug_ctas - r * ROW_SLICES)
+    x, q = sl % 8, sl // 8
+    n = (ctas - x + 7) // 8
+    low = x < 2
+    entries = 12 + low.select(fx.Int32(3), (7 - x) // 2)
+    units = []
+    for i in range(ROW_UNITS):
+        j = q + n * i
+        t = j - 12
+        k = (j < 12).select(j // 2, low.select(x + 2 * t, x - 2 + 4 * t))
+        k = fx.min(fx.max(k, fx.Int32(0)), fx.Int32(rs.topk - 1))
+        h1 = (x - 3 * fx.ptr_load(tab + k)) & 7
+        h = (j < 12).select(h1 + 8 * (j % 2), low.select(fx.Int32(17), fx.Int32(16)))
+        units.append((k, h, j < entries))
+    return units
+
+
+def row_unit(c, units, u):
+    """Unit ``u`` (a runtime index) of ``row_units``' list."""
+    k, h, live = units[-1]
+    for i in range(len(units) - 2, -1, -1):
+        ki, hi, li = units[i]
+        k, h, live = (
+            (u == i).select(ki, k),
+            (u == i).select(hi, h),
+            (u == i).select(li, live),
+        )
+    return k, h, live
 
 
 def row_tile_loads(c, rw, rws, e, rg, sc0, st0, n, sc_steps):
@@ -1453,14 +1484,16 @@ def fp4_tile_mfma(c, k, xl, xsl, st0, n, av, sa, acc, col):
 
 
 def ug_row_stream(c, rw, rws, chains, t, ks, xl, xsl):
-    """Tile ``t`` of each chain's half (expert, half) over K slice ``ks``, the chains in turn in one
+    """Tile ``t`` of each chain's half (expert, half) over K slice ``ks``, the chains round by round in one
     load stream ``ROW_UG_AHEAD`` rounds deep; each is ``gemv_fp4_pair``'s chain of that tile."""
     lane, wave = c["lane"], c["wave"]
     sl = c["wsl"] + wave * wsl_words(c["d"])
+    # the units' rounds interleaved: every CTA streams each of its units over the whole stage, so the
+    # rows' copies of a unit on one XCD are read at about the same time
     rounds = [
         (p, rd)
-        for p in range(len(chains))
         for rd in ug_rounds(HIDDEN, ks, c["rs"].ug_k_slices)
+        for p in range(len(chains))
     ]
 
     def issue(i):
@@ -1505,7 +1538,7 @@ def stage_row_ug(c, bid):
         c["args"],
     )
     r, _ = row_of(bid)
-    units = [row_unit(c, bid, i) for i in range(ROW_UNITS)]
+    units = row_units(c, bid)
     nb13 = rs.experts * 2 * d.inter * HIDDEN // 2
     rw, rws = rsrc(a["w13"], nb13), rsrc(a["w13_s"], nb13 // 16)
     chains = [
@@ -1524,7 +1557,7 @@ def stage_row_ug(c, bid):
     if tid < ROW_UNITS * 8:
         u = tid // 8
         m2 = tid % 8
-        k, h, live = row_unit(c, bid, u)
+        k, h, live = row_unit(c, units, u)
         vs = []
         for m in range_constexpr(2):
             col = 2 * m2 + m
