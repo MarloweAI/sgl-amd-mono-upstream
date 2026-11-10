@@ -179,7 +179,9 @@ struct Split : TopKSplit {
     const auto n_eq = min(smem->count_eq, kMaxNumTie);
     if (tx == 0) {
       smem->base_gt = l2_add(&ctr->count_gt, n_gt);
-      smem->base_eq = l2_add(&ctr->count_eq, smem->count_eq);
+      smem->base_eq = l2_add(
+          &ctr->count_eq,
+          impl::kExact ? smem->count_eq : n_eq);
       if (zero_bin && smem->tie_nonzero != 0) l2_or(&ctr->tie_nonzero, 1u);
     }
     __syncthreads();
@@ -229,7 +231,7 @@ struct Split : TopKSplit {
     const auto tx = threadIdx.x;
     uint32_t above_count, tie_count;
     const bool zero_ties = TOPK_ONE_ZERO_BIN(smem->v_lo) && smem->tie_nonzero == 0;
-    if (smem->total_eq > kMaxNumTie && !zero_ties) [[unlikely]] {
+    if (impl::kExact && smem->total_eq > kMaxNumTie && !zero_ties) [[unlikely]] {
       if (tx == 0) smem->count_gt = smem->total_gt;
       __syncthreads();
       refine_ties(problem, smem, smem->v_lo, smem->v_hi, smem->total_eq);
@@ -237,7 +239,7 @@ struct Split : TopKSplit {
       tie_count = min(smem->count_eq, kMaxNumTie);
     } else {
       above_count = smem->total_gt;
-      tie_count = zero_ties ? min(smem->total_eq, kMaxNumTie) : smem->total_eq;
+      tie_count = min(smem->total_eq, kMaxNumTie);
       for (uint32_t t = tx; t < tie_count; t += kBlockSize) {
         const auto v = l2_read64(reinterpret_cast<unsigned long long*>(ties + t));
         smem->tie_values[t] = *reinterpret_cast<const impl::TieValue*>(&v);
