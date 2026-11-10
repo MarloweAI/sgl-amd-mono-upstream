@@ -20,7 +20,9 @@ SGLANG_READS = {
         "load_jit(cuda_files)",
         "load_jit(cuda_wrappers)",
         "load_jit(extra_include_paths)",
+        "load_jit(extra_cuda_cflags)",
     ),
+    "srt/environ.py": ("envs",),
 }
 
 MAX_ROWS = 8  # a row an XCC
@@ -34,8 +36,11 @@ def module():
     """The JIT module, built at first use."""
     import sglang
     from sglang.kernels.jit.utils import load_jit
+    from sglang.srt.environ import envs
 
     csrc = Path(sglang.__file__).resolve().parent / "kernels" / "jit" / "csrc"
+    # since sglang#47960 the top-k header needs the exactness mode SGLang's own top-k uses
+    mode = getattr(envs, "SGLANG_TOPK_V2_MODE", None)
     return load_jit(
         "sgl_amd_mono_dsv41_topk_one",
         cuda_files=[str(Path(__file__).with_name("topk_one.cuh"))],
@@ -43,6 +48,7 @@ def module():
             ("transform_paged", "TopKOne::transform_paged"),
             ("transform_paged_pair", "TopKOne::transform_paged_pair"),
         ],
+        extra_cuda_cflags=[] if mode is None else [f"-DSGL_TOPK_MODE={mode.get()}"],
         extra_include_paths=[str(csrc)],
     )
 
