@@ -49,6 +49,7 @@ constexpr int X_LOADS    = (MAX_M * MAX_K / 8 + THREADS - 1) / THREADS; // 16 B 
 // uncached scratch, peer-mapped: every rank's blocks' records [launch parity 2][key row][source rank][block]
 constexpr int64_t SCRATCH_BYTES = 2ll * MAX_M * MAX_TP * MAX_BLOCKS * 8;
 // a record or slot: the candidate key above a 15-bit launch tag
+constexpr int      MAX_HISTORY = 8; // the Engram history's width at most
 constexpr int      TAG_BITS = 15;
 constexpr uint64_t TAG_MASK = (1ull << TAG_BITS) - 1;
 constexpr int      IDX_BITS = 17; // the vocab (129280) below 2^17
@@ -76,6 +77,13 @@ struct Params {
     int64_t       *correct_out, *bonus_out, *new_seq_out, *out_tokens, *target_out;
     int32_t       *cap_trim_out, *commit_out, *gated_out;
     int64_t        out_tokens_stride;
+    // the Engram history commit in the accept (or null): history [slots, history_width] int32, the requests'
+    // slots [bs] int64, the FutureMap relay rows (new seq lens, bonus) by slot (or null)
+    int32_t        *history;
+    int64_t         history_stride;
+    int             history_width;
+    const int64_t  *slots;
+    int64_t        *relay_lens, *relay_tokens;
     uint32_t      *counts; // [blocks] each block's launches
     void          *recv[MAX_TP];
     uint64_t       deadline_ticks;
@@ -429,6 +437,22 @@ __global__ __launch_bounds__(THREADS) void fused_tail_kernel(const Params p) {
     if (p.gated_out != nullptr) {
         p.gated_out[r] = min(commit, static_cast<int>(s_vlen[r])) * p.gate[0];
     }
+    if (p.history != nullptr) { // the Engram history commit of the request's slot (SGLang's engram_commit_history)
+        const int64_t slot = p.slots[r];
+        if (p.relay_lens != nullptr) {
+            p.relay_lens[slot]   = s_seq[r] + commit;
+            p.relay_tokens[slot] = bonus;
+        }
+        if (s_vlen[r] != 0 && p.gate[0] != 0) {
+            int32_t *row = p.history + slot * p.history_stride;
+            int32_t  old[MAX_HISTORY];
+            for (int c = 0; c < p.history_width; ++c) old[c] = row[c];
+            for (int c = 0; c < p.history_width; ++c) {
+                const int src = commit + c;
+                row[c] = src < p.history_width ? old[src] : static_cast<int32_t>(cand[src - p.history_width]);
+            }
+        }
+    }
 }
 
 void check(const at::Tensor &t, const at::Tensor &ref, at::ScalarType dtype, const char *name) {
@@ -441,6 +465,31 @@ template <typename T> T *ptr(const c10::optional<at::Tensor> &t) {
     return t.has_value() ? static_cast<T *>(t->data_ptr()) : nullptr;
 }
 
+// the Engram history commit's tensors (all or none of history and slots; the relay rows optional)
+void commit_params(Params &p, const c10::optional<at::Tensor> &history, const c10::optional<at::Tensor> &slots,
+                   const c10::optional<at::Tensor> &relay_lens, const c10::optional<at::Tensor> &relay_tokens,
+                   int64_t bs) {
+    TORCH_CHECK(history.has_value() == slots.has_value() && relay_lens.has_value() == relay_tokens.has_value() &&
+                    (history.has_value() || !relay_lens.has_value()),
+                "history and slots together, the relay rows with them");
+    if (!history.has_value()) return;
+    TORCH_CHECK(history->scalar_type() == at::kInt && history->dim() == 2 && history->stride(1) == 1 &&
+                    history->size(1) <= MAX_HISTORY,
+                "history [slots, <= 8] int32");
+    TORCH_CHECK(slots->scalar_type() == at::kLong && slots->numel() >= bs && slots->stride(0) == 1, "slots [bs] int64");
+    p.history        = history->data_ptr<int32_t>();
+    p.history_stride = history->stride(0);
+    p.history_width  = static_cast<int>(history->size(1));
+    p.slots          = slots->data_ptr<int64_t>();
+    if (relay_lens.has_value()) {
+        TORCH_CHECK(relay_lens->scalar_type() == at::kLong && relay_tokens->scalar_type() == at::kLong &&
+                        relay_lens->is_contiguous() && relay_tokens->is_contiguous(),
+                    "relay rows int64");
+        p.relay_lens   = relay_lens->data_ptr<int64_t>();
+        p.relay_tokens = relay_tokens->data_ptr<int64_t>();
+    }
+}
+
 // x [M, K] bf16 contiguous (the head's normed rows); weight [part, K] bf16 (this rank's head shard, 16 B aligned
 // rows); logits [M, part] bf16 out; candidates [bs, T] int64 and the accept's tensors as vtail.hip's verify_tail;
 // counts [256] int32 (zeroed once), peers [tp] int64 on the host: every rank's uncached scratch, scratch this rank's
@@ -451,7 +500,9 @@ void fused_tail(const at::Tensor &x, const at::Tensor &weight, at::Tensor &logit
                 at::Tensor &cap_trim_out, at::Tensor &commit_out, at::Tensor &new_seq_out, at::Tensor &out_tokens,
                 const c10::optional<at::Tensor> &gated_out, const c10::optional<at::Tensor> &target_out,
                 at::Tensor &counts, const at::Tensor &peers, int64_t scratch, int64_t rank, int64_t vocab_start,
-                int64_t width, int64_t vocab, double deadline_s) {
+                int64_t width, int64_t vocab, double deadline_s, const c10::optional<at::Tensor> &history,
+                const c10::optional<at::Tensor> &slots, const c10::optional<at::Tensor> &relay_lens,
+                const c10::optional<at::Tensor> &relay_tokens) {
     const int64_t M = x.size(0), K = x.size(1), part = weight.size(0);
     const int64_t bs = candidates.size(0), T = candidates.size(1), tp = peers.numel();
     const int64_t tiles  = (part + TILE_N - 1) / TILE_N;
@@ -540,6 +591,7 @@ void fused_tail(const at::Tensor &x, const at::Tensor &weight, at::Tensor &logit
     p.target_out        = ptr<int64_t>(target_out);
     p.counts            = reinterpret_cast<uint32_t *>(counts.data_ptr<int>());
     p.deadline_ticks    = static_cast<uint64_t>(deadline_s * 1e8); // the 100 MHz realtime clock
+    commit_params(p, history, slots, relay_lens, relay_tokens, bs);
     for (int r = 0; r < p.tp; ++r) {
         p.recv[r] = reinterpret_cast<void *>(peers.data_ptr<int64_t>()[r]);
     }
@@ -571,7 +623,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
           "Tensor verify_lens, Tensor gate, Tensor? sim, Tensor? temps, Tensor? seed, Tensor(b!) correct_out, "
           "Tensor(c!) bonus_out, Tensor(d!) cap_trim_out, Tensor(e!) commit_out, Tensor(f!) new_seq_out, "
           "Tensor(g!) out_tokens, Tensor(h!)? gated_out, Tensor(i!)? target_out, Tensor(j!) counts, Tensor peers, "
-          "int scratch, int rank, int vocab_start, int width, int vocab, float deadline_s) -> ()");
+          "int scratch, int rank, int vocab_start, int width, int vocab, float deadline_s, "
+          "Tensor(x!)? history=None, Tensor? slots=None, Tensor(y!)? relay_lens=None, "
+          "Tensor(z!)? relay_tokens=None) -> ()");
     m.def("scratch_bytes() -> int", &scratch_bytes);
     m.impl("fused_tail", at::kCUDA, &fused_tail);
 }

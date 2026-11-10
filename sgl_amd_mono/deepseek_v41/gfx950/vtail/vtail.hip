@@ -35,6 +35,7 @@ constexpr int MAX_BLOCKS = 128;
 constexpr int POLLS      = 8; // records a thread keeps in flight
 // the records: one 8 B record a key row, source rank and block, [launch parity 2][MAX_ROWS][MAX_TP][MAX_BLOCKS]
 // (vtail/__init__.py's RECORD_BYTES); a record is the row's key above a 15-bit launch tag
+constexpr int      MAX_HISTORY = 8; // the Engram history's width at most
 constexpr int      TAG_BITS = 15;
 constexpr uint64_t TAG_MASK = (1ull << TAG_BITS) - 1;
 constexpr int      IDX_BITS = 17; // the vocab (129280) below 2^17
@@ -55,6 +56,13 @@ struct Params {
     int64_t        *correct_out, *bonus_out, *new_seq_out, *out_tokens, *target_out;
     int32_t        *cap_trim_out, *commit_out, *gated_out;
     int64_t         out_tokens_stride;
+    // the Engram history commit in the accept (or null): history [slots, history_width] int32, the requests'
+    // slots [bs] int64, the FutureMap relay rows (new seq lens, bonus) by slot (or null)
+    int32_t        *history;
+    int64_t         history_stride;
+    int             history_width;
+    const int64_t  *slots;
+    int64_t        *relay_lens, *relay_tokens;
     uint32_t       *counts; // [blocks] each block's launches
     void           *recv[MAX_TP];
     uint64_t        deadline_ticks;
@@ -257,6 +265,22 @@ __device__ inline void verify_tail_body(const Params &p) {
     if (p.gated_out != nullptr) {
         p.gated_out[r] = min(commit, static_cast<int>(p.verify_lens[r])) * p.gate[0];
     }
+    if (p.history != nullptr) { // the Engram history commit of the request's slot (SGLang's engram_commit_history)
+        const int64_t slot = p.slots[r];
+        if (p.relay_lens != nullptr) {
+            p.relay_lens[slot]   = p.seq_lens[r] + commit;
+            p.relay_tokens[slot] = bonus;
+        }
+        if (p.verify_lens[r] != 0 && p.gate[0] != 0) {
+            int32_t *row = p.history + slot * p.history_stride;
+            int32_t  old[MAX_HISTORY];
+            for (int c = 0; c < p.history_width; ++c) old[c] = row[c];
+            for (int c = 0; c < p.history_width; ++c) {
+                const int src = commit + c;
+                row[c] = src < p.history_width ? old[src] : static_cast<int32_t>(cand[src - p.history_width]);
+            }
+        }
+    }
 }
 
 __global__ __launch_bounds__(THREADS) void verify_tail_kernel(const Params p) { verify_tail_body(p); }
@@ -280,6 +304,31 @@ void check(const at::Tensor &t, const at::Tensor &ref, at::ScalarType dtype, con
 
 template <typename T> T *ptr(const c10::optional<at::Tensor> &t) {
     return t.has_value() ? static_cast<T *>(t->data_ptr()) : nullptr;
+}
+
+// the Engram history commit's tensors (all or none of history and slots; the relay rows optional)
+void commit_params(Params &p, const c10::optional<at::Tensor> &history, const c10::optional<at::Tensor> &slots,
+                   const c10::optional<at::Tensor> &relay_lens, const c10::optional<at::Tensor> &relay_tokens,
+                   int64_t bs) {
+    TORCH_CHECK(history.has_value() == slots.has_value() && relay_lens.has_value() == relay_tokens.has_value() &&
+                    (history.has_value() || !relay_lens.has_value()),
+                "history and slots together, the relay rows with them");
+    if (!history.has_value()) return;
+    TORCH_CHECK(history->scalar_type() == at::kInt && history->dim() == 2 && history->stride(1) == 1 &&
+                    history->size(1) <= MAX_HISTORY,
+                "history [slots, <= 8] int32");
+    TORCH_CHECK(slots->scalar_type() == at::kLong && slots->numel() >= bs && slots->stride(0) == 1, "slots [bs] int64");
+    p.history        = history->data_ptr<int32_t>();
+    p.history_stride = history->stride(0);
+    p.history_width  = static_cast<int>(history->size(1));
+    p.slots          = slots->data_ptr<int64_t>();
+    if (relay_lens.has_value()) {
+        TORCH_CHECK(relay_lens->scalar_type() == at::kLong && relay_tokens->scalar_type() == at::kLong &&
+                        relay_lens->is_contiguous() && relay_tokens->is_contiguous(),
+                    "relay rows int64");
+        p.relay_lens   = relay_lens->data_ptr<int64_t>();
+        p.relay_tokens = relay_tokens->data_ptr<int64_t>();
+    }
 }
 
 // local [bs * T, part] bf16 (16 B aligned rows; the first width columns valid), candidates [bs, T] int64; the
@@ -379,10 +428,13 @@ void verify_tail(const at::Tensor &local, const at::Tensor &candidates, const at
                  at::Tensor &correct_out, at::Tensor &bonus_out, at::Tensor &cap_trim_out, at::Tensor &commit_out,
                  at::Tensor &new_seq_out, at::Tensor &out_tokens, const c10::optional<at::Tensor> &gated_out,
                  const c10::optional<at::Tensor> &target_out, at::Tensor &counts, const at::Tensor &peers,
-                 int64_t rank, int64_t vocab_start, int64_t width, int64_t vocab, int64_t chunk, double deadline_s) {
-    const Params p = make_params(local, candidates, seq_lens, verify_lens, gate, sim, temps, seed, correct_out,
-                                 bonus_out, cap_trim_out, commit_out, new_seq_out, out_tokens, gated_out, target_out,
-                                 counts, peers, rank, vocab_start, width, vocab, chunk, deadline_s);
+                 int64_t rank, int64_t vocab_start, int64_t width, int64_t vocab, int64_t chunk, double deadline_s,
+                 const c10::optional<at::Tensor> &history, const c10::optional<at::Tensor> &slots,
+                 const c10::optional<at::Tensor> &relay_lens, const c10::optional<at::Tensor> &relay_tokens) {
+    Params p = make_params(local, candidates, seq_lens, verify_lens, gate, sim, temps, seed, correct_out,
+                           bonus_out, cap_trim_out, commit_out, new_seq_out, out_tokens, gated_out, target_out,
+                           counts, peers, rank, vocab_start, width, vocab, chunk, deadline_s);
+    commit_params(p, history, slots, relay_lens, relay_tokens, candidates.size(0));
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA guard(local.device());
     const hipStream_t stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA(local.device().index()).stream();
     verify_tail_kernel<<<p.blocks, THREADS, 0, stream>>>(p);
@@ -400,10 +452,13 @@ void verify_tail_proj(const at::Tensor &local, const at::Tensor &candidates, con
                       at::Tensor &counts, const at::Tensor &peers, int64_t rank, int64_t vocab_start, int64_t width,
                       int64_t vocab, int64_t chunk, double deadline_s, const at::Tensor &x, const at::Tensor &w,
                       const at::Tensor &ws, at::Tensor &proj_out, at::Tensor &proj_state, at::Tensor &proj_work,
-                      const at::Tensor &proj_peers, double proj_deadline_s) {
-    const Params p = make_params(local, candidates, seq_lens, verify_lens, gate, sim, temps, seed, correct_out,
-                                 bonus_out, cap_trim_out, commit_out, new_seq_out, out_tokens, gated_out, target_out,
-                                 counts, peers, rank, vocab_start, width, vocab, chunk, deadline_s);
+                      const at::Tensor &proj_peers, double proj_deadline_s,
+                      const c10::optional<at::Tensor> &history, const c10::optional<at::Tensor> &slots,
+                      const c10::optional<at::Tensor> &relay_lens, const c10::optional<at::Tensor> &relay_tokens) {
+    Params p = make_params(local, candidates, seq_lens, verify_lens, gate, sim, temps, seed, correct_out,
+                           bonus_out, cap_trim_out, commit_out, new_seq_out, out_tokens, gated_out, target_out,
+                           counts, peers, rank, vocab_start, width, vocab, chunk, deadline_s);
+    commit_params(p, history, slots, relay_lens, relay_tokens, candidates.size(0));
     TORCH_CHECK(x.device() == local.device() && proj_peers.numel() == peers.numel(), "main_proj on the same group");
     const main_proj::Params q =
         main_proj::params(x, w, ws, proj_out, proj_state, proj_work, proj_peers, rank, proj_deadline_s);
@@ -447,14 +502,16 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
           "Tensor? sim, Tensor? temps, Tensor? seed, Tensor(a!) correct_out, Tensor(b!) bonus_out, "
           "Tensor(c!) cap_trim_out, Tensor(d!) commit_out, Tensor(e!) new_seq_out, Tensor(f!) out_tokens, "
           "Tensor(g!)? gated_out, Tensor(h!)? target_out, Tensor(i!) counts, Tensor peers, int rank, "
-          "int vocab_start, int width, int vocab, int chunk, float deadline_s) -> ()");
+          "int vocab_start, int width, int vocab, int chunk, float deadline_s, Tensor(x!)? history=None, "
+          "Tensor? slots=None, Tensor(y!)? relay_lens=None, Tensor(z!)? relay_tokens=None) -> ()");
     m.def("verify_tail_proj(Tensor local, Tensor candidates, Tensor seq_lens, Tensor verify_lens, Tensor gate, "
           "Tensor? sim, Tensor? temps, Tensor? seed, Tensor(a!) correct_out, Tensor(b!) bonus_out, "
           "Tensor(c!) cap_trim_out, Tensor(d!) commit_out, Tensor(e!) new_seq_out, Tensor(f!) out_tokens, "
           "Tensor(g!)? gated_out, Tensor(h!)? target_out, Tensor(i!) counts, Tensor peers, int rank, "
           "int vocab_start, int width, int vocab, int chunk, float deadline_s, Tensor x, Tensor w, Tensor ws, "
           "Tensor(j!) proj_out, Tensor(k!) proj_state, Tensor(l!) proj_work, Tensor proj_peers, "
-          "float proj_deadline_s) -> ()");
+          "float proj_deadline_s, Tensor(x!)? history=None, Tensor? slots=None, Tensor(y!)? relay_lens=None, "
+          "Tensor(z!)? relay_tokens=None) -> ()");
     m.def("noisy_values(Tensor values, Tensor(a!) out, float t, int seed, int start) -> ()");
     m.impl("verify_tail", at::kCUDA, &verify_tail);
     m.impl("verify_tail_proj", at::kCUDA, &verify_tail_proj);

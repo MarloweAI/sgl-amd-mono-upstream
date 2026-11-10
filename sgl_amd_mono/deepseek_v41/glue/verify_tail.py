@@ -52,7 +52,20 @@ SGLANG_READS = {
         "run_static",
         "run_static(kv_projected)",
         "hidden",
+        # the engram commit in the accept's launch
+        "_commit_engram_history",
+        "_commit_engram_history(candidates)",
+        "_commit_engram_history(req_pool_indices)",
+        "_commit_engram_history(commit_lens)",
+        "_commit_engram_history(verify_lens)",
+        "_commit_engram_history(gate)",
+        "_commit_engram_history(relay)",
+        "engram_history",
+        "_future_relay_rows",
+        "_post_fold",
+        "req_pool_indices",
     ),
+    "kernels/ops/embeddings/engram_hash.py": ("_engram_commit_history_kernel",),
     "srt/layers/logits_processor.py": (
         "LogitsProcessor",
         "deferred_shard_offset",
@@ -84,6 +97,37 @@ _HEADS: dict = {}
 _ACCEPTS: dict = {}
 # per epilogue: the commit rows of the static verify being run or captured (``run_static``)
 _COMMITS: dict = {}
+# per epilogue: its requests' slots in the static verify being run or captured (``run_static``), and
+# the engram commit the accept's launch ran for this step: (history, slots, candidates) addresses
+_SLOTS: dict = {}
+_COMMITTED: dict = {}
+
+
+def _commit_args(epi, slots, candidates, bs):
+    """(history, slots, relay lens, relay bonus) of SGLang's engram commit that follows the accept
+    (``run_static``'s), for the accept's launch to run, or None; noted for ``_commit_engram_history``."""
+    _COMMITTED.pop(id(epi), None)
+    history = epi.engram_history() if slots is not None else None
+    if (
+        history is None
+        or history.dtype != torch.int32
+        or history.stride(1) != 1
+        or history.shape[1] > 8
+    ):
+        return None
+    relay = epi._future_relay_rows(bs) if epi._post_fold else None
+    if relay is not None and (relay[2].data_ptr(), relay[3].data_ptr()) != (
+        epi.new_seq_lens_buf.data_ptr(),
+        epi.bonus_buf.data_ptr(),
+    ):
+        return None
+    _COMMITTED[id(epi)] = (
+        history.data_ptr(),
+        slots.data_ptr(),
+        candidates.data_ptr(),
+        relay is not None,
+    )
+    return history, slots, *(relay[:2] if relay is not None else (None, None))
 
 
 def _why_not(epi, shard, logits, candidates) -> str | None:
@@ -232,6 +276,7 @@ def fused_head(lm, forward_batch, x):
         cap_trim_out=epi.cap_trim_lens_buf, commit_out=epi.commit_lens_buf,
         new_seq_out=epi.new_seq_lens_buf, out_tokens=epi.out_tokens_buf,
         gated_out=epi.gated_commit_lens_buf if gated else None,
+        commit=_commit_args(epi, forward_batch.req_pool_indices, candidates, bs),
     )  # fmt: skip
     _HEADS[id(lp)] = (x, logits)
     _ACCEPTS[id(epi)] = (logits, candidates.data_ptr(), forward_batch.seq_lens.data_ptr(),
@@ -276,6 +321,7 @@ def _static_accept_tail(
         bs = candidates.shape[0]
         self._log_accept_tail(bs, bonus_in=None, shard=shard)
         return self.gated_commit_lens_buf[:bs] if gated else None
+    _COMMITTED.pop(id(self), None)
     if not chose("verify_tail", why is None, why):
         return orig(
             self, candidates=candidates, logits=logits, seq_lens=seq_lens,
@@ -283,6 +329,7 @@ def _static_accept_tail(
         )  # fmt: skip
     launch, zeros = _tail(self, shard, logits.shape[1])
     bs = candidates.shape[0]
+    commit = _commit_args(self, _SLOTS.get(id(self)), candidates, bs)
     sim = self.simulated_correct_len
     # SGLang's tail draws a simulated length's bonus at the request's temperature under
     # simulate_fold, else takes that row's argmax
@@ -298,18 +345,59 @@ def _static_accept_tail(
         correct_out=self.correct_len_buf, bonus_out=self.bonus_buf,
         cap_trim_out=self.cap_trim_lens_buf, commit_out=self.commit_lens_buf,
         new_seq_out=self.new_seq_lens_buf, out_tokens=self.out_tokens_buf,
-        gated_out=self.gated_commit_lens_buf if gated else None, proj=proj,
+        gated_out=self.gated_commit_lens_buf if gated else None, proj=proj, commit=commit,
     )  # fmt: skip
     return self.gated_commit_lens_buf[:bs] if gated else None
 
 
 def _run_static(orig, self, io, *, accept, gate, kv_projected=False):
     _COMMITS[id(self)] = None if kv_projected else io.hidden
+    _SLOTS[id(self)] = io.req_pool_indices
+    if (
+        id(self) not in _ACCEPTS
+    ):  # a commit claim stands only with the fused launch's accept of this forward
+        _COMMITTED.pop(id(self), None)
     try:
         return orig(self, io, accept=accept, gate=gate, kv_projected=kv_projected)
     finally:
         _COMMITS.pop(id(self), None)
+        _SLOTS.pop(id(self), None)
+        _COMMITTED.pop(id(self), None)
         inject.check_projected()
+
+
+def _commit_engram_history(
+    orig, self, candidates, req_pool_indices, commit_lens, verify_lens, gate, *, relay
+):
+    """SGLang's engram commit, or nothing where the accept's launch ran it (``_commit_args``)."""
+    done = _COMMITTED.pop(id(self), None)
+    if done is None:
+        return orig(
+            self,
+            candidates,
+            req_pool_indices,
+            commit_lens,
+            verify_lens,
+            gate,
+            relay=relay,
+        )
+    history = self.engram_history()
+    want = (
+        history.data_ptr(),
+        req_pool_indices.data_ptr(),
+        candidates.data_ptr(),
+        relay is not None,
+    )
+    same = (commit_lens.data_ptr(), verify_lens.data_ptr(), gate.data_ptr()) == (
+        self.commit_lens_buf.data_ptr(),
+        self.verify_lens_buf.data_ptr(),
+        self.inject_gate_buf.data_ptr(),
+    )
+    if done != want or not same:
+        raise RuntimeError(
+            "DSV4.1 accept commit: the epilogue's engram commit is not the launch's"
+        )
+    return True
 
 
 def _epilogue_init(orig, self, *args, **kwargs):
@@ -326,6 +414,7 @@ def install() -> None:
     route(verify.DsparkVerifyEpilogue, "__init__", _epilogue_init)
     route(verify.DsparkVerifyEpilogue, "_static_accept_tail", _static_accept_tail)
     route(verify.DsparkVerifyEpilogue, "run_static", _run_static)
+    route(verify.DsparkVerifyEpilogue, "_commit_engram_history", _commit_engram_history)
     route(
         importlib.import_module(LOGITS).LogitsProcessor,
         "_compute_lm_head",

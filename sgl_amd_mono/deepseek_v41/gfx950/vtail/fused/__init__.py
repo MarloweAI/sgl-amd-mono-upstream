@@ -78,11 +78,12 @@ class FusedTail:
 
     def __call__(self, x, weight, candidates, seq_lens, verify_lens, gate, *, sim, temps, seed,
                  correct_out, bonus_out, cap_trim_out, commit_out, new_seq_out, out_tokens,
-                 gated_out=None, target_out=None):  # fmt: skip
+                 gated_out=None, target_out=None, commit=None):  # fmt: skip
         """The logits shard [M, part] of the verify's normed rows ``x`` [M = bs * T, K] on
         this rank's head shard ``weight``, and static_accept_tail's outputs (rows [:bs]) in
         the out tensors; ``sim`` the simulated length [1] (with ``temps`` [bs] and ``seed``
-        [1]), or None."""
+        [1]), or None. ``commit``: (history, slots, relay_lens, relay_tokens), SGLang's
+        engram_commit_history of the accept in the same launch (relay rows None: none stored)."""
         logits = torch.empty(
             (x.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device
         )
@@ -91,6 +92,7 @@ class FusedTail:
             correct_out, bonus_out, cap_trim_out, commit_out, new_seq_out, out_tokens,
             gated_out, target_out, self.counts, self.peers, self.scratch, self.rank,
             self.vocab_start, self.width, self.vocab, self.deadline_s,
+            *(commit if commit is not None else (None,) * 4),
         )  # fmt: skip
         return logits
 
