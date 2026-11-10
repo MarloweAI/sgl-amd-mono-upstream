@@ -24,6 +24,8 @@ from sgl_amd_mono.deepseek_v41.gfx950.stages.router import PARTS as ROUTER_PARTS
 EXPERTS, TOPK = 384, 6  # DeepSeek-V4.1-Flash routing
 ROUTER0 = 8  # the router's first task: past the xq tasks (a token each)
 MASK_WORDS = 2  # an expert's token bitmap in the route table: tokens <= 64
+ROW_SLICES = 40  # a token row's CTAs in the per-row MoE: 128 hidden rows each (``RouteShape.row_moe``)
+ROW_CTAS = 240  # the per-row MoE's CTAs at most: 6 rows
 # a route lane's experts sorted descending, ties in index order
 SORT_NETS = {
     2: [(0, 1)],
@@ -111,7 +113,26 @@ class RouteShape(msgspec.Struct, frozen=True):
         return self.router0 + self.router_tasks
 
     @property
+    def row_moe(self) -> bool:
+        """The MoE split per (token row, slot), TileRT's: no expert dedup, the routing on every CTA,
+        a CTA's down one (row, 128 hidden rows) of its row's picks. TP8, one token tile, the target's route."""
+        return (
+            self.tp >= 8
+            and not self.multi
+            and self.tokens * ROW_SLICES <= ROW_CTAS
+            and (self.experts, self.topk) == (EXPERTS, TOPK)
+        )
+
+    @property
+    def row_ug_ctas(self) -> int:
+        """The per-row MoE's ug CTAs: those below the shared units."""
+        return min(self.tokens * ROW_SLICES, self.shared0)
+
+    @property
     def shared0(self) -> int:
+        if self.row_moe:
+            # the last CTAs: past every row's ug units
+            return BLOCKS - self.shared_units
         return self.route0 + max(8, self.tokens)
 
     @property
