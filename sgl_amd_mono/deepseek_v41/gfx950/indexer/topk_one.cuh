@@ -20,8 +20,10 @@
 // SGLang's top-k header takes an exactness mode (SGL_TOPK_MODE) since sglang#47960, and its
 // zero-bin shortcut then applies in exact mode only; older headers have is_zero_bin.
 #ifdef SGL_TOPK_MODE
+#define TOPK_ONE_EXACT impl::kExact
 #define TOPK_ONE_ZERO_BIN(v) (impl::kExact && zero_bin_shortcut(v))
 #else
+#define TOPK_ONE_EXACT true
 #define TOPK_ONE_ZERO_BIN(v) is_zero_bin(v)
 #endif
 
@@ -181,7 +183,7 @@ struct Split : TopKSplit {
       smem->base_gt = l2_add(&ctr->count_gt, n_gt);
       smem->base_eq = l2_add(
           &ctr->count_eq,
-          impl::kExact ? smem->count_eq : n_eq);
+          TOPK_ONE_EXACT ? smem->count_eq : n_eq);
       if (zero_bin && smem->tie_nonzero != 0) l2_or(&ctr->tie_nonzero, 1u);
     }
     __syncthreads();
@@ -231,7 +233,7 @@ struct Split : TopKSplit {
     const auto tx = threadIdx.x;
     uint32_t above_count, tie_count;
     const bool zero_ties = TOPK_ONE_ZERO_BIN(smem->v_lo) && smem->tie_nonzero == 0;
-    if (impl::kExact && smem->total_eq > kMaxNumTie && !zero_ties) [[unlikely]] {
+    if (TOPK_ONE_EXACT && smem->total_eq > kMaxNumTie && !zero_ties) [[unlikely]] {
       if (tx == 0) smem->count_gt = smem->total_gt;
       __syncthreads();
       refine_ties(problem, smem, smem->v_lo, smem->v_hi, smem->total_eq);
