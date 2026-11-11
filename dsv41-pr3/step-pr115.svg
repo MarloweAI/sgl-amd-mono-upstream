@@ -1,0 +1,162 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="328" font-family="Helvetica,Arial" font-size="12">
+<rect width="1500" height="328" fill="white"/>
+<text x="110" y="22" font-size="15" font-weight="bold">#115's head: median verify step, rank 0, TP8 DSpark, one 8K request</text>
+<text x="110" y="42" fill="#444">step 3254 us: layers 2683 us (layer launches busy 2608, glue and gaps 75), outside 571 us; index select 8 launches, 64 us. Outlined: launches this PR changes.</text>
+<text x="102" y="77" text-anchor="end">K1</text>
+<line x1="110" y1="85" x2="1480" y2="85" stroke="#eee"/>
+<text x="102" y="103" text-anchor="end">K2i</text>
+<line x1="110" y1="111" x2="1480" y2="111" stroke="#eee"/>
+<text x="102" y="129" text-anchor="end">K2</text>
+<line x1="110" y1="137" x2="1480" y2="137" stroke="#eee"/>
+<text x="102" y="155" text-anchor="end">layer</text>
+<line x1="110" y1="163" x2="1480" y2="163" stroke="#eee"/>
+<text x="102" y="181" text-anchor="end">FFN</text>
+<line x1="110" y1="189" x2="1480" y2="189" stroke="#eee"/>
+<text x="102" y="207" text-anchor="end">index select</text>
+<line x1="110" y1="215" x2="1480" y2="215" stroke="#eee"/>
+<text x="102" y="233" text-anchor="end">glue</text>
+<line x1="110" y1="241" x2="1480" y2="241" stroke="#eee"/>
+<text x="102" y="259" text-anchor="end">outside</text>
+<line x1="110" y1="267" x2="1480" y2="267" stroke="#eee"/>
+<rect x="110.00" y="141" width="28.63" height="19" fill="#54A24B" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_layer_s6_tp8_c0_f0_u1_em1_eg200 68.0 us</title></rect>
+<rect x="138.63" y="219" width="2.12" height="19" fill="#9D755D"><title>_post_gate_kernel 5.0 us</title></rect>
+<rect x="140.75" y="141" width="26.22" height="19" fill="#54A24B" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_layer_s6_tp8_c0_f0_u1_eg18 62.3 us</title></rect>
+<rect x="166.97" y="63" width="10.07" height="19" fill="#4C78A8" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_k1_s6_tp8_kt0_f1_i1_q1_cp2_u1 23.9 us</title></rect>
+<rect x="177.04" y="89" width="2.90" height="19" fill="#72B7B2" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_k2i_s6 6.9 us</title></rect>
+<rect x="179.94" y="193" width="3.33" height="19" fill="#E45756" stroke="black" stroke-width="0.6"><title>sglang::topk_one::topk_one(sglang::TopKPagedParams, sglang::topk_one::Workspace) 7.9 us</title></rect>
+<rect x="183.27" y="115" width="22.40" height="19" fill="#F58518" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_k2_s6_tp8_c1_i1_u1 53.2 us</title></rect>
+<rect x="205.67" y="141" width="26.81" height="19" fill="#54A24B" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_layer_s6_tp8_c1_f1_u1_eg18 63.7 us</title></rect>
+<rect x="232.48" y="141" width="25.28" height="19" fill="#54A24B" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_layer_s6_tp8_c1_f1_u1_eg18 60.0 us</title></rect>
+<rect x="257.76" y="141" width="25.31" height="19" fill="#54A24B" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_layer_s6_tp8_c1_f1_u1_eg18 60.1 us</title></rect>
+<rect x="283.07" y="141" width="24.91" height="19" fill="#54A24B" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_layer_s6_tp8_c1_f1_u1_eg18 59.2 us</title></rect>
+<rect x="307.98" y="141" width="26.12" height="19" fill="#54A24B" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_layer_s6_tp8_c1_f1_u1_eg18 62.0 us</title></rect>
+<rect x="334.10" y="63" width="9.90" height="19" fill="#4C78A8" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_k1_s6_tp8_kt0_f1_i1_q1_cp2_u1 23.5 us</title></rect>
+<rect x="344.00" y="89" width="2.48" height="19" fill="#72B7B2" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_k2i_s6 5.9 us</title></rect>
+<rect x="346.48" y="193" width="2.90" height="19" fill="#E45756" stroke="black" stroke-width="0.6"><title>sglang::topk_one::topk_one(sglang::TopKPagedParams, sglang::topk_one::Workspace) 6.9 us</title></rect>
+<rect x="349.37" y="115" width="21.02" height="19" fill="#F58518" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_k2_s6_tp8_c1_i1_u1 49.9 us</title></rect>
+<rect x="370.39" y="141" width="25.46" height="19" fill="#54A24B" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_layer_s6_tp8_c1_f1_u1_eg18 60.5 us</title></rect>
+<rect x="395.85" y="141" width="26.07" height="19" fill="#54A24B" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_layer_s6_tp8_c1_f1_u1_eg18 61.9 us</title></rect>
+<rect x="421.92" y="141" width="25.36" height="19" fill="#54A24B" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_layer_s6_tp8_c1_f1_u1_eg18 60.2 us</title></rect>
+<rect x="447.28" y="141" width="25.46" height="19" fill="#54A24B" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_layer_s6_tp8_c1_f1_u1_eg18 60.5 us</title></rect>
+<rect x="472.75" y="141" width="26.96" height="19" fill="#54A24B" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_layer_s6_tp8_c1_f1_u1_eg20 64.0 us</title></rect>
+<rect x="499.71" y="219" width="2.24" height="19" fill="#9D755D"><title>_post_gate_kernel 5.3 us</title></rect>
+<rect x="501.95" y="63" width="10.14" height="19" fill="#4C78A8" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_k1_s6_tp8_kt0_f0_i1_q1_cp2_u1 24.1 us</title></rect>
+<rect x="512.09" y="89" width="2.51" height="19" fill="#72B7B2" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_k2i_s6 6.0 us</title></rect>
+<rect x="514.60" y="193" width="2.78" height="19" fill="#E45756" stroke="black" stroke-width="0.6"><title>sglang::topk_one::topk_one(sglang::TopKPagedParams, sglang::topk_one::Workspace) 6.6 us</title></rect>
+<rect x="517.37" y="115" width="21.54" height="19" fill="#F58518" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_k2_s6_tp8_c1_i1_u1 51.2 us</title></rect>
+<rect x="538.91" y="141" width="26.56" height="19" fill="#54A24B" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_layer_s6_tp8_c1_f1_u1 63.1 us</title></rect>
+<rect x="565.47" y="141" width="25.50" height="19" fill="#54A24B" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_layer_s6_tp8_c1_f1_u1 60.6 us</title></rect>
+<rect x="590.97" y="141" width="25.45" height="19" fill="#54A24B" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_layer_s6_tp8_c1_f1_u1 60.4 us</title></rect>
+<rect x="616.41" y="141" width="26.89" height="19" fill="#54A24B" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_layer_s6_tp8_c1_f1_u1 63.9 us</title></rect>
+<rect x="643.31" y="141" width="27.03" height="19" fill="#54A24B" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_layer_s6_tp8_c1_f1_u1 64.2 us</title></rect>
+<rect x="670.34" y="63" width="9.19" height="19" fill="#4C78A8" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_k1_s6_tp8_kt0_f1_i1_q1_cp1_u1 21.8 us</title></rect>
+<rect x="679.53" y="89" width="2.91" height="19" fill="#72B7B2" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_k2i_s6 6.9 us</title></rect>
+<rect x="682.45" y="193" width="3.47" height="19" fill="#E45756" stroke="black" stroke-width="0.6"><title>sglang::topk_one::topk_one(sglang::TopKPagedParams, sglang::topk_one::Workspace) 8.2 us</title></rect>
+<rect x="685.92" y="115" width="22.43" height="19" fill="#F58518" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_k2_s6_tp8_c1_i1_u1 53.3 us</title></rect>
+<rect x="708.35" y="141" width="25.80" height="19" fill="#54A24B" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_layer_s6_tp8_c1_f1_u1 61.3 us</title></rect>
+<rect x="734.15" y="141" width="25.21" height="19" fill="#54A24B" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_layer_s6_tp8_c1_f1_u1 59.9 us</title></rect>
+<rect x="759.36" y="141" width="26.12" height="19" fill="#54A24B" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_layer_s6_tp8_c1_f1_u1 62.0 us</title></rect>
+<rect x="785.48" y="63" width="7.61" height="19" fill="#4C78A8" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_k1_s6_tp8_kt0_f1_i1_q1_u1 18.1 us</title></rect>
+<rect x="793.09" y="89" width="2.51" height="19" fill="#72B7B2" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_k2i_s6 6.0 us</title></rect>
+<rect x="795.60" y="193" width="4.06" height="19" fill="#E45756" stroke="black" stroke-width="0.6"><title>sglang::topk_one::topk_one(sglang::TopKPagedParams, sglang::topk_one::Workspace) 9.6 us</title></rect>
+<rect x="799.66" y="115" width="20.97" height="19" fill="#F58518" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_k2_s6_tp8_c1_i1_u1 49.8 us</title></rect>
+<rect x="820.62" y="141" width="25.58" height="19" fill="#54A24B" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_layer_s6_tp8_c1_f1_u1 60.8 us</title></rect>
+<rect x="846.20" y="141" width="26.79" height="19" fill="#54A24B" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_layer_s6_tp8_c1_f1_u1 63.6 us</title></rect>
+<rect x="873.00" y="141" width="26.39" height="19" fill="#54A24B" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_layer_s6_tp8_c1_f1_u1 62.7 us</title></rect>
+<rect x="899.39" y="63" width="7.63" height="19" fill="#4C78A8" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_k1_s6_tp8_kt0_f1_i1_q1_u1 18.1 us</title></rect>
+<rect x="907.02" y="89" width="2.44" height="19" fill="#72B7B2" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_k2i_s6 5.8 us</title></rect>
+<rect x="909.46" y="193" width="3.57" height="19" fill="#E45756" stroke="black" stroke-width="0.6"><title>sglang::topk_one::topk_one(sglang::TopKPagedParams, sglang::topk_one::Workspace) 8.5 us</title></rect>
+<rect x="913.03" y="115" width="21.17" height="19" fill="#F58518" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_k2_s6_tp8_c1_i1_u1 50.3 us</title></rect>
+<rect x="934.20" y="141" width="26.91" height="19" fill="#54A24B" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_layer_s6_tp8_c1_f1_u1 63.9 us</title></rect>
+<rect x="961.11" y="141" width="25.97" height="19" fill="#54A24B" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_layer_s6_tp8_c1_f1_u1 61.7 us</title></rect>
+<rect x="987.08" y="141" width="26.54" height="19" fill="#54A24B" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_layer_s6_tp8_c1_f1_u1 63.0 us</title></rect>
+<rect x="1013.62" y="63" width="7.59" height="19" fill="#4C78A8" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_k1_s6_tp8_kt0_f1_i1_q1_u1 18.0 us</title></rect>
+<rect x="1021.21" y="89" width="2.51" height="19" fill="#72B7B2" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_k2i_s6 6.0 us</title></rect>
+<rect x="1023.72" y="193" width="3.55" height="19" fill="#E45756" stroke="black" stroke-width="0.6"><title>sglang::topk_one::topk_one(sglang::TopKPagedParams, sglang::topk_one::Workspace) 8.4 us</title></rect>
+<rect x="1027.27" y="115" width="22.04" height="19" fill="#F58518" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_k2_s6_tp8_c1_i1_u1 52.4 us</title></rect>
+<rect x="1049.32" y="141" width="26.84" height="19" fill="#54A24B" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_layer_s6_tp8_c1_f1_u1 63.8 us</title></rect>
+<rect x="1076.16" y="141" width="25.45" height="19" fill="#54A24B" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_layer_s6_tp8_c1_f1_u1 60.4 us</title></rect>
+<rect x="1101.61" y="141" width="25.87" height="19" fill="#54A24B" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_layer_s6_tp8_c1_f1_u1 61.4 us</title></rect>
+<rect x="1127.48" y="63" width="7.63" height="19" fill="#4C78A8" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_k1_s6_tp8_kt0_f1_i1_q1_u1 18.1 us</title></rect>
+<rect x="1135.10" y="89" width="2.44" height="19" fill="#72B7B2" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_k2i_s6 5.8 us</title></rect>
+<rect x="1137.55" y="193" width="3.38" height="19" fill="#E45756" stroke="black" stroke-width="0.6"><title>sglang::topk_one::topk_one(sglang::TopKPagedParams, sglang::topk_one::Workspace) 8.0 us</title></rect>
+<rect x="1140.93" y="115" width="20.90" height="19" fill="#F58518" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_k2_s6_tp8_c1_i1_u1 49.6 us</title></rect>
+<rect x="1161.83" y="141" width="26.62" height="19" fill="#54A24B" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_layer_s6_tp8_c1_f1_u1 63.2 us</title></rect>
+<rect x="1188.46" y="141" width="25.53" height="19" fill="#54A24B" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_layer_s6_tp8_c1_f1_u1 60.6 us</title></rect>
+<rect x="1213.99" y="141" width="25.50" height="19" fill="#54A24B" stroke="black" stroke-width="0.6"><title>aiter::dsv41_mono_layer_s6_tp8_c1_f1_u1 60.6 us</title></rect>
+<rect x="1239.48" y="245" width="1.97" height="19" fill="#BAB0AC"><title>_post_combine_kernel 4.7 us</title></rect>
+<rect x="1241.45" y="245" width="1.94" height="19" fill="#BAB0AC"><title>aiter::add_rmsnorm_quant_kernelIDF16bDF16bLi256ELi24ELb0ELb0ELb1ELi1ELb0EEEvPT0_PT_PfS4_S4 4.6 us</title></rect>
+<rect x="1243.39" y="245" width="12.21" height="19" fill="#BAB0AC"><title>Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT64x16x512_MI16x16x1_SN_LDSB1_AFC0_AFEM1_AFE 29.0 us</title></rect>
+<rect x="1255.60" y="245" width="4.71" height="19" fill="#BAB0AC"><title>aiter::allgather_vecIDF16bLi8EEEvPNS_8RankDataENS_11RankSignalsEPNS_6SignalEPT_ii 11.2 us</title></rect>
+<rect x="1260.31" y="245" width="2.21" height="19" fill="#BAB0AC"><title>void at::native::elementwise_kernel_manual_unroll 5.2 us</title></rect>
+<rect x="1262.52" y="245" width="2.00" height="19" fill="#BAB0AC"><title>softcap_inplace_logits_kernel 4.8 us</title></rect>
+<rect x="1264.52" y="245" width="1.94" height="19" fill="#BAB0AC"><title>_argmax_partial_kernel 4.6 us</title></rect>
+<rect x="1266.46" y="245" width="1.85" height="19" fill="#BAB0AC"><title>_argmax_final_kernel 4.4 us</title></rect>
+<rect x="1268.31" y="245" width="1.90" height="19" fill="#BAB0AC"><title>_static_accept_tail_kernel 4.5 us</title></rect>
+<rect x="1270.22" y="245" width="1.92" height="19" fill="#BAB0AC"><title>_mxfp8_quant_kernel 4.6 us</title></rect>
+<rect x="1272.14" y="245" width="7.17" height="19" fill="#BAB0AC"><title>_gemm_afp8wfp8_packed_kernel_BLOCK_SIZE_M_8_BLOCK_SIZE_N_16_BLOCK_SIZE_K_256_K_PACK_2_A_SC 17.0 us</title></rect>
+<rect x="1279.31" y="245" width="4.58" height="19" fill="#BAB0AC"><title>aiter::add_rmsnorm_quant_kernelIDF16bDF16bLi256ELi24ELb0ELb0ELb1ELi1ELb0EEEvPT0_PT_PfS4_S4 10.9 us</title></rect>
+<rect x="1283.89" y="245" width="1.90" height="19" fill="#BAB0AC"><title>_mxfp8_quant_kernel 4.5 us</title></rect>
+<rect x="1285.79" y="245" width="2.22" height="19" fill="#BAB0AC"><title>_gemm_afp8wfp8_packed_kernel_BLOCK_SIZE_M_16_BLOCK_SIZE_N_32_BLOCK_SIZE_K_1024_K_PACK_1_A_ 5.3 us</title></rect>
+<rect x="1288.02" y="245" width="1.53" height="19" fill="#BAB0AC"><title>void (anonymous namespace)::swa_store_kernel 3.6 us</title></rect>
+<rect x="1295.07" y="245" width="1.70" height="19" fill="#BAB0AC"><title>_engram_commit_history_kernel 4.0 us</title></rect>
+<rect x="1296.77" y="245" width="1.45" height="19" fill="#BAB0AC"><title>void at::native::index_elementwise_kernel 3.4 us</title></rect>
+<rect x="1300.39" y="245" width="1.68" height="19" fill="#BAB0AC"><title>void at::native::vectorized_elementwise_kernel 4.0 us</title></rect>
+<rect x="1302.08" y="245" width="1.84" height="19" fill="#BAB0AC"><title>void at::native::index_elementwise_kernel 4.4 us</title></rect>
+<rect x="1303.91" y="245" width="1.77" height="19" fill="#BAB0AC"><title>Memcpy DtoD (Device -> Device) 4.2 us</title></rect>
+<rect x="1305.68" y="245" width="1.78" height="19" fill="#BAB0AC"><title>Memcpy DtoD (Device -> Device) 4.2 us</title></rect>
+<rect x="1307.47" y="245" width="1.45" height="19" fill="#BAB0AC"><title>Memcpy DtoD (Device -> Device) 3.4 us</title></rect>
+<rect x="1318.57" y="245" width="1.84" height="19" fill="#BAB0AC"><title>void at::native::index_elementwise_kernel 4.4 us</title></rect>
+<rect x="1320.40" y="245" width="1.82" height="19" fill="#BAB0AC"><title>void at::native::index_elementwise_kernel 4.3 us</title></rect>
+<rect x="1322.22" y="245" width="1.75" height="19" fill="#BAB0AC"><title>assign_extend_cache_locs_uniform 4.2 us</title></rect>
+<rect x="1323.97" y="245" width="1.82" height="19" fill="#BAB0AC"><title>void at::native::elementwise_kernel_manual_unroll 4.3 us</title></rect>
+<rect x="1325.79" y="245" width="1.95" height="19" fill="#BAB0AC"><title>Memcpy DtoD (Device -> Device) 4.6 us</title></rect>
+<rect x="1327.74" y="245" width="1.82" height="19" fill="#BAB0AC"><title>_small_copy_kernel 4.3 us</title></rect>
+<rect x="1329.56" y="245" width="1.77" height="19" fill="#BAB0AC"><title>Memcpy DtoD (Device -> Device) 4.2 us</title></rect>
+<rect x="1331.33" y="245" width="1.94" height="19" fill="#BAB0AC"><title>void at::native::elementwise_kernel_manual_unroll 4.6 us</title></rect>
+<rect x="1333.27" y="245" width="1.78" height="19" fill="#BAB0AC"><title>_block_meta_kernel 4.2 us</title></rect>
+<rect x="1335.05" y="245" width="23.09" height="19" fill="#BAB0AC"><title>aiter::dsv41_mono_layer_s5_tp8_c0_f0_e128_k3_u1_w192_em1 54.8 us</title></rect>
+<rect x="1358.14" y="245" width="23.42" height="19" fill="#BAB0AC"><title>aiter::dsv41_mono_layer_s5_tp8_c0_f1_e128_k3_u1_w192 55.6 us</title></rect>
+<rect x="1381.57" y="245" width="23.26" height="19" fill="#BAB0AC"><title>aiter::dsv41_mono_layer_s5_tp8_c0_f1_e128_k3_u1_w192 55.2 us</title></rect>
+<rect x="1404.82" y="245" width="1.97" height="19" fill="#BAB0AC"><title>_post_combine_kernel 4.7 us</title></rect>
+<rect x="1406.79" y="245" width="1.97" height="19" fill="#BAB0AC"><title>aiter::add_rmsnorm_quant_kernelIDF16bDF16bLi256ELi24ELb0ELb0ELb1ELi1ELb0EEEvPT0_PT_PfS4_S4 4.7 us</title></rect>
+<rect x="1408.76" y="245" width="12.16" height="19" fill="#BAB0AC"><title>Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT64x16x512_MI16x16x1_SN_LDSB1_AFC0_AFEM1_AFE 28.9 us</title></rect>
+<rect x="1420.92" y="245" width="2.83" height="19" fill="#BAB0AC"><title>(anonymous namespace)::markov_sample_step_kernel((anonymous namespace)::Params) 6.7 us</title></rect>
+<rect x="1423.75" y="245" width="3.18" height="19" fill="#BAB0AC"><title>(anonymous namespace)::markov_sample_finish_kernel((anonymous namespace)::Params) 7.6 us</title></rect>
+<rect x="1426.93" y="245" width="2.27" height="19" fill="#BAB0AC"><title>(anonymous namespace)::markov_sample_step_kernel((anonymous namespace)::Params) 5.4 us</title></rect>
+<rect x="1429.21" y="245" width="3.00" height="19" fill="#BAB0AC"><title>(anonymous namespace)::markov_sample_finish_kernel((anonymous namespace)::Params) 7.1 us</title></rect>
+<rect x="1432.21" y="245" width="2.02" height="19" fill="#BAB0AC"><title>(anonymous namespace)::markov_sample_step_kernel((anonymous namespace)::Params) 4.8 us</title></rect>
+<rect x="1434.23" y="245" width="3.00" height="19" fill="#BAB0AC"><title>(anonymous namespace)::markov_sample_finish_kernel((anonymous namespace)::Params) 7.1 us</title></rect>
+<rect x="1437.22" y="245" width="1.97" height="19" fill="#BAB0AC"><title>(anonymous namespace)::markov_sample_step_kernel((anonymous namespace)::Params) 4.7 us</title></rect>
+<rect x="1439.20" y="245" width="3.15" height="19" fill="#BAB0AC"><title>(anonymous namespace)::markov_sample_finish_kernel((anonymous namespace)::Params) 7.5 us</title></rect>
+<rect x="1442.34" y="245" width="1.97" height="19" fill="#BAB0AC"><title>(anonymous namespace)::markov_sample_step_kernel((anonymous namespace)::Params) 4.7 us</title></rect>
+<rect x="1444.31" y="245" width="3.23" height="19" fill="#BAB0AC"><title>(anonymous namespace)::markov_sample_finish_kernel((anonymous namespace)::Params) 7.7 us</title></rect>
+<rect x="1447.55" y="245" width="1.43" height="19" fill="#BAB0AC"><title>(anonymous namespace)::markov_gather_kernel((anonymous namespace)::GatherParams) 3.4 us</title></rect>
+<rect x="1454.37" y="245" width="1.97" height="19" fill="#BAB0AC"><title>void at::native::(anonymous namespace)::CatArrayBatchedCopy_contig 4.7 us</title></rect>
+<rect x="1456.34" y="245" width="1.87" height="19" fill="#BAB0AC"><title>_small_copy_kernel 4.4 us</title></rect>
+<rect x="1458.21" y="245" width="1.75" height="19" fill="#BAB0AC"><title>Memcpy DtoD (Device -> Device) 4.2 us</title></rect>
+<rect x="1459.96" y="245" width="1.77" height="19" fill="#BAB0AC"><title>void at::native::elementwise_kernel_manual_unroll 4.2 us</title></rect>
+<rect x="1461.73" y="245" width="1.82" height="19" fill="#BAB0AC"><title>Memcpy DtoD (Device -> Device) 4.3 us</title></rect>
+<rect x="1463.55" y="245" width="1.95" height="19" fill="#BAB0AC"><title>Memcpy DtoD (Device -> Device) 4.6 us</title></rect>
+<rect x="1465.50" y="245" width="1.92" height="19" fill="#BAB0AC"><title>_verify_meta_kernel 4.6 us</title></rect>
+<rect x="1467.42" y="245" width="3.20" height="19" fill="#BAB0AC"><title>_engram_hash_kernel 7.6 us</title></rect>
+<rect x="1470.62" y="245" width="1.90" height="19" fill="#BAB0AC"><title>void at::native::elementwise_kernel_manual_unroll 4.5 us</title></rect>
+<rect x="1472.52" y="245" width="1.92" height="19" fill="#BAB0AC"><title>_engram_gather_kernel 4.6 us</title></rect>
+<rect x="1474.44" y="245" width="1.99" height="19" fill="#BAB0AC"><title>_engram_gather_kernel 4.7 us</title></rect>
+<rect x="1476.43" y="245" width="3.57" height="19" fill="#BAB0AC"><title>aiter::cross_device_reduce_2stageIDF16bLi8ELb0ELb0EEEvPNS_8RankDataES2_NS_11RankSignalsEPN 8.5 us</title></rect>
+<line x1="110" y1="276" x2="1480" y2="276" stroke="#444"/>
+<line x1="110.0" y1="276" x2="110.0" y2="281" stroke="#444"/>
+<text x="110.0" y="294" text-anchor="middle">0 us</text>
+<line x1="320.5" y1="276" x2="320.5" y2="281" stroke="#444"/>
+<text x="320.5" y="294" text-anchor="middle">500 us</text>
+<line x1="531.0" y1="276" x2="531.0" y2="281" stroke="#444"/>
+<text x="531.0" y="294" text-anchor="middle">1000 us</text>
+<line x1="741.5" y1="276" x2="741.5" y2="281" stroke="#444"/>
+<text x="741.5" y="294" text-anchor="middle">1500 us</text>
+<line x1="952.0" y1="276" x2="952.0" y2="281" stroke="#444"/>
+<text x="952.0" y="294" text-anchor="middle">2000 us</text>
+<line x1="1162.5" y1="276" x2="1162.5" y2="281" stroke="#444"/>
+<text x="1162.5" y="294" text-anchor="middle">2500 us</text>
+<line x1="1373.0" y1="276" x2="1373.0" y2="281" stroke="#444"/>
+<text x="1373.0" y="294" text-anchor="middle">3000 us</text>
+</svg>
