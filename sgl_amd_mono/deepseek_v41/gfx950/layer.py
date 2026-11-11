@@ -582,6 +582,11 @@ def run_k1(key: MonoBuild, sl, front, a: dict, ep, k2=None, early=None):
             index_query.run_cp(c, c["args"], own_n, CP0, c["xl"], key.cp)
         if const_expr(early is not None):
             early.entries()
+            early.touch()
+
+    def early_keys():
+        early.entries()
+        early.touch()
 
     if const_expr(key.seamed):
 
@@ -599,7 +604,7 @@ def run_k1(key: MonoBuild, sl, front, a: dict, ep, k2=None, early=None):
             x8_given=True,
             before_wqkv=seam_slice,
             after_wqkv=entry_norm,
-            before_wqb=early.entries,
+            before_wqb=early_keys,
             qkv_first=QKV0,
             # a row tile's sums each on one CTA: no partner hand-off
             row_halves=True,

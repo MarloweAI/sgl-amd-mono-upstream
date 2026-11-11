@@ -316,22 +316,36 @@ def await_k1(c, unit, t):
     ``c["k1_seen"](unit)`` runs once they are: a flag of every CTA was seen."""
     tag = c["mb"].tag
     load = k1_flag_load(c["krdy"], c["k1_words"], c["tid"], t, c["S"])
-    _spin(load, lambda v: v[1] != tag, first=c["k1_first"])
+    # staged: the q flags alone (each CTA's follows its key table rows), on the waves
+    # without keys, so no record load is ahead of their polls
+    q_only = staged(c["d"], c["S"]) and "vrdy" not in c["k1_words"]
+    polls = c["tid"] < (BLOCKS if q_only else THREADS)
+    if polls:
+        _spin(load, lambda v: v[1] != tag, first=c["k1_first"])
     gpu.barrier()
     c["k1_seen"](unit)
 
 
+def staged(d: Dims, s: int) -> bool:
+    """Whether a split unit's keys take half the waves (``key_wave``), their records staged
+    in the L2 before wq_b (``EarlyKeys``): on TP8 (on TP4 it slows the front)."""
+    return d.tp == 8 and 2 * head_groups(d, s) * key_tiles(d, s) == WAVES
+
+
+def key_wave(d: Dims, s: int, wave):
+    """Whether ``wave`` loads and scores keys: the first ``head_groups * key_tiles``
+    waves, or where they are half the CTA (``staged``), the upper half."""
+    if staged(d, s):
+        return wave >= WAVES // 2
+    return wave < head_groups(d, s) * key_tiles(d, s)
+
+
 def split_lane(d, s, nchunk, wave, lane, unit):
     """Split unit ``unit``: its token, its first key, this lane's key and whether this
-    wave loads keys (``key_tiles``)."""
+    wave loads keys (``key_wave``)."""
     nkt = key_tiles(d, s)
     k0 = (unit % nchunk) * chunk_keys(d, s)
-    return (
-        unit // nchunk,
-        k0,
-        k0 + (wave % nkt) * 16 + lane % 16,
-        wave < (head_groups(d, s) * nkt),
-    )
+    return unit // nchunk, k0, k0 + (wave % nkt) * 16 + lane % 16, key_wave(d, s, wave)
 
 
 class EarlyKeys:
@@ -339,7 +353,12 @@ class EarlyKeys:
     (``key_table``'s entries, not its table): the inputs past the CTA's wqkv weights,
     the entry words past its wq_b weights, and at K1's end the old keys' record loads,
     in flight through the wait on q. A key of this step's rows (a record this launch
-    writes) is read past the q flags (``stage_split``)."""
+    writes) is read past the q flags (``stage_split``).
+
+    Where the chunk's keys take half the waves (``staged``: the upper half), those waves
+    touch every 64 B of their old keys' records into the L2 once the entry words are in,
+    before wq_b: at K1's end the records land from the L2, and the lower half poll the
+    q flags with no record loads ahead of their polls (``await_k1``)."""
 
     def __init__(self, key, sw, a, unit, has):
         d = Dims(key.tp)
@@ -351,6 +370,7 @@ class EarlyKeys:
             key.ratio,
         )
         self.nchunk = cdiv(KEYS, chunk_keys(d, self.s))
+        self.staged = staged(d, self.s)
         tid = fx.thread_idx.x
         self.lane, self.wave = tid % 64, tid // 64
         self.t, _, self.key, self.keyed = split_lane(
@@ -367,9 +387,9 @@ class EarlyKeys:
         self.nswa, self.ntopk = kt_lens(self.ins, self.sw)
         self.words = kt_entry_loads(self.a, self.t, self.key, self.ntopk, self.sw)
 
-    def loads(self):
-        """The entry, the token's key count, 1 for a key of this step's rows, and the
-        record loads (a new key's: the zero record's)."""
+    def records(self):
+        """The entry, 1 for a key of this step's rows, and the record's data and scale
+        addresses (a new key's: the zero record's)."""
         val = kt_entry(self.words, self.key, self.nswa, self.ntopk)
         hit = None
         for j in range_constexpr(self.s):
@@ -379,7 +399,23 @@ class EarlyKeys:
         new = hit.select(fx.Int32(1), fx.Int32(0))
         data, sc, _ = key_addr(self.a, self.ratio, val)
         z, old = self.a["zrec"], new == 0
-        data, sc = old.select(data, z), old.select(sc, z + fx.Int64(DATA))
+        return val, new, old.select(data, z), old.select(sc, z + fx.Int64(DATA))
+
+    def touch(self):
+        """``staged``: the key waves touch their keys' records."""
+        if const_expr(self.staged):
+            _, _, data, sc = self.records()
+            self.touched = touch_record(
+                self.has & self.keyed, data, sc, self.lane // 16
+            )
+
+    def loads(self):
+        """The entry, the token's key count, 1 for a key of this step's rows, and the
+        record loads (a new key's: the zero record's)."""
+        if const_expr(self.staged):
+            # landed long before; their registers held to here
+            keep(self.touched)
+        val, new, data, sc = self.records()
         loads = early_key_loads(self.has & self.keyed, data, sc, self.lane // 16)
         return {
             "val": val,
@@ -387,6 +423,30 @@ class EarlyKeys:
             "new": new,
             "loads": (loads[0], list(loads[1:8]), list(loads[8:])),
         }
+
+
+@flyc.jit
+def touch_record(on, data, sc, g):
+    """Where ``on``: one word of each 64 B of a key's record into the L2, lane g of the
+    key's four taking data bytes 64 g, 64 g + 256 and (g 0) 512 or (g 1) the scale word."""
+    t0, t1, t2 = fx.Int32(0), fx.Int32(0), fx.Int32(0)
+    if on:
+        t0 = global_load(data + fx.Int64(64 * g))
+        t1 = global_load(data + fx.Int64(64 * g + 256))
+    if on & (g < 2):
+        t2 = global_load((g == 0).select(data + fx.Int64(512), sc))
+    return t0, t1, t2
+
+
+def keep(values):
+    """``values`` (their loads) waited for here, never used."""
+    llvm.InlineAsmOp(
+        None,
+        [as_ir_value(fx.Int32(v)) for v in values],
+        "",
+        ",".join("v" * len(values)),
+        has_side_effects=True,
+    )
 
 
 @flyc.jit
@@ -420,10 +480,11 @@ def stage_split(c, unit):
     idle = ngrp * nkt < WAVES
     hgi = fx.min(wave // nkt, ngrp - 1) if idle else wave // nkt
     kt = wave % nkt
+    kwave = key_wave(d, s, wave)
 
     def keyed(cond):
         # ``cond`` on a wave that loads keys
-        return cond & (wave < ngrp * nkt) if idle else cond
+        return cond & kwave if idle else cond
 
     g = lane // 16
     r16 = lane % 16
@@ -472,7 +533,7 @@ def stage_split(c, unit):
         if const_expr(one):
             scw, nope, rope = keys
         elif const_expr(idle):
-            got = early_key_loads(wave < ngrp * nkt, data, sc, g)
+            got = early_key_loads(kwave, data, sc, g)
             scw, nope, rope = got[0], list(got[1:8]), list(got[8:])
         else:
             scw, nope, rope = key_loads(data, sc, g)
@@ -569,7 +630,7 @@ def stage_split(c, unit):
             )
             pv2 = fx.Vector.from_elements([pw[0], pw[1]], fx.Int32)
             if const_expr(idle):
-                if wave < ngrp * nkt:
+                if kwave:
                     fx.ptr_store(pv2, pbase)
             else:
                 fx.ptr_store(pv2, pbase)
