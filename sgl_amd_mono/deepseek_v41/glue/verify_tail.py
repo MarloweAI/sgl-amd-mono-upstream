@@ -8,6 +8,11 @@ Where the verify's rows fit (``gfx950/vtail/fused``), the vocab projection and t
 are one launch after the head's combine and norm (``fused_head``, from the monokernel
 forward): the logits processor returns its shard in place of its head GEMM, and the
 epilogue's accept takes the outputs it wrote. Its logits are not hipBLASLt's bits.
+An all-sampled static step's accept (SGLang's block-wise rejection, its simulated bonus and
+accept tail) runs on the same shard and the draft's step logits' columns of this rank
+(``gfx950/vtail/sampled``), in the sampling-accept region after the "sampled" variant, which
+then keeps the shard (``sampled_accept_on_shard``). Its outcomes are SGLang's draws.
+
 ``SGLANG_AMD_MONO_DSV41_VERIFY_TAIL=0`` keeps SGLang's."""
 
 from __future__ import annotations
@@ -64,6 +69,18 @@ SGLANG_READS = {
         "_future_relay_rows",
         "_post_fold",
         "req_pool_indices",
+        "deferred_commit",
+        # the sampled accept on the shard
+        "sampled_accept_on_shard",
+        "_static_sampled_tail",
+        "_static_sampled_tail(draft_logits)",
+        "_static_sampled_tail(temperatures)",
+        "_static_sampled_tail(rejection_noise)",
+    ),
+    "kernels/ops/speculative/dspark/blockwise_rejection.py": (
+        "RejectionNoise",
+        "key",
+        "counter",
     ),
     "kernels/ops/embeddings/engram_hash.py": ("_engram_commit_history_kernel",),
     "srt/layers/logits_processor.py": (
@@ -103,7 +120,7 @@ _SLOTS: dict = {}
 _COMMITTED: dict = {}
 
 
-def _commit_args(epi, slots, candidates, bs):
+def _commit_args(epi, slots, candidates, bs, gate=None):
     """(history, slots, relay lens, relay bonus) of SGLang's engram commit that follows the accept
     (``run_static``'s), for the accept's launch to run, or None; noted for ``_commit_engram_history``."""
     _COMMITTED.pop(id(epi), None)
@@ -121,11 +138,13 @@ def _commit_args(epi, slots, candidates, bs):
         epi.bonus_buf.data_ptr(),
     ):
         return None
+    gate = epi.inject_gate_buf if gate is None else gate
     _COMMITTED[id(epi)] = (
         history.data_ptr(),
         slots.data_ptr(),
         candidates.data_ptr(),
         relay is not None,
+        gate.data_ptr(),
     )
     return history, slots, *(relay[:2] if relay is not None else (None, None))
 
@@ -350,8 +369,101 @@ def _static_accept_tail(
     return self.gated_commit_lens_buf[:bs] if gated else None
 
 
+def _sampled_why_not(epi, shard, logits, candidates, draft_logits, noise) -> str | None:
+    from sgl_amd_mono.deepseek_v41.gfx950.vtail import sampled
+
+    if shard is None:
+        return "whole logits"
+    bs, t = candidates.shape
+    if logits.dtype != torch.bfloat16 or logits.stride(1) != 1 or logits.dim() != 2:
+        return f"{logits.dtype} logits"
+    if logits.shape[0] != bs * t or t > sampled.MAX_T or bs > sampled.MAX_SEQ:
+        return f"{bs} x {t} verify rows"
+    if logits.shape[1] % 8 or logits.stride(0) % 8 or logits.data_ptr() % 16:
+        return "unaligned shard rows"
+    if noise is None:
+        return "no block-wise rejection noise"
+    if (
+        draft_logits is None
+        or draft_logits.dtype != torch.float32
+        or draft_logits.stride(2) != 1
+    ):
+        return "no f32 draft step logits"
+    if (
+        draft_logits.shape[-1] != shard.vocab_size
+        or draft_logits.stride(1) % 4
+        or draft_logits.data_ptr() % 16
+    ):
+        return f"draft step logits {tuple(draft_logits.shape)}"
+    return None
+
+
+def _sampled(epi, shard, part: int):
+    """The epilogue's sampled accept launch (built at the region's eager first step)."""
+    got = _TAILS.get(("sampled", id(epi)))
+    if got is None:
+        from sglang.srt.runtime_context import get_parallel
+
+        from sgl_amd_mono.deepseek_v41.gfx950.vtail import sampled
+
+        assert not torch.cuda.is_current_stream_capturing(), (
+            "the sampled accept's peer buffers are built before capture"
+        )
+        group = get_parallel().tp_group
+        vocab_start, width = shard.deferred_shard_offset(torch.empty(0, part))
+        if vocab_start % 4 or not sampled.fits(
+            tp=group.world_size, width=width, vocab=shard.vocab_size
+        ):
+            raise RuntimeError(
+                f"DSV4.1 sampled verify tail: a {width}-column shard at TP {group.world_size}"
+            )
+        got = _TAILS["sampled", id(epi)] = sampled.SampledTail(
+            group.cpu_group, group.rank_in_group, group.world_size, epi.inject_gate_buf.device,
+            width=width, vocab_start=vocab_start, vocab=shard.vocab_size, deadline_s=DEADLINE_S,
+        )  # fmt: skip
+    return got
+
+
+def _static_sampled_tail(orig, self, *, candidates, logits, draft_logits, temperatures, rejection_noise,
+                         seq_lens, verify_lens, gate, gated):  # fmt: skip
+    shard = self.verify_shard(logits)
+    why = _sampled_why_not(
+        self, shard, logits, candidates, draft_logits, rejection_noise
+    )
+    if why is not None:
+        raise RuntimeError(f"DSV4.1 sampled verify tail: {why}")
+    from sgl_amd_mono.deepseek_v41.draft_sampler import step_logits_shard
+
+    launch = _sampled(self, shard, logits.shape[1])
+    bs = candidates.shape[0]
+    start = launch.vocab_start
+    # the kernels' Markov block keeps this rank's columns; SGLang's writes the whole rows
+    draft = step_logits_shard(draft_logits, bs)
+    if draft is None:
+        draft = draft_logits[:bs, :, start : start + launch.width]
+    commit = _commit_args(self, _SLOTS.get(id(self)), candidates, bs, gate)
+    sim = self.simulated_correct_len
+    # the commit that follows in this forward: its main_proj in this launch
+    hidden = _COMMITS.get(id(self))
+    proj = inject.projection(self, hidden) if gated and hidden is not None else None
+    launch(
+        logits, draft, temperatures,
+        key=rejection_noise.key, counter=rejection_noise.counter, candidates=candidates,
+        seq_lens=seq_lens, verify_lens=verify_lens, gate=gate, sim=sim,
+        sim_seed=self.sim_seed_buf if sim is not None else None,
+        correct_out=self.correct_len_buf, bonus_out=self.bonus_buf,
+        cap_trim_out=self.cap_trim_lens_buf, commit_out=self.commit_lens_buf,
+        new_seq_out=self.new_seq_lens_buf, out_tokens=self.out_tokens_buf,
+        gated_out=self.gated_commit_lens_buf if gated else None, proj=proj, commit=commit,
+    )  # fmt: skip
+    return self.gated_commit_lens_buf[:bs] if gated else None
+
+
 def _run_static(orig, self, io, *, accept, gate, kv_projected=False):
-    _COMMITS[id(self)] = None if kv_projected else io.hidden
+    # kv_projected: a deferred commit's projection already joined (without one, the commit projects here)
+    _COMMITS[id(self)] = (
+        None if kv_projected and self.deferred_commit is not None else io.hidden
+    )
     _SLOTS[id(self)] = io.req_pool_indices
     if (
         id(self) not in _ACCEPTS
@@ -387,11 +499,11 @@ def _commit_engram_history(
         req_pool_indices.data_ptr(),
         candidates.data_ptr(),
         relay is not None,
+        gate.data_ptr(),
     )
-    same = (commit_lens.data_ptr(), verify_lens.data_ptr(), gate.data_ptr()) == (
+    same = (commit_lens.data_ptr(), verify_lens.data_ptr()) == (
         self.commit_lens_buf.data_ptr(),
         self.verify_lens_buf.data_ptr(),
-        self.inject_gate_buf.data_ptr(),
     )
     if done != want or not same:
         raise RuntimeError(
@@ -415,6 +527,9 @@ def install() -> None:
     route(verify.DsparkVerifyEpilogue, "_static_accept_tail", _static_accept_tail)
     route(verify.DsparkVerifyEpilogue, "run_static", _run_static)
     route(verify.DsparkVerifyEpilogue, "_commit_engram_history", _commit_engram_history)
+    if hasattr(verify.DsparkVerifyEpilogue, "_static_sampled_tail"):
+        route(verify.DsparkVerifyEpilogue, "_static_sampled_tail", _static_sampled_tail)
+        verify.DsparkVerifyEpilogue.sampled_accept_on_shard = True
     route(
         importlib.import_module(LOGITS).LogitsProcessor,
         "_compute_lm_head",

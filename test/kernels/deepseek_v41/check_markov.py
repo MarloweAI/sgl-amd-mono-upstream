@@ -1,5 +1,5 @@
 """Check the sampled DSpark Markov block (gfx950/markov, one launch) against SGLang's arithmetic (torchrun,
-TP2 to TP8): the tokens on every rank alike, the whole step logits of the sampled rows (a
+TP2 to TP8): the tokens on every rank alike, the whole step logits of the sampled rows gathered from the ranks' shards (a
 temperature-0 row's left unwritten) and the noise counter, eager and under graph replay; and
 the draft sampler's block (draft_sampler) against SGLang's ``draft_markov_block`` on a TP-sharded
 ``DSparkV4MarkovHead``."""
@@ -105,6 +105,12 @@ def against_sglang(rank, tp, cpu, dev, w1, w2, gamma) -> list:
         n = DraftNoise(key=key, offset=offset.clone())
         sampler.block(base, anchor, temps, n, got, got_logits)
         torch.cuda.synchronize()
+        dist.barrier()  # every rank's shard written
+        sampler.ops.gather_step_logits(
+            temps, sampler.exchange.peers, got_logits, sampler.width
+        )
+        torch.cuda.synchronize()
+        dist.barrier()  # every rank's shard read before the next launch writes it
         whole = group.all_gather(base.float(), dim=-1)[..., :VOCAB]
         sampled = temps != 0
         # the bias GEMV sums in another order: a bf16 rounding flip of the bias now and then
@@ -226,6 +232,10 @@ def main():
 
         block()
         torch.cuda.synchronize()
+        dist.barrier()  # every rank's shard written
+        ops.gather_step_logits(temps, x.peers, logits, part)
+        torch.cuda.synchronize()
+        dist.barrier()  # every rank's shard read before the next launch writes it
         bad_tok = int((out.view(bs, gamma) != want).sum())
         bad_tok += int((verify != torch.cat([anchor.view(bs, 1), want], 1)).sum())
         bias = (want_logits - whole_base).abs()[sampled]
