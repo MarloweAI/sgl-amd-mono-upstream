@@ -169,9 +169,32 @@ def split_keys(d: Dims, s: int) -> int:
     return 64 if units <= 112 else 128
 
 
+WORD = 16  # a tagged word's bytes: three data words, then the launch tag
+
+
+def tagged_x8b(d: Dims, s: int) -> bool:
+    """Whether wo_a hands X8B to wo_b as tagged words (no store-completion wait, no
+    flag): on TP8 at one token tile."""
+    return d.tp == 8 and s <= TILE
+
+
+def x8b_words(d: Dims, s: int) -> int:
+    """Tagged X8B's words: three a (token, wo_a task), its 32 e4m3 and E8M0 code."""
+    return s * d.woa_tasks * 3
+
+
 def back_scratch(s: int, d: Dims, start: int = 0) -> dict:
     """Return K2's scratch regions past ``start`` -> (byte offset, bytes)."""
     nchunk = cdiv(KEYS, split_keys(d, s))
+    if tagged_x8b(d, s):
+        x8b = [("x8t", x8b_words(d, s) * WORD)]
+    else:
+        x8b = [
+            ("x8b", s * d.o_rows),
+            ("x8bs", s * d.o_rows // 32 * 4),
+            # a flag a wo_a unit, a line each (``FLAG_STRIDE``)
+            ("ardy", d.woa_tasks * cdiv(s, ROWS) * PAIR * FLAG_STRIDE),
+        ]
     return byte_layout(
         [
             ("part", s * nchunk * d.heads * HEAD_DIM * 2),  # bf16 partials
@@ -179,10 +202,7 @@ def back_scratch(s: int, d: Dims, start: int = 0) -> dict:
             ("srdy", s * nchunk * PAIR * FLAG_STRIDE),
             ("xo", s * d.q_rows * 2),  # bf16: wo_a reads it unquantized
             ("crdy", s * d.heads // 8 * comb_parts(d, s) * PAIR * FLAG_STRIDE),
-            ("x8b", s * d.o_rows),
-            ("x8bs", s * d.o_rows // 32 * 4),
-            # a flag a wo_a unit, a line each (``FLAG_STRIDE``)
-            ("ardy", d.woa_tasks * cdiv(s, ROWS) * PAIR * FLAG_STRIDE),
-        ],
+        ]
+        + x8b,
         start=start,
     )

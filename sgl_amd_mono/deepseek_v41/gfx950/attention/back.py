@@ -6,7 +6,8 @@ rank's wo_b partial, adapted from vLLM's mono decode (``attention/back.py``).
 One launch a layer and rank runs split (flash-decoding over a chunk of a token's
 keys from K1's key table, every head of the rank), combine (the chunks merged with
 the sink, inverse GPT-J RoPE -> bf16 XO), wo_a (-> MXFP8 X8B) and wo_b (-> the
-caller's hook); the stages hand off device-scope data behind tagged flags.
+caller's hook); the stages hand off device-scope data behind tagged flags, and on
+TP8 wo_a's X8B as tagged 16-B words (``plan.tagged_x8b``).
 """
 
 import flydsl.compiler as flyc
@@ -79,8 +80,10 @@ from .plan import (
     cdiv,
     comb_parts,
     split_keys,
+    tagged_x8b,
     tile_rows,
     token_tiles,
+    x8b_words,
 )
 
 _STREAM = fx.Stream(None)
@@ -168,6 +171,73 @@ def await_flags(c, region, n, index, also=None):
             )
             c["mb"].poll([(region, i, 1)])
     gpu.barrier()
+
+
+def tagged_slots(tid, count):
+    """This thread's words of ``count`` tagged words, one a thread a round: [(index,
+    live)], live None where every thread's word is real; a dead slot reads the last word
+    (one line a wave) and is not waited on."""
+    out = []
+    for i in range(cdiv(count, THREADS)):
+        w = tid + THREADS * i
+        if (i + 1) * THREADS <= count:
+            out.append((w, None))
+        else:
+            out.append((fx.min(w, count - 1), w < count))
+    return out
+
+
+def tagged_loads(c, base, slots, also=None):
+    """One load of each slot's 16-B word of ``base`` (device scope), and with ``also``
+    (on, n, flags, index) the last n threads' flag pairs ``index(u)`` of ``flags`` (the
+    other threads load flag 0's, not waited on). Addresses only: a per-thread resource
+    would split each load into a loop over its distinct values."""
+    out = []
+    for w, _ in slots:
+        v = fx.Vector(
+            bo.buffer_load(
+                rsrc(base), w * 4, vec_width=4, dtype=T.i32, cache_modifier=CM_DEV
+            )
+        )
+        out += [v[e] for e in range(4)]
+    if const_expr(also is not None):
+        _, n, flags, index = also
+        u = fx.min(fx.max(c["tid"] - (THREADS - n), 0), n - 1)
+        f = fx.Vector(
+            bo.buffer_load(
+                rsrc(flags),
+                index(u) * 2,
+                vec_width=2,
+                dtype=T.i32,
+                cache_modifier=CM_DEV,
+            )
+        )
+        out += [f[0], f[1]]
+    return fx.Vector.from_elements(out, fx.Int32)
+
+
+def await_tagged(c, base, slots, also=None):
+    """Until every live slot's word (``tagged_loads``) carries the launch tag, and the
+    ``also`` flags do where ``on``: the words' data, [[three i32] a slot]. A 16-B store
+    is seen whole by a 16-B load, so a word with the tag holds this launch's data."""
+    tag = c["mb"].tag
+    mine = None
+    if const_expr(also is not None):
+        on, n = also[0], also[1]
+        mine = on & (c["tid"] >= THREADS - n)
+
+    def pending(v):
+        bad = None
+        for i, (_, live) in enumerate(slots):
+            b = v[4 * i + 3] != tag
+            b = b if live is None else live & b
+            bad = b if bad is None else bad | b
+        if const_expr(mine is not None):
+            bad = bad | (mine & (v[4 * len(slots) + 1] != tag))
+        return bad
+
+    v = _spin(lambda: tagged_loads(c, base, slots, also), pending)
+    return [[v[4 * i + e] for e in range(3)] for i in range(len(slots))]
 
 
 # ---------------------------------------------------------------- keys
@@ -902,7 +972,8 @@ def stage_combine(c, unit):
 @flyc.jit
 def stage_woa(c, task, acc, t0, n):
     """Rows 32 task .. of wo_a from the waves' accumulators (``bf16_gemv_mfmas``)
-    -> bf16 -> vLLM's MXFP8 of the 32 -> X8B, wo_b's input."""
+    -> bf16 -> vLLM's MXFP8 of the 32 -> X8B, wo_b's input (``tagged_x8b``: three
+    tagged words a token, rows 0 .. 11, 12 .. 23, then 24 .. 31 and the code)."""
     tid, red, d, lane = c["tid"], c["red"], c["d"], c["lane"]
     split = WOA_SPLIT_K
     fx.ptr_store(acc, red + (c["wave"] * 64 + lane) * 4)
@@ -925,17 +996,65 @@ def stage_woa(c, task, acc, t0, n):
             for k in (1, 2, 3)
         ],
     )
-    if mine & (row % 4 == 0):
-        bo.buffer_store(
-            w,
-            rsrc(c["x8b"]),
-            t * (d.o_rows // 4) + (task * WOA_ROWS + row) // 4,
-            cache_modifier=CM_DEV,
-        )
-    if mine & (row == 0):
-        bo.buffer_store(
-            code, rsrc(c["x8bs"]), t * (d.o_rows // 32) + task, cache_modifier=CM_DEV
-        )
+    if const_expr(tagged_x8b(d, c["S"])):
+        w4 = lane_gather(w, fx.min(lane + 4, 63))
+        w8 = lane_gather(w, fx.min(lane + 8, 63))
+        j = row // 12
+        if mine & (row % 12 == 0):
+            bo.buffer_store(
+                fx.Vector.from_elements(
+                    [w, w4, (j == 2).select(code, w8), c["mb"].tag], fx.Int32
+                ),
+                rsrc(c["x8t"]),
+                ((t * d.woa_tasks + task) * 3 + j) * 4,
+                cache_modifier=CM_DEV,
+            )
+    else:
+        if mine & (row % 4 == 0):
+            bo.buffer_store(
+                w,
+                rsrc(c["x8b"]),
+                t * (d.o_rows // 4) + (task * WOA_ROWS + row) // 4,
+                cache_modifier=CM_DEV,
+            )
+        if mine & (row == 0):
+            bo.buffer_store(
+                code,
+                rsrc(c["x8bs"]),
+                t * (d.o_rows // 32) + task,
+                cache_modifier=CM_DEV,
+            )
+    gpu.barrier()
+
+
+@flyc.jit
+def _store_x8b_word(c, w, ws):
+    d = c["d"]
+    per_t = 3 * d.woa_tasks
+    t, rem = w // per_t, w % per_t
+    task, j = rem // 3, rem % 3
+    at = c["xl"] + t * lds_row(d.o_rows // 4) + task * (WOA_ROWS // 4) + 3 * j
+    fx.ptr_store(ws[0], at)
+    fx.ptr_store(ws[1], at + 1)
+    if j == 2:
+        fx.ptr_store(ws[2], c["xsl"] + t * lds_row(d.o_rows // 32) + task)
+    else:
+        fx.ptr_store(ws[2], at + 2)
+
+
+@flyc.jit
+def x8b_rows(c, n, also):
+    """Tagged X8B of tokens 0 .. n (one token tile) polled whole, then into the LDS rows
+    of ``rows_store``'s layout: e4m3 words to ``xl``, a task's code to ``xsl``."""
+    slots = tagged_slots(c["tid"], x8b_words(c["d"], n))
+    words = await_tagged(c, c["x8t"], slots, also)
+    for i in range_constexpr(len(slots)):
+        w, live = slots[i]
+        if const_expr(live is None):
+            _store_x8b_word(c, w, words[i])
+        else:
+            if live:
+                _store_x8b_word(c, w, words[i])
     gpu.barrier()
 
 
@@ -1145,6 +1264,7 @@ def run_back(c, key, bid, idle=None, before_wob=None):
         for unit in range(first_task(bid, 0), n_split, BLOCKS):
             stage_split(c, unit)
     stamp(c, 1)
+    tx8 = tagged_x8b(dd, s)
     for unit in range(first_task(bid, COMB0), n_comb, BLOCKS):
         stage_combine(c, unit)
     gpu.barrier()
@@ -1235,14 +1355,22 @@ def run_back(c, key, bid, idle=None, before_wob=None):
             for ti in range_constexpr(nt):
                 woa_tile(ti, s if ti == 0 else 0)
             stamp(c, 10)
-            publish(c, c["ardy"], woa_t * FLAG_STRIDE)
+            if const_expr(not tx8):
+                publish(c, c["ardy"], woa_t * FLAG_STRIDE)
     stamp(c, 3)
     if const_expr(not early_wob):
         wops = wob_weights()
     stamp(c, 11)
     early = before_wob() if const_expr(before_wob is not None) else None
     also = c.get("ardy_also")
-    if const_expr(woa_spread):
+    if const_expr(tx8):
+        assert early_wob and nt == 1 and wob_ctas < BLOCKS
+        # every CTA's wo_b loads (masked where it has none) landed long before X8B:
+        # drained here, as below
+        rocdl.s_waitcnt(vmcnt=0)
+        if has_wob:
+            x8b_rows(c, s, also)
+    elif const_expr(woa_spread):
         # this tile's wo_a units
         await_flags(
             c,
@@ -1261,28 +1389,33 @@ def run_back(c, key, bid, idle=None, before_wob=None):
             await_flags(c, c["ardy"], woa_tasks, lambda u: u * FLAG_STRIDE, also)
     stamp(c, 12)
     x8b = (
-        c["x8b"],
-        c["x8bs"],
-        o_rows // 4,
-        0,
-        o_rows // 4,
-        o_rows // 32,
-        0,
-        o_rows // 32,
+        None
+        if tx8
+        else (
+            c["x8b"],
+            c["x8bs"],
+            o_rows // 4,
+            0,
+            o_rows // 4,
+            o_rows // 32,
+            0,
+            o_rows // 32,
+        )
     )
 
     def wob_tile_run(ti):
         # every wo_b task of this CTA on token tile ``ti``, two at a time
         t0, n = tiles[ti]
-        rows_store(
-            c,
-            rows_loads(c, *x8b, t0, n),
-            o_rows // 4,
-            o_rows // 32,
-            c["xl"],
-            c["xsl"],
-            n,
-        )
+        if const_expr(not tx8):
+            rows_store(
+                c,
+                rows_loads(c, *x8b, t0, n),
+                o_rows // 4,
+                o_rows // 32,
+                c["xl"],
+                c["xsl"],
+                n,
+            )
         stamp(c, 14)
         for k in range_constexpr(0, len(wob_ts), 2):
             k2 = min(k + 1, len(wob_ts) - 1)
