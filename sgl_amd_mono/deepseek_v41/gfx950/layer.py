@@ -61,10 +61,19 @@ from .indexer import compress
 from .stages import engram, index_glue, moe, seam
 from .stages.dims import Dims as StageDims
 from .stages.gemv import plus, token_tiles
-from .stages.moe_shape import EXPERTS, SORT_NETS, TOPK, MoeBuild, route_shape
+from .stages.moe_shape import (
+    EXPERTS,
+    ROW_CTAS,
+    ROW_SLICES,
+    SORT_NETS,
+    TOPK,
+    MoeBuild,
+    route_shape,
+)
 from .token_par import (
     acell_region,
     chunk_pairs,
+    fcell_region,
     half_pair,
     own_view,
     peer_offsets,
@@ -234,9 +243,23 @@ def acell_region_bytes(tp: int) -> int:
     return acell_region(tp, range(1, MAX_TOKENS + 1))[1]
 
 
+# the per-row MoE's widths (``RouteShape.row_moe``): FCELL's
+ROW_WIDTHS = range(1, ROW_CTAS // ROW_SLICES + 1)
+
+
+def fcell_offset(tp: int) -> int:
+    """FCELL's byte offset in a parity's half (``token_par.fcell_region``)."""
+    return fcell_region(tp, range(1, MAX_TOKENS + 1), ROW_WIDTHS)[0]
+
+
+def fcell_region_bytes(tp: int) -> int:
+    """FCELL's bytes in a parity's half (``token_par.fcell_region``)."""
+    return fcell_region(tp, range(1, MAX_TOKENS + 1), ROW_WIDTHS)[1]
+
+
 def peer_half_bytes(tp: int) -> int:
-    """One parity's peer regions (``token_par.peer_layout``), then ACELL."""
-    return sum(acell_region(tp, range(1, MAX_TOKENS + 1)))
+    """One parity's peer regions (``token_par.peer_layout``), then ACELL, then FCELL."""
+    return sum(fcell_region(tp, range(1, MAX_TOKENS + 1), ROW_WIDTHS))
 
 
 def _epoch(epoch):
@@ -1218,6 +1241,7 @@ def run_ffn(
         s, rs, lds.moe.peek(), amb, bases, mlayout, scratch, margs, rank, own
     )
     cb["tag"] = ep & 255
+    cb["fcell_off"] = fcell_offset(tp)
     if const_expr(key.timeline):
         cb["tl"] = ca["tl"]
     for i, region in enumerate(COUNTERS):
@@ -1356,40 +1380,65 @@ def seam_tail(key: MonoBuild, ca, cb, a, sn, frdy):
         "fold": True,
         "aux_on": sn["nx_aux"] != 0,
     }
-    own = preg(cb["sym"], cb["ffn_off"], "ffn")
+    if const_expr(cb["rs"].row_moe):
+        ffn = preg(cb["sym"], cb["fcell_off"], "fcell")
+    else:
+        ffn = preg(cb["sym"], cb["ffn_off"], "ffn")
     return (
         lambda task: tail_loads(ca, cn, frdy, s, task),
-        lambda task, pre: tail_run(ca, cn, own, s, tp, task, pre),
+        lambda task, pre: tail_run(ca, cn, ffn, s, tp, task, pre),
     )
 
 
 @flyc.jit
 def tail_loads(ca, cn, frdy, s, task):
     """``seam_tail``'s loads: the FFN gates' mixes (post, comb, next pre) waited on first,
-    the slice's rows read them; then the slice's own loads."""
+    the slice's rows read them; then the slice's own loads. The flags are polled on wave 1:
+    wave 0 pushed the down sums, and a wave's first wait also waits on its own pushes' acks."""
     stamp(ca, 29)
-    if ca["tid"] < s:
-        ca["poll"]([(frdy, ca["tid"] * FLAG_STRIDE, 1)])
+    u = ca["tid"] - 64
+    if (u >= 0) & (u < s):
+        ca["poll"]([(frdy, u * FLAG_STRIDE, 1)])
     gpu.barrier()
     return seam.slice_prefetch(cn, task)
 
 
+def tail_cells(s, tp, task, u):
+    """Summing thread u's FCELL cells: row u // 8, columns 32 task + 4 (u % 8) .., every rank's."""
+    per = seam.COLS // seam.CELL_VALUES
+    col = task * seam.COLS + seam.CELL_VALUES * (u % per)
+    return [seam.ffn_cell(src, u // per, s, col) for src in range(tp)]
+
+
 @flyc.jit
-def tail_run(ca, cn, own, s, tp, task, pre):
-    """``seam_tail``'s sums and slice."""
+def tail_run(ca, cn, ffn, s, tp, task, pre):
+    """``seam_tail``'s sums and slice. ``ffn``: FCELL (the per-row MoE: the summed cells
+    emptied) or the tagged pairs' region."""
     gpu.barrier()
-    # the sums on waves 2 .. : wave 0 pushed the down partials, and a wave's first wait
-    # also waits on its own pushes' acks
+    # the sums on waves 2 .. : wave 0 pushed the down partials, wave 1 polled the gates' flags
     u = ca["tid"] - TAIL_SUM0
-    if (u >= 0) & (u < s * seam.COLS // 2):
-        t = u // (seam.COLS // 2)
-        cc = 2 * (u % (seam.COLS // 2))
-        col = task * seam.COLS + cc
-        acc0, acc1 = sum_partials(
-            ca["poll"], own, lambda src: moe.region_pair(src, t, s, col), tp
-        )
-        fx.ptr_store(bf16_round(acc0), ca["pend_lds"] + (t * seam.COLS + cc))
-        fx.ptr_store(bf16_round(acc1), ca["pend_lds"] + (t * seam.COLS + cc + 1))
+    if const_expr(ffn.region == "fcell"):
+        per = seam.COLS // seam.CELL_VALUES
+        live = (u >= 0) & (u < s * per)
+        if live:
+            cells = tail_cells(s, tp, task, u)
+            accs = seam.sum_cells(ffn.value, cells)
+            cc = seam.CELL_VALUES * (u % per)
+            for i in range_constexpr(seam.CELL_VALUES):
+                at = ca["pend_lds"] + ((u // per) * seam.COLS + cc + i)
+                fx.ptr_store(bf16_round(accs[i]), at)
+            # emptied here, not past the slice: the launch's end would wait on the stores
+            seam.empty_cells(ffn.value, cells)
+    else:
+        if (u >= 0) & (u < s * seam.COLS // 2):
+            t = u // (seam.COLS // 2)
+            cc = 2 * (u % (seam.COLS // 2))
+            col = task * seam.COLS + cc
+            acc0, acc1 = sum_partials(
+                ca["poll"], ffn, lambda src: moe.region_pair(src, t, s, col), tp
+            )
+            fx.ptr_store(bf16_round(acc0), ca["pend_lds"] + (t * seam.COLS + cc))
+            fx.ptr_store(bf16_round(acc1), ca["pend_lds"] + (t * seam.COLS + cc + 1))
     gpu.barrier()
     stamp(ca, 31)
     seam.stage_slice(cn, task, pre)

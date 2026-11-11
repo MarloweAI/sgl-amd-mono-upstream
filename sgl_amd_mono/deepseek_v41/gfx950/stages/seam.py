@@ -163,6 +163,42 @@ def attn_cell(src, task, s, t0, u):
     return (src * WOB_TASKS + task) * cells_task(s) + t0 // TILE * cells_tile(TILE) + u
 
 
+# ---------------------------------------------------------------- FFN cells
+# The per-row MoE's down sums cross as cells too: [source rank][row][hidden / 4], four bf16
+# values a cell, empty as ATTN's (the reader stores them back to empty).
+def ffn_cells(s: int, tp: int) -> int:
+    """FCELL's cells."""
+    return tp * s * HIDDEN // CELL_VALUES
+
+
+def ffn_cell(src, t, s, col):
+    """The cell of rank ``src``'s down sums of row t at hidden column ``col`` (a multiple of 4)."""
+    return (src * s + t) * (HIDDEN // CELL_VALUES) + col // CELL_VALUES
+
+
+def cell_words(vs):
+    """Four values as a cell's two words, never an empty word: a pair of bf16 0xFFFF NaNs
+    goes out as 0xFFFE, 0xFFFF."""
+    ws = []
+    for k in range_constexpr(2):
+        w = bf16_pair(vs[2 * k], vs[2 * k + 1]).bitcast(fx.Int32)
+        ws.append((w == CELL_EMPTY).select(fx.Int32(CELL_EMPTY - 1), w))
+    return fx.Vector.from_elements(ws, fx.Int32)
+
+
+def sum_cells(addr, cells):
+    """Poll the TP ranks' cells at ``addr`` and sum each of the four values in fp32 in rank
+    order."""
+    ws = poll_cells(addr, cells)
+    out = []
+    for i in range_constexpr(CELL_VALUES):
+        acc = cell_value(ws[0], i)
+        for src in range_constexpr(1, len(cells)):
+            acc = acc + cell_value(ws[src], i)
+        out.append(acc)
+    return out
+
+
 def sigmoid(z):
     """Triton's ``tl.sigmoid``: 1 / (1 + exp2(-z log2(e)))."""
     return fx.Float32(1.0) / (fx.Float32(1.0) + hw_exp2(z * fx.Float32(-LOG2E)))
