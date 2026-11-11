@@ -1116,11 +1116,22 @@ def _seam_lds(s):
 
 @flyc.jit
 def run_ffn(
-    key: MonoBuild, lds, a: dict, amb, bases, own, rank, ep, part=None, sn=None
+    key: MonoBuild,
+    lds,
+    a: dict,
+    amb,
+    bases,
+    own,
+    rank,
+    ep,
+    part=None,
+    sn=None,
+    pre=None,
 ):
     """Run the FFN seam, the MoE and its all-reduce into ``a["out"]``; ``sn``
     (``key.seam_next``, ``SEAM_ARGS``): the all-reduce into the next layer's attention seam
-    slice instead, whose outputs go to the seam state ``sn["seam_out"]``."""
+    slice instead, whose outputs go to the seam state ``sn["seam_out"]``. ``pre``: the
+    slice's first loads, issued before wo_b (``early_slice``)."""
     assert (sn is not None) == key.seam_next, key
     assert not key.seam_next or not key.tok_par, key
     s, tp = key.tokens, key.tp
@@ -1220,7 +1231,7 @@ def run_ffn(
         out_own = a["out"] + fx.Int64(t0) * fx.Int64(HIDDEN * 2)
         cb["own_view"] = {**cb, "S": own_n, "args": {**margs, "out": out_own}}
     grdy = a.get("grdy")
-    if const_expr(grdy is not None):
+    if const_expr(grdy is not None and pre is None):
         # one launch per layer: the slices read the mixes K1's gates wrote (the CTAs that
         # waited on wo_a's flags polled them there)
         poll = amb.poll
@@ -1231,14 +1242,29 @@ def run_ffn(
     if const_expr(part is None and not key.tok_par):
         # K2's partials arrive as cells (``push_attn_cell``)
         ca["acell"] = own + fx.Int64(acell_offset(tp))
+        if const_expr(early_slice(key)):
+            # polled on wave 1: wave 0 pushed wo_b's cells, and a wave's first wait also
+            # waits on its own pushes' acks
+            ca["cell0"] = 64
+    # read before the loop: a method call on ca inside one carries ca
+    reset = ca.get("cell0") is not None
     for task in range(first_task(bid, 0), SLICES, BLOCKS):
-        # the slice's own loads go out ahead of the wait on the ranks' partials, where
-        # they fit in registers beside the reduce
-        pre = seam.slice_prefetch(ca, task) if seam.slice_prefetch_fits(own_n) else None
+        if const_expr(pre is None):
+            # the slice's own loads go out ahead of the wait on the ranks' partials, where
+            # they fit in registers beside the reduce
+            got = (
+                seam.slice_prefetch(ca, task)
+                if seam.slice_prefetch_fits(own_n)
+                else None
+            )
+        else:
+            got = pre
         if const_expr(part is not None):
             seam.stage_push(ca, task, part)
         seam.stage_reduce(ca, task)
-        seam.stage_slice(ca, task, pre)
+        seam.stage_slice(ca, task, got)
+        if const_expr(reset):
+            seam.reset_attn_cells(ca, task)
     stamp(ca, 17)
 
     def store(t, col, ys, live):
@@ -1288,6 +1314,13 @@ def run_ffn(
         gpu.barrier()
         for task in range(first_task(bid, 0), SLICES, BLOCKS):
             run(task, loads(task))
+
+
+def early_slice(key: MonoBuild) -> bool:
+    """Whether the FFN seam slice's first loads go out before wo_b, so a slice CTA's poll on
+    the ranks' wo_b cells has no loads ahead of it, and the cells are polled on a wave that
+    pushed none: TP8, the cells' path, the loads in registers."""
+    return key.tp == 8 and not key.tok_par and seam.slice_prefetch_fits(key.tokens)
 
 
 TAIL_SUM0 = 128  # the seam tail's first summing thread
@@ -1744,12 +1777,13 @@ def run_k2(
                 )
 
         c["k1_seen"] = k1_seen
-        # the slice CTAs that wait on wo_a's flags poll the gates' flags in the same wait:
-        # in ``run_ffn`` the poll would queue behind their wo_b push's peer stores
-        gap = layout["grdy"][0] - layout["ardy"][0]
-        assert gap >= 0 and gap % 8 == 0, gap
-        own_n = s // tp if const_expr(key.tok_par) else s
-        c["ardy_also"] = (bid < SLICES, own_n, lambda u: gap // 8 + u * FLAG_STRIDE)
+        if const_expr(not early_slice(key)):
+            # the slice CTAs that wait on wo_a's flags poll the gates' flags in the same wait:
+            # in ``run_ffn`` the poll would queue behind their wo_b push's peer stores
+            gap = layout["grdy"][0] - layout["ardy"][0]
+            assert gap >= 0 and gap % 8 == 0, gap
+            own_n = s // tp if const_expr(key.tok_par) else s
+            c["ardy_also"] = (bid < SLICES, own_n, lambda u: gap // 8 + u * FLAG_STRIDE)
     else:
         epoch_begin(ctx, epoch, ep)
     if const_expr(key.index):
@@ -1804,7 +1838,32 @@ def run_k2(
         def idle():
             engram.run_eg(gc, ec, s)
 
-    mb_back.run_back(c, bkey, bid, idle)
+    before_wob = None
+    if const_expr(early_slice(key)):
+        cs = {
+            "S": s,
+            "tid": c["tid"],
+            "args": {
+                "res_in": res_in,
+                "post_in": post_in,
+                "comb_in": comb_in,
+                "pre_in": pre_in,
+                "hc_fn": hc_fn,
+            },
+        }
+        grdy = sreg(scratch, layout["grdy"][0], "grdy") if const_expr(one) else None
+        poll, tid = amb.poll, c["tid"]
+
+        def before_wob():
+            # one launch per layer: the slice reads the mixes K1's gates wrote. Every CTA
+            # loads a slice's rows, those past the slices a copy of slice bid - SLICES'
+            if const_expr(grdy is not None):
+                if tid < s:
+                    poll([(grdy, tid * FLAG_STRIDE, 1)])
+                gpu.barrier()
+            return seam.slice_prefetch(cs, bid % SLICES)
+
+    spre = mb_back.run_back(c, bkey, bid, idle, before_wob)
     if const_expr(not one):
         # the epoch moves on once every CTA marked it, off the launch's end: the last CTA
         # waits on its next stage's inputs (the FFN seam) a while
@@ -1841,7 +1900,7 @@ def run_k2(
         a["grdy"] = sreg(scratch, layout["grdy"][0], "grdy")
         wob0 = mb_back.back_plan(bkey)[5]
         a["grdy_late"] = first_task(bid, wob0) >= mb_back.ardy_waiters(bkey)
-    run_ffn(key, lds, a, amb, bases, own, rank, ep, sn=sn)
+    run_ffn(key, lds, a, amb, bases, own, rank, ep, sn=sn, pre=spre)
     if const_expr(key.eg):
         # every rank's share of the projection in, long since: into ``eg_kv``
         engram.unpack(gc, ec, s)
