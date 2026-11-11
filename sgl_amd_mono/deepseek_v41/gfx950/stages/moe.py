@@ -45,6 +45,7 @@ from sgl_amd_mono.common.ops import (
     row_sum,
     rsrc,
     sum_partials,
+    uniform,
 )
 from sgl_amd_mono.common.plan import (
     BLOCKS,
@@ -324,9 +325,10 @@ def _score(x):
     return fmath.sqrt(sp)
 
 
-def route_topk(c, t):
+def route_topk(c, t, on_slot=None):
     """vLLM's topk_hash_softplus_sqrt for token t on one wave (f32 logits): lane k < topk's
-    expert id and unscaled weight, in top-k order, and the weights' scale."""
+    expert id and unscaled weight, in top-k order, and the weights' scale. ``on_slot(k, id)``:
+    called as slot k's expert is found."""
     lane = c["lane"]
     experts, topk = c["rs"].experts, c["rs"].topk
     a = c["args"]
@@ -383,6 +385,8 @@ def route_topk(c, t):
         w = fx.Int32(
             rocdl.readlane(T.i32, mine_o.bitcast(fx.Int32), win_id & 63)
         ).bitcast(fx.Float32)
+        if on_slot is not None:
+            on_slot(k, win_id)
         cursor = cursor + won.select(1, 0)
         total = total + w
         my_w = (lane == k).select(w, my_w)
@@ -1341,7 +1345,7 @@ def reduce_pair(c, task, idx):
 ROW_UNITS = 3
 ROW_TILES = 8  # a CTA's down: hidden rows 128 slice .. of its row, 8 tiles of 16
 ROW_SCALE_WORDS = 1024  # a slot wave's down scale blocks in LDS: 4 of 256 words
-ROW_UG_AHEAD = 8  # ug rounds a wave keeps in flight (2 KB a round)
+ROW_UG_AHEAD = 3  # ug rounds a wave keeps in flight (2 KB a round)
 
 
 def row_of(bid):
@@ -1359,17 +1363,47 @@ def row_mid_pairs(d) -> int:
     return d.inter_real // 2
 
 
+def lds_barrier():
+    """``s_barrier`` for an LDS hand-off: the waves' loads in flight stay in flight."""
+    fx.memory_fence(ordering=fx.AtomicOrdering.Release, syncscope="workgroup")
+    rocdl.s_barrier()
+    fx.memory_fence(ordering=fx.AtomicOrdering.Acquire, syncscope="workgroup")
+
+
+@flyc.jit
+def put_slot(c, k, e):
+    """Slot k's expert id into LDS ``tab`` (lane 0)."""
+    if c["lane"] == 0:
+        fx.ptr_store(e, c["tab"] + k)
+
+
+def await_slot(c, k):
+    """Slot k's expert id from LDS ``tab``, once ``put_slot`` stored it."""
+    return _spin(
+        lambda: fx.generic_load(
+            c["tab"] + k,
+            memory_order=fx.AtomicOrdering.Monotonic,
+            syncscope="workgroup",
+        ),
+        lambda v: v < 0,
+        guarded=False,
+    )
+
+
 @flyc.jit
 def row_inputs(c, bid):
-    """The CTA's row's top-k (``route_topk``) on wave 0 into LDS ``tab`` (ids, then weights as
-    f32 bits), while the other waves load its X8R row (``load_x8_rows``' one row) and its
-    slice's shared down weights into LDS."""
+    """The CTA's row's top-k (``route_topk``) on wave 0 into LDS ``tab`` (each id as its slot is
+    found, then the weights as f32 bits), while the other waves load its X8R row
+    (``load_x8_rows``' one row) and its slice's shared down weights into LDS. No barrier at
+    the end: the ug's waves wait on each slot they need (``await_slot``)."""
     lane, tid, topk, tab, d = c["lane"], c["tid"], c["rs"].topk, c["tab"], c["d"]
     r, sl = row_of(bid)
-    if c["wave"] == 0:
-        my_id, my_w, scale = route_topk(c, r)
+    if tid < topk:
+        fx.ptr_store(fx.Int32(-1), tab + tid)
+    lds_barrier()
+    if uniform(c["wave"]) == 0:
+        my_id, my_w, scale = route_topk(c, r, lambda k, e: put_slot(c, k, e))
         if lane < topk:
-            fx.ptr_store(my_id, tab + lane)
             fx.ptr_store((my_w * scale).bitcast(fx.Int32), tab + (topk + lane))
     else:
         if lane == 0:
@@ -1399,18 +1433,17 @@ def row_inputs(c, bid):
             if u < quads:
                 v = fx.Vector(bo.buffer_load(w, base + 4 * u, vec_width=4, dtype=T.i32))
                 fx.ptr_store(v, c["rsw"] + 4 * u)
-    gpu.barrier()
 
 
 # a row's ug units by CTA class (CTA % 8, one XCD in every row): unit (slot k, half h < 16) of expert e
 # goes to class (h + 3 e) % 8, so every row's copy of a (expert, half) shares one L2; half 17 of slots
 # x, x + 2, x + 4 to class x < 2, half 16 of slots x - 2, x + 2 to class x in 2..5 (5 CTAs a class in
 # every row, 4 in classes 6 and 7 of a 38-CTA row: 3 units a CTA at most)
-def row_units(c, bid):
-    """This CTA's ug units of its row, [(slot, half, live)] x ``ROW_UNITS``: entries q, q + n, q + 2 n of
+def row_slots(c, bid):
+    """This CTA's ug units of its row, [(slot, entry, live)] x ``ROW_UNITS``: entries q, q + n, q + 2 n of
     its class's list, the CTA the q-th of the row's n CTAs of its class. The list: each slot's two halves
     below 16 in slot order, then the class's halves 16 or 17."""
-    rs, tab = c["rs"], c["tab"]
+    rs = c["rs"]
     r, sl = row_of(bid)
     assert rs.topk == 6 and row_halves(c["d"]) == 18
     ctas = fx.min(fx.Int32(ROW_SLICES), rs.row_ug_ctas - r * ROW_SLICES)
@@ -1418,16 +1451,21 @@ def row_units(c, bid):
     n = (ctas - x + 7) // 8
     low = x < 2
     entries = 12 + low.select(fx.Int32(3), (7 - x) // 2)
-    units = []
+    slots = []
     for i in range(ROW_UNITS):
         j = q + n * i
         t = j - 12
         k = (j < 12).select(j // 2, low.select(x + 2 * t, x - 2 + 4 * t))
         k = fx.min(fx.max(k, fx.Int32(0)), fx.Int32(rs.topk - 1))
-        h1 = (x - 3 * fx.ptr_load(tab + k)) & 7
-        h = (j < 12).select(h1 + 8 * (j % 2), low.select(fx.Int32(17), fx.Int32(16)))
-        units.append((k, h, j < entries))
-    return units
+        slots.append((k, j, j < entries))
+    return slots
+
+
+def row_half(bid, j, e):
+    """Entry j's half of its slot's expert e (``row_slots``' list)."""
+    x = row_of(bid)[1] % 8
+    h1 = (x - 3 * e) & 7
+    return (j < 12).select(h1 + 8 * (j % 2), (x < 2).select(fx.Int32(17), fx.Int32(16)))
 
 
 def row_unit(c, units, u):
@@ -1445,21 +1483,21 @@ def row_unit(c, units, u):
 
 def row_tile_loads(c, rw, rws, e, rg, sc0, st0, n, sc_steps):
     """``fp4_pair_loads`` of one tile ``rg`` (its 32-row scale block's round words), on resources
-    of exact size: expert ``experts`` loads nothing."""
+    of exact size: expert ``experts`` loads nothing. Default cache policy: the other rows' CTAs on
+    this XCD read the same lines later, and ``nt`` lines are evicted before they arrive."""
     lane, d = c["lane"], c["d"]
     n_rows, k, scale_cols = 2 * d.inter, HIDDEN, HIDDEN // 32
     block = (e * n_rows + rg * 16) // 32 * (scale_cols * 8)
     words = sc_steps // 2
     sv = bo.buffer_load(
-        rws,
-        block + 32 * sc0 + lane * words,
-        vec_width=words,
-        dtype=T.i32,
-        cache_modifier=CM_NT,
+        rws, block + 32 * sc0 + lane * words, vec_width=words, dtype=T.i32
     )
     sv = fx.Vector(sv) if words > 1 else fx.Int32(sv)
     base = e * n_rows * (k // 2) // 4
-    return sv, [fp4_tile_load(rw, base, rg, k, st0 + i, lane * 4) for i in range(n)]
+    return sv, [
+        fp4_tile_load(rw, base, rg, k, st0 + i, lane * 4, cache_modifier=0)
+        for i in range(n)
+    ]
 
 
 def fp4_tile_mfma(c, k, xl, xsl, st0, n, av, sa, acc, col):
@@ -1483,25 +1521,33 @@ def fp4_tile_mfma(c, k, xl, xsl, st0, n, av, sa, acc, col):
     return acc
 
 
-def ug_row_stream(c, rw, rws, chains, t, ks, xl, xsl):
-    """Tile ``t`` of each chain's half (expert, half) over K slice ``ks``, the chains round by round in one
-    load stream ``ROW_UG_AHEAD`` rounds deep; each is ``gemv_fp4_pair``'s chain of that tile."""
-    lane, wave = c["lane"], c["wave"]
-    sl = c["wsl"] + wave * wsl_words(c["d"])
-    # the units' rounds interleaved: every CTA streams each of its units over the whole stage, so the
-    # rows' copies of a unit on one XCD are read at about the same time
-    rounds = [
+def ug_row_rounds(c, ks):
+    """The stream's rounds, [(unit, round)]: the units' rounds interleaved, so every CTA streams each of
+    its units over the whole stage and the rows' copies of a unit on one XCD are read at about the
+    same time."""
+    return [
         (p, rd)
         for rd in ug_rounds(HIDDEN, ks, c["rs"].ug_k_slices)
-        for p in range(len(chains))
+        for p in range(ROW_UNITS)
     ]
 
-    def issue(i):
-        p, (sc0, st0, n, sc_steps) = rounds[i]
-        e, h = chains[p]
-        return row_tile_loads(c, rw, rws, e, 2 * h + t, sc0, st0, n, sc_steps)
 
-    ops = [issue(i) for i in range(min(ROW_UG_AHEAD, len(rounds)))]
+def ug_row_issue(c, rw, rws, rounds, chains, t, i):
+    """Round i's loads of tile ``t`` of its unit's chain."""
+    p, (sc0, st0, n, sc_steps) = rounds[i]
+    e, h = chains[p]
+    return row_tile_loads(c, rw, rws, e, 2 * h + t, sc0, st0, n, sc_steps)
+
+
+def ug_row_stream(c, rw, rws, chains, t, ks, xl, xsl, ops):
+    """Tile ``t`` of each chain's half (expert, half) over K slice ``ks``, the chains round by round in one
+    load stream ``ROW_UG_AHEAD`` rounds deep, its first rounds' loads ``ops`` ({round: loads}) issued
+    already; each is ``gemv_fp4_pair``'s chain of that tile."""
+    lane, wave = c["lane"], c["wave"]
+    sl = c["wsl"] + wave * wsl_words(c["d"])
+    rounds = ug_row_rounds(c, ks)
+    nxt = len(ops)
+    assert sorted(ops) == list(range(min(ROW_UG_AHEAD, len(rounds))))
     accs = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in chains]
     for i in range_constexpr(len(rounds)):
         p, (sc0, st0, n, sc_steps) = rounds[i]
@@ -1518,8 +1564,9 @@ def ug_row_stream(c, rw, rws, chains, t, ks, xl, xsl):
             for q in range(n)
         ]
         accs[p] = fp4_tile_mfma(c, HIDDEN, xl, xsl, st0, n, av, sa, accs[p], 0)
-        if const_expr(i + ROW_UG_AHEAD < len(rounds)):
-            ops.append(issue(i + ROW_UG_AHEAD))
+        if const_expr(nxt < len(rounds)):
+            ops[nxt] = ug_row_issue(c, rw, rws, rounds, chains, t, nxt)
+            nxt += 1
     return accs
 
 
@@ -1528,7 +1575,9 @@ def stage_row_ug(c, bid):
     """This CTA's ug units against its row's X8R row: silu x up, bf16, into MID-B (tagged pairs).
 
     Wave w runs tile w % 2 (gate, up) over K quarter w // 2 of every unit, each
-    ``gemv_fp4_pair``'s chain; the epilogue sums the quarters as ``ug_epilogue``."""
+    ``gemv_fp4_pair``'s chain; the epilogue sums the quarters as ``ug_epilogue``. The stream's first
+    ``ROW_UG_AHEAD`` rounds go out unit by unit, each as its unit's slot is found, before the barrier
+    that hands over the X8R row."""
     tid, lane, wave, d, rs, a = (
         c["tid"],
         c["lane"],
@@ -1538,15 +1587,23 @@ def stage_row_ug(c, bid):
         c["args"],
     )
     r, _ = row_of(bid)
-    units = row_units(c, bid)
     nb13 = rs.experts * 2 * d.inter * HIDDEN // 2
     rw, rws = rsrc(a["w13"], nb13), rsrc(a["w13_s"], nb13 // 16)
-    chains = [
-        (live.select(fx.ptr_load(c["tab"] + k), fx.Int32(rs.experts)), h)
-        for k, h, live in units
-    ]
     t, q = wave % 2, wave // 2
-    accs = ug_row_stream(c, rw, rws, chains, t, q, c["x8rl"], c["x8rsl"])
+    rounds = ug_row_rounds(c, q)
+    early = min(ROW_UG_AHEAD, len(rounds))
+    slots = row_slots(c, bid)
+    units, chains, ops = [], [], {}
+    for p in range_constexpr(ROW_UNITS):
+        k, j, live = slots[p]
+        e = await_slot(c, k)
+        h = row_half(bid, j, e)
+        units.append((k, h, live))
+        chains.append((live.select(e, fx.Int32(rs.experts)), h))
+        for i in range_constexpr(p, early, ROW_UNITS):
+            ops[i] = ug_row_issue(c, rw, rws, rounds, chains, t, i)
+    lds_barrier()
+    accs = ug_row_stream(c, rw, rws, chains, t, q, c["x8rl"], c["x8rsl"], ops)
     red = c["rred"]
     for u in range_constexpr(ROW_UNITS):
         fx.ptr_store(
@@ -1817,6 +1874,8 @@ def run_row_moe(c, bid):
         stamp(c, 21)
         if bid < rs.row_ug_ctas:
             stage_row_ug(c, bid)
+        else:
+            gpu.barrier()
         # the MID-B stores ahead of every wave's down burst in the CU's queue
         gpu.barrier()
         stamp(c, 24)
