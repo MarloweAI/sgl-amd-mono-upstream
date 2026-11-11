@@ -48,7 +48,16 @@ def main():
     )  # the fused launch's
     base_words = torch.zeros(gamma * part, dtype=torch.int64, device=dev)
 
-    def fused(x, anchor, temps, offset, out, logits, verify):
+    def gathered(
+        xch, temps, logits
+    ):  # every rank's shard written first, and read before the next launch
+        torch.cuda.synchronize()
+        dist.barrier()
+        ops.gather_step_logits(temps, xch.peers, logits, part)
+        torch.cuda.synchronize()
+        dist.barrier()
+
+    def fused(x, anchor, temps, offset, out, logits, verify, gather=True):
         ops.draft_head(
             x,
             lms,
@@ -71,8 +80,10 @@ def main():
             20.0,
             verify,
         )
+        if gather:
+            gathered(xb, temps, logits)
 
-    def two(base, anchor, temps, offset, out, logits, verify):
+    def two(base, anchor, temps, offset, out, logits, verify, gather=True):
         ops.markov_block(
             base,
             w1,
@@ -93,6 +104,8 @@ def main():
             20.0,
             verify,
         )
+        if gather:
+            gathered(xa, temps, logits)
 
     def bufs():
         return (
@@ -170,7 +183,7 @@ def main():
             graph = torch.cuda.CUDAGraph()
             offset.fill_(offset0)
             with torch.cuda.graph(graph):
-                fused(x, anchor, temps, offset, out, logits, verify)
+                fused(x, anchor, temps, offset, out, logits, verify, gather=False)
             for _ in range(5):
                 offset.fill_(offset0)
                 out.zero_()
@@ -233,17 +246,33 @@ def main():
         dist.all_reduce(t, op=dist.ReduceOp.MAX)
         return t.item()
 
-    t_one = timed(lambda: fused(x, anchor, temps, offset, out, logits, verify))
+    t_one = timed(
+        lambda: fused(x, anchor, temps, offset, out, logits, verify, gather=False)
+    )
     t_two = timed(
         lambda: (
             torch.mm(x, lms.t(), out=hip),
-            two(hip.view(1, gamma, part), anchor, temps, offset, out, logits, verify),
+            two(
+                hip.view(1, gamma, part),
+                anchor,
+                temps,
+                offset,
+                out,
+                logits,
+                verify,
+                gather=False,
+            ),
         )
     )
     t_gemm = timed(lambda: torch.mm(x, lms.t(), out=hip))
+    temps.fill_(1.0)
+    t_one_s = timed(
+        lambda: fused(x, anchor, temps, offset, out, logits, verify, gather=False)
+    )
     if rank == 0:
         print(
-            f"time us: one launch {t_one:.2f} | bf16 GEMM + markov_block {t_two:.2f} (GEMM alone {t_gemm:.2f})"
+            f"time us: one launch {t_one:.2f} (sampled {t_one_s:.2f}) | bf16 GEMM + markov_block {t_two:.2f} "
+            f"(GEMM alone {t_gemm:.2f})"
         )
         print("ALL PASS" if not fails else f"FAILED {fails}", flush=True)
     dist.destroy_process_group()

@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """A sampled DSpark draft's Markov block, its step logits included, in one launch
 (``gfx950/markov``), offered through SGLang's draft sampler entry where the
-draft's Markov head and step logits have the layout the kernels read. The step logits are
-SGLang's whole rows: a sampled sequence's are gathered from every rank's shard, a
-temperature-0 sequence's stay as SGLang's buffer holds them.
+draft's Markov head and step logits have the layout the kernels read. Each rank keeps its
+shard of a sampled sequence's step logits (``step_logits_shard``, what the verify's sampled
+accept reads); SGLang's whole rows are gathered from every rank's shard only for a reader
+that needs them (``gather_step_logits``). A temperature-0 sequence's stay as SGLang's
+buffer holds them.
 ``SGLANG_AMD_MONO_DSV41_MARKOV=0`` keeps SGLang's steps."""
 
 from __future__ import annotations
@@ -49,8 +51,24 @@ SGLANG_READS = {
     "srt/speculative/dspark_components/dspark_draft_sampler.py": (
         '"verify_ids"',
         '"writes_verify_ids"',
+        '"gather_step_logits"',
+        "whole_step_logits",
     ),
 }
+
+
+# per SGLang step-logits buffer (its address): the sampler whose launches keep their shards
+_SAMPLERS: dict = {}
+
+
+def step_logits_shard(step_logits: torch.Tensor, bs: int):
+    """This rank's columns of the last block's sampled step logits [bs, gamma, width] f32, where the
+    kernels' Markov block ran it (SGLang's whole ``step_logits`` buffer then holds no rows until
+    gathered), else None (SGLang's block wrote the whole rows)."""
+    sampler = _SAMPLERS.get(step_logits.data_ptr())
+    if sampler is None or bs not in sampler.ran:
+        return None
+    return sampler.ran[bs].slab[:bs, :, : sampler.width]
 
 
 # the draft forward's last (combined rows, their norm by the last stage's RMSNorm) from one launch
@@ -160,6 +178,8 @@ class _Sampler:
             self.width,
         )
         self.ops = markov.ops()
+        # per batch size: the exchange whose shard holds that block's step logits
+        self.ran: dict = {}
         # one sequence's head and Markov block in one launch: its own exchange, launch counts and base logits
         self.fused = None
         if _head_folds(model, gamma, group.world_size):
@@ -202,6 +222,7 @@ class _Sampler:
         ):
             # the head's projection of the normed rows and the Markov block in one launch
             x = self.fused
+            self._ran(bs, x)
             out, verify = (
                 self.out[: self.gamma],
                 None if self.verify_ids is None else self.verify_ids[:1],
@@ -224,6 +245,7 @@ class _Sampler:
                 hidden_states
             )
         base = base_logits.view(bs, self.gamma, -1)
+        self._ran(bs, self.exchange)
         out = self.out[: bs * self.gamma]
         verify = None if self.verify_ids is None else self.verify_ids[:bs]
         self.block(
@@ -231,6 +253,20 @@ class _Sampler:
             self.step_logits[:bs], verify,
         )  # fmt: skip
         return out.view(bs, self.gamma), confidence_features
+
+    def _ran(self, bs, exchange):
+        held = self.ran.setdefault(bs, exchange)
+        if held is not exchange:
+            raise RuntimeError(
+                f"DSV4.1 Markov block: batch size {bs} ran on two exchanges"
+            )
+
+    def gather_step_logits(self, bs):
+        """SGLang's whole step-logits rows [:bs] of the last block, from every rank's shard."""
+        x = self.ran[bs]
+        self.ops.gather_step_logits(
+            self.temps[:bs], x.peers, self.step_logits[:bs], self.width
+        )
 
 
 def _head_folds(model, gamma: int, tp: int) -> bool:
@@ -280,4 +316,6 @@ def _factory(
         return sampler.step if 1 <= bs <= top else None
 
     steps.writes_verify_ids = verify_ids is not None
+    steps.gather_step_logits = sampler.gather_step_logits
+    _SAMPLERS[step_logits.data_ptr()] = sampler
     return steps
