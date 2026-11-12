@@ -20,7 +20,10 @@ Every 30 s each process prints a line per width class (``wide.CLASSES``) and out
 summed over the layers: ``differing``, the elements where the wide layer's bits differ from
 SGLang's; ``rerun_differing``, where SGLang's rerun differs from its first run; ``wide_only``,
 where the wide layer differs and SGLang's rerun does not (0 for a bitwise stage); ``of``, the
-elements compared. Each stage also runs twice on the same inputs (``field=det_<stage>``:
+elements compared. A token-parallel class (``wide.TokenParallelStages``) runs the wide layer
+on this rank's rows of the input state and is compared on those rows; its reduce-scatters
+are also compared with the all-reduce of the same partials (``field=rs_vs_ar``: its
+``differing`` and ``wide_only`` count the elements whose bits differ). Each stage also runs twice on the same inputs (``field=det_<stage>``:
 ``rerun_differing`` between its two runs), which names the kernels that do not reproduce
 their own bits. ``check_wide.py`` reads them. A test tool only: no timing.
 """
@@ -159,6 +162,31 @@ def _install(mod, backbone):
         return ffn(self, layer, x, *args, **kwargs)
 
     mod.Stages.wo_b, mod.Stages.ffn = stage_wo_b, stage_ffn
+    tp_wo_b, tp_ffn = mod.TokenParallelStages.wo_b, mod.TokenParallelStages.ffn
+
+    def tp_stage_wo_b(self, attn, o, defer_all_reduce):
+        out = tp_wo_b(self, attn, o, defer_all_reduce)
+        record("attn", out)
+        return out
+
+    def tp_stage_ffn(self, layer, x, *args, **kwargs):
+        record("moe_in", x)
+        return tp_ffn(self, layer, x, *args, **kwargs)
+
+    mod.TokenParallelStages.wo_b, mod.TokenParallelStages.ffn = tp_stage_wo_b, tp_stage_ffn
+    reduce_scatter = mod.Exchange.reduce_scatter
+
+    def checked_reduce_scatter(self, x):
+        out = reduce_scatter(self, x)
+        if active:
+            from sglang.srt.distributed import tensor_model_parallel_all_reduce
+
+            _, _, c = active[0]
+            ref = tensor_model_parallel_all_reduce(x.clone())[self.own(x.shape[0])]
+            count(c, "rs_vs_ar", [ref], [ref], [out])
+        return out
+
+    mod.Exchange.reduce_scatter = checked_reduce_scatter
     sglang_layer = dv4.forward_layer_fused_boundary
 
     def run(fn):
@@ -191,37 +219,49 @@ def _install(mod, backbone):
         )
         # each run on its own copy of the input state: a run may write it in place
         copies = [fresh(state) for _ in range(2)]
+        rows = kw["positions"].shape[0]
+        mine = copies[1].take_rows(lambda t: t[stages.own(rows)].contiguous())
         out, ref = run(lambda: sglang_layer(model, i, state, **kw))
         _, again = run(lambda: sglang_layer(model, i, copies[0], **kw))
         _, got = run(
             lambda: stages.layer(
-                wide, i, copies[1], kw["positions"], kw["input_ids"], kw["forward_batch"],
+                wide, i, mine, kw["positions"], kw["input_ids"], kw["forward_batch"],
                 kw["input_ids_global"], defer,
             )
         )  # fmt: skip
-        dev = kw["positions"].device
-        one = torch.ones((), dtype=torch.int64, device=dev)
+        one = torch.ones((), dtype=torch.int64, device=kw["positions"].device)
+        own = stages.own(rows)
         for field in FIELDS:
-            counter = counters.get((c, field))
-            if counter is None:
-                assert not torch.cuda.is_current_stream_capturing(), "no eager step first"
-                counter = counters[c, field] = torch.zeros(5, dtype=torch.int64, device=dev)
-            r, a, g = ref.get(field, []), again.get(field, []), got.get(field, [])
-            n = sum(x.numel() for x in r)
-            if len(r) != len(g) or any(
-                x.shape != y.shape or x.dtype != y.dtype for x, y in zip(r, g)
-            ):
-                counter += torch.stack([one, n * one, 0 * one, n * one, n * one])
-                continue
-            diff = again_diff = wide_only = 0 * one
-            for x, y, z in zip(r, a, g):
-                wd, ad = _bits(x) != _bits(z), _bits(x) != _bits(y)
-                diff = diff + wd.sum()
-                again_diff = again_diff + ad.sum()
-                wide_only = wide_only + (wd & ~ad).sum()
-            counter += torch.stack([one, diff, again_diff, wide_only, n * one])
-        stage_reruns(wide, stages, c, model, i, fresh(state), kw, one)
+            # a token-parallel layer holds this rank's rows
+            r, a = ([t[own] if t.shape[0] == rows else t for t in got_ref.get(field, [])]
+                    for got_ref in (ref, again))  # fmt: skip
+            count(c, field, r, a, got.get(field, []))
+        if not isinstance(stages, mod.TokenParallelStages):
+            stage_reruns(wide, stages, c, model, i, fresh(state), kw, one)
         return out
+
+    def count(c, field, r, a, g):
+        """Where the wide outputs ``g`` differ from SGLang's ``r`` and SGLang's rerun ``a``
+        from ``r``, into the (class, field) counter."""
+        dev = r[0].device if r else g[0].device
+        one = torch.ones((), dtype=torch.int64, device=dev)
+        counter = counters.get((c, field))
+        if counter is None:
+            assert not torch.cuda.is_current_stream_capturing(), "no eager step first"
+            counter = counters[c, field] = torch.zeros(5, dtype=torch.int64, device=dev)
+        n = sum(x.numel() for x in r)
+        if len(r) != len(g) or any(
+            x.shape != y.shape or x.dtype != y.dtype for x, y in zip(r, g)
+        ):
+            counter += torch.stack([one, n * one, 0 * one, n * one, n * one])
+            return
+        diff = again_diff = wide_only = 0 * one
+        for x, y, z in zip(r, a, g):
+            wd, ad = _bits(x) != _bits(z), _bits(x) != _bits(y)
+            diff = diff + wd.sum()
+            again_diff = again_diff + ad.sum()
+            wide_only = wide_only + (wd & ~ad).sum()
+        counter += torch.stack([one, diff, again_diff, wide_only, n * one])
 
     def tally(c, field, a, b, one):
         """Stage ``field`` run twice on the same inputs: where its two outputs differ."""

@@ -72,6 +72,14 @@ def test_wide_steps_take_stock_graphs():
     assert [wide.width_class(r) for r in rows] == [96, 96, 192, 192, 384, 384]
 
 
+def test_token_parallel_rows_split_evenly():
+    # every rank owns the same number of rows of every width a token-parallel class serves
+    for tp, classes in wide.TOKEN_PARALLEL.items():
+        for rows in wide.WIDTHS:
+            if wide.width_class(rows) in classes:
+                assert rows % tp == 0 and (rows // tp) * 5120 * 2 % (tp * 16) == 0
+
+
 def test_kv_records_are_bit_exact():
     # the normal path (a prefill, a batch past the largest width) reads the KV records K1 writes
     for spec in (dsv41.SPEC, draft.SPEC):
@@ -94,14 +102,50 @@ def _layer(i, **attn):
         hc_boundary_fused=True,
         engram=None,
         self_attn=SimpleNamespace(**attn),
-        mlp=SimpleNamespace(is_nextn=False, is_hash=False, experts=experts),
+        mlp=SimpleNamespace(
+            is_nextn=False,
+            is_hash=False,
+            experts=experts,
+            reduce_results=True,
+            _shared_expert_tp1=False,
+            _enable_a2a_moe=False,
+        ),
     )
+
+
+def _parallel(tp_size=4, attn_tp_size=4, ca=True):
+    """get_parallel() of a plain-TP server, its TP group's custom all-reduce aiter's."""
+    comm = SimpleNamespace(disabled=False, custom_reduce_scatter=None) if ca else None
+    return SimpleNamespace(
+        tp_size=tp_size, attn_tp_size=attn_tp_size, tp_group=SimpleNamespace(ca_comm=comm)
+    )
+
+
+def test_token_parallel_reasons(monkeypatch):
+    import sglang.srt.runtime_context as rc
+
+    layers = [_layer(i) for i in range(40)]
+    model = SimpleNamespace(model=SimpleNamespace(layers=layers))
+    monkeypatch.setattr(rc, "get_parallel", _parallel)
+    assert wide.reasons(model, range(40)) == []
+    monkeypatch.setattr(rc, "get_parallel", lambda: _parallel(ca=False))
+    assert wide.reasons(model, range(40)) == [
+        "token-parallel wide steps need aiter's custom all-reduce on the TP group"
+    ]
+    monkeypatch.setattr(rc, "get_parallel", lambda: _parallel(attn_tp_size=2))
+    assert "attention TP group" in wide.reasons(model, range(40))[0]
+    monkeypatch.setattr(rc, "get_parallel", _parallel)
+    layers[3].mlp._shared_expert_tp1 = True
+    assert wide.reasons(model, range(40))[0].startswith("layer 3: token-parallel")
+    # TP8 has no token-parallel class
+    monkeypatch.setattr(rc, "get_parallel", lambda: _parallel(tp_size=8, ca=False))
+    assert wide.reasons(model, range(40)) == []
 
 
 def test_model_reasons(monkeypatch):
     import sglang.srt.runtime_context as rc
 
-    monkeypatch.setattr(rc, "get_parallel", lambda: SimpleNamespace(tp_size=4))
+    monkeypatch.setattr(rc, "get_parallel", _parallel)
     layers = [_layer(i) for i in range(40)]
     model = SimpleNamespace(model=SimpleNamespace(layers=layers))
     seen = {

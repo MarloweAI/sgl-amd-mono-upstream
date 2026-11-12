@@ -24,6 +24,15 @@ package replaces one stage (or ``layer``, the whole layer) of ``Stages`` for the
 classes (``CLASSES``) it serves; every row count takes one class's stages, so each
 (TP size, width) runs one path.
 
+The classes of ``TOKEN_PARALLEL`` run token parallel (``TokenParallelStages``): rank r
+owns rows r S / TP .. (r + 1) S / TP of an S-row step and keeps only their residual
+streams. Each sublayer's all-reduce becomes a reduce-scatter to the rows' owners, the
+row-local work (the mHC seams and their norms, the posts, Engram's gate, DSpark's
+captures, the head's combine and norm) runs on the owner alone, and an all-gather brings
+every rank the rows the next projection reads. The reduce-scatter sums an owner's rows
+in the all-reduce's order (``Exchange``), and every row-local kernel computes a row the
+same way at any row count, so each output is the same to the bit.
+
 The forward reads what SGLang's backend builds for the step, except the low-ratio
 indexers' decode schedules: the spec declares them unread (the monokernel scores every
 index source itself), so ``prepare_step`` builds them here, in the graph, as the backend
@@ -42,6 +51,7 @@ SGLANG_READS = {
     # the step's model and its ROCm glue, read through their module namespaces
     "srt/models/deepseek_v4.py": (
         "_hip",
+        "wo_b",
         "_is_gfx95_supported",
         "_FUSED_WO_A_MAX_TOKENS",
         "_wo_a_fp8_mxscale",
@@ -141,7 +151,38 @@ SGLANG_READS = {
         "post",
         "comb",
     ),
-    "srt/layers/engram.py": ("new_hash_ids", "layer_hash_index"),
+    "srt/layers/engram.py": (
+        "new_hash_ids",
+        "layer_hash_index",
+        # a token-parallel step's gate on the owner's rows (``TokenParallelStages.engram``)
+        "embed_rows",
+        "wkv",
+        "engram_gate",
+        "q_weight",
+        "k_weight",
+        "eps",
+        "clamp_value",
+        "image_token_id",
+    ),
+    # the token-parallel exchange
+    "srt/runtime_context.py": (
+        "get_parallel",
+        '"tp_size"',
+        '"tp_group"',
+        '"attn_tp_size"',
+        '"attn_tp_group"',
+        '"attn_dp_size"',
+    ),
+    "srt/distributed/parallel_state.py": ("ca_comm", "world_size", "rank_in_group"),
+    "srt/layers/linear.py": ("RowParallelLinear.forward(skip_all_reduce)", "use_decode_attn_tp"),
+    # the operand the next projection takes, rebuilt from the gathered norm
+    "kernels/ops/quantization/mxfp8_amd_gfx95.py": (
+        "Fp8GridActivation",
+        "Mxfp8Activation",
+        "fake_quant_fp8_activation",
+        "fp8_grid_quantize",
+    ),
+    "srt/models/deepseek_common/amd/deepseek_v4_gfx95_dense.py": ("_hip_mxfp8_operand",),
     "srt/layers/radix_attention.py": ("v_head_dim", "layer_id"),
     # the fused boundary's coefficients
     "kernels/ops/layernorm/mhc_boundary_hip.py": ("tensors",),
@@ -587,25 +628,11 @@ class Stages:
         """``DeepseekV2MoE.forward``: its ``forward_normal`` in stages; the other routes
         (mega MoE, a2a, the dual-stream graph) SGLang's whole."""
         import sglang.srt.models.deepseek_v2 as dv2
-        from sglang.srt.layers.moe.mega_moe import should_use_mega_moe
 
         use_vision_topk = moe.gate.e_score_correction_bias_vl is not None
         if use_vision_topk and dv2._is_hip:
             use_vision_topk = dv2._hip_moe.batch_has_images(forward_batch)
-        if (
-            should_use_mega_moe(moe, x)
-            or moe._enable_a2a_moe
-            or moe._can_dual_stream_graph(x)
-            or (
-                moe.alt_stream is not None
-                and moe.num_fused_shared_experts == 0
-                and x.shape[0] > 0
-                and dv2.get_is_capture_mode()
-                and not dv2.is_in_breakable_cuda_graph()
-            )
-            or moe._fuse_shared_experts_inside_sbo
-            or x.shape[0] == 0
-        ):
+        if self.whole_moe(moe, x):
             return moe.forward(
                 x, forward_batch, input_ids=input_ids,
                 input_ids_global=input_ids_global,
@@ -630,14 +657,223 @@ class Stages:
             shared = moe._forward_shared_experts(x, None, pre_quant_input=pre_quant)
         return self.moe_out(moe, routed, shared, return_moe_output)
 
+    def whole_moe(self, moe, x) -> bool:
+        """Whether ``moe`` takes one of the routes SGLang runs whole."""
+        import sglang.srt.models.deepseek_v2 as dv2
+        from sglang.srt.layers.moe.mega_moe import should_use_mega_moe
+
+        return (
+            should_use_mega_moe(moe, x)
+            or moe._enable_a2a_moe
+            or moe._can_dual_stream_graph(x)
+            or (
+                moe.alt_stream is not None
+                and moe.num_fused_shared_experts == 0
+                and x.shape[0] > 0
+                and dv2.get_is_capture_mode()
+                and not dv2.is_in_breakable_cuda_graph()
+            )
+            or moe._fuse_shared_experts_inside_sbo
+            or x.shape[0] == 0
+        )
+
+    # ---- the step's rows (all of them on every rank) ----
+
+    def own(self, rows: int) -> slice:
+        """The rows of an ``rows``-row step whose residual streams this rank keeps."""
+        return slice(0, rows)
+
+    def engram(self, engram, residual, hash_ids, forward_batch, input_ids):
+        """Engram's gated value added to the residual streams."""
+        return engram(
+            residual, hash_ids, forward_batch, input_ids=input_ids, cp_all_tokens=False
+        )
+
+    def gather(self, x):
+        """Every row of a row-local result (each rank holds them all)."""
+        return x
+
+
+class Exchange:
+    """A TP group's token-parallel collectives, on its custom all-reduce's registered
+    buffers (aiter's ``CustomAllreduce``). Rank r owns rows r S / TP .. (r + 1) S / TP.
+
+    The reduce-scatter is the custom all-reduce's own first half: each owner sums its rows
+    over the ranks' partials in fp32, in the order the all-reduce sums them (its own
+    partial first, then ranks r + 1, r + 2, ... modulo TP; at TP 2 the order of two terms
+    does not change an fp32 sum), and rounds once to bf16. So an owner's rows are bit for
+    bit the all-reduce's. The all-gather copies each owner's rows to every rank."""
+
+    def __init__(self, group):
+        self.ca, self.world, self.rank = group.ca_comm, group.world_size, group.rank_in_group
+
+    def own(self, rows: int) -> slice:
+        n = rows // self.world
+        return slice(self.rank * n, (self.rank + 1) * n)
+
+    def reduce_scatter(self, x: torch.Tensor) -> torch.Tensor:
+        """This rank's rows of the sum of every rank's ``x``."""
+        assert self.ca.should_custom_rs(x, 0), (x.shape, x.dtype)
+        out = x.new_empty((x.shape[0] // self.world, *x.shape[1:]))
+        self.ca.custom_reduce_scatter(x, out)
+        return out
+
+    def all_gather(self, x: torch.Tensor) -> torch.Tensor:
+        """Every owner's rows of ``x``, in row order."""
+        out = self.ca.custom_all_gather(x.contiguous())
+        assert out is not None, (x.shape, x.dtype)
+        return out
+
+
+def regrid(like, x: torch.Tensor):
+    """The fp8-grid operand ``like`` (a norm launch's, ``Fp8GridActivation`` or
+    ``Mxfp8Activation``) rebuilt for the rows ``x`` of that norm: the norm quantizes its
+    own bf16 output, per 32 values, by the rule of ``fake_quant_fp8_activation``, so the
+    same rule on the bf16 rows gives the same bits."""
+    from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
+        Fp8GridActivation,
+        Mxfp8Activation,
+        fake_quant_fp8_activation,
+        fp8_grid_quantize,
+    )
+
+    if like is None:
+        return None
+    if isinstance(like, Fp8GridActivation):
+        return Fp8GridActivation(fake_quant_fp8_activation(x))
+    assert isinstance(like, Mxfp8Activation), type(like)
+    return Mxfp8Activation(*fp8_grid_quantize(x))
+
+
+class TokenParallelStages(Stages):
+    """``Stages`` token parallel (the module docstring): the residual streams of this rank's
+    rows only. Per layer:
+
+    - ``seam_attn`` on the owner's rows, then the all-gather of its input norm (bf16; the
+      projections' fp8-grid operand rebuilt from it on every rank);
+    - the attention on every row, as ``Stages``; ``wo_b`` leaves its sum to the exchange;
+    - the reduce-scatter of wo_b's partials, ``seam_ffn`` on the owner's rows, the
+      all-gather of the MoE input;
+    - the MoE on every row, as ``Stages``, but for its all-reduce: the reduce-scatter of
+      its merged output, and ``post`` on the owner's rows.
+    """
+
+    def __init__(self, exchange: Exchange):
+        self.x = exchange
+
+    def own(self, rows: int) -> slice:
+        return self.x.own(rows)
+
+    def gather(self, x):
+        return self.x.all_gather(x)
+
+    def layer(self, wide, i, state, positions, input_ids, forward_batch, input_ids_global,
+              defer_post):  # fmt: skip
+        layer = wide.model.layers[i]
+        attn = layer.self_attn
+        residual, x, x_quant, co = self.seam_attn(layer, state, positions, forward_batch)
+        x, x_quant = self.gather_norm(x, x_quant)
+        with attn.maybe_use_decode_attn_tp(forward_batch):
+            front = self.attn_front(attn, x, positions, forward_batch, x_quant)
+            o = self.attn_core(attn, front, forward_batch)
+            o = self.wo_a(attn, o, positions, forward_batch, front)
+            x = self.wo_b(attn, o, False)
+        residual, x, ffn_co = self.seam_ffn(layer, x, residual, co, None, forward_batch)
+        x = self.ffn(layer, x, forward_batch, input_ids, input_ids_global, False)
+        return self.post(layer, x, residual, ffn_co, None, defer_post)
+
+    def gather_norm(self, x, x_quant):
+        """Every row of the input norm and of the projections' operand made with it."""
+        x = self.x.all_gather(x)
+        return x, regrid(x_quant, x)
+
+    def wo_b(self, attn, o, defer_all_reduce: bool):
+        """wo_b's partial, reduce-scattered: this rank's rows of the attention output."""
+        assert not defer_all_reduce and not attn.wo_b.use_decode_attn_tp
+        partial, _ = attn.wo_b(
+            o.flatten(1) if isinstance(o, torch.Tensor) else o, skip_all_reduce=True
+        )
+        return self.x.reduce_scatter(partial)
+
+    def ffn(self, layer, x, forward_batch, input_ids, input_ids_global, return_moe_output):
+        """Every row of the MoE input to the MoE; this rank's rows of its output."""
+        from sglang.srt.models.deepseek_common.moe_transport import MoeRowTransport
+
+        rows = self.x.all_gather(x)
+        operand = getattr(x, "_hip_mxfp8_operand", None)
+        if operand is not None:
+            rows._hip_mxfp8_operand = regrid(operand, rows)
+        prepared = MoeRowTransport(
+            layer.mlp, rows, forward_batch, input_ids, input_ids_global,
+            cp_return_contiguous=layer.config.model_type == "deepseek_v41",
+        )  # fmt: skip
+        assert not (
+            prepared._use_cp
+            or prepared._use_tp_moe_gather
+            or prepared._use_tp_attn_a2a_scatter
+        ), "a token-parallel step moves no MoE rows of its own"
+        with prepared.scope():
+            out = self.moe(
+                layer.mlp, prepared.input, forward_batch,
+                input_ids_global=prepared.input_ids_global,
+                skip_shared_experts=prepared.do_shared_local,
+                return_moe_output=False,
+                input_ids=prepared.input_ids,
+            )  # fmt: skip
+        prepared.input = None
+        return self.x.reduce_scatter(prepared.return_output(out))
+
+    def whole_moe(self, moe, x) -> bool:
+        # SGLang's whole routes sum over the ranks themselves
+        assert not super().whole_moe(moe, x), "a token-parallel MoE runs in stages"
+        return False
+
+    def moe_out(self, moe, routed, shared, return_moe_output):
+        """The routed scale and the shared add; the sum over the ranks is ``ffn``'s."""
+        import sglang.srt.models.deepseek_v2 as dv2
+
+        assert not return_moe_output and moe.reduce_results and not moe._shared_expert_tp1
+        return dv2.maybe_fuse_routed_scale_and_shared_add(
+            moe.experts, routed, shared, moe.routed_scaling_factor
+        )
+
+    def engram(self, engram, residual, hash_ids, forward_batch, input_ids):
+        """``Engram.forward`` with the gate on this rank's rows: the table lookup is a
+        collective over every row, and the projection runs on every row too, so the
+        owner's rows of it are the replicated forward's."""
+        from sglang.srt.layers.engram import engram_gate
+
+        emb = engram.embed_rows(hash_ids, forward_batch, False)
+        kv, _ = engram.wkv(emb.flatten(-2))
+        own = self.own(kv.shape[0])
+        image_ids = input_ids[own] if engram.image_token_id is not None else None
+        return engram_gate(
+            residual, kv[own], engram.q_weight, engram.k_weight, engram.eps,
+            engram.clamp_value, image_ids, engram.image_token_id,
+        )  # fmt: skip
+
+
+# the TP sizes and width classes whose steps run token parallel (``TokenParallelStages``):
+# from 240 rows the owners' share of the seams saves more than the second collective of each
+# sublayer and the operand rebuild cost; at 96 and 192 rows it does not (served, both TPs)
+TOKEN_PARALLEL = {2: (384,), 4: (384,)}
+
 
 class WideForward:
     """``DeepseekV4ForCausalLM.forward`` for a wide step, its layers in ``Stages``."""
 
     def __init__(self, lm):
+        from sglang.srt.runtime_context import get_parallel
+
         self.lm, self.model = lm, lm.model
         # one set of stages a width class: SGLang's until a kernel replaces one
-        self.stages: dict[int, Any] = {c: Stages() for c in CLASSES}
+        parallel = get_parallel()
+        token_parallel = TOKEN_PARALLEL.get(parallel.tp_size, ())
+        exchange = Exchange(parallel.tp_group) if token_parallel else None
+        self.stages: dict[int, Any] = {
+            c: TokenParallelStages(exchange) if c in token_parallel else Stages()
+            for c in CLASSES
+        }
 
     def forward(self, plan, input_ids, positions, forward_batch, input_embeds=None):
         from sglang.srt.layers.layer_boundary import get_attn_tp_context
@@ -711,7 +947,11 @@ class WideForward:
 
         m = self.model
         hidden = m.embed_tokens(input_ids) if input_embeds is None else input_embeds
-        hidden = hc_broadcast(hidden, m.hc_mult)
+        rows = hidden.shape[0]
+        # this rank's rows: their streams and every row-local result of them
+        own = stages.own(rows)
+        like = hidden[own]  # a row of the captures' shape
+        hidden = hc_broadcast(like, m.hc_mult)
         input_ids_global = getattr(forward_batch, "input_ids_global", input_ids)
         targets = m.dspark_layers_to_capture
         aux = None if targets is None else dv4.AuxHiddenStatePacker(len(targets))
@@ -735,17 +975,17 @@ class WideForward:
             engram = m.layers[i].engram
             if engram is not None:
                 state = state.with_residual(
-                    engram(
+                    stages.engram(
+                        engram,
                         state.residual,
                         hash_ids[:, engram.layer_hash_index],
                         forward_batch,
-                        input_ids=input_ids,
-                        cp_all_tokens=False,
+                        input_ids,
                     )
                 )
             if aux is not None and i in targets:
                 # the draft head reads the attention input of its target layers
-                mhc_stream_mean(state.residual, out=aux.slot(state.residual[:, 0]))
+                mhc_stream_mean(state.residual, out=aux.slot(like))
             nxt = i + 1
             # the next layer's Engram gate or DSpark capture reads the settled residual
             defer = (
@@ -768,17 +1008,38 @@ class WideForward:
         pre_hc_head = residual.flatten(1)
         # the kernel widens each element to f32 as it loads it
         hidden = m.norm(mhc_combine(pre_hc_head, pre, m.hc_mult, residual.dtype))
+        # the head reads every row (and the streams without the captures)
+        hidden = stages.gather(hidden)
         if aux is not None:
-            return (hidden, pre_hc_head), aux.finalize()
-        return hidden, pre_hc_head
+            return (hidden, pre_hc_head), stages.gather(aux.finalize())
+        return hidden, stages.gather(pre_hc_head)
 
 
 def reasons(model, layers) -> list[str]:
     """What the wide forward needs of ``layers`` past the spec's other reasons: the
     attention this module opens (not the mega one; an FP8 wo_a only on aiter's mxscale
-    GEMM). A late-layer tail is a prefill's: decode and verify steps run every row."""
+    GEMM). A late-layer tail is a prefill's: decode and verify steps run every row.
+    Token parallel (``TOKEN_PARALLEL``) needs plain TP (the attention's TP group is the
+    MoE's), aiter's custom all-reduce on it, and MoEs whose only sum over the ranks is
+    their all-reduce."""
+    from sglang.srt.runtime_context import get_parallel
+
     m = model.model
     out = []
+    parallel = get_parallel()
+    if TOKEN_PARALLEL.get(parallel.tp_size):
+        ca = parallel.tp_group.ca_comm
+        if parallel.attn_tp_size != parallel.tp_size:
+            out.append("token-parallel wide steps need the attention TP group to be the TP group")
+        if ca is None or ca.disabled or not hasattr(ca, "custom_reduce_scatter"):
+            out.append("token-parallel wide steps need aiter's custom all-reduce on the TP group")
+        for i in layers:
+            moe = m.layers[i].mlp
+            if not moe.reduce_results or moe._shared_expert_tp1 or moe._enable_a2a_moe:
+                out.append(
+                    f"layer {i}: token-parallel wide steps need the MoE's sum to be its "
+                    "all-reduce (no TP1 shared expert, no all-to-all)"
+                )
     for i in layers:
         a = m.layers[i].self_attn
         if getattr(a, "use_mega_attention", False):
