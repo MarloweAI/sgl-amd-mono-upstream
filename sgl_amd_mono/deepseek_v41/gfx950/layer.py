@@ -53,6 +53,7 @@ from .attention.plan import (
     Dims,
     back_scratch,
     front_scratch,
+    tagged_x8b,
     wqkv_split,
 )
 from .indexer import compress
@@ -1664,10 +1665,19 @@ def run_k2(
         if const_expr(not early_slice(key)):
             # the slice CTAs that wait on wo_a's flags poll the gates' flags in the same wait:
             # in ``run_ffn`` the poll would queue behind their wo_b push's peer stores
-            gap = layout["grdy"][0] - layout["ardy"][0]
-            assert gap >= 0 and gap % 8 == 0, gap
             own_n = s // tp if const_expr(key.tok_par) else s
-            c["ardy_also"] = (bid < SLICES, own_n, lambda u: gap // 8 + u * FLAG_STRIDE)
+            if const_expr(tagged_x8b(Dims(tp), s)):
+                # with X8B's words (``back.x8b_rows``), from the flags' own region
+                grdy = scratch + fx.Int64(layout["grdy"][0])
+                c["ardy_also"] = (bid < SLICES, own_n, grdy, lambda u: u * FLAG_STRIDE)
+            else:
+                gap = layout["grdy"][0] - layout["ardy"][0]
+                assert gap >= 0 and gap % 8 == 0, gap
+                c["ardy_also"] = (
+                    bid < SLICES,
+                    own_n,
+                    lambda u: gap // 8 + u * FLAG_STRIDE,
+                )
     else:
         epoch_begin(ctx, epoch, ep)
     if const_expr(key.index):
