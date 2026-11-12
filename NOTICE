@@ -3,9 +3,11 @@ Copyright 2026 SGLang contributors. Licensed under the Apache License 2.0.
 
 Portions are adapted from ROCm/ATOM (https://github.com/ROCm/ATOM): the shared
 device primitives, the DeepSeek-V4.1 seam and MoE stages, the DeepSeek-V4.1
-indexer (by way of sgl-project/sglang#43984), and the DeepSeek-V4 layer kernel,
-its weight packing and host runner (ROCm/ATOM#2559). Each adapted file names its
-origin in its header. ROCm/ATOM is distributed under this license:
+indexer (by way of sgl-project/sglang#43984), the DeepSeek-V4 layer kernel,
+its weight packing and host runner (ROCm/ATOM#2559), and the Kimi-K3 helpers
+that the Qwen3.8 MoE kernels use (by way of sgl-project/sglang#43481). Each
+adapted file names its origin in its header. ROCm/ATOM is distributed under
+this license:
 
   MIT License
 
@@ -32,8 +34,10 @@ origin in its header. ROCm/ATOM is distributed under this license:
 Portions are adapted from vllm-project/vllm (https://github.com/vllm-project/vllm):
 the GLM-5.3-Flash decoder-layer kernel, which vLLM adapted from ROCm/aiter
 (https://github.com/ROCm/aiter, Copyright (c) 2025 FlyDSL Project Contributors),
-and its geometry, host runner and weight views. Each adapted file names its
-origin in its header. These portions are distributed under the Apache License 2.0.
+and its geometry, host runner and weight views; and the Qwen3.8 MoE decode
+kernels of vllm-project/vllm#60833 (by way of sgl-project/sglang#43516). Each
+adapted file names its origin in its header. These portions are distributed under
+the Apache License 2.0.
 
 Portions are adapted from ROCm/aiter (https://github.com/ROCm/aiter): the GLM-5.3
 decoder-layer kernel of ROCm/aiter#6173 (Copyright (c) 2025 FlyDSL Project
