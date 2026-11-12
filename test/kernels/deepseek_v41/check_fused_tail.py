@@ -6,6 +6,11 @@ replays with fresh inputs. Then the time in a graph of 10 (the maximum over rank
 (combine and norm, then the one launch), of the launches it replaces (combine and norm, SGLang's head GEMM, the
 verify tail), of the one launch alone and of the head GEMMs alone.
 
+With the draft's main_proj in the launch (``proj=``, ``gfx950/inject/proj``'s exchange): the logits, the accept's
+outputs and every rank's main_proj rows bitwise the launch without it followed by main_proj's own launch, greedy and
+under a simulated length, 5, 6 and 8 rows, wide-range rows, and under graph replay with fresh inputs; then both
+forms' time in a graph.
+
 With ``--rows`` (recorded head inputs, ``head_in_*.pt``) and ``--weights`` (the checkpoint's head): each 6 recorded
 rows through the launch, its full-vocab argmax (the ranks' exchange) against SGLang's (torch's bf16 linear, gathered)
 over every row, ties counted.
@@ -168,6 +173,169 @@ def bits_equal(a, b):
 
 def same_outs(a, b, bs):
     return all(torch.equal(a[k][:bs], b[k][:bs]) for k in a)
+
+
+def hidden_rows(rows, dev, seed):
+    """main_proj's input rows [rows, 15360], the same on every rank (``seed`` odd: wide-range values)."""
+    g = torch.Generator(device=dev).manual_seed(seed)
+    x = (torch.randn(rows, 3 * K, generator=g, device=dev) * 2).bfloat16()
+    if seed % 2:
+        x[:, ::7] *= 300.0
+        x[:, 3::11] *= 1e-3
+    return x
+
+
+def proj_checks(args, ft, w, nw, dev, rank, tp, cpu, say, all_ok):
+    """The launch with main_proj against the launch without it, then main_proj's own launch."""
+    from sgl_amd_mono.deepseek_v41.gfx950.inject import proj
+
+    mp = proj.Exchange(cpu, rank, tp, dev, deadline_s=30.0)
+    g = torch.Generator(device=dev).manual_seed(3)
+    pw = (
+        (torch.randn(proj.H, proj.K, generator=g, device=dev) * 40)
+        .clamp(-448, 448)
+        .to(torch.float8_e4m3fn)
+    )
+    pws = torch.randint(
+        116,
+        124,
+        (proj.H // 32, proj.K // 32),
+        generator=g,
+        device=dev,
+        dtype=torch.uint8,
+    )
+    cols = mp.columns(pw, pws)
+    fails = 0
+    seed = 500
+    for mode in ("greedy", "sim0", "simt"):
+        for rows in (proj.MIN_ROWS, T, proj.MAX_ROWS):
+            for rep in range(2):
+                seed += 1
+                g = torch.Generator(device=dev).manual_seed(seed)
+                x = normed_rows(norm_inputs(T, g, dev, wide=rep == 1), nw)
+                a = accept_inputs(1, mode, g, dev)
+                hidden = hidden_rows(rows, dev, seed)
+                want, got = outs(dev), outs(dev)
+                wl = run_fused(ft, x, w, a, want)
+                want_rows = mp.run(hidden, *cols).clone()
+                mp.out.zero_()
+                gl = ft(
+                    x,
+                    w,
+                    a["cand"],
+                    a["seq_lens"],
+                    a["verify_lens"],
+                    a["gate"],
+                    **acc_args(a),
+                    **got,
+                    proj=(hidden, *cols, mp),
+                )
+                torch.cuda.synchronize()
+                checks = {
+                    "logits": bits_equal(wl, gl),
+                    "accept": same_outs(want, got, 1),
+                    "main_proj": bits_equal(mp.out[:rows], want_rows),
+                }
+                agree = all_ok(all(checks.values()))
+                if not agree or rep == 0:
+                    say(
+                        f"with main_proj {mode} rows {rows} seed {seed}{' wide' if rep else ''}: "
+                        + ", ".join(
+                            f"{k} {'same' if v else 'DIFFER'}"
+                            for k, v in checks.items()
+                        )
+                        + f" (all ranks {'PASS' if agree else 'FAIL'})"
+                    )
+                fails += not agree
+    for mode in ("greedy", "simt"):
+        g = torch.Generator(device=dev).manual_seed(9)
+        x = normed_rows(norm_inputs(T, g, dev), nw)
+        a = accept_inputs(1, mode, g, dev)
+        hidden = hidden_rows(T, dev, 9)
+        got = outs(dev)
+
+        def fused():
+            return ft(
+                x,
+                w,
+                a["cand"],
+                a["seq_lens"],
+                a["verify_lens"],
+                a["gate"],
+                **acc_args(a),
+                **got,
+                proj=(hidden, *cols, mp),
+            )
+
+        fused()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            gl = fused()
+        nbad = 0
+        for r in range(args.replays):
+            g = torch.Generator(device=dev).manual_seed(2000 + r)
+            x.copy_(normed_rows(norm_inputs(T, g, dev, wide=r % 2 == 1), nw))
+            a2 = accept_inputs(1, mode, g, dev)
+            for k in ("cand", "seq_lens", "verify_lens", "temps", "seed"):
+                a[k].copy_(a2[k])
+            if a["sim"] is not None:
+                a["sim"].copy_(a2["sim"])
+            hidden.copy_(hidden_rows(T, dev, 2001 + 2 * r))
+            want = outs(dev)
+            wl = run_fused(ft, x, w, a, want)
+            want_rows = mp.run(hidden, *cols).clone()
+            mp.out.zero_()
+            graph.replay()
+            torch.cuda.synchronize()
+            nbad += not (
+                same_outs(want, got, 1)
+                and bits_equal(wl, gl)
+                and bits_equal(mp.out[:T], want_rows)
+            )
+        agree = all_ok(nbad == 0)
+        say(
+            f"with main_proj graph replays {mode}: {'PASS' if agree else 'FAIL'} ({args.replays})"
+        )
+        fails += not agree
+    sync = lambda: dist.barrier()  # noqa: E731
+    for mode in ("greedy", "sim0"):
+        g = torch.Generator(device=dev).manual_seed(3)
+        x = normed_rows(norm_inputs(T, g, dev), nw)
+        a = accept_inputs(1, mode, g, dev)
+        hidden = hidden_rows(T, dev, 4)
+        o = outs(dev)
+        t = {
+            name: graph_us(fn, args.reps, sync)
+            for name, fn in (
+                (
+                    "one launch, then main_proj",
+                    lambda: (run_fused(ft, x, w, a, o), mp.run(hidden, *cols)),
+                ),
+                (
+                    "one launch with main_proj",
+                    lambda: ft(
+                        x,
+                        w,
+                        a["cand"],
+                        a["seq_lens"],
+                        a["verify_lens"],
+                        a["gate"],
+                        **acc_args(a),
+                        **o,
+                        proj=(hidden, *cols, mp),
+                    ),
+                ),
+                ("one launch", lambda: run_fused(ft, x, w, a, o)),
+                ("main_proj", lambda: mp.run(hidden, *cols)),
+            )
+        }
+        say(
+            f"time {mode} with main_proj: "
+            + ", ".join(f"{k} {v:.2f} us" for k, v in t.items())
+            + " (max over ranks)"
+        )
+    return fails
 
 
 def graph_us(fn, reps, rank_sync):
@@ -367,6 +535,7 @@ def main():
             + " (max over ranks)"
         )
 
+    fails += proj_checks(args, ft, w, nw, dev, rank, tp, cpu, say, all_ok)
     if args.rows:
         fails += real_rows(args, ft, w, dev, rank, tp, part, say, all_ok)
     say("ALL PASS" if fails == 0 else f"{fails} FAIL")

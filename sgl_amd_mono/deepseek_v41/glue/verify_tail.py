@@ -262,10 +262,12 @@ def _fused_why_not(lm, forward_batch, x) -> str | None:
     return None
 
 
-def fused_head(lm, forward_batch, x):
+def fused_head(lm, forward_batch, x, commit_rows=None):
     """The head's projection of a greedy-variant target verify's normed rows ``x`` and the
     epilogue's accept in one launch: its logits shard handed to the logits processor and its
-    accept's outputs to the epilogue. Returns whether the forward takes it."""
+    accept's outputs to the epilogue; with the commit's main_proj of ``commit_rows`` (the
+    forward's DSpark captures, the epilogue's commit rows) where the commit takes it. Returns
+    whether the forward takes it."""
     if not flag(ENV) or torch.version.hip is None:
         return False
     from sgl_amd_mono.deepseek_v41.gfx950.vtail import fused
@@ -287,6 +289,12 @@ def fused_head(lm, forward_batch, x):
     gated = epi.folds_commit
     sim = epi.simulated_correct_len
     temps = (epi.sim_temperatures_buf if epi.simulate_fold else _TAILS[id(epi)][1])[:bs]
+    # the commit that follows in this forward: its main_proj in this launch
+    proj = (
+        inject.projection(epi, commit_rows)
+        if gated and commit_rows is not None
+        else None
+    )
     logits = launch(
         x, lm.lm_head.weight, candidates, forward_batch.seq_lens, verify_lens,
         epi.inject_gate_buf, sim=sim, temps=temps if sim is not None else None,
@@ -294,7 +302,7 @@ def fused_head(lm, forward_batch, x):
         correct_out=epi.correct_len_buf, bonus_out=epi.bonus_buf,
         cap_trim_out=epi.cap_trim_lens_buf, commit_out=epi.commit_lens_buf,
         new_seq_out=epi.new_seq_lens_buf, out_tokens=epi.out_tokens_buf,
-        gated_out=epi.gated_commit_lens_buf if gated else None,
+        gated_out=epi.gated_commit_lens_buf if gated else None, proj=proj,
         commit=_commit_args(epi, forward_batch.req_pool_indices, candidates, bs),
     )  # fmt: skip
     _HEADS[id(lp)] = (x, logits)

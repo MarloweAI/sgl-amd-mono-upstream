@@ -47,7 +47,7 @@ static_assert(MAX_CTAS <= STATE_INTS);
 constexpr int64_t WORK_BYTES = int64_t{MAX_CTAS} * WAVE * 4 * 8;
 
 #ifdef MAIN_PROJ_STAMPS // a timing build (tests only): thread 0's realtime ticks per CTA, past the state ints
-#define MAIN_PROJ_STAMP(k) if (threadIdx.x == 0) reinterpret_cast<uint64_t *>(p.state + STATE_INTS)[b * 8 + (k)] = __builtin_amdgcn_s_memrealtime()
+#define MAIN_PROJ_STAMP(k) if (tid == 0) reinterpret_cast<uint64_t *>(p.state + STATE_INTS)[b * 8 + (k)] = __builtin_amdgcn_s_memrealtime()
 #else
 #define MAIN_PROJ_STAMP(k)
 #endif
@@ -135,8 +135,8 @@ __device__ inline void check_deadline(const Params &p, int n, uint64_t &t0) {
 // split * SPLIT_K + (c / 32) * STEP + panel * PANEL + (c % 32) * 8; a thread's chunks i = j * 192 + t
 constexpr int PER = QWAVES * WAVE, BATCH = (MAX_ROWS * SLICE_CHUNKS + PER - 1) / PER;
 
-__device__ inline void load_slice(const Params &p, int split, int panel, uint32x4 (&v)[BATCH]) {
-    const int t = threadIdx.x - WAVE, total = p.rows * SLICE_CHUNKS;
+__device__ inline void load_slice(const Params &p, int tid, int split, int panel, uint32x4 (&v)[BATCH]) {
+    const int t = tid - WAVE, total = p.rows * SLICE_CHUNKS;
 #pragma unroll
     for (int j = 0; j < BATCH; ++j) {
         const int i = j * PER + t;
@@ -149,9 +149,9 @@ __device__ inline void load_slice(const Params &p, int split, int panel, uint32x
 }
 
 // the loaded chunks quantized into xq, xs (LDS)
-__device__ inline void quant_slice(const Params &p, const uint32x4 (&v)[BATCH], uint8_t (*xq)[SLICE],
+__device__ inline void quant_slice(const Params &p, int tid, const uint32x4 (&v)[BATCH], uint8_t (*xq)[SLICE],
                                    uint8_t (*xs)[SLICE / 32]) {
-    const int t = threadIdx.x - WAVE, total = p.rows * SLICE_CHUNKS;
+    const int t = tid - WAVE, total = p.rows * SLICE_CHUNKS;
 #pragma unroll
     for (int j = 0; j < BATCH; ++j) {
         const int i = j * PER + t; // quad-uniform: a quad's 4 chunks are one row's group
@@ -168,13 +168,15 @@ __device__ inline void quant_slice(const Params &p, const uint32x4 (&v)[BATCH], 
     }
 }
 
-// CTA b of the grid CTAs (b < tiles * UNITS); any launch may run it: the caller's block, 256 threads, the grid
-// co-resident
-__device__ inline void run(const Params &p, const int b, const int grid) {
-    __shared__ __attribute__((aligned(16))) uint8_t xq[MAX_ROWS][SLICE];
-    __shared__ uint8_t xs[MAX_ROWS][SLICE / 32];
-    __shared__ int slot;
-    const int tid = threadIdx.x, wave = tid / WAVE, lane = tid % WAVE;
+// a CTA's LDS: the rows' quantized K slice and its scales, the CTA's launch count
+constexpr int LDS_BYTES = MAX_ROWS * SLICE + MAX_ROWS * (SLICE / 32) + 16;
+
+// CTA b of the grid CTAs (b < tiles * UNITS) on THREADS threads of the caller's block, tid this thread's index among
+// them, its LDS xq (16 B aligned), xs and slot; any launch may run it, the grid co-resident. Every thread of the block
+// reaches its two barriers: a block of 2 x THREADS runs two CTAs side by side
+__device__ inline void run(const Params &p, const int b, const int grid, const int tid, uint8_t (*xq)[SLICE],
+                           uint8_t (*xs)[SLICE / 32], int &slot) {
+    const int wave = tid / WAVE, lane = tid % WAVE;
     const int tile = b / UNITS, unit = b % UNITS, split = unit / PANELS, panel = unit % PANELS;
     const int n0 = tile * TILE_N, r = lane % 16, g = lane / 16;
     if (tid == 0) slot = __hip_atomic_fetch_add(p.state + b, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) + 1;
@@ -183,7 +185,7 @@ __device__ inline void run(const Params &p, const int b, const int grid) {
     int wsc[CHAIN];
     uint32x4 xv[BATCH];
     // the rows' slice first (waves 1-3), then the weights (wave 0): the slice's loads are ahead in the CU's queue
-    if (wave != 0) load_slice(p, split, panel, xv);
+    if (wave != 0) load_slice(p, tid, split, panel, xv);
     __builtin_amdgcn_s_barrier();
     if (wave == 0) { // the chain's weights and scales, all in flight
         const uint8_t *wrow = p.w + static_cast<int64_t>(n0 + r) * K;
@@ -195,9 +197,9 @@ __device__ inline void run(const Params &p, const int b, const int grid) {
             wsc[i] = srow[k0 / 32];
         }
     } else {
-        quant_slice(p, xv, xq, xs);
+        quant_slice(p, tid, xv, xq, xs);
 #ifdef MAIN_PROJ_STAMPS
-        if (threadIdx.x == WAVE) reinterpret_cast<uint64_t *>(p.state + STATE_INTS)[b * 8 + 6] = __builtin_amdgcn_s_memrealtime();
+        if (tid == WAVE) reinterpret_cast<uint64_t *>(p.state + STATE_INTS)[b * 8 + 6] = __builtin_amdgcn_s_memrealtime();
 #endif
     }
     __syncthreads();
@@ -295,6 +297,14 @@ __device__ inline void run(const Params &p, const int b, const int grid) {
         reinterpret_cast<uint32_t *>(p.out + static_cast<int64_t>(row) * p.out_stride)[pair] = static_cast<uint32_t>(v);
     }
     MAIN_PROJ_STAMP(5);
+}
+
+// CTA b of the grid CTAs on the caller's block of THREADS threads
+__device__ inline void run(const Params &p, const int b, const int grid) {
+    __shared__ __attribute__((aligned(16))) uint8_t xq[MAX_ROWS][SLICE];
+    __shared__ uint8_t xs[MAX_ROWS][SLICE / 32];
+    __shared__ int slot;
+    run(p, b, grid, threadIdx.x, xq, xs, slot);
 }
 
 // x [rows, 15360] bf16; w [5120 / tp, 15360] E4M3 and ws [5120 / tp / 32, 480] E8M0 (this rank's columns of

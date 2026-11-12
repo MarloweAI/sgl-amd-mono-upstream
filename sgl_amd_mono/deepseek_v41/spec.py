@@ -1229,7 +1229,8 @@ class _Built:
             )
             if not tok_par:
                 # a greedy-variant verify's projection and accept in one launch, where it fits
-                verify_tail.fused_head(self.lm, forward_batch, hidden)
+                commit_rows = None if aux is None else self._packed[: hidden.shape[0]]
+                verify_tail.fused_head(self.lm, forward_batch, hidden, commit_rows)
         pre_hc_head = residual.flatten(1)
         if aux is None:
             return hidden, pre_hc_head
