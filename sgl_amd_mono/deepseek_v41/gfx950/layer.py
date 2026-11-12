@@ -1291,8 +1291,8 @@ def run_ffn(
 def early_slice(key: MonoBuild) -> bool:
     """Whether the FFN seam slice's first loads go out before wo_b, so a slice CTA's poll on
     the ranks' wo_b cells has no loads ahead of it, and the cells are polled on a wave that
-    pushed none: TP8, the cells' path, the loads in registers."""
-    return key.tp == 8 and not key.tok_par and seam.slice_prefetch_fits(key.tokens)
+    pushed none: TP4 and TP8, the cells' path, the loads in registers."""
+    return key.tp in (4, 8) and not key.tok_par and seam.slice_prefetch_fits(key.tokens)
 
 
 def reset_counters(epoch, ep):
