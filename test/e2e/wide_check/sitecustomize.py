@@ -129,6 +129,9 @@ def _install(mod, backbone):
                 )
 
     seen: dict = {}  # the outputs the layer under check recorded, by field
+    # cleared in a graph's warm-up runs: there SGLang's custom all-reduce returns zeros
+    # (it only mimics the capture's allocations), so its layers are not a reference
+    counting: list = [True]
     active: list = []  # (wide forward, its stages, width class) while SGLang's forward runs
 
     def record(field, x):
@@ -249,6 +252,8 @@ def _install(mod, backbone):
         if counter is None:
             assert not torch.cuda.is_current_stream_capturing(), "no eager step first"
             counter = counters[c, field] = torch.zeros(5, dtype=torch.int64, device=dev)
+        if not counting[0]:
+            return
         n = sum(x.numel() for x in r)
         if len(r) != len(g) or any(
             x.shape != y.shape or x.dtype != y.dtype for x, y in zip(r, g)
@@ -270,6 +275,8 @@ def _install(mod, backbone):
         if counter is None:
             assert not torch.cuda.is_current_stream_capturing(), "no eager step first"
             counter = counters[c, field] = torch.zeros(5, dtype=torch.int64, device=one.device)
+        if not counting[0]:
+            return
         n = sum(x.numel() for x in a)
         again = 0 * one
         for x, y in zip(a, b):
@@ -327,6 +334,11 @@ def _install(mod, backbone):
     def checked_backbone(self, stages, input_ids, positions, forward_batch, input_embeds):
         if not counters:
             threading.Thread(target=report, args=(input_ids.device,), daemon=True).start()
+        from sglang.srt.distributed import get_tp_group
+
+        ca = get_tp_group().ca_comm
+        warm_up = getattr(ca, "_IS_CAPTURING", False)
+        counting[:] = [not warm_up or torch.cuda.is_current_stream_capturing()]
         # SGLang's forward reads the schedules its backend skipped for a routed step
         self.prepare_step(forward_batch)
         active.append((self, stages, mod.width_class(input_ids.shape[0])))
