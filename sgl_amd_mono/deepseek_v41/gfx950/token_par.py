@@ -22,6 +22,8 @@ TOKEN_PAR_FROM = 12
 QX_WORDS = Q_RANK // 4  # the q latent's e4m3 words
 QX_GROUPS = Q_RANK // 32
 KG_WORDS = DATA // 4 + 2  # a window record's data words, then its two scale words
+# a gathered MoE input row's tagged 16-B words: three of its bf16 pairs, then the launch tag
+XG_WORDS = -(-(HIDDEN // 2) // 3)
 LINE = 128  # every peer region starts on a cache line
 
 # a row's bytes in each per-row seam argument (``own_view``)
@@ -49,6 +51,13 @@ def chunk_pairs(n: int, q):
     return 4 * (q % (n // 4)) + 2 * (q // (n // 4))
 
 
+def tagged_rows(tp: int) -> bool:
+    """Whether token-parallel normed rows go to the other ranks as tagged 16-B words
+    (``XG_WORDS`` a row) instead of (bf16 pair, tag) words: TP2 and TP4, where a rank's
+    rows to a peer cross one link."""
+    return tp < 8
+
+
 def token_par(s: int, tp: int) -> bool:
     """Whether an s-row target step runs token parallel."""
     return tp > 1 and s >= TOKEN_PAR_FROM and s % tp == 0
@@ -60,10 +69,12 @@ def peer_layout(s: int, tp: int) -> dict[str, tuple[int, int]]:
     ATTN and FFN hold the sublayers' partials ``[source rank][row][hidden / 2]``; the
     token-parallel gathers follow, ``[row][..]`` each: XG the MoE input rows, QG / QGS
     the q latent's MXFP8 words / codes, KG the window records, NBG and QRG an index
-    source's normed rows and qr, and IWG its index head weights (bf16 pairs). ENG: the
+    source's normed rows and qr, and IWG its index head weights (bf16 pairs). XG and NBG
+    hold a row's ``XG_WORDS`` tagged 16-B words in the space of its pairs. ENG: the
     Engram projection ``[row][25600]`` (bf16 pairs, ``stages.engram``). K2's cells
     (``acell_region``) lie past every width's regions."""
     row = s * HIDDEN // 2
+    assert XG_WORDS * 16 <= HIDDEN // 2 * 8
     return pair_layout(
         [
             ("attn", tp * row),

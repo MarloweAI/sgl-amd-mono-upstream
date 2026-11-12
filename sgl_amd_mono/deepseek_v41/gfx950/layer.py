@@ -43,7 +43,7 @@ from sgl_amd_mono.common.plan import (
     key_tuple,
 )
 from sgl_amd_mono.common.stamps import TL_POINTS, stamp, timeline_row
-from sgl_amd_mono.common.sync import FLAG_STRIDE, Mailbox, preg, publish, sreg
+from sgl_amd_mono.common.sync import FLAG_STRIDE, Mailbox, _spin, preg, publish, sreg
 
 from .attention import back as mb_back
 from .attention import device as mb_device
@@ -75,12 +75,14 @@ from .stages.moe_shape import (
     route_shape,
 )
 from .token_par import (
+    XG_WORDS,
     acell_region,
     chunk_pairs,
     fcell_region,
     half_pair,
     own_view,
     peer_offsets,
+    tagged_rows,
 )
 
 SOURCES = kernel_sources(__name__)
@@ -579,17 +581,24 @@ def run_k1(key: MonoBuild, sl, front, a: dict, ep, k2=None, early=None):
             gpu.barrier()
             stamp(c, 33)
 
+    xr = sl.xr.ptr if tagged_rows(tp) else None
+
     def store(t, col, ys, live):
         store_x8(c, t, col, ys, live)
         if const_expr(key.index):
             # the normed input, SGLang's compressor and indexer's input
             store_normed(normed_out, plus(t0, t), col, ys, live)
-            if const_expr(key.tok_par):
-                push_bf_row(ca, bases, pl["nbg"], plus(t0, t), col, ys, live)
+            if const_expr(key.tok_par and tagged_rows(tp)):
+                stage_xg_row(xr, col, ys, live)
+            elif const_expr(key.tok_par):
+                push_bf_row(ca, bases, pl["nbg"], plus(t0, t), (col, ys, live))
 
     def seam_norm():
         for t in range(first_task(bid, NORM0), own_n, BLOCKS):
             seam.stage_norm(ca, t, store)
+            if const_expr(key.index and key.tok_par and tagged_rows(tp)):
+                # the LDS row is whole past the norm's barrier
+                push_bf_row(ca, bases, pl["nbg"], plus(t0, t), xr, amb.tag)
             publish_x8(c, t)
         gpu.barrier()
         stamp(c, 34)
@@ -683,7 +692,10 @@ def run_k1(key: MonoBuild, sl, front, a: dict, ep, k2=None, early=None):
             if t // own_n != rank:
                 mb_front.record_from(c, preg(own, pl["kg"], "kg"), t)
                 if const_expr(key.index):
-                    gather_row(ca, preg(own, pl["nbg"], "nbg"), t, normed_out)
+                    if const_expr(tagged_rows(tp)):
+                        gather_words(ca, own + fx.Int64(pl["nbg"]), t, normed_out, amb.tag)
+                    else:
+                        gather_row(ca, preg(own, pl["nbg"], "nbg"), t, normed_out)
                     mb_front.qr_from(c, preg(own, pl["qrg"], "qrg"), t)
                 if const_expr(key.iq):
                     index_query.iw_from(c, preg(own, pl["iwg"], "iwg"), t)
@@ -705,11 +717,23 @@ def run_k1(key: MonoBuild, sl, front, a: dict, ep, k2=None, early=None):
 def _k1_lds(s, tp):
     """K1's LDS: its seam's and its front's stages, one at a time."""
 
-    @fx.struct
-    class SeamLds:
-        red: fx.Array[fx.Float32, WAVES * 2 * 64 * 4, 16]
-        rl: fx.Array[fx.Float32, s * seam.KT, 16]
-        fl: fx.Array[fx.Float32, seam.MIX * seam.KT, 16]
+    if tagged_rows(tp):
+
+        @fx.struct
+        class SeamLds:
+            red: fx.Array[fx.Float32, WAVES * 2 * 64 * 4, 16]
+            rl: fx.Array[fx.Float32, s * seam.KT, 16]
+            fl: fx.Array[fx.Float32, seam.MIX * seam.KT, 16]
+            # an index source's normed row for the other ranks (``push_bf_row``)
+            xr: fx.Array[fx.Int32, 3 * XG_WORDS, 16]
+
+    else:
+
+        @fx.struct
+        class SeamLds:
+            red: fx.Array[fx.Float32, WAVES * 2 * 64 * 4, 16]
+            rl: fx.Array[fx.Float32, s * seam.KT, 16]
+            fl: fx.Array[fx.Float32, seam.MIX * seam.KT, 16]
 
     FrontLds = mb_front.front_lds(s, Dims(tp))
 
@@ -1129,15 +1153,57 @@ def push_head_pair(c, bases, off, t, h, vs):
 
 
 @flyc.jit
-def push_bf_row(c, bases, off, t, col, ys, live):
-    """Row t's 8 bf16 values at ``col`` to every other rank's peer region ``off``."""
+def stage_xg_row(xr, col, ys, live):
+    """A normed row's 8 bf16 values at ``col`` into the LDS row ``xr``, packed as
+    ``store_normed`` packs them (``push_bf_row`` sends the row)."""
+    words = [
+        fx.Vector.from_elements([ys[2 * i], ys[2 * i + 1]], fx.Float32)
+        .to(fx.BFloat16)
+        .bitcast(fx.Int32)[0]
+        for i in range(4)
+    ]
     if live:
-        for p in range_constexpr(c["d"].tp):
-            if c["rank"] != p:
-                dst = preg(bases[p], off, "gather")
-                for h in range_constexpr(2):
-                    at = t * HIDDEN + 2 * half_pair(HIDDEN // 2, col // 8, h)
-                    c["put_bf"](dst, at, ys[4 * h : 4 * h + 4])
+        fx.ptr_store(fx.Vector.from_elements(words, fx.Int32), xr + col // 2)
+
+
+def xg_slots(tid):
+    """This thread's tagged words of a gathered row: [(word, live)]."""
+    out = []
+    for i in range(-(-XG_WORDS // THREADS)):
+        w = tid + THREADS * i
+        out.append((fx.min(w, XG_WORDS - 1), w < XG_WORDS))
+    return out
+
+
+@flyc.jit
+def push_bf_row(c, bases, off, t, row, tag=None):
+    """Row t to every other rank's peer region ``off``. With ``tag`` (``tagged_rows``):
+    the row's bf16 pairs from the LDS row ``row`` (``stage_xg_row``) as ``XG_WORDS`` tagged
+    16-B words, three pairs and ``tag`` each (a 16-B store is seen whole, so a word with the
+    tag is this launch's), 3/4 of the bytes on the link where (value, tag) pairs take 1/2.
+    Else ``row`` = (col, ys, live): its 8 bf16 values at ``col`` as (pair, tag) words."""
+    if const_expr(tag is None):
+        col, ys, live = row
+        if live:
+            for p in range_constexpr(c["d"].tp):
+                if c["rank"] != p:
+                    dst = preg(bases[p], off, "gather")
+                    for h in range_constexpr(2):
+                        at = t * HIDDEN + 2 * half_pair(HIDDEN // 2, col // 8, h)
+                        c["put_bf"](dst, at, ys[4 * h : 4 * h + 4])
+    else:
+        for w, live in xg_slots(c["tid"]):
+            if live:
+                d = [fx.Int32(fx.ptr_load(row + (3 * w + e))) for e in range(3)]
+                word = fx.Vector.from_elements(d + [tag], fx.Int32)
+                for p in range_constexpr(c["d"].tp):
+                    if c["rank"] != p:
+                        bo.buffer_store(
+                            word,
+                            rsrc(bases[p] + fx.Int64(off)),
+                            (t * XG_WORDS + w) * 4,
+                            cache_modifier=CM_SYS,
+                        )
 
 
 @flyc.jit
@@ -1156,13 +1222,66 @@ def gather_row(c, src, t, dst):
             )
 
 
-def _seam_lds(s):
-    @fx.struct
-    class SeamLds:
-        red: fx.Array[fx.Float32, WAVES * 2 * 64 * 4, 16]
-        rl: fx.Array[fx.Float32, s * seam.KT, 16]
-        fl: fx.Array[fx.Float32, seam.MIX * seam.KT, 16]
-        pl: fx.Array[fx.Float32, s * seam.COLS, 16]
+@flyc.jit
+def gather_words(c, src, t, dst, tag):
+    """Row t of the tagged words (``push_bf_row``) of the peer region at ``src`` -> its
+    bf16 [row][HIDDEN] row of ``dst`` (device scope)."""
+    slots = xg_slots(c["tid"])
+
+    def load_all():
+        out = []
+        for w, _ in slots:
+            v = fx.Vector(
+                bo.buffer_load(
+                    rsrc(src),
+                    (t * XG_WORDS + w) * 4,
+                    vec_width=4,
+                    dtype=T.i32,
+                    cache_modifier=CM_SYS,
+                )
+            )
+            out += [v[e] for e in range(4)]
+        return fx.Vector.from_elements(out, fx.Int32)
+
+    def pending(v):
+        bad = None
+        for i, (_, live) in enumerate(slots):
+            b = live & (v[4 * i + 3] != tag)
+            bad = b if bad is None else bad | b
+        return bad
+
+    v = _spin(load_all, pending)
+    for i, (w, live) in enumerate(slots):
+        for e in range_constexpr(3):
+            if live & (3 * w + e < HIDDEN // 2):
+                bo.buffer_store(
+                    v[4 * i + e],
+                    rsrc(dst),
+                    t * (HIDDEN // 2) + 3 * w + e,
+                    cache_modifier=CM_DEV,
+                )
+
+
+def _seam_lds(s, tp):
+    if tagged_rows(tp):
+
+        @fx.struct
+        class SeamLds:
+            red: fx.Array[fx.Float32, WAVES * 2 * 64 * 4, 16]
+            rl: fx.Array[fx.Float32, s * seam.KT, 16]
+            fl: fx.Array[fx.Float32, seam.MIX * seam.KT, 16]
+            pl: fx.Array[fx.Float32, s * seam.COLS, 16]
+            # a normed row for the other ranks (token parallel, ``push_bf_row``)
+            xr: fx.Array[fx.Int32, 3 * XG_WORDS, 16]
+
+    else:
+
+        @fx.struct
+        class SeamLds:
+            red: fx.Array[fx.Float32, WAVES * 2 * 64 * 4, 16]
+            rl: fx.Array[fx.Float32, s * seam.KT, 16]
+            fl: fx.Array[fx.Float32, seam.MIX * seam.KT, 16]
+            pl: fx.Array[fx.Float32, s * seam.COLS, 16]
 
     return SeamLds
 
@@ -1321,11 +1440,16 @@ def run_ffn(
             seam.reset_attn_cells(ca, task)
     stamp(ca, 17)
 
+    xr = sl.xr.ptr if tagged_rows(tp) else None
+
     def store(t, col, ys, live):
         store_normed(normed, plus(t0, t), col, ys, live)
-        if const_expr(key.tok_par):
+        if const_expr(key.tok_par and tagged_rows(tp)):
+            # the row for every other rank's MoE (``push_bf_row``, ``gather_words``)
+            stage_xg_row(xr, col, ys, live)
+        elif const_expr(key.tok_par):
             # the row for every other rank's MoE (``gather_row``)
-            push_bf_row(ca, bases, xg, plus(t0, t), col, ys, live)
+            push_bf_row(ca, bases, xg, plus(t0, t), (col, ys, live))
 
     xbox = scratch + fx.Int64(layout["xbox"][0])
     cb["xbox"], cb["xtag"] = xbox, amb.tag
@@ -1337,11 +1461,17 @@ def run_ffn(
 
     for t in range(first_task(bid, NORM0), own_n, BLOCKS):
         seam.stage_norm(ca, t, store)
+        if const_expr(key.tok_par and tagged_rows(tp)):
+            # the LDS row is whole past the norm's barrier
+            push_bf_row(ca, bases, xg, plus(t0, t), xr, amb.tag)
         x_ready(plus(t0, t))
     if const_expr(key.tok_par):
         for t in range(first_task(bid, GATHER0), s, BLOCKS):
             if t // own_n != rank:
-                gather_row(ca, preg(own, xg, "xg"), t, normed)
+                if const_expr(tagged_rows(tp)):
+                    gather_words(ca, own + fx.Int64(xg), t, normed, amb.tag)
+                else:
+                    gather_row(ca, preg(own, xg, "xg"), t, normed)
                 x_ready(t)
     gpu.barrier()
     stamp(ca, 18)
@@ -1504,7 +1634,7 @@ def build_mono_ffn(key: MonoBuild):
     MoeLds = moe.moe_smem(s, rs)
     half = peer_half_bytes(tp)
     assert SLICES + 2 * s <= BLOCKS
-    SeamLds = _seam_lds(s)
+    SeamLds = _seam_lds(s, tp)
 
     @fx.union
     class FfnLds:
@@ -2018,7 +2148,7 @@ def run_k2(
 
 def _k2_members(s, tp, rs):
     back_m = mb_back.back_lds_members(s, Dims(tp))
-    return back_m["split"], back_m["gemv"], _seam_lds(s), moe.moe_smem(s, rs)
+    return back_m["split"], back_m["gemv"], _seam_lds(s, tp), moe.moe_smem(s, rs)
 
 
 # K2's selection glue (``MonoBuild.glue``), past K2_ARGS in K2's own launch
