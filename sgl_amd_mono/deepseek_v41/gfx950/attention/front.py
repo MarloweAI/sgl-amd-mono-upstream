@@ -829,7 +829,7 @@ def run_front(
                 c, task, accs, slots, order, t0, n, has_wqkv, part if split else None, s
             )
 
-        if const_expr(key.tp == 8):
+        if const_expr(key.tp in (4, 8)):
             # a CTA without a tile (the norms', gates', qkv's) goes on to its next stage
             if has_wqkv:
                 wqkv_tile()
