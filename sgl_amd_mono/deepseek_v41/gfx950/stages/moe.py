@@ -29,6 +29,7 @@ from sgl_amd_mono.common.mx import (
 from sgl_amd_mono.common.ops import (
     CM_DEV,
     CM_NT,
+    CM_SYS,
     ballot,
     bf16_round,
     bf_hi,
@@ -63,6 +64,7 @@ from sgl_amd_mono.common.sync import (
     sreg,
 )
 from sgl_amd_mono.deepseek_v41.gfx950.stages import moe_plan as mplan
+from sgl_amd_mono.deepseek_v41.gfx950.stages import seam
 from sgl_amd_mono.deepseek_v41.gfx950.stages.dims import UG_PART
 
 # FlyDSL keys a build by the source of same-directory functions it names: import helpers by name
@@ -92,7 +94,7 @@ from sgl_amd_mono.deepseek_v41.gfx950.stages.router import (
     router_weight_loads,
     router_x_loads,
 )
-from sgl_amd_mono.deepseek_v41.gfx950.stages.seam import HIDDEN
+from sgl_amd_mono.deepseek_v41.gfx950.stages.seam import CELL_VALUES, HIDDEN
 from sgl_amd_mono.deepseek_v41.gfx950.token_par import peer_offsets
 
 # a pick tile is a token tile's MFMA N: ``gather_x8r`` fills one from the other
@@ -1250,6 +1252,16 @@ def down_combine(c, task, j, t0, n):
     gpu.barrier()
 
 
+def push_ffn_cell(c, t, s, col, vs):
+    """Push row t's down sums of columns col .. col + 3 to every rank's FCELL, at this rank's
+    cell (``seam.ffn_cell``)."""
+    words = seam.cell_words(vs)
+    at = seam.ffn_cell(c["rank"], t, s, col)
+    for p in range_constexpr(c["d"].tp):
+        dst = c["peer_addr"](p) + fx.Int64(c["fcell_off"])
+        bo.buffer_store(words, rsrc(dst), at * 2, cache_modifier=CM_SYS)
+
+
 def put_ffn(c, dst, p, t, s, col, v0, v1):
     """Push token t's down sums of columns col, col + 1 into rank p's FFN region ``dst``, at this
     rank's partial."""
@@ -1845,22 +1857,26 @@ def stage_row_down(c, bid):
             routed = bf16_round(routed + bf16_round(v * w))
         fx.ptr_store(bf16_round(routed + shared).bitcast(fx.Int32), c["rpair"] + tid)
     gpu.barrier()
-    col = width * sl + 2 * tid
-    if tid < width // 2:
-        v0 = fx.ptr_load(c["rpair"] + 2 * tid).bitcast(fx.Float32)
-        v1 = fx.ptr_load(c["rpair"] + 2 * tid + 1).bitcast(fx.Float32)
-        for p in range_constexpr(d.tp):
-            dst = preg(c["peer_addr"](p), c["ffn_off"], "ffn")
-            put_ffn(c, dst, p, r, s, col, v0, v1)
+    # four sums a lane, as a cell to every rank's FCELL (``seam.ffn_cell``)
+    col = width * sl + CELL_VALUES * tid
+    if tid < width // CELL_VALUES:
+        vs = [
+            fx.ptr_load(c["rpair"] + (CELL_VALUES * tid + i)).bitcast(fx.Float32)
+            for i in range(CELL_VALUES)
+        ]
+        push_ffn_cell(c, r, s, col, vs)
     stamp(c, 25)
-    if tid < width // 2:
-        own = preg(c["sym"], c["ffn_off"], "ffn")
-        acc0, acc1 = sum_partials(
-            c["poll"], own, lambda src: region_pair(src, r, s, col), d.tp
-        )
+    # on wave 1: wave 0 pushed, and a wave's first wait also waits on its own pushes' acks
+    u = tid - 64
+    if (u >= 0) & (u < width // CELL_VALUES):
+        cc = width * sl + CELL_VALUES * u
+        fcell = c["sym"] + fx.Int64(c["fcell_off"])
+        cells = [seam.ffn_cell(src, r, s, cc) for src in range(d.tp)]
+        accs = seam.sum_cells(fcell, cells)
         out = rsrc(c["args"]["out"])
-        bo.buffer_store(acc0.to(fx.BFloat16), out, r * HIDDEN + col)
-        bo.buffer_store(acc1.to(fx.BFloat16), out, r * HIDDEN + col + 1)
+        for i in range_constexpr(CELL_VALUES):
+            bo.buffer_store(accs[i].to(fx.BFloat16), out, r * HIDDEN + cc + i)
+        seam.empty_cells(fcell, cells)
 
 
 @flyc.jit

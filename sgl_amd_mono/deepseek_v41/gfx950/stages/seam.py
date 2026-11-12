@@ -21,6 +21,7 @@ from sgl_amd_mono.common.ops import (
     CM_DEV,
     CM_SYS,
     batched_rounds,
+    bf16_pair,
     bf16_round,
     bf_hi,
     bf_lo,
@@ -115,6 +116,42 @@ def acell_cells(s: int, tp: int) -> int:
 def attn_cell(src, task, s, t0, u):
     """Cell u of wo_b ``task`` on the token tile from row t0, from rank ``src``."""
     return (src * WOB_TASKS + task) * cells_task(s) + t0 // TILE * cells_tile(TILE) + u
+
+
+# ---------------------------------------------------------------- FFN cells
+# The per-row MoE's down sums cross as cells too: [source rank][row][hidden / 4], four bf16
+# values a cell, empty as ATTN's (the reader stores them back to empty).
+def ffn_cells(s: int, tp: int) -> int:
+    """FCELL's cells."""
+    return tp * s * HIDDEN // CELL_VALUES
+
+
+def ffn_cell(src, t, s, col):
+    """The cell of rank ``src``'s down sums of row t at hidden column ``col`` (a multiple of 4)."""
+    return (src * s + t) * (HIDDEN // CELL_VALUES) + col // CELL_VALUES
+
+
+def cell_words(vs):
+    """Four values as a cell's two words, never an empty word: a pair of bf16 0xFFFF NaNs
+    goes out as 0xFFFE, 0xFFFF."""
+    ws = []
+    for k in range_constexpr(2):
+        w = bf16_pair(vs[2 * k], vs[2 * k + 1]).bitcast(fx.Int32)
+        ws.append((w == CELL_EMPTY).select(fx.Int32(CELL_EMPTY - 1), w))
+    return fx.Vector.from_elements(ws, fx.Int32)
+
+
+def sum_cells(addr, cells):
+    """Poll the TP ranks' cells at ``addr`` and sum each of the four values in fp32 in rank
+    order."""
+    ws = poll_cells(addr, cells)
+    out = []
+    for i in range_constexpr(CELL_VALUES):
+        acc = cell_value(ws[0], i)
+        for src in range_constexpr(1, len(cells)):
+            acc = acc + cell_value(ws[src], i)
+        out.append(acc)
+    return out
 
 
 def sigmoid(z):

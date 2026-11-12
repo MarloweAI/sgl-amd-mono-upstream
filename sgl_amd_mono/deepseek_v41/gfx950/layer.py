@@ -59,10 +59,19 @@ from .indexer import compress
 from .stages import engram, index_glue, moe, seam
 from .stages.dims import Dims as StageDims
 from .stages.gemv import plus, token_tiles
-from .stages.moe_shape import EXPERTS, SORT_NETS, TOPK, MoeBuild, route_shape
+from .stages.moe_shape import (
+    EXPERTS,
+    ROW_CTAS,
+    ROW_SLICES,
+    SORT_NETS,
+    TOPK,
+    MoeBuild,
+    route_shape,
+)
 from .token_par import (
     acell_region,
     chunk_pairs,
+    fcell_region,
     half_pair,
     own_view,
     peer_offsets,
@@ -222,9 +231,23 @@ def acell_region_bytes(tp: int) -> int:
     return acell_region(tp, range(1, MAX_TOKENS + 1))[1]
 
 
+# the per-row MoE's widths (``RouteShape.row_moe``): FCELL's
+ROW_WIDTHS = range(1, ROW_CTAS // ROW_SLICES + 1)
+
+
+def fcell_offset(tp: int) -> int:
+    """FCELL's byte offset in a parity's half (``token_par.fcell_region``)."""
+    return fcell_region(tp, range(1, MAX_TOKENS + 1), ROW_WIDTHS)[0]
+
+
+def fcell_region_bytes(tp: int) -> int:
+    """FCELL's bytes in a parity's half (``token_par.fcell_region``)."""
+    return fcell_region(tp, range(1, MAX_TOKENS + 1), ROW_WIDTHS)[1]
+
+
 def peer_half_bytes(tp: int) -> int:
-    """One parity's peer regions (``token_par.peer_layout``), then ACELL."""
-    return sum(acell_region(tp, range(1, MAX_TOKENS + 1)))
+    """One parity's peer regions (``token_par.peer_layout``), then ACELL, then FCELL."""
+    return sum(fcell_region(tp, range(1, MAX_TOKENS + 1), ROW_WIDTHS))
 
 
 def _epoch(epoch):
@@ -1156,6 +1179,7 @@ def run_ffn(
         s, rs, lds.moe.peek(), amb, bases, mlayout, scratch, margs, rank, own
     )
     cb["tag"] = ep & 255
+    cb["fcell_off"] = fcell_offset(tp)
     if const_expr(key.timeline):
         cb["tl"] = ca["tl"]
     for i, region in enumerate(COUNTERS):
