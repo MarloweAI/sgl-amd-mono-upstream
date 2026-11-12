@@ -47,6 +47,7 @@ from sgl_amd_mono.common.ops import (
     rsrc,
     sum_partials,
     uniform,
+    xshfl,
 )
 from sgl_amd_mono.common.plan import (
     BLOCKS,
@@ -73,6 +74,7 @@ from sgl_amd_mono.deepseek_v41.gfx950.stages.gemv import (
     TILE,
     _fp8_step_load,
     _fp8_step_mfma,
+    _gemv_steps,
     gemv_fp8_loads,
     gemv_fp8_mfmas,
     ld_f32,
@@ -562,19 +564,75 @@ def stage_shared(c, task, gops, uops, t0, n):
 
 
 def shared_loads(c, unit, per, i=0, gate=True, up=True):
-    """Shared unit ``unit``'s task i's gate and up weight loads (``gemv_fp8_loads``), or the one of them
-    ``gate`` / ``up`` keep: task ``unit`` at ``per`` 1 (one token tile: the unit's own task, its index
-    taken for each), else task ``unit * per + i``."""
+    """Shared unit ``unit``'s task i's gate and up weight loads (``gemv_fp8_loads``; ``shared_line_loads``
+    for a unit of several tasks), or the one of them ``gate`` / ``up`` keep: task ``unit`` at ``per`` 1
+    (one token tile: the unit's own task, its index taken for each), else task ``unit * per + i``."""
     a, tasks = c["args"], c["d"].shared_tasks
     ops = []
     for half, want in ((0, gate), (tasks, up)):
         if const_expr(want):
             rg = unit % tasks if const_expr(per == 1) else unit * per + i
             row = rg if const_expr(half == 0) else half + rg
-            ops.append(
-                gemv_fp8_loads(c, a["sgu"], a["sgu_s"], HIDDEN, row, row_major=True)
-            )
+            if const_expr(per == 1):
+                ops.append(
+                    gemv_fp8_loads(c, a["sgu"], a["sgu_s"], HIDDEN, row, row_major=True)
+                )
+            else:
+                ops.append(shared_line_loads(c, a["sgu"], a["sgu_s"], HIDDEN, row))
     return ops if len(ops) > 1 else ops[0]
+
+
+def shared_line_loads(c, w, ws, k, rg):
+    """``gemv_fp8_loads``' row-major operands of rows 16 ``rg`` .., as two loads a K step that each read
+    whole 128-byte lines: lane 16 j + p of the first takes row p % 8's 16-byte chunk j (p < 8) or
+    j + 4 (p >= 8), the second the same of row 8 + p % 8. ``gemv_fp8_loads`` reads each line as two
+    halves in two loads, and streams slower. ``line_operands`` moves the chunks to the MFMA lanes."""
+    lane = c["lane"]
+    r_w, r_ws = rsrc(w), rsrc(ws)
+    j, p, kg = lane // 16, lane % 16, k // 32
+    assert k % 128 == 0
+    out = []
+    for st, live in _gemv_steps(c, k, None):
+        assert live is None
+        at = (rg * 16 + p % 8) * (k // 4) + st * 32 + (j + p // 8 * 4) * 4
+        lines = [
+            fx.Vector(
+                bo.buffer_load(
+                    r_w,
+                    at + h * 8 * (k // 4),
+                    vec_width=4,
+                    dtype=T.i32,
+                    cache_modifier=CM_NT,
+                )
+            )
+            for h in range(2)
+        ]
+        wsi = (rg // 2) * kg + fx.min(st * 4 + j, kg - 1)
+        word = fx.Int32(bo.buffer_load(r_ws, wsi // 4, vec_width=1, dtype=T.i32))
+        out.append((lines[0], lines[1], (word >> (wsi % 4 * 8)) & 0xFF))
+    return out
+
+
+def line_operands(c, ops):
+    """``shared_line_loads``' K steps as ``_fp8_step_load``'s (lo, hi, scale): lane 16 j + p (row p) has
+    chunk j of row p (p < 8: the first load's; p >= 8: the second's from lane p - 8) and chunk j + 4
+    (p < 8: the first's from lane p + 8; p >= 8: the second's), one lane swap (``xshfl`` 8) a word."""
+    low = c["lane"] % 16 < 8
+    out = []
+    for a, b, sa in ops:
+        lo, hi = [], []
+        for e in range_constexpr(4):
+            t = xshfl(low.select(b[e], a[e]), 8)
+            lo.append(low.select(a[e], t))
+            hi.append(low.select(t, b[e]))
+        out.append(
+            (
+                fx.Vector.from_elements(lo, fx.Int32),
+                fx.Vector.from_elements(hi, fx.Int32),
+                sa,
+            )
+        )
+    return out
 
 
 @flyc.jit
@@ -587,7 +645,7 @@ def stage_shared_unit(c, unit, per, gops, uops):
     for i in range_constexpr(per):
         task = unit * per + i
         more = i + 1 < per
-        gemv_fp8_mfmas(c, HIDDEN, c["xl"], c["xsl"], red, gops)
+        gemv_fp8_mfmas(c, HIDDEN, c["xl"], c["xsl"], red, line_operands(c, gops))
         gpu.barrier()
         if const_expr(more):
             gops = shared_loads(c, unit, per, i + 1, up=False)
@@ -595,7 +653,7 @@ def stage_shared_unit(c, unit, per, gops, uops):
         if tid < ROWS * s:
             gate = row_sum(red, tid % ROWS, tid // ROWS)
         gpu.barrier()
-        gemv_fp8_mfmas(c, HIDDEN, c["xl"], c["xsl"], red, uops)
+        gemv_fp8_mfmas(c, HIDDEN, c["xl"], c["xsl"], red, line_operands(c, uops))
         gpu.barrier()
         if const_expr(more):
             uops = shared_loads(c, unit, per, i + 1, gate=False)
