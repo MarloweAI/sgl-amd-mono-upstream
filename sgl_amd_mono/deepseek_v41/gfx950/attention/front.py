@@ -839,7 +839,7 @@ def run_front(
                 part if halved else None,
             )  # fmt: skip
 
-        if const_expr(key.tp == 8):
+        if const_expr(key.tp in (4, 8)):
             # a CTA without a tile (the norms', gates', qkv's) goes on to its next stage
             if has_wqkv:
                 wqkv_tile()
