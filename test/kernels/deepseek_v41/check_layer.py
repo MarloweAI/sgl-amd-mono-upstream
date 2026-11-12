@@ -283,6 +283,115 @@ def main():
                     if not same:
                         fails.append(name)
 
+    # the seam move: three layers A, B, C, each layer's attention seam run by the launch
+    # before it (``layer(nxt=)``, ``layer(seamed=True)``), against three plain launches each on
+    # the previous one's outputs; B's mix weights its own, so a launch that takes its own
+    # layer's for the next one's differs
+    k1b = K1Weights(
+        hc_fn=(mw.hc_ffn_fn * 0.75).contiguous(), hc_scale=(mw.hc_ffn_scale * 1.25).contiguous(),
+        hc_base=(mw.hc_ffn_base + 0.125).contiguous(), norm=(mw.ffn_norm * 1.5).contiguous(),
+        cos_sin=cos_sin, **a,
+    )  # fmt: skip
+    chain = (k1w, k1b, k1w)
+
+    def run_chain(M, step, compressed, seam):
+        """The three layers on ``step``: their outputs, B's and C's attention seams' (R_new,
+        mixes), B's capture and the SWA cache."""
+        x, res, post, comb, pre, pos, slot, keys = step
+        cc = comp if compressed else None
+        if not compressed:
+            keys = (*keys[:2], runner.no_topk, runner.no_topk_lens)
+        swa.copy_(swa0)
+        aux = torch.full((M, HIDDEN), SENTINEL, dtype=torch.bfloat16, device=dev)
+        got, ins = [], (x, res, post, comb, pre)
+        for i, w in enumerate(chain):
+            kw = {}
+            if seam and i > 0:
+                ins, kw["seamed"] = (None,) * 5, True
+            if seam and i + 1 < len(chain):
+                kw["nxt"] = chain[i + 1]
+                kw["nxt_aux"] = aux if i == 0 else None
+            outs = runner._outs(M, step[1])
+            for t in outs:
+                t.fill_(SENTINEL)
+            outs = runner.layer(
+                w, aw, mw, *ins, pos, slot, swa, SWA_BLOCK, cc, COMP_BLOCK, keys,
+                outs=outs, aux=aux if (i == 1 and not seam) else None, **kw,
+            )  # fmt: skip
+            mids = [
+                runner.seam_res(runner.seam_state(M), M) if seam and i > 0 else runner.res_mid[:M],
+                runner.post_a[:M], runner.comb_a[:M], runner.pre_a[:M],
+            ]  # fmt: skip
+            # a launch that runs the next seam does not write its MoE output, and a seamed
+            # one's R_new is gone once its tail wrote the next seam's into the same state
+            keep = outs[1:] if seam and i + 1 < len(chain) else outs
+            if seam and 0 < i < len(chain) - 1:
+                mids = mids[1:]
+            got += [t.clone() for t in keep] + [t.clone() for t in mids]
+            ins = outs
+        return got + [aux.clone(), swa.clone()]
+
+    def chain_names(seam):
+        names = []
+        for i in range(len(chain)):
+            outs = ["res", "post", "comb", "pre"]
+            if not (seam and i + 1 < len(chain)):
+                outs = ["out"] + outs
+            mids = ["res_mid", "post_a", "comb_a", "pre_a"]
+            if seam and 0 < i < len(chain) - 1:
+                mids = mids[1:]
+            names += [f"{'ABC'[i]}.{n}" for n in outs + mids]
+        return names + ["aux", "swa"]
+
+    seam_cases = []
+    for M in (int(v) for v in args.widths.split(",")):
+        if not runner.seam_moves(M):
+            continue
+        step = step_inputs(M, tp, rank, dev)
+        for compressed in (True, False):
+            plain = dict(zip(chain_names(False), run_chain(M, step, compressed, False)))
+            moved = dict(zip(chain_names(True), run_chain(M, step, compressed, True)))
+            bad = [
+                n for n, t in moved.items()
+                if not t.view(torch.uint8).equal(plain[n].view(torch.uint8))
+            ]  # fmt: skip
+            name = f"M={M} compressed={compressed} seam move"
+            if rank == 0:
+                print(
+                    f"{name}: {'bitwise' if not bad else 'DIFFERS ' + ' '.join(bad)}",
+                    flush=True,
+                )
+            if bad:
+                fails.append(name)
+            seam_cases.append((M, step, compressed, moved))
+
+    # the seam move's three launches in one graph: bit for bit against eager under replay
+    if seam_cases:
+
+        def seam_all():
+            return [run_chain(M, st, cmp, True) for M, st, cmp, _ in seam_cases]
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            outs_g = seam_all()
+        bad = 0
+        for i in range(args.replays):
+            graph.replay()
+            if i % 10 == 9 or i == args.replays - 1:
+                torch.cuda.synchronize()
+                for got, (_, _, _, want) in zip(outs_g, seam_cases):
+                    bad += sum(
+                        not x.view(torch.uint8).equal(y.view(torch.uint8))
+                        for x, y in zip(got, want.values())
+                    )
+        if rank == 0:
+            print(
+                f"seam move replays: {args.replays}, {bad} mismatching checks",
+                flush=True,
+            )
+        if bad:
+            fails.append("seam move replay")
+
     # every step's layer launch in one graph: bit for bit against eager under replay; the
     # steps share the cache their K1s write, so each pass starts from the same one
     def run_all():
