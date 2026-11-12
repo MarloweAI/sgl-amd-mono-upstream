@@ -623,6 +623,9 @@ def run_k1(key: MonoBuild, sl, front, a: dict, ep, k2=None, early=None):
         # waited for them to land
         qkv_first=QKV0,
         kv_first=KV0,
+        # TP4: a row tile's sums each on one CTA, so no partial crosses CTAs and each
+        # wqkv CTA's wq_b weights go out right past its own GEMV
+        row_halves=tp == 4,
     )
     if const_expr(key.tok_par):
         # K1's outputs hold every row: copy in the rows the other ranks computed
@@ -1295,6 +1298,17 @@ def early_slice(key: MonoBuild) -> bool:
     return key.tp in (4, 8) and not key.tok_par and seam.slice_prefetch_fits(key.tokens)
 
 
+def split_first(key: MonoBuild) -> int:
+    """The first CTA of the attention back's split units in one launch a layer: on TP4,
+    where the front's wqkv row tiles run as row halves, the grid's last CTAs, whose K1
+    half (no seam slice, the norms', gates', qkv's and the CTAs without wqkv) ends first,
+    so their old keys' records go out sooner; else CTA 0."""
+    s = key.tokens
+    if key.tp == 4 and not (key.tok_par or key.eg or key.glue) and wqkv_split(s, s):
+        return BLOCKS - mb_back.back_plan(_back_key(key))[1]
+    return 0
+
+
 def reset_counters(epoch, ep):
     """Clear the MoE counters' slot 128 launches ahead: its last use is long done."""
     slot = (ep + 128) & 255
@@ -1668,12 +1682,20 @@ def run_k2(
         c["k1_words"] = k1_words(layout, key.tok_par or tq)
         c["k1_first"] = k1_first
         c["pre"] = pre
+        split0 = split_first(key)
+        c["split0"] = split0
 
         def k1_seen(unit):
             # every CTA's q flag is in, each stored past its epoch read: move the epoch on
             if unit == 0:
+                # unit 0's CTA: ``split_first``
                 epoch_end(
-                    ctx, epoch, ep, lambda: reset_counters(epoch, ep), marks=False
+                    ctx,
+                    epoch,
+                    ep,
+                    lambda: reset_counters(epoch, ep),
+                    who=split0,
+                    marks=False,
                 )
 
         c["k1_seen"] = k1_seen
@@ -2334,6 +2356,7 @@ def build_mono_layer(key: MonoBuild):
     nchunk, n_split = mb_back.back_plan(_back_key(key))[:2]
     # a split unit a CTA (``back.run_back``), its keys loaded in K1's half
     assert n_split <= BLOCKS
+    SPLIT0 = split_first(key)
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def layer(
@@ -2540,12 +2563,14 @@ def build_mono_layer(key: MonoBuild):
             layout = scratch_layout(s, tp, key.timeline, **route_of(key))
             k2 = layer_handoff(scratch, layout, ep)
             bid = fx.block_idx.x
+            # this CTA's split unit (``split_first``)
+            sunit = bid if SPLIT0 == 0 else first_task(bid, SPLIT0)
             early = mb_back.EarlyKeys(
                 _back_key(key),
                 key.swa_width,
                 a,
-                fx.min(bid, n_split - 1),
-                bid < n_split,
+                fx.min(sunit, n_split - 1),
+                sunit < n_split,
             )
             run_k1(key, lds.seam.peek(), lds.front.peek(), a, ep, k2, early)
             # the K1 half's LDS is free
@@ -2559,20 +2584,20 @@ def build_mono_layer(key: MonoBuild):
                     k2["krdy"],
                     k1_words(layout, True),
                     fx.thread_idx.x,
-                    fx.min(bid, n_split - 1) // nchunk,
+                    fx.min(sunit, n_split - 1) // nchunk,
                     s,
                     Dims(tp),
                     # the waves past the poll's (the keys') issue none
-                    pred=(bid < n_split) & (fx.thread_idx.x < 256),
+                    pred=(sunit < n_split) & (fx.thread_idx.x < 256),
                 )()
             else:
                 first = mb_back.k1_flag_load(
                     k2["krdy"],
                     k1_words(layout, key.tok_par),
                     fx.thread_idx.x,
-                    fx.min(bid, n_split - 1) // nchunk,
+                    fx.min(sunit, n_split - 1) // nchunk,
                     s,
-                    pred=bid < n_split,
+                    pred=sunit < n_split,
                 )()
             pre = early.loads()
             names = [K2_OF_LAYER.get(n, n) for n in K2_ARGS]
