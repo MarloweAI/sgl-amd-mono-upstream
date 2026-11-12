@@ -7,7 +7,7 @@ One launch a layer and rank runs split (flash-decoding over a chunk of a token's
 keys from K1's key table, every head of the rank), combine (the chunks merged with
 the sink, inverse GPT-J RoPE -> bf16 XO), wo_a (-> MXFP8 X8B) and wo_b (-> the
 caller's hook); the stages hand off device-scope data behind tagged flags, and on
-TP8 wo_a's X8B as tagged 16-B words (``plan.tagged_x8b``).
+TP4 and TP8 wo_a's X8B as tagged 16-B words (``plan.tagged_x8b``).
 """
 
 import flydsl.compiler as flyc
