@@ -751,15 +751,24 @@ def run_front(
         def kflag(u):
             return WQKV_KPARTS * u + part if own_half else u
 
-        await_flags(c, c["xrdy"], nflags, kflag)
-        regs = x_loads(t0, n, parts)
-        x_store(regs, n, parts)
-        accs = stage_wqkv(c, kops, slots, n, halves)
-        wqkv_publish(
-            c, task, accs, slots, order, t0, n, has_wqkv, part if split else None, s
-        )
-        if has_wqkv:
-            bops = wqb_weights()
+        def wqkv_tile():
+            await_flags(c, c["xrdy"], nflags, kflag)
+            regs = x_loads(t0, n, parts)
+            x_store(regs, n, parts)
+            accs = stage_wqkv(c, kops, slots, n, halves)
+            wqkv_publish(
+                c, task, accs, slots, order, t0, n, has_wqkv, part if split else None, s
+            )
+
+        if const_expr(key.tp == 8):
+            # a CTA without a tile (the norms', gates', qkv's) goes on to its next stage
+            if has_wqkv:
+                wqkv_tile()
+                bops = wqb_weights()
+        else:
+            wqkv_tile()
+            if has_wqkv:
+                bops = wqb_weights()
     else:
         # wqkv_a: this CTA's tiles of its row tile, each on its own tokens' flags
         for ti in range_constexpr(len(wtiles)):
