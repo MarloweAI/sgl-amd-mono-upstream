@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""A sampled DSpark draft's Markov block in two launches a step and one more for its step
-logits (``gfx950/markov``), offered through SGLang's draft sampler entry where the
+"""A sampled DSpark draft's Markov block, its step logits included, in one launch
+(``gfx950/markov``), offered through SGLang's draft sampler entry where the
 draft's Markov head and step logits have the layout the kernels read. The step logits are
 SGLang's whole rows: a sampled sequence's are gathered from every rank's shard, a
 temperature-0 sequence's stay as SGLang's buffer holds them.
@@ -88,6 +88,8 @@ def _why_not(model, step_logits) -> str | None:
     part = int(model.lm_head.num_embeddings_per_partition)
     if step_logits is None or step_logits.dtype != torch.float32:
         return "no fp32 step logits"
+    if step_logits.shape[1] > markov.MAX_STEPS:
+        return f"{step_logits.shape[1]} draft steps, the kernel's at most {markov.MAX_STEPS}"
     if step_logits.shape[-1] != head.vocab_size:
         return f"step logits {step_logits.shape[-1]} wide, not the vocab's {head.vocab_size}"
     if shard.org_vocab_start != group.rank_in_group * part or part % 4:
@@ -112,13 +114,6 @@ class _Sampler:
         assert self.head.is_contiguous()
         device = self.head.device
         self.width = int(model.lm_head.num_embeddings_per_partition)
-        self.part = torch.empty(
-            markov.MAX_SEQUENCES,
-            markov.blocks(self.width),
-            2,
-            dtype=torch.float32,
-            device=device,
-        )
         self.exchange = markov.Exchange(
             group.cpu_group,
             group.rank_in_group,
@@ -133,20 +128,12 @@ class _Sampler:
         """Every step of a [bs, gamma, padded] base logits block: tokens to ``out``
         ([bs * gamma]), the sampled sequences' step logits to ``step_logits``
         ([bs, gamma, vocab])."""
-        from sgl_amd_mono.deepseek_v41.gfx950 import markov
-
-        x, bs = self.exchange, base_logits.shape[0]
-        for s in range(self.gamma):
-            self.ops.markov_sample_step(
-                base_logits[:, s], self.embed, self.head, anchor, x.slab[:bs, s], temps,
-                noise.offset, int(noise.key), self.vocab_start, s, self.part, out,
-                self.gamma, x.tok, x.calls, x.peers, x.rank, s == self.gamma - 1,
-                self.deadline_s,
-            )  # fmt: skip
-        # the last step's swap saw every rank's packet: their step logits are written
-        self.ops.markov_gather(
-            step_logits, temps, x.peers, markov.EXCHANGE_BYTES, self.width
-        )
+        x = self.exchange
+        self.ops.markov_block(
+            base_logits, self.embed, self.head, anchor, temps, noise.offset,
+            int(noise.key), self.vocab_start, out, self.gamma, x.tok, x.control, x.peers,
+            x.rank, step_logits, self.width, self.deadline_s,
+        )  # fmt: skip
 
     def step(self, hidden_states, anchor_tokens):
         """SGLang's base logits and Markov block of a bs-row draft block."""

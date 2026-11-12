@@ -15,7 +15,7 @@ import flydsl.expr as fx
 from sgl_amd_mono.common.plan import pair_layout
 
 from .attention.plan import DATA, Q_RANK
-from .stages.seam import HC, HIDDEN, acell_cells
+from .stages.seam import HC, HIDDEN, acell_cells, ffn_cells
 
 # below this many rows the gathers' extra hop costs more than a rank's few rows save (ROCm/ATOM)
 TOKEN_PAR_FROM = 12
@@ -88,6 +88,14 @@ def acell_region(tp: int, widths) -> tuple[int, int]:
     set marks."""
     end = max(o + n for s in widths for o, n in peer_layout(s, tp).values())
     return -(-end // LINE) * LINE, max(acell_cells(s, tp) for s in widths) * 8
+
+
+def fcell_region(tp: int, widths, row_widths) -> tuple[int, int]:
+    """FCELL, the per-row MoE's down sums as cells (``seam.ffn_cell``) at ``row_widths``:
+    (byte offset, bytes) in a parity's half, past ACELL; a region of its own for the reason
+    ACELL has one."""
+    off, n = acell_region(tp, widths)
+    return -(-(off + n) // LINE) * LINE, max(ffn_cells(s, tp) for s in row_widths) * 8
 
 
 def peer_offsets(s: int, tp: int) -> dict[str, int]:

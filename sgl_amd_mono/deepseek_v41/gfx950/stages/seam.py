@@ -21,6 +21,7 @@ from sgl_amd_mono.common.ops import (
     CM_DEV,
     CM_SYS,
     batched_rounds,
+    bf16_pair,
     bf16_round,
     bf_hi,
     bf_lo,
@@ -115,6 +116,42 @@ def acell_cells(s: int, tp: int) -> int:
 def attn_cell(src, task, s, t0, u):
     """Cell u of wo_b ``task`` on the token tile from row t0, from rank ``src``."""
     return (src * WOB_TASKS + task) * cells_task(s) + t0 // TILE * cells_tile(TILE) + u
+
+
+# ---------------------------------------------------------------- FFN cells
+# The per-row MoE's down sums cross as cells too: [source rank][row][hidden / 4], four bf16
+# values a cell, empty as ATTN's (the reader stores them back to empty).
+def ffn_cells(s: int, tp: int) -> int:
+    """FCELL's cells."""
+    return tp * s * HIDDEN // CELL_VALUES
+
+
+def ffn_cell(src, t, s, col):
+    """The cell of rank ``src``'s down sums of row t at hidden column ``col`` (a multiple of 4)."""
+    return (src * s + t) * (HIDDEN // CELL_VALUES) + col // CELL_VALUES
+
+
+def cell_words(vs):
+    """Four values as a cell's two words, never an empty word: a pair of bf16 0xFFFF NaNs
+    goes out as 0xFFFE, 0xFFFF."""
+    ws = []
+    for k in range_constexpr(2):
+        w = bf16_pair(vs[2 * k], vs[2 * k + 1]).bitcast(fx.Int32)
+        ws.append((w == CELL_EMPTY).select(fx.Int32(CELL_EMPTY - 1), w))
+    return fx.Vector.from_elements(ws, fx.Int32)
+
+
+def sum_cells(addr, cells):
+    """Poll the TP ranks' cells at ``addr`` and sum each of the four values in fp32 in rank
+    order."""
+    ws = poll_cells(addr, cells)
+    out = []
+    for i in range_constexpr(CELL_VALUES):
+        acc = cell_value(ws[0], i)
+        for src in range_constexpr(1, len(cells)):
+            acc = acc + cell_value(ws[src], i)
+        out.append(acc)
+    return out
 
 
 def sigmoid(z):
@@ -499,14 +536,17 @@ def stage_norm(c, t, store):
 @flyc.jit
 def stage_reduce(c, task):
     """Sum the TP ranks' attention partials at this slice's 32 columns in rank order into
-    ``pend_lds``: K2's cells (``c["acell"]``) or the tagged pairs."""
+    ``pend_lds``: K2's cells (``c["acell"]``) or the tagged pairs. ``c["cell0"]``: the cells'
+    first thread, a wave that pushed no wo_b cells (their reset then waits for
+    ``reset_attn_cells``)."""
     s, tid = c["S"], c["tid"]
+    first = c.get("cell0", 0)
     if const_expr(c.get("acell") is not None):
         units, reduce_unit = 2 * cells_task(s), reduce_attn_cell
     else:
         units, reduce_unit = s * COLS // 2, reduce_attn_pair
-    if const_expr(units <= THREADS):
-        reduce_unit(c, task, tid)
+    if const_expr(units <= THREADS - first):
+        reduce_unit(c, task, tid - first)
     else:
         # past one pass a traced loop: one pass's polls in flight at a time, not every pass's
         for pas in range(0, units, THREADS):
@@ -537,18 +577,21 @@ def reduce_attn_pair(c, task, idx):
 @flyc.jit
 def reduce_attn_cell(c, task, idx):
     """Thread ``idx``'s cell of the slice's two wo_b tasks: every rank's cell, once written,
-    summed value by value in rank order into ``pend_lds``; then the cells emptied."""
+    summed value by value in rank order into ``pend_lds``; then the cells emptied (with
+    ``c["cell0"]``, by ``reset_attn_cells``)."""
     s, tp, pend, acell = c["S"], c["d"].tp, c["pend_lds"], c["acell"]
     per = cells_task(s)
     full = cells_tile(TILE)
-    if idx < 2 * per:
+    first = c.get("cell0", 0)
+    live = idx < 2 * per
+    if const_expr(first > 0):
+        live = (idx >= 0) & live
+    if live:
         j = idx // per
         at = idx % per  # the cell in the task's block: its tile, then the tile's cell
         tile = at // full
         u = at - tile * full
-        cells = [
-            attn_cell(src, COLS // ROWS * task + j, s, 0, 0) + at for src in range(tp)
-        ]
+        cells = slice_cells(c, task, idx)
         ws = poll_cells(acell, cells)
         for i in range_constexpr(CELL_VALUES):
             acc = cell_value(ws[0], i)
@@ -557,9 +600,32 @@ def reduce_attn_cell(c, task, idx):
             v = CELL_VALUES * u + i
             at_lds = pend + ((tile * TILE + v // ROWS) * COLS + j * ROWS + v % ROWS)
             fx.ptr_store(bf16_round(acc), at_lds)
-        empty = fx.Vector.from_elements([fx.Int32(CELL_EMPTY)] * 2, fx.Int32)
-        for src in range_constexpr(tp):
-            bo.buffer_store(empty, rsrc(acell), cells[src] * 2, cache_modifier=CM_SYS)
+        if const_expr(first == 0):
+            empty_cells(acell, cells)
+
+
+def slice_cells(c, task, idx):
+    """Thread ``idx``'s cell of the slice's two wo_b tasks, from every rank."""
+    per = cells_task(c["S"])
+    return [
+        attn_cell(src, COLS // ROWS * task + idx // per, c["S"], 0, 0) + idx % per
+        for src in range(c["d"].tp)
+    ]
+
+
+def empty_cells(addr, cells):
+    """Store the cells at ``addr`` back to empty, once read."""
+    empty = fx.Vector.from_elements([fx.Int32(CELL_EMPTY)] * 2, fx.Int32)
+    for at in cells:
+        bo.buffer_store(empty, rsrc(addr), at * 2, cache_modifier=CM_SYS)
+
+
+@flyc.jit
+def reset_attn_cells(c, task):
+    """``stage_reduce``'s cells back to empty, past the slice (``c["cell0"]``)."""
+    idx = c["tid"] - c["cell0"]
+    if (idx >= 0) & (idx < 2 * cells_task(c["S"])):
+        empty_cells(c["acell"], slice_cells(c, task, idx))
 
 
 def cell_value(w, i):

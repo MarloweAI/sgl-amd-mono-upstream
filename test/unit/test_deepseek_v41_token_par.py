@@ -8,6 +8,7 @@ from sgl_amd_mono.deepseek_v41.gfx950.token_par import (
     LINE,
     acell_region,
     chunk_pairs,
+    fcell_region,
     half_pair,
     peer_layout,
 )
@@ -46,3 +47,13 @@ def test_cells_overlap_no_region(tp):
     assert off % LINE == 0 and size > 0
     for s in WIDTHS:
         assert all(o + n <= off for o, n in peer_layout(s, tp).values())
+
+
+@pytest.mark.parametrize("tp", [2, 4, 8])
+def test_ffn_cells_follow_the_attention_cells(tp):
+    # the per-row MoE's cells read any word in their region as a mark too: past ACELL
+    a_off, a_size = acell_region(tp, WIDTHS)
+    off, size = fcell_region(tp, WIDTHS, range(1, 7))
+    assert (
+        off % LINE == 0 and off >= a_off + a_size and size == tp * 6 * HIDDEN // 4 * 8
+    )

@@ -171,6 +171,24 @@ def mx_region(scratch, layout, name, rows, cols):
     )
 
 
+def x8b_tagged(scratch, layout, rows, cols):
+    """X8B handed to wo_b as tagged 16-B words (``plan.tagged_x8b``: three a (row, wo_a task), its
+    32 e4m3 as 12 + 12 + 8 bytes and the E8M0 code in the last), dequantized as ``mx_region``."""
+    tasks = cols // 32
+    off = layout["x8t"][0]
+    w = (
+        scratch[off : off + rows * tasks * 3 * 16]
+        .view(torch.int32)
+        .view(rows, tasks, 3, 4)
+    )
+    data = torch.cat(
+        [w[:, :, 0, :3], w[:, :, 1, :3], w[:, :, 2, :2]], dim=2
+    ).contiguous()
+    q = data.view(torch.float8_e4m3fn).view(rows, tasks, 32).float()
+    code = w[:, :, 2, 2]
+    return (q * torch.exp2(code.float() - 127)[..., None]).view(rows, cols)
+
+
 def k2_timeline(M, tl) -> str:
     """Every mark K2 passed (the back's 0 .., the FFN's 16 ..) in median order, in µs."""
     marks = [k for k in range(28) if bool((tl[:, k] != 0).all())]
@@ -291,7 +309,10 @@ def main():
         xo_ref = attention_xo(q, swa_keys, comp_keys, lists, sink, pos, cos_sin)
         row_cos = F.cosine_similarity(xo[live], xo_ref[live], dim=1)
         # X8B: wo_a of K2's own XO
-        x8b = mx_region(sc, lay, "x8b", M, o_rows)
+        if "x8t" in lay:
+            x8b = x8b_tagged(sc, lay, M, o_rows)
+        else:
+            x8b = mx_region(sc, lay, "x8b", M, o_rows)
         wa = deq_fp8_block(*woa).reshape(d.groups, O_RANK, -1)
         ya = torch.einsum("tgk,grk->tgr", xo.view(M, d.groups, -1), wa)
         x8b_ref = mxfp8_qdq(ya.bfloat16().float().reshape(M, -1), "vllm")

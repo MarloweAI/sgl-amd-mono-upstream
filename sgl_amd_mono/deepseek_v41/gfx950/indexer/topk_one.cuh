@@ -11,6 +11,10 @@
 // split floor take SGLang's one-block path. The row placement relies on that round-robin dispatch,
 // and the launch checks it: every CTA reports its rank on its XCC, and one more CTA traps unless
 // every XCC holds each rank exactly once; a barrier that never completes traps too.
+//
+// A candidate producer selects twice from one scoring pass: its top 512 columns and its top 2048
+// 8-column blocks. The two are independent, so `topk_pair` runs both in one launch, each row's
+// columns on ranks 0-9 of its XCC and its blocks on ranks 10-19, with workspace rows of their own.
 #include <deepseek_v4/topk_v2.cuh>
 
 namespace sglang {
@@ -19,6 +23,7 @@ namespace topk_one {
 constexpr uint32_t kSplit = 10;  // CTAs a long row; kXcc of them a dispatch round
 constexpr uint32_t kXcc = 8;
 constexpr uint32_t kMaxRows = kXcc;
+constexpr uint32_t kMaxProblems = 2;  // topk_pair's columns and blocks
 constexpr uint32_t kRanks = (1u << kSplit) - 1u;
 constexpr uint32_t kSpinLimit = 1u << 20;
 
@@ -39,10 +44,10 @@ struct alignas(128) Presence {
 static_assert(sizeof(Presence) == 128);
 
 struct Workspace {
-  uint32_t* __restrict__ hist;        // [kMaxRows][kHistSize], left zeroed
-  Counters* __restrict__ ctr;         // [kMaxRows]
+  uint32_t* __restrict__ hist;        // [kMaxProblems * kMaxRows][kHistSize], left zeroed
+  Counters* __restrict__ ctr;         // [kMaxProblems * kMaxRows]
   Presence* __restrict__ presence;    // [kXcc], after ctr's rows
-  impl::TieValue* __restrict__ ties;  // [kMaxRows][kMaxNumTie]
+  impl::TieValue* __restrict__ ties;  // [kMaxProblems * kMaxRows][kMaxNumTie]
   uint32_t floor;
 };
 
@@ -66,13 +71,14 @@ SGL_DEVICE void l2_zero(uint32_t* p) {
 SGL_DEVICE void present(Presence* p, uint32_t xcc, uint32_t rank) {
   __hip_atomic_fetch_add(&p[xcc].ranks, 1u << rank, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 }
-/// The checker CTA, a lane an XCC: wait until every XCC holds each rank once, then zero the words
-/// for the next launch. The CTAs report as they start, so this ends before the rows do.
-SGL_DEVICE void check_presence(Presence* p) {
+/// The checker CTA, a lane an XCC: wait until every XCC holds each of the launch's ranks once
+/// (`all`, a bit a rank), then zero the words for the next launch. The CTAs report as they start,
+/// so this ends before the rows do.
+SGL_DEVICE void check_presence(Presence* p, uint32_t all) {
   const auto tx = threadIdx.x;
   if (tx < kXcc) {
     uint32_t spins = 0;
-    while (__hip_atomic_load(&p[tx].ranks, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) != kRanks) {
+    while (__hip_atomic_load(&p[tx].ranks, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) != all) {
       __builtin_amdgcn_s_sleep(1);
       if (++spins == kSpinLimit) __builtin_trap();
     }
@@ -248,41 +254,36 @@ struct Split : TopKSplit {
   }
 };
 
-TOPK_KERNEL void topk_one(const __grid_constant__ TopKPagedParams params, const Workspace ws) {
-  constexpr auto kMode = TopKMode::DUAL_OUTPUT;
-  device::enable_smem_spilling();
-  if (blockIdx.x == kXcc * kSplit) return check_presence(ws.presence);
-  uint32_t xcc;
-  asm volatile("s_getreg_b32 %0, hwreg(HW_REG_XCC_ID)" : "=s"(xcc));
-  const uint32_t row = xcc & 15u;
-  const uint32_t rank = blockIdx.x / kXcc;
-  if (row >= kXcc) __builtin_trap();
-  if (threadIdx.x == 0) present(ws.presence, row, rank);
-  if (row >= params.batch_size) return;
+/// One row's top-k on its XCC: `slot` is its workspace row, `rank` its CTA among the row's kSplit.
+template <TopKMode kMode>
+SGL_DEVICE void run(const TopKPagedParams& params, const Workspace& ws, uint32_t row, uint32_t slot, uint32_t rank) {
+  constexpr bool kStaged = kMode != TopKMode::INDICES;
   auto problem = params.problem(row);
   __shared__ impl::MaxSmem<Register4::Smem, Streaming::Smem, TopKSplit::Smem> smem;
 
   if (problem.seq_len <= ws.floor) {  // topk_split_select's one-block path
     if (rank != 0) return;
-    __shared__ int32_t s_topk_indices[kMaxTopK];
+    __shared__ int32_t s_topk_indices[kStaged ? kMaxTopK : 1];
     if (problem.seq_len <= problem.topk) {
       return trivial_transform<false, kMode>(problem, params.template get_transform<kMode>(row));
     }
-    problem.out = s_topk_indices;
+    if constexpr (kStaged) problem.out = s_topk_indices;
     if (problem.seq_len <= kReg4MaxSeqLen) {
       Register4::forward<false>(problem, &smem);
     } else {
       Streaming::forward<false>(problem, &smem);
     }
-    __syncthreads();
-    paged_transform<kMode>(problem, params.get_output_ptr(row), params.template get_transform<kMode>(row));
+    if constexpr (kStaged) {
+      __syncthreads();
+      paged_transform<kMode>(problem, params.get_output_ptr(row), params.template get_transform<kMode>(row));
+    }
     return;
   }
 
   auto* const sm = reinterpret_cast<Split::Smem*>(&smem);
-  auto* const ctr = &ws.ctr[row];
-  auto* const ties = ws.ties + static_cast<size_t>(row) * TopKSplit::kMaxNumTie;
-  auto* const row_hist = ws.hist + static_cast<size_t>(row) * TopKSplit::kHistSize;
+  auto* const ctr = &ws.ctr[slot];
+  auto* const ties = ws.ties + static_cast<size_t>(slot) * TopKSplit::kMaxNumTie;
+  auto* const row_hist = ws.hist + static_cast<size_t>(slot) * TopKSplit::kHistSize;
   const auto chunk = TopKSplit::chunk_of(problem.seq_len, rank, kSplit);
 
   if (threadIdx.x == 0) l2_or(&ctr->ranks, 1u << rank);
@@ -292,14 +293,102 @@ TOPK_KERNEL void topk_one(const __grid_constant__ TopKPagedParams params, const 
   if (!Split::arrive_last(ctr, sm)) return;
   Split::clear_row(row_hist);
   Split::finish_ties(problem, ties, sm);
-  drain();
-  __syncthreads();
-  Split::transform(problem, params.template get_transform<kMode>(row));
+  if constexpr (kStaged) {
+    drain();
+    __syncthreads();
+    Split::transform(problem, params.template get_transform<kMode>(row));
+  }
+}
+
+/// This CTA's XCC (its row) and its rank on that XCC, reported for the checker.
+SGL_DEVICE uint32_t xcc_row(const Workspace& ws, uint32_t rank) {
+  uint32_t xcc;
+  asm volatile("s_getreg_b32 %0, hwreg(HW_REG_XCC_ID)" : "=s"(xcc));
+  const uint32_t row = xcc & 15u;
+  if (row >= kXcc) __builtin_trap();
+  if (threadIdx.x == 0) present(ws.presence, row, rank);
+  return row;
+}
+
+TOPK_KERNEL void topk_one(const __grid_constant__ TopKPagedParams params, const Workspace ws) {
+  device::enable_smem_spilling();
+  if (blockIdx.x == kXcc * kSplit) return check_presence(ws.presence, kRanks);
+  const uint32_t rank = blockIdx.x / kXcc;
+  const uint32_t row = xcc_row(ws, rank);
+  if (row >= params.batch_size) return;
+  run<TopKMode::DUAL_OUTPUT>(params, ws, row, row, rank);
+}
+
+/// `cols` (both outputs) on each XCC's ranks 0 to kSplit - 1, `blocks` (indices only) on the next kSplit.
+TOPK_KERNEL void topk_pair(
+    const __grid_constant__ TopKPagedParams cols, const __grid_constant__ TopKPagedParams blocks, const Workspace ws) {
+  device::enable_smem_spilling();
+  if (blockIdx.x == kXcc * kSplit * 2) return check_presence(ws.presence, (1u << (2 * kSplit)) - 1u);
+  const uint32_t rank = blockIdx.x / kXcc;
+  const uint32_t row = xcc_row(ws, rank);
+  if (row >= cols.batch_size) return;
+  if (rank < kSplit) return run<TopKMode::DUAL_OUTPUT>(cols, ws, row, row, rank);
+  run<TopKMode::INDICES>(blocks, ws, row, kMaxRows + row, rank - kSplit);
 }
 
 }  // namespace topk_one
 
 struct TopKOne {
+  /// SGLang's paged top-k parameters for `scores` [rows, width] into `page_out` [rows, k] (and
+  /// `raw_out` when given); no page table when `page_table` is empty.
+  static TopKPagedParams params_of(
+      const tvm::ffi::TensorView scores,
+      const tvm::ffi::TensorView seq_lens,
+      const int32_t* page_table,
+      int64_t page_table_stride,
+      const tvm::ffi::TensorView page_out,
+      int32_t* raw_out,
+      const int64_t page_size) {
+    using namespace host;
+    const auto B = static_cast<uint32_t>(scores.size(0));
+    const auto topk = static_cast<uint32_t>(page_out.size(1));
+    RuntimeCheck(B > 0 && B <= topk_one::kMaxRows, "the one-launch top-k takes 1 to 8 rows");
+    RuntimeCheck(topk > 0 && topk <= kMaxTopK, "topk must be in (0, 2048]");
+    RuntimeCheck(scores.stride(0) % 4 == 0, "score rows must be 16-byte aligned");
+    RuntimeCheck(page_size > 0 && std::has_single_bit(static_cast<uint64_t>(page_size)), "page_size must be a power of 2");
+    return TopKPagedParams{
+        .scores = static_cast<const float*>(scores.data_ptr()),
+        .seq_lens = static_cast<const int32_t*>(seq_lens.data_ptr()),
+        .page_table = page_table,
+        .page_indices = static_cast<int32_t*>(page_out.data_ptr()),
+        .raw_indices = raw_out,
+        .metadata = nullptr,
+        .score_stride = scores.stride(0),
+        .page_table_stride = page_table_stride,
+        .topk = topk,
+        .page_bits = static_cast<uint32_t>(std::countr_zero(static_cast<uint64_t>(page_size))),
+        .static_cluster_floor = 0,
+        .batch_size = B,
+        .out_stride = static_cast<int64_t>(topk),
+        .token_seq_lens = nullptr,
+        .out_offsets = nullptr,
+        .pool_bits = 0,
+        .out_cols = topk,
+    };
+  }
+
+  static topk_one::Workspace workspace_of(
+      const tvm::ffi::TensorView hist, const tvm::ffi::TensorView ctr, const tvm::ffi::TensorView ties, uint32_t rows) {
+    using namespace host;
+    constexpr auto kSlots = topk_one::kMaxProblems * topk_one::kMaxRows;
+    RuntimeCheck(
+        hist.size(0) == kSlots * TopKSplit::kHistSize && ctr.size(0) == (kSlots + topk_one::kXcc) * 32 &&
+            ties.size(0) == kSlots * TopKSplit::kMaxNumTie * 2,
+        "workspace shape");
+    return topk_one::Workspace{
+        .hist = static_cast<uint32_t*>(hist.data_ptr()),
+        .ctr = static_cast<topk_one::Counters*>(ctr.data_ptr()),
+        .presence = reinterpret_cast<topk_one::Presence*>(static_cast<topk_one::Counters*>(ctr.data_ptr()) + kSlots),
+        .ties = static_cast<impl::TieValue*>(ties.data_ptr()),
+        .floor = split_floor(rows),
+    };
+  }
+
   /// `page_out` / `raw_out` [rows, k] of SGLang's `topk_transform_paged` (both outputs) for at most
   /// kMaxRows rows; `hist`, `ctr`, `ties`: the module's zeroed workspace.
   static void transform_paged(
@@ -313,46 +402,42 @@ struct TopKOne {
       const tvm::ffi::TensorView ctr,
       const tvm::ffi::TensorView ties) {
     using namespace host;
-    const auto B = static_cast<uint32_t>(scores.size(0));
-    const auto topk = static_cast<uint32_t>(page_out.size(1));
-    RuntimeCheck(B > 0 && B <= topk_one::kMaxRows, "the one-launch top-k takes 1 to 8 rows");
-    RuntimeCheck(topk > 0 && topk <= kMaxTopK, "topk must be in (0, 2048]");
-    RuntimeCheck(scores.stride(0) % 4 == 0, "score rows must be 16-byte aligned");
-    RuntimeCheck(page_size > 0 && std::has_single_bit(static_cast<uint64_t>(page_size)), "page_size must be a power of 2");
-    RuntimeCheck(
-        hist.size(0) == topk_one::kMaxRows * TopKSplit::kHistSize && ctr.size(0) == (topk_one::kMaxRows + topk_one::kXcc) * 32 &&
-            ties.size(0) == topk_one::kMaxRows * TopKSplit::kMaxNumTie * 2,
-        "workspace shape");
-    const auto params = TopKPagedParams{
-        .scores = static_cast<const float*>(scores.data_ptr()),
-        .seq_lens = static_cast<const int32_t*>(seq_lens.data_ptr()),
-        .page_table = static_cast<const int32_t*>(page_table.data_ptr()),
-        .page_indices = static_cast<int32_t*>(page_out.data_ptr()),
-        .raw_indices = static_cast<int32_t*>(raw_out.data_ptr()),
-        .metadata = nullptr,
-        .score_stride = scores.stride(0),
-        .page_table_stride = page_table.stride(0),
-        .topk = topk,
-        .page_bits = static_cast<uint32_t>(std::countr_zero(static_cast<uint64_t>(page_size))),
-        .static_cluster_floor = 0,
-        .batch_size = B,
-        .out_stride = static_cast<int64_t>(topk),
-        .token_seq_lens = nullptr,
-        .out_offsets = nullptr,
-        .pool_bits = 0,
-        .out_cols = topk,
-    };
-    const auto ws = topk_one::Workspace{
-        .hist = static_cast<uint32_t*>(hist.data_ptr()),
-        .ctr = static_cast<topk_one::Counters*>(ctr.data_ptr()),
-        .presence = reinterpret_cast<topk_one::Presence*>(static_cast<topk_one::Counters*>(ctr.data_ptr()) + topk_one::kMaxRows),
-        .ties = static_cast<impl::TieValue*>(ties.data_ptr()),
-        .floor = split_floor(B),
-    };
+    const auto params = params_of(
+        scores, seq_lens, static_cast<const int32_t*>(page_table.data_ptr()), page_table.stride(0), page_out,
+        static_cast<int32_t*>(raw_out.data_ptr()), page_size);
+    const auto ws = workspace_of(hist, ctr, ties, params.batch_size);
     // a dispatch round of kXcc CTAs a rank, and the checker
     LaunchKernel(topk_one::kXcc * topk_one::kSplit + 1, kBlockSize, scores.device())
         .config({.use_pdl = false})
         .launch(topk_one::topk_one, params, ws);
+  }
+
+  /// `transform_paged` of the columns, and in the same launch the top-k indices of `block_scores`
+  /// [rows, blocks] (bounds `block_lens`) into `block_out` [rows, k2]: SGLang's
+  /// `topk_transform_paged` without a page table.
+  static void transform_paged_pair(
+      const tvm::ffi::TensorView scores,
+      const tvm::ffi::TensorView seq_lens,
+      const tvm::ffi::TensorView page_table,
+      const tvm::ffi::TensorView page_out,
+      const tvm::ffi::TensorView raw_out,
+      const int64_t page_size,
+      const tvm::ffi::TensorView block_scores,
+      const tvm::ffi::TensorView block_lens,
+      const tvm::ffi::TensorView block_out,
+      const tvm::ffi::TensorView hist,
+      const tvm::ffi::TensorView ctr,
+      const tvm::ffi::TensorView ties) {
+    using namespace host;
+    const auto cols = params_of(
+        scores, seq_lens, static_cast<const int32_t*>(page_table.data_ptr()), page_table.stride(0), page_out,
+        static_cast<int32_t*>(raw_out.data_ptr()), page_size);
+    const auto blocks = params_of(block_scores, block_lens, nullptr, 0, block_out, nullptr, 1);
+    RuntimeCheck(blocks.batch_size == cols.batch_size, "the pair's selections take the same rows");
+    const auto ws = workspace_of(hist, ctr, ties, cols.batch_size);
+    LaunchKernel(topk_one::kXcc * topk_one::kSplit * 2 + 1, kBlockSize, scores.device())
+        .config({.use_pdl = false})
+        .launch(topk_one::topk_pair, cols, blocks, ws);
   }
 };
 

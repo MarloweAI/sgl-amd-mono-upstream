@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The DSpark draft's sampled Markov steps on gfx950 (``markov.hip``): a step's bias
-GEMV, scores, Gumbel-max pick and the ranks' bests swapped in two launches, every
-rank's token alike without a collective; after a block, the sampled sequences' step
-logits gathered whole from every rank's shard in one launch."""
+"""The DSpark draft's sampled Markov block on gfx950 (``markov.hip``) in one launch: each
+step's bias GEMV, scores, Gumbel-max pick and the ranks' bests swapped through peer
+buffers, every rank's token alike without a collective; after the last step, the sampled
+sequences' step logits gathered whole from every rank's shard."""
 
 from __future__ import annotations
 
@@ -14,9 +14,13 @@ import torch
 _HERE = Path(__file__).resolve().parent
 DIM = 256  # the Markov rank the kernels hold in registers
 MAX_SEQUENCES = 4
-BLOCK_ROWS = 64
-# a sequence's 16 packet slots of 16 B (markov.hip's SLOTS); the rank's step logits follow
-EXCHANGE_BYTES = MAX_SEQUENCES * 16 * 16
+MAX_STEPS = 8
+MAX_TP = 8
+MAX_BLOCKS = 256
+BLOCK_ROWS = 256
+# every block's step record, 8 B each [launch parity][step][sequence][source rank][block]; the rank's step
+# logits follow
+EXCHANGE_BYTES = 2 * MAX_STEPS * MAX_SEQUENCES * MAX_TP * MAX_BLOCKS * 8
 
 
 @functools.cache
@@ -30,10 +34,10 @@ def ops():
 
 class Exchange:
     """One TP group's exchange: every rank's buffer address (int64 on the host), the
-    per-sequence call counters and last tokens, and this rank's step logits
-    (``slab``, [MAX_SEQUENCES, gamma, part] f32, which every rank reads at
-    ``EXCHANGE_BYTES`` past its peers' addresses). Collective: every rank builds it
-    together, ``group`` the gloo group."""
+    launch count of each block (``control``), the last tokens, and this rank's step logits (``slab``,
+    [MAX_SEQUENCES, gamma, part] f32, which every rank reads at ``EXCHANGE_BYTES``
+    past its peers' addresses). Collective: every rank builds it together, ``group``
+    the gloo group."""
 
     def __init__(
         self, group, rank: int, size: int, device: torch.device, gamma: int, part: int
@@ -50,7 +54,7 @@ class Exchange:
             .view(MAX_SEQUENCES, gamma, part)
         )
         self.peers = self._buffer.addresses.cpu()
-        self.calls = torch.zeros(MAX_SEQUENCES, dtype=torch.int32, device=device)
+        self.control = torch.zeros(blocks(part), dtype=torch.int32, device=device)
         self.tok = torch.zeros(MAX_SEQUENCES, dtype=torch.int64, device=device)
 
     def close(self) -> None:

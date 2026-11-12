@@ -49,20 +49,33 @@ from .attention import front as mb_front
 from .attention import index_query
 from .attention.plan import (
     WINDOW,
+    WORD,
     WQKV_TASKS,
     Dims,
     back_scratch,
     front_scratch,
+    q_words,
+    tagged_q_split,
+    tagged_x8b,
     wqkv_split,
 )
 from .indexer import compress
 from .stages import engram, index_glue, moe, seam
 from .stages.dims import Dims as StageDims
 from .stages.gemv import plus, token_tiles
-from .stages.moe_shape import EXPERTS, SORT_NETS, TOPK, MoeBuild, route_shape
+from .stages.moe_shape import (
+    EXPERTS,
+    ROW_CTAS,
+    ROW_SLICES,
+    SORT_NETS,
+    TOPK,
+    MoeBuild,
+    route_shape,
+)
 from .token_par import (
     acell_region,
     chunk_pairs,
+    fcell_region,
     half_pair,
     own_view,
     peer_offsets,
@@ -199,6 +212,8 @@ def scratch_layout(s: int, tp: int, timeline: bool = False, **route) -> dict:
             "grdy": (256 + q_flags + s * flag, s * flag),
         }
     )
+    # one launch per layer with ``tagged_q_split``: q as tagged words (``front.stage_wqb``)
+    place({"qt": (0, s * q_words(d) * WORD if tagged_q_split(d, s) else 0)})
     # the router CTAs' x boxes (``moe.signal_xbox``): uncached scratch, scalar-polled
     place({"xbox": (0, moe.xbox_bytes(s))})
     if timeline:
@@ -222,9 +237,23 @@ def acell_region_bytes(tp: int) -> int:
     return acell_region(tp, range(1, MAX_TOKENS + 1))[1]
 
 
+# the per-row MoE's widths (``RouteShape.row_moe``): FCELL's
+ROW_WIDTHS = range(1, ROW_CTAS // ROW_SLICES + 1)
+
+
+def fcell_offset(tp: int) -> int:
+    """FCELL's byte offset in a parity's half (``token_par.fcell_region``)."""
+    return fcell_region(tp, range(1, MAX_TOKENS + 1), ROW_WIDTHS)[0]
+
+
+def fcell_region_bytes(tp: int) -> int:
+    """FCELL's bytes in a parity's half (``token_par.fcell_region``)."""
+    return fcell_region(tp, range(1, MAX_TOKENS + 1), ROW_WIDTHS)[1]
+
+
 def peer_half_bytes(tp: int) -> int:
-    """One parity's peer regions (``token_par.peer_layout``), then ACELL."""
-    return sum(acell_region(tp, range(1, MAX_TOKENS + 1)))
+    """One parity's peer regions (``token_par.peer_layout``), then ACELL, then FCELL."""
+    return sum(fcell_region(tp, range(1, MAX_TOKENS + 1), ROW_WIDTHS))
 
 
 def _epoch(epoch):
@@ -400,6 +429,9 @@ def run_k1(key: MonoBuild, sl, front, a: dict, ep, k2=None, early=None):
     assert not key.iq or (key.index and index_query.fused(s, key.tok_par)), key
     assert not key.cp or (key.iq and not key.tok_par and key.cp in (1, 2)), key
     QKV0 = GATE0 + own_n if GATE0 + 2 * own_n <= BLOCKS else 0
+    # one launch per layer with tagged q to the split: the kv norms apart, on the seam
+    # norms' CTAs, off the q path
+    KV0 = NORM0 if tagged_q_split(Dims(tp), s, key.tok_par) and k2 is not None else QKV0
     # the head weights' CTAs, past the q / kv norms': they run in q's wait
     IW0 = (QKV0 + own_n) % BLOCKS
     # the compressor projection's CTAs, past the head weights'
@@ -451,6 +483,9 @@ def run_k1(key: MonoBuild, sl, front, a: dict, ep, k2=None, early=None):
         # one launch per layer: the products the attention back reads, device scope, flagged
         c["k2"] = k2
         c["dev"] = True
+        if const_expr(tagged_q_split(Dims(tp), s, key.tok_par)):
+            # q to the attention back as tagged words, the records behind flags of their own
+            c["qt"] = scratch + fx.Int64(layout["qt"][0])
     if const_expr(key.iq):
         c["iq_chains"] = index_query.iq_chains(s)
     if const_expr(key.timeline):
@@ -556,10 +591,21 @@ def run_k1(key: MonoBuild, sl, front, a: dict, ep, k2=None, early=None):
                 )
             index_query.run_iw(c, c["args"], own_n, IW0, c["xl"], t0, push)
         if const_expr(key.cp):
-            # the compressor projection fills it too, on the CTAs past them
-            index_query.run_cp(c, c["args"], own_n, CP0, c["xl"], key.cp)
+            # the compressor projection fills it too, on the CTAs past them (one token
+            # tile: its operands issued past the wqkv GEMV)
+            index_query.run_cp(
+                c, c["args"], own_n, CP0, c["xl"], key.cp, cp_ops if cp_ops else None
+            )
         if const_expr(early is not None):
             early.entries()
+            early.touch()
+
+    # one token tile: the compressor projection's operands go out past the wqkv GEMV, ahead
+    # of the wq_b weights (they return in issue order), not behind them in q's wait
+    cp_ops = {}
+
+    def cp_issue(seen):
+        cp_ops.update(index_query.cp_issue(c, c["args"], own_n, CP0, key.cp, seen))
 
     mb_front.run_front(
         c,
@@ -569,10 +615,17 @@ def run_k1(key: MonoBuild, sl, front, a: dict, ep, k2=None, early=None):
         before_wqkv=seam_slice,
         after_wqkv=seam_norm,
         before_wqb=seam_gate,
+        before_wqb_weights=cp_issue
+        if key.cp and len(token_tiles(own_n)) == 1
+        else None,
         # past the slices, norms and gates where the grid has room: a slice CTA
         # issues its weights after its slice, and the norms' publish (vmcnt(0))
         # waited for them to land
         qkv_first=QKV0,
+        kv_first=KV0,
+        # TP4: a row tile's sums each on one CTA, so no partial crosses CTAs and each
+        # wqkv CTA's wq_b weights go out right past its own GEMV
+        row_halves=tp == 4,
     )
     if const_expr(key.tok_par):
         # K1's outputs hold every row: copy in the rows the other ranks computed
@@ -715,6 +768,7 @@ def build_mono_k1(key: MonoBuild):
         kc_live: Int32,
     ):
         _ = keyed
+        warm_kernargs(K1_KERNARG_BYTES)
         # every wait runs under the guard, so a timeout flags every peer and stops the launch
         with guard.scope(
             guard.Guard(
@@ -1065,8 +1119,11 @@ def _seam_lds(s):
 
 
 @flyc.jit
-def run_ffn(key: MonoBuild, lds, a: dict, amb, bases, own, rank, ep, part=None):
-    """Run the FFN seam, the MoE and its all-reduce into ``a["out"]``."""
+def run_ffn(
+    key: MonoBuild, lds, a: dict, amb, bases, own, rank, ep, part=None, pre=None
+):
+    """Run the FFN seam, the MoE and its all-reduce into ``a["out"]``. ``pre``: the
+    slice's first loads, issued before wo_b (``early_slice``)."""
     s, tp = key.tokens, key.tp
     layout = scratch_layout(s, tp, key.timeline, **route_of(key))
     mkey = _moe_key(key)
@@ -1151,6 +1208,7 @@ def run_ffn(key: MonoBuild, lds, a: dict, amb, bases, own, rank, ep, part=None):
         s, rs, lds.moe.peek(), amb, bases, mlayout, scratch, margs, rank, own
     )
     cb["tag"] = ep & 255
+    cb["fcell_off"] = fcell_offset(tp)
     if const_expr(key.timeline):
         cb["tl"] = ca["tl"]
     for i, region in enumerate(COUNTERS):
@@ -1161,24 +1219,40 @@ def run_ffn(key: MonoBuild, lds, a: dict, amb, bases, own, rank, ep, part=None):
         out_own = a["out"] + fx.Int64(t0) * fx.Int64(HIDDEN * 2)
         cb["own_view"] = {**cb, "S": own_n, "args": {**margs, "out": out_own}}
     grdy = a.get("grdy")
-    if const_expr(grdy is not None):
-        # one launch per layer: the slices read the mixes K1's gates wrote
+    if const_expr(grdy is not None and pre is None):
+        # one launch per layer: the slices read the mixes K1's gates wrote (the CTAs that
+        # waited on wo_a's flags polled them there)
         poll = amb.poll
-        if bid < SLICES:
+        if (bid < SLICES) & a["grdy_late"]:
             if tid < own_n:
                 poll([(grdy, tid * FLAG_STRIDE, 1)])
             gpu.barrier()
     if const_expr(part is None and not key.tok_par):
         # K2's partials arrive as cells (``push_attn_cell``)
         ca["acell"] = own + fx.Int64(acell_offset(tp))
+        if const_expr(early_slice(key)):
+            # polled on wave 1: wave 0 pushed wo_b's cells, and a wave's first wait also
+            # waits on its own pushes' acks
+            ca["cell0"] = 64
+    # read before the loop: a method call on ca inside one carries ca
+    reset = ca.get("cell0") is not None
     for task in range(first_task(bid, 0), SLICES, BLOCKS):
-        # the slice's own loads go out ahead of the wait on the ranks' partials, where
-        # they fit in registers beside the reduce
-        pre = seam.slice_prefetch(ca, task) if seam.slice_prefetch_fits(own_n) else None
+        if const_expr(pre is None):
+            # the slice's own loads go out ahead of the wait on the ranks' partials, where
+            # they fit in registers beside the reduce
+            got = (
+                seam.slice_prefetch(ca, task)
+                if seam.slice_prefetch_fits(own_n)
+                else None
+            )
+        else:
+            got = pre
         if const_expr(part is not None):
             seam.stage_push(ca, task, part)
         seam.stage_reduce(ca, task)
-        seam.stage_slice(ca, task, pre)
+        seam.stage_slice(ca, task, got)
+        if const_expr(reset):
+            seam.reset_attn_cells(ca, task)
     stamp(ca, 17)
 
     def store(t, col, ys, live):
@@ -1215,6 +1289,24 @@ def run_ffn(key: MonoBuild, lds, a: dict, amb, bases, own, rank, ep, part=None):
 
     moe.run_moe(cb, mkey, bid, before_ug=gates)
     stamp(ca, 27)
+
+
+def early_slice(key: MonoBuild) -> bool:
+    """Whether the FFN seam slice's first loads go out before wo_b, so a slice CTA's poll on
+    the ranks' wo_b cells has no loads ahead of it, and the cells are polled on a wave that
+    pushed none: TP4 and TP8, the cells' path, the loads in registers."""
+    return key.tp in (4, 8) and not key.tok_par and seam.slice_prefetch_fits(key.tokens)
+
+
+def split_first(key: MonoBuild) -> int:
+    """The first CTA of the attention back's split units in one launch a layer: on TP4,
+    where the front's wqkv row tiles run as row halves, the grid's last CTAs, whose K1
+    half (no seam slice, the norms', gates', qkv's and the CTAs without wqkv) ends first,
+    so their old keys' records go out sooner; else CTA 0."""
+    s = key.tokens
+    if key.tp == 4 and not (key.tok_par or key.eg or key.glue) and wqkv_split(s, s):
+        return BLOCKS - mb_back.back_plan(_back_key(key))[1]
+    return 0
 
 
 def reset_counters(epoch, ep):
@@ -1581,21 +1673,48 @@ def run_k2(
         # every CTA's q flags (each past the CTA's records, table and mixes), its token's
         # table flag and, token parallel, the records copied from the other ranks; the
         # combine on the table flag, the FFN seam's slices on the mixes'
+        # tagged q (``tagged_q_split``): q in tagged words, each row's record behind its flag
+        tq = tagged_q_split(Dims(tp), s, key.tok_par)
         regions = ("krdy", "qb", "vrdy") if key.tok_par else ("krdy", "qb")
+        regions += ("vrdy", "qt") if tq else ()
         for region in regions:
             c[region] = scratch + fx.Int64(layout[region][0])
-        c["k1_words"] = k1_words(layout, key.tok_par)
+        c["k1_words"] = k1_words(layout, key.tok_par or tq)
         c["k1_first"] = k1_first
         c["pre"] = pre
+        split0 = split_first(key)
+        c["split0"] = split0
 
         def k1_seen(unit):
             # every CTA's q flag is in, each stored past its epoch read: move the epoch on
             if unit == 0:
+                # unit 0's CTA: ``split_first``
                 epoch_end(
-                    ctx, epoch, ep, lambda: reset_counters(epoch, ep), marks=False
+                    ctx,
+                    epoch,
+                    ep,
+                    lambda: reset_counters(epoch, ep),
+                    who=split0,
+                    marks=False,
                 )
 
         c["k1_seen"] = k1_seen
+        if const_expr(not early_slice(key)):
+            # the slice CTAs that wait on wo_a's flags poll the gates' flags in the same wait:
+            # in ``run_ffn`` the poll would queue behind their wo_b push's peer stores
+            own_n = s // tp if const_expr(key.tok_par) else s
+            if const_expr(tagged_x8b(Dims(tp), s)):
+                # with X8B's words (``back.x8b_rows``), from the flags' own region
+                grdy = scratch + fx.Int64(layout["grdy"][0])
+                c["ardy_also"] = (bid < SLICES, own_n, grdy, lambda u: u * FLAG_STRIDE)
+            else:
+                gap = layout["grdy"][0] - layout["ardy"][0]
+                assert gap >= 0 and gap % 8 == 0, gap
+                c["ardy_also"] = (
+                    bid < SLICES,
+                    own_n,
+                    lambda u: gap // 8 + u * FLAG_STRIDE,
+                )
     else:
         epoch_begin(ctx, epoch, ep)
     if const_expr(key.index):
@@ -1650,7 +1769,32 @@ def run_k2(
         def idle():
             engram.run_eg(gc, ec, s)
 
-    mb_back.run_back(c, bkey, bid, idle)
+    before_wob = None
+    if const_expr(early_slice(key)):
+        cs = {
+            "S": s,
+            "tid": c["tid"],
+            "args": {
+                "res_in": res_in,
+                "post_in": post_in,
+                "comb_in": comb_in,
+                "pre_in": pre_in,
+                "hc_fn": hc_fn,
+            },
+        }
+        grdy = sreg(scratch, layout["grdy"][0], "grdy") if const_expr(one) else None
+        poll, tid = amb.poll, c["tid"]
+
+        def before_wob():
+            # one launch per layer: the slice reads the mixes K1's gates wrote. Every CTA
+            # loads a slice's rows, those past the slices a copy of slice bid - SLICES'
+            if const_expr(grdy is not None):
+                if tid < s:
+                    poll([(grdy, tid * FLAG_STRIDE, 1)])
+                gpu.barrier()
+            return seam.slice_prefetch(cs, bid % SLICES)
+
+    spre = mb_back.run_back(c, bkey, bid, idle, before_wob)
     if const_expr(not one):
         # the epoch moves on once every CTA marked it, off the launch's end: the last CTA
         # waits on its next stage's inputs (the FFN seam) a while
@@ -1685,7 +1829,9 @@ def run_k2(
     )
     if const_expr(one):
         a["grdy"] = sreg(scratch, layout["grdy"][0], "grdy")
-    run_ffn(key, lds, a, amb, bases, own, rank, ep)
+        wob0 = mb_back.back_plan(bkey)[5]
+        a["grdy_late"] = first_task(bid, wob0) >= mb_back.ardy_waiters(bkey)
+    run_ffn(key, lds, a, amb, bases, own, rank, ep, pre=spre)
     if const_expr(key.eg):
         # every rank's share of the projection in, long since: into ``eg_kv``
         engram.unpack(gc, ec, s)
@@ -1789,6 +1935,7 @@ def build_mono_k2(key: MonoBuild):
         gl_raw: Int64,
     ):
         _ = keyed
+        warm_kernargs(K2_KERNARG_BYTES)
         # every wait runs under the guard, so a timeout flags every peer and stops the launch
         with guard.scope(
             guard.Guard(
@@ -2079,6 +2226,52 @@ def kernarg_offsets(names, i32) -> dict:
     return out
 
 
+def warm_kernargs(nbytes: int):
+    """Load a word of every 64-byte line of the kernarg segment at the launch's start, in
+    the entry's wait: the arguments LLVM loads again later (it rematerializes them under
+    SGPR pressure) then hit the scalar cache instead of waiting on L2 where they are used."""
+    seg_ptr = ir.Type.parse("!llvm.ptr<4>")
+    seg = llvm.PtrToIntOp(
+        T.i64,
+        llvm.call_intrinsic(seg_ptr, "llvm.amdgcn.kernarg.segment.ptr", [], [], []),
+    ).result
+    words = []
+    for off in range(0, nbytes, 64):
+        ptr = llvm.IntToPtrOp(
+            seg_ptr, as_ir_value(fx.Int64(seg) + fx.Int64(off))
+        ).result
+        words.append(llvm.LoadOp(T.i32, ptr, alignment=4, invariant=True).result)
+    llvm.InlineAsmOp(
+        None, words, "", ",".join(["s"] * len(words)), has_side_effects=True
+    )
+
+
+def kernarg_bytes(names, i32) -> int:
+    """The kernarg segment's size: its last argument's offset plus its size."""
+    off = kernarg_offsets(names, i32)[names[-1]]
+    return off + (4 if names[-1] in i32 else 8)
+
+
+# the index K1's and K2's 32-bit arguments past the layer launch's
+K1_KC_I32 = frozenset(
+    f"kc_{n}"
+    for n in (
+        "per_req",
+        "ring",
+        "eps",
+        "page_bits",
+        "page_bytes",
+        "keps",
+        "wide",
+        "live",
+    )
+)
+K1_KERNARG_BYTES = kernarg_bytes(
+    K1_ARGS + K1_CP_ARGS + K1_KC_ARGS, LAYER_I32 | K1_KC_I32
+)
+K2_KERNARG_BYTES = kernarg_bytes(K2_ARGS + K2_GLUE_ARGS, LAYER_I32 | {"gl_ptab_stride"})
+
+
 def reload_args(names, offsets: dict, i32) -> dict:
     """Arguments ``names`` loaded again from the kernarg segment, its address through an
     empty asm first so LLVM keeps these loads apart from the entry's: an argument a
@@ -2104,10 +2297,10 @@ def reload_args(names, offsets: dict, i32) -> dict:
     return out
 
 
-def k1_words(layout: dict, tok_par: bool) -> dict:
-    """The split's K1 flag regions (``back.k1_flag_load``) as i32 offsets from the
-    key-table flags'."""
-    regions = ("qb", "vrdy") if tok_par else ("qb",)
+def k1_words(layout: dict, records: bool) -> dict:
+    """The split's K1 flag regions (``back.k1_flag_load``, ``back.q_flag_load``) as i32
+    offsets from the key-table flags'; ``records``: with the record flags'."""
+    regions = ("qb", "vrdy") if records else ("qb",)
     return {r: (layout[r][0] - layout["krdy"][0]) // 4 for r in regions}
 
 
@@ -2128,6 +2321,8 @@ def build_mono_layer(key: MonoBuild):
     flags its q rows past its wq_b, so the flag also tells that the CTA's records, key
     table rows and mixes landed: the attention back's split waits on every CTA's q
     flag and its token's key-table flag, the FFN seam's slices on the gates' flags.
+    With ``tagged_q_split`` the q rows come as tagged words instead, each row's record
+    behind a flag of its own.
     The epoch moves on once a CTA has seen every CTA's q flag, so no CTA waits at the
     launch's end."""
     s, tp = key.tokens, key.tp
@@ -2161,6 +2356,7 @@ def build_mono_layer(key: MonoBuild):
     nchunk, n_split = mb_back.back_plan(_back_key(key))[:2]
     # a split unit a CTA (``back.run_back``), its keys loaded in K1's half
     assert n_split <= BLOCKS
+    SPLIT0 = split_first(key)
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def layer(
@@ -2252,6 +2448,7 @@ def build_mono_layer(key: MonoBuild):
         eg_row0: Int32,
     ):
         _ = keyed
+        warm_kernargs(max(offsets.values()) + 8)
         # every wait runs under the guard, so a timeout flags every peer and stops the launch
         with guard.scope(
             guard.Guard(
@@ -2366,12 +2563,14 @@ def build_mono_layer(key: MonoBuild):
             layout = scratch_layout(s, tp, key.timeline, **route_of(key))
             k2 = layer_handoff(scratch, layout, ep)
             bid = fx.block_idx.x
+            # this CTA's split unit (``split_first``)
+            sunit = bid if SPLIT0 == 0 else first_task(bid, SPLIT0)
             early = mb_back.EarlyKeys(
                 _back_key(key),
                 key.swa_width,
                 a,
-                fx.min(bid, n_split - 1),
-                bid < n_split,
+                fx.min(sunit, n_split - 1),
+                sunit < n_split,
             )
             run_k1(key, lds.seam.peek(), lds.front.peek(), a, ep, k2, early)
             # the K1 half's LDS is free
@@ -2379,14 +2578,27 @@ def build_mono_layer(key: MonoBuild):
             # a split CTA's K2 inputs in issue order, past the barrier (it would drain them):
             # its K1 flags' first loads, then its old keys' records, in flight through the
             # wait on q
-            first = mb_back.k1_flag_load(
-                k2["krdy"],
-                k1_words(layout, key.tok_par),
-                fx.thread_idx.x,
-                fx.min(bid, n_split - 1) // nchunk,
-                s,
-                pred=bid < n_split,
-            )()
+            if const_expr(tagged_q_split(Dims(tp), s, key.tok_par)):
+                first = mb_back.q_flag_load(
+                    scratch + fx.Int64(layout["qt"][0]),
+                    k2["krdy"],
+                    k1_words(layout, True),
+                    fx.thread_idx.x,
+                    fx.min(sunit, n_split - 1) // nchunk,
+                    s,
+                    Dims(tp),
+                    # the waves past the poll's (the keys') issue none
+                    pred=(sunit < n_split) & (fx.thread_idx.x < 256),
+                )()
+            else:
+                first = mb_back.k1_flag_load(
+                    k2["krdy"],
+                    k1_words(layout, key.tok_par),
+                    fx.thread_idx.x,
+                    fx.min(sunit, n_split - 1) // nchunk,
+                    s,
+                    pred=sunit < n_split,
+                )()
             pre = early.loads()
             names = [K2_OF_LAYER.get(n, n) for n in K2_ARGS]
             names += list(EG_ARGS) if key.eg else []

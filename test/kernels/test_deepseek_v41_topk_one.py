@@ -184,3 +184,137 @@ def test_graph_replay_carries_counters():
         bad += sum(int(not torch.equal(_pairs(o), w)) for o, w in zip(got, want[d]))
     torch.cuda.synchronize()
     assert bad == 0, f"{bad} mismatched calls over {replays} replays"
+
+
+KB = 2048
+# a producer's columns and its 8-column blocks: (column bounds, column width, block bounds, block width)
+PAIRS = {
+    "6x320k": ([328224] * 6, 328256, [41028] * 6, 41032),
+    "6x128k": ([131072] * 6, 328256, [16384] * 6, 41032),
+    "6x8k": (
+        [8662, 8661, 8660, 8659, 8658, 8657],
+        328256,
+        [1083, 1083, 1083, 1083, 1083, 1083],
+        41032,
+    ),
+    "mixed": (
+        [328224, 300, 0, 4096, 40961, 200000],
+        328256,
+        [41028, 38, 0, 512, 5121, 25000],
+        41032,
+    ),
+    "8x_long": (
+        [600000, 500000, 400000, 328000, 100000, 50000, 41000, 300],
+        600064,
+        [75000, 62500, 50000, 41000, 12500, 6250, 5125, 38],
+        75008,
+    ),
+}
+
+
+def _pair_case(name, seed):
+    bounds, width, bbounds, bwidth = PAIRS[name]
+    case = _case(bounds=bounds, width=width, seed=seed)
+    g = torch.Generator(device="cpu").manual_seed(seed + 1000)
+    blocks = {
+        "scores": torch.randn(len(bounds), bwidth, generator=g).cuda(),
+        "seq_lens": torch.tensor(bbounds, dtype=torch.int32).cuda(),
+    }
+    return case, blocks
+
+
+def _block_ids(rows):
+    return torch.full((rows, KB), -7, dtype=torch.int32, device="cuda")
+
+
+def _sglang_blocks(blocks, ids):
+    from sglang.kernels.ops.attention.dsv4.candidate_blocks_hip import (
+        topk_transform_paged_hip,
+    )
+
+    topk_transform_paged_hip(
+        page_table=None, page_indices=ids, page_size=1, raw_indices=None, **blocks
+    )
+
+
+def _mine_pair(case, blocks, outs, ids):
+    _one().transform_paged_pair(
+        page_indices=outs[0], raw_indices=outs[1], block_scores=blocks["scores"],
+        block_lens=blocks["seq_lens"], block_ids=ids, **case,
+    )  # fmt: skip
+
+
+def _same_ids(got, want):
+    big = torch.iinfo(torch.int32).max
+    key = lambda t: torch.where(t >= 0, t, big).sort(dim=1).values  # noqa: E731
+    return torch.equal(key(got), key(want))
+
+
+@pytest.mark.parametrize("name", list(PAIRS))
+@pytest.mark.parametrize("seed", range(3))
+def test_pair_equals_sglangs_two_calls(name, seed):
+    """The producer's pair launch: the columns as ``transform_paged``, the blocks as SGLang's
+    unpaged top-2048, both as sets; the workspace is zeroed after every launch."""
+    case, blocks = _pair_case(name, seed)
+    rows = len(PAIRS[name][0])
+    want, got = _outs(rows), _outs(rows)
+    want_ids, got_ids = _block_ids(rows), _block_ids(rows)
+    _sglang(case, want)
+    _sglang_blocks(blocks, want_ids)
+    for _ in range(3):
+        for t in (*got, got_ids):
+            t.fill_(-7)
+        _mine_pair(case, blocks, got, got_ids)
+        torch.cuda.synchronize()
+        assert _same(case, got, want), name
+        assert _same_ids(got_ids, want_ids), name
+        assert not _one().ctr.any() and not _one().hist.any(), name
+
+
+def test_pair_graph_replay():
+    """Pair and single launches in one graph, replayed over two data sets."""
+    names = ["6x320k", "6x8k", "mixed", "6x128k"]
+    pcs = [_pair_case(n, 31) for n in names]
+    alt = [_pair_case(n, 32) for n in names]
+    data = [[(c["scores"].clone(), b["scores"].clone()) for c, b in pcs],
+            [(c["scores"].clone(), b["scores"].clone()) for c, b in alt]]  # fmt: skip
+    rows = [len(PAIRS[n][0]) for n in names]
+    want = []
+    for d in data:
+        for (c, b), (s, bs) in zip(pcs, d):
+            c["scores"].copy_(s)
+            b["scores"].copy_(bs)
+        w = []
+        for (c, b), r in zip(pcs, rows):
+            o, i = _outs(r), _block_ids(r)
+            _sglang(c, o)
+            _sglang_blocks(b, i)
+            w.append((_pairs(o), i))
+        want.append(w)
+    got = [(_outs(r), _block_ids(r)) for r in rows]
+
+    def step():
+        for (c, b), (o, i) in zip(pcs, got):
+            _mine_pair(c, b, o, i)
+            _mine(c, o)  # a single launch between pairs shares the workspace
+
+    step()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        step()
+    replays = int(os.environ.get("TOPK_ONE_REPLAYS", "300"))
+    bad = 0
+    for k in range(replays):
+        d = k % 2
+        for (c, b), (s, bs) in zip(pcs, data[d]):
+            c["scores"].copy_(s)
+            b["scores"].copy_(bs)
+        for o, i in got:
+            for t in (*o, i):
+                t.fill_(-7)
+        graph.replay()
+        for (o, i), (wp, wi) in zip(got, want[d]):
+            bad += int(not torch.equal(_pairs(o), wp)) + int(not _same_ids(i, wi))
+    torch.cuda.synchronize()
+    assert bad == 0, f"{bad} mismatches over {replays} replays"
