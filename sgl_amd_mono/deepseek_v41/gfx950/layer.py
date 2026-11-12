@@ -1115,14 +1115,32 @@ def store_normed(normed, t, col, ys, live):
         )
 
 
+def row_cells(key: MonoBuild) -> bool:
+    """Whether token-parallel wo_b partials reach their rows' owners as ACELL cells (four bf16
+    values in 8 B, no tag: ``seam.attn_row_cell``) instead of tagged pairs (two in 8 B):
+    TP2, where the partials of the peer's rows all cross one link."""
+    return key.tok_par and key.tp == 2
+
+
 @flyc.jit
-def push_attn_pair(c, bases, own, t, col, vs):
-    """Push this rank's wo_b partial pair of row t at ``col`` to the row's owner (token
-    parallel, ``own`` rows a rank), at its row of the owner's ATTN region."""
+def push_attn_pair(c, bases, own, t, col, vs, acell=None):
+    """Push this rank's wo_b partial of row t at ``col`` to the row's owner (token
+    parallel, ``own`` rows a rank): a bf16 pair at its row of the owner's ATTN region, or
+    with ``acell`` (ACELL's byte offset, ``row_cells``) a cell of four values at the
+    owner's ``seam.attn_row_cell``."""
     for p in range_constexpr(len(bases)):
         if t // own == p:
-            pair = seam.attn_region_pair(c["rank"], t - p * own, own, col)
-            c["put_bf"](preg(bases[p], 0, "attn"), 2 * pair, vs)
+            if const_expr(acell is None):
+                pair = seam.attn_region_pair(c["rank"], t - p * own, own, col)
+                c["put_bf"](preg(bases[p], 0, "attn"), 2 * pair, vs)
+            else:
+                at = seam.attn_row_cell(c["rank"], t - p * own, own, col)
+                bo.buffer_store(
+                    seam.cell_words(vs),
+                    rsrc(bases[p] + fx.Int64(acell)),
+                    at * 2,
+                    cache_modifier=CM_SYS,
+                )
 
 
 @flyc.jit
@@ -1412,6 +1430,10 @@ def run_ffn(
             if tid < own_n:
                 poll([(grdy, tid * FLAG_STRIDE, 1)])
             gpu.barrier()
+    if const_expr(part is None and row_cells(key)):
+        # K2's partials of this rank's rows arrive as cells (``push_attn_pair``)
+        ca["acell"] = own + fx.Int64(acell_offset(tp))
+        ca["row_cells"] = True
     if const_expr(part is None and not key.tok_par):
         # K2's partials arrive as cells (``push_attn_cell``)
         ca["acell"] = own + fx.Int64(acell_offset(tp))
@@ -1967,7 +1989,19 @@ def run_k2(
     amb = Mailbox(tag)
 
     cp = {"put_bf": amb.put_bf, "rank": rank}
-    if const_expr(key.tok_par):
+    if const_expr(row_cells(key)):
+        acell = acell_offset(tp)
+        assert s * HIDDEN // seam.CELL_VALUES * 8 <= acell_region_bytes(tp)
+
+        def wob_cell(task, t0, u, vs):
+            # cell u of a task's tile: row u // 4, its columns 4 (u % 4) ..
+            per_row = seam.ROWS // seam.CELL_VALUES
+            t = plus(t0, u // per_row)
+            col = task * seam.ROWS + seam.CELL_VALUES * (u % per_row)
+            push_attn_pair(cp, bases, s // tp, t, col, vs, acell)
+
+        c["wob_cell"] = wob_cell
+    elif const_expr(key.tok_par):
         c["wob_out"] = lambda t, col, v0, v1: push_attn_pair(
             cp, bases, s // tp, t, col, [v0, v1]
         )

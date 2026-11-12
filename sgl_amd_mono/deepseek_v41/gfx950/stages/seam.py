@@ -163,6 +163,13 @@ def attn_cell(src, task, s, t0, u):
     return (src * WOB_TASKS + task) * cells_task(s) + t0 // TILE * cells_tile(TILE) + u
 
 
+def attn_row_cell(src, t, s, col):
+    """Token parallel (``layer.row_cells``): the owner's cell of rank ``src``'s wo_b partial
+    of its row t (of s) at hidden column ``col`` (a multiple of 4), ``[source rank][row]
+    [hidden / 4]`` in ACELL."""
+    return (src * s + t) * (HIDDEN // CELL_VALUES) + col // CELL_VALUES
+
+
 # ---------------------------------------------------------------- FFN cells
 # The per-row MoE's down sums cross as cells too: [source rank][row][hidden / 4], four bf16
 # values a cell, empty as ATTN's (the reader stores them back to empty).
@@ -586,7 +593,9 @@ def stage_reduce(c, task):
     ``reset_attn_cells``)."""
     s, tid = c["S"], c["tid"]
     first = c.get("cell0", 0)
-    if const_expr(c.get("acell") is not None):
+    if const_expr(c.get("row_cells", False)):
+        units, reduce_unit = s * COLS // CELL_VALUES, reduce_attn_row_cell
+    elif const_expr(c.get("acell") is not None):
         units, reduce_unit = 2 * cells_task(s), reduce_attn_cell
     else:
         units, reduce_unit = s * COLS // 2, reduce_attn_pair
@@ -647,6 +656,26 @@ def reduce_attn_cell(c, task, idx):
             fx.ptr_store(bf16_round(acc), at_lds)
         if const_expr(first == 0):
             empty_cells(acell, cells)
+
+
+@flyc.jit
+def reduce_attn_row_cell(c, task, idx):
+    """Token parallel (``c["row_cells"]``): thread ``idx``'s cell of the slice's 32 columns
+    of a row (``attn_row_cell``), every rank's once written, summed value by value in rank
+    order into ``pend_lds``, then emptied."""
+    s, tp = c["S"], c["d"].tp
+    per = COLS // CELL_VALUES
+    if idx < s * per:
+        t = idx // per
+        cc = CELL_VALUES * (idx % per)
+        cells = [attn_row_cell(src, t, s, task * COLS + cc) for src in range(tp)]
+        ws = poll_cells(c["acell"], cells)
+        for i in range_constexpr(CELL_VALUES):
+            acc = cell_value(ws[0], i)
+            for src in range_constexpr(1, tp):
+                acc = acc + cell_value(ws[src], i)
+            fx.ptr_store(bf16_round(acc), c["pend_lds"] + (t * COLS + cc + i))
+        empty_cells(c["acell"], cells)
 
 
 def slice_cells(c, task, idx):
