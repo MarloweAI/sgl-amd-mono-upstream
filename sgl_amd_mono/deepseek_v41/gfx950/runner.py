@@ -32,6 +32,7 @@ from .layer import (
     K2_OF_LAYER,
     LAYER_ARGS,
     MAX_TOKENS,
+    SEAM_ARGS,
     MonoBuild,
     acell_offset,
     acell_region_bytes,
@@ -45,7 +46,7 @@ from .layer import (
     scratch_bytes,
     scratch_layout,
 )
-from .stages import engram
+from .stages import engram, seam
 from .stages.dims import Dims as MoeDims
 from .stages.moe_shape import EXPERTS
 from .stages.moe_shape import TOPK as ROUTE_TOPK
@@ -359,6 +360,7 @@ class DSV41MonoRunner:
             dev = torch.device(dev.type, torch.cuda.current_device())
         self.device = dev
         self._scratch: dict = {}  # width -> its scratch's PeerBuffer
+        self._seam: dict = {}  # width -> its seam state (``seam_state``)
         # [epoch, the guard block (deadline, error words), a mark per CTA, the MoE's counters]
         self.epoch = torch.zeros(EPOCH_WORDS, dtype=torch.int32, device=dev)
         self.fault_site, self.fault_after = guard.fault_injection(rank) or (0, 0)
@@ -449,6 +451,53 @@ class DSV41MonoRunner:
             buf = PeerBuffer(nbytes, None, self.rank, 1, self.device)
             self._scratch[tokens] = buf
         return buf.bytes
+
+    def new_seam_state(self, tokens: int) -> torch.Tensor:
+        """A seam state of this width (``stages.seam.seam_state_layout``): the next layer's
+        attention R_new, LIN and mixes' partials, as a launch's tail writes them."""
+        return torch.zeros(
+            seam.seam_state_bytes(tokens), dtype=torch.uint8, device=self.device
+        )
+
+    def seam_state(self, tokens: int) -> torch.Tensor:
+        """This width's seam state, allocated before graph capture: a launch's tail writes
+        it (``layer(nxt=)``), the next launch reads it (``layer(seamed=True)``)."""
+        buf = self._seam.get(tokens)
+        if buf is None:
+            no_capture(f"seam state width {tokens}")
+            buf = self._seam[tokens] = self.new_seam_state(tokens)
+        return buf
+
+    def _check_seam(self, state: torch.Tensor, tokens: int) -> None:
+        if not (
+            state.dtype == torch.uint8
+            and state.is_contiguous()
+            and state.numel() >= seam.seam_state_bytes(tokens)
+            and state.device == self.device
+        ):
+            raise RuntimeError(f"seam state: {tuple(state.shape)} {state.dtype}")
+
+    def _check_aux(self, aux: torch.Tensor, tokens: int) -> None:
+        if not (
+            aux.dtype == torch.bfloat16
+            and aux.shape[0] >= tokens
+            and aux.shape[-1] == HIDDEN
+            and aux.stride(-1) == 1
+            and aux.stride(0) % 8 == 0
+            and aux.device == self.device
+        ):
+            raise RuntimeError(f"aux: {tuple(aux.shape)} {aux.stride()} {aux.dtype}")
+
+    def seam_moves(self, tokens: int, tok_par: bool = False) -> bool:
+        """Whether a reuse layer's launch at this width runs the next reuse layer's
+        attention seam (``layer(nxt=)``): TP8 (the per-row MoE's), up to
+        ``SEAM_MAX_TOKENS`` rows, not token parallel."""
+        return self.tp == 8 and not tok_par and tokens <= seam.SEAM_MAX_TOKENS
+
+    def seam_res(self, state: torch.Tensor, tokens: int) -> torch.Tensor:
+        """The R_new rows [tokens, 4, 5120] bf16 of a seam state."""
+        off, n = seam.seam_state_layout(tokens)["res"]
+        return state[off : off + n].view(torch.bfloat16).view(tokens, HC, HIDDEN)
 
     def route_at(self, tokens: int) -> dict:
         """The route every launch and the scratch of this width share.
@@ -1075,12 +1124,15 @@ class DSV41MonoRunner:
         embed: bool = False,
         eg: int = 0,
         tok_par: bool = False,
+        seamed: bool = False,
+        seam_next: bool = False,
     ):
         """A reuse layer's one launch at this width (``build_mono_layer``); ``embed``:
         the first layer, on the embedding table; ``eg``: with this many tasks of a later
-        Engram layer's projection, where ``eg_fused`` (else none)."""
+        Engram layer's projection, where ``eg_fused`` (else none); ``seamed``,
+        ``seam_next``: ``MonoBuild``'s."""
         eg = eg if self.eg_fused(tokens, tok_par) else 0
-        key = (tokens, "layer", fold, compressed, tok_par, embed, eg)
+        key = (tokens, "layer", fold, compressed, tok_par, embed, eg, seamed, seam_next)
         if key not in self._kernels:
             no_capture(f"layer launch width {tokens}")
             self._kernels[key] = build_mono_layer(
@@ -1097,6 +1149,8 @@ class DSV41MonoRunner:
                     tok_par=tok_par,
                     embed=embed,
                     eg=eg,
+                    seamed=seamed,
+                    seam_next=seam_next,
                     **self.route_at(tokens),
                 )
             )
@@ -1124,21 +1178,67 @@ class DSV41MonoRunner:
         aux: torch.Tensor | None = None,
         embed: tuple | None = None,
         eg: tuple | None = None,  # (rows [M, 6144] bf16, EngramWeights)
+        nxt: K1Weights | None = None,
+        nxt_aux: torch.Tensor | None = None,
+        seamed: bool = False,
+        seam_in: torch.Tensor | None = None,
+        seam_out: torch.Tensor | None = None,
     ):
         """Run a reuse layer (not an index source) in one launch: ``k1``, then ``k2`` on
         its outputs, with their arguments; returns K2's outputs. ``eg``: a later Engram
         layer's rows and this launch's share of its projection, into ``egkv``
-        (``eg_fused``)."""
+        (``eg_fused``).
+
+        ``nxt``: the next layer's weights; the launch ends with that layer's attention
+        seam (its capture into ``nxt_aux``) into the seam state ``seam_out`` (default
+        ``seam_state``), and its MoE output (K2's first output) is not written.
+        ``seamed``: the previous launch ran this layer's attention seam into ``seam_in``
+        (default ``seam_state``); x, residual, post, comb and pre are not read (None).
+        One state may be both a launch's ``seam_in`` and its ``seam_out``."""
         if aw.cos_sin.data_ptr() != w.cos_sin.data_ptr():
             raise RuntimeError("the layer launch takes K1's rope table for K2's too")
+        if seamed or nxt is not None:
+            # a seamed launch's rows: its positions' (the step's, as the caller slices them)
+            if seamed:
+                M = pos.shape[0]
+            else:
+                M = residual.shape[0] if embed is None else embed[1].shape[0]
+            if not self.seam_moves(M, tok_par) or (seamed and embed is not None):
+                raise RuntimeError(f"seam move at width {M}, token parallel {tok_par}")
+        if seamed:
+            if aux is not None:
+                raise RuntimeError("a seamed launch's capture is the previous launch's")
+            seam_in = self.seam_state(M) if seam_in is None else seam_in
+            self._check_seam(seam_in, M)
+            # the seam's outputs K1 would write: R_new from the state, the others unread
+            residual = self.seam_res(seam_in, M)
+            off, n = seam.seam_state_layout(M)["lin"]
+            x = seam_in[off : off + n].view(torch.bfloat16).view(M, HIDDEN)
+            post, comb, pre = self.post_a[:M], self.comb_a[:M], self.pre_a[:M]
         a1, M, fold, _, _ = self._k1_args(
             w, x, residual, post, comb, pre, pos, slot, swa, swa_block, keys, False,
             tok_par, aux, embed,
         )  # fmt: skip
+        if seamed:
+            a1["res_out"] = residual.data_ptr()
         a2, outs, compressed = self._k2_args(
             aw, fw, M, pos, swa, swa_block, comp, comp_block, outs, tok_par=tok_par
         )
         a2 |= dict.fromkeys(EG_ARGS, 0)
+        a2 |= dict.fromkeys(SEAM_ARGS, 0)
+        a2["nx_aux_stride"] = HIDDEN
+        a2["seam_in"] = seam_in.data_ptr() if seamed else 0
+        if nxt is not None:
+            seam_out = self.seam_state(M) if seam_out is None else seam_out
+            self._check_seam(seam_out, M)
+            if nxt_aux is not None:
+                self._check_aux(nxt_aux, M)
+            a2 |= {
+                "nx_fn": nxt.hc_fn.data_ptr(),
+                "nx_aux": 0 if nxt_aux is None else nxt_aux.data_ptr(),
+                "nx_aux_stride": HIDDEN if nxt_aux is None else nxt_aux.stride(0),
+                "seam_out": seam_out.data_ptr(),
+            }
         if eg is not None:
             rows, ew = eg
             if not (
@@ -1163,6 +1263,8 @@ class DSV41MonoRunner:
                 embed is not None,
                 eg[1].tasks if eg else 0,
                 tok_par,
+                seamed,
+                nxt is not None,
             ),
             *(a1[n] for n in K1_ARGS),
             *(a2[k2_name.get(n, n)] for n in LAYER_ARGS[len(K1_ARGS) :]),

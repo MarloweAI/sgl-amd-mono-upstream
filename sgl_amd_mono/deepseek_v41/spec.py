@@ -790,6 +790,8 @@ def _launch(
     tok_par=False,
     embed=None,
     eg=None,
+    nxt=None,
+    seamed=False,
 ):
     """Layer ``L``: one launch (K1, then K2), or on an index source K1, the indexer and
     K2: the previous layer's pending post (x, residual, post, comb) and pre in; K2's
@@ -798,7 +800,9 @@ def _launch(
     residual, or a draft stage's input. ``embed`` (table, token ids): the first layer
     reads each stream from the embedding table itself (residual None). ``eg``: a reuse
     layer's launch projects its share of a later Engram layer's rows too
-    (``runner.layer(eg=)``)."""
+    (``runner.layer(eg=)``). ``nxt``: the next layer (a reuse layer), whose attention seam
+    this launch runs (``runner.layer(nxt=)``); ``seamed``: the previous launch ran this
+    layer's (the pending post is not read)."""
     from sglang.srt.model_executor.forward_context import (
         get_attn_backend,
         get_token_to_kv_pool,
@@ -834,13 +838,24 @@ def _launch(
             residual = residual.contiguous()  # the broadcast embedding may be a view
         if prev_pre is None:
             prev_pre = runner.first_pre[:M]
-    aux = None if capture is None else capture(L, M)
+    # a seamed layer's capture came from the launch that ran its seam
+    aux = None if capture is None or seamed else capture(L, M)
     if not L.index:
+        seam = {}
+        if nxt is not None:
+            seam |= {
+                "nxt": nxt.k1,
+                "nxt_aux": None if capture is None else capture(nxt, M),
+            }
+        if seamed:
+            x = residual = post = comb = prev_pre = None
+            seam["seamed"] = True
         return runner.layer(
             L.k1, L.k2, L.ffn, x, residual, post, comb, prev_pre, pos, slot, L.swa,
             L.swa_block, L.comp, L.comp_block, keys, tok_par=tok_par, aux=aux,
-            embed=embed, eg=eg,
+            embed=embed, eg=eg, **seam,
         )  # fmt: skip
+    assert nxt is None and not seamed, L.i
     kc = None
     if _kc_fused(runner=runner, L=L, M=M, tok_par=tok_par):
         # K1 runs the source's compressor past its projection
@@ -1135,6 +1150,8 @@ class _Built:
         SGLang's Engram writes, then the head's combine and norm."""
         from sglang.kernels.ops.layernorm.mhc import hc_broadcast, mhc_combine
 
+        from sgl_amd_mono.deepseek_v41.glue import verify_tail
+
         m = self.model
         self._warm_normal_moe()
         # the first layer's launch reads the embedding rows itself where it can (no
@@ -1171,6 +1188,7 @@ class _Built:
         plan.state["tok_par"] = self.runner.tok_par(rows)
         tok_par = plan.state["tok_par"]
         fuse = fused.enabled()
+        seamed = False
         for i in range(m.start_layer, m.end_layer):
             engram = m.layers[i].engram
             if engram is not None:
@@ -1187,11 +1205,14 @@ class _Built:
                 defer = fuse and not (tok_par and aux is None)
             else:
                 defer = nxt.engram is None or fuse
+            moves = self._seam_moves(i, rows, tok_par)
             hidden, pre, post = self._layer(
                 self._layers[i], plan, positions, forward_batch, pending, pre, defer,
                 first if i == m.start_layer else None,
                 self._engram_projection(plan, i, engram_rows, rows),
+                nxt=self._layers[i + 1] if moves else None, seamed=seamed,
             )  # fmt: skip
+            seamed = moves
             pending = post if defer else (None, hidden, None, None)
         last = m.layers[m.end_layer - 1]
         if pending[0] is None:
@@ -1201,10 +1222,16 @@ class _Built:
                 residual, pre = self._gather_rows([residual, pre])
             # mhc_combine widens x on load: no f32 copy first
             combined = mhc_combine(residual.flatten(1), pre, m.hc_mult, residual.dtype)
+            hidden = m.norm(combined)
         else:
-            residual, combined = fused.post_combine(last, pending, pre, m.hc_mult)
+            residual, hidden = fused.post_combine_norm(
+                last, pending, pre, m.hc_mult, m.norm
+            )
+            if not tok_par:
+                # a greedy-variant verify's projection and accept in one launch, where it fits
+                commit_rows = None if aux is None else self._packed[: hidden.shape[0]]
+                verify_tail.fused_head(self.lm, forward_batch, hidden, commit_rows)
         pre_hc_head = residual.flatten(1)
-        hidden = m.norm(combined)
         if aux is None:
             return hidden, pre_hc_head
         packed = self._packed[: hidden.shape[0]]
@@ -1215,6 +1242,22 @@ class _Built:
         # every captured layer wrote its block: the logits processor reads them packed
         assert len(aux) == len(m.dspark_layers_to_capture)
         return (hidden, pre_hc_head), packed
+
+    def _seam_moves(self, i, rows, tok_par) -> bool:
+        """Whether layer i's launch runs layer i + 1's attention seam: both reuse layers in
+        one launch each, no Engram write between, a width ``runner.seam_moves`` takes."""
+        m = self.model
+        if i + 1 >= m.end_layer or not fused.enabled():
+            return False
+        L, N = self._layers.get(i), self._layers.get(i + 1)
+        return (
+            L is not None
+            and N is not None
+            and not L.index
+            and not N.index
+            and m.layers[i + 1].engram is None
+            and self.runner.seam_moves(rows, tok_par)
+        )
 
     def _engram_projection(self, plan, i, engram_rows, rows):
         """(rows, EngramWeights) of a later Engram layer for layer i's launch to project its
@@ -1404,15 +1447,17 @@ class _Built:
         defer_post,
         embed=None,
         eg=None,
+        nxt=None,
+        seamed=False,
     ):
         """One layer: the previous layer's pending post (x, residual, post, comb)
         and pre in; the fused boundary's outputs out. ``eg``: a later Engram layer's
-        projection (``_engram_projection``)."""
+        projection (``_engram_projection``); ``nxt``, ``seamed``: ``_launch``'s."""
         self._warm_normal_moe()
         out = _launch(
             self.runner, L, plan, positions, forward_batch, pending_post, prev_pre,
             capture=lambda L, M: self._capture(plan, L, M),
-            tok_par=plan.state["tok_par"], embed=embed, eg=eg,
+            tok_par=plan.state["tok_par"], embed=embed, eg=eg, nxt=nxt, seamed=seamed,
         )  # fmt: skip
         return _boundary_out(L.module, defer_post, *out)
 

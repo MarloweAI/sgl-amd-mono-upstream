@@ -69,6 +69,7 @@ SGLANG_READS = {
         "hc_mult",
         "hc_pre_from_prev_sublayer",
         "sample_from_anchor",
+        "norm",
         '"dspark_n_routed_experts"',
         '"dspark_num_experts_per_tok"',
     ),
@@ -218,7 +219,18 @@ class _Draft:
             # mhc_combine widens x on load: no f32 copy first
             x = mhc_combine(x.flatten(1), pre, lm.hc_mult, x.dtype)
         else:
-            _, x = fused.post_combine(self.stages[-1].module, pending, pre, lm.hc_mult)
+            last = self.stages[-1].module
+            norm = getattr(last, "norm", None)
+            if (
+                draft_sampler.head_input_folds(lm)
+                and norm is not None
+                and fused.post_combine_norm_fits(pending, pre, norm)
+            ):
+                # the sampler's base logits read the rows normed here, in the combine's launch
+                x, normed = fused.combine_and_norm(*pending, pre, norm)
+                draft_sampler.keep_head_input(x, normed)
+            else:
+                _, x = fused.post_combine(last, pending, pre, lm.hc_mult)
         return LogitsProcessorOutput(next_token_logits=None, hidden_states=x)
 
 

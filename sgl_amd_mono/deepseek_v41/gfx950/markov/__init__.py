@@ -34,13 +34,20 @@ def ops():
 
 class Exchange:
     """One TP group's exchange: every rank's buffer address (int64 on the host), the
-    launch count of each block (``control``), the last tokens, and this rank's step logits (``slab``,
+    launch count of each block (``control``: that many, else a Markov block's), the last tokens, and this rank's step logits (``slab``,
     [MAX_SEQUENCES, gamma, part] f32, which every rank reads at ``EXCHANGE_BYTES``
     past its peers' addresses). Collective: every rank builds it together, ``group``
     the gloo group."""
 
     def __init__(
-        self, group, rank: int, size: int, device: torch.device, gamma: int, part: int
+        self,
+        group,
+        rank: int,
+        size: int,
+        device: torch.device,
+        gamma: int,
+        part: int,
+        control: int | None = None,
     ):
         from sgl_amd_mono.common.peer import PeerBuffer
 
@@ -54,7 +61,9 @@ class Exchange:
             .view(MAX_SEQUENCES, gamma, part)
         )
         self.peers = self._buffer.addresses.cpu()
-        self.control = torch.zeros(blocks(part), dtype=torch.int32, device=device)
+        self.control = torch.zeros(
+            control or blocks(part), dtype=torch.int32, device=device
+        )
         self.tok = torch.zeros(MAX_SEQUENCES, dtype=torch.int64, device=device)
 
     def close(self) -> None:

@@ -2153,17 +2153,19 @@ def stage_row_down(c, bid):
         ]
         push_ffn_cell(c, r, s, col, vs)
     stamp(c, 25)
-    # on wave 1: wave 0 pushed, and a wave's first wait also waits on its own pushes' acks
-    u = tid - 64
-    if (u >= 0) & (u < width // CELL_VALUES):
-        cc = width * sl + CELL_VALUES * u
-        fcell = c["sym"] + fx.Int64(c["fcell_off"])
-        cells = [seam.ffn_cell(src, r, s, cc) for src in range(d.tp)]
-        accs = seam.sum_cells(fcell, cells)
-        out = rsrc(c["args"]["out"])
-        for i in range_constexpr(CELL_VALUES):
-            bo.buffer_store(accs[i].to(fx.BFloat16), out, r * HIDDEN + cc + i)
-        seam.empty_cells(fcell, cells)
+    # ``seam_next``: the next layer's seam slices sum the partials (``layer.seam_tail``)
+    if const_expr(not c.get("seam_next", False)):
+        # on wave 1: wave 0 pushed, and a wave's first wait also waits on its own pushes' acks
+        u = tid - 64
+        if (u >= 0) & (u < width // CELL_VALUES):
+            cc = width * sl + CELL_VALUES * u
+            fcell = c["sym"] + fx.Int64(c["fcell_off"])
+            cells = [seam.ffn_cell(src, r, s, cc) for src in range(d.tp)]
+            accs = seam.sum_cells(fcell, cells)
+            out = rsrc(c["args"]["out"])
+            for i in range_constexpr(CELL_VALUES):
+                bo.buffer_store(accs[i].to(fx.BFloat16), out, r * HIDDEN + cc + i)
+            seam.empty_cells(fcell, cells)
 
 
 @flyc.jit
@@ -2406,8 +2408,10 @@ def run_moe(c, key, bid, before_ug=None):
         stamp(c, 25)
         # token parallel: this rank's rows' sums alone, ``out`` from its first row
         cr = c if const_expr(c["own"] is None) else c["own_view"]
-        for task in range(first_task(bid, RED0), RED_TASKS, BLOCKS):
-            stage_reduce(cr, task)
+        # ``seam_next``: the next layer's seam slices sum the partials (``layer.seam_tail``)
+        if const_expr(not c.get("seam_next", False)):
+            for task in range(first_task(bid, RED0), RED_TASKS, BLOCKS):
+                stage_reduce(cr, task)
         stamp(c, 26)
 
 

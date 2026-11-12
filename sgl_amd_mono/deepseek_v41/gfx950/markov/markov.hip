@@ -2,7 +2,8 @@
 // Adapted from AKLR (https://github.com/AMD-AGI/AKLR, MIT, Copyright (C) 2025-2026 Advanced Micro Devices, Inc.).
 // A sampled DSpark draft's Markov block on this rank's vocab shard as SGLang's MarkovSampleStep, every step in one
 // launch: each step's bias GEMV, Philox Gumbel-max scores and the shard's bests, the ranks' bests swapped through
-// peer buffers, and after the last step the sampled sequences' step logits of every rank's shard gathered whole.
+// peer buffers. Each rank keeps its shard of the sampled sequences' step logits in its exchange buffer;
+// gather_step_logits copies every rank's shard into the whole rows, for a reader that needs them.
 #include <climits>
 #include <cstdint>
 
@@ -56,12 +57,22 @@ struct Params {
     int             vocab_start, width, padded, gamma, nseq, blocks, rank, tp, part, vocab;
     int64_t        *out; // sequence s's token of step t at out[s * out_stride + t]
     int64_t         out_stride;
+    int64_t        *verify; // or null: sequence s's [anchor | tokens] at verify[s * verify_stride ...] (the verify's ids)
+    int64_t         verify_stride;
     int64_t        *tok;      // [nseq] the last step's tokens
     uint32_t       *counts; // [blocks] each block's launches
     float          *whole; // sequence s's step t row at whole + s * whole_seq_stride + t * whole_step_stride, [vocab]
     int64_t         whole_seq_stride, whole_step_stride;
     void           *recv[MAX_TP]; // every rank's exchange buffer
     uint64_t        deadline_ticks;
+    // the draft head in the same launch (draft_head): x [gamma, K] bf16 (the normed rows), this rank's head rows w
+    // [width, K] bf16, base [gamma, padded] tagged bf16 (the base logits, a word a value), gemm_blocks blocks over
+    // tiles 16-row tiles, tiles_per_block of them a block
+    const bfloat16 *x;
+    const bfloat16 *w;
+    int64_t         w_stride;
+    uint64_t       *base;
+    int             K, tiles, tiles_per_block, gemm_blocks;
 };
 
 __device__ inline void keep_best(float &v, int &i, float v2, int i2) {
@@ -216,26 +227,138 @@ __device__ inline uint64_t wave_max(uint64_t x) {
 __device__ inline float bf16_lo(uint32_t w) { return __builtin_bit_cast(float, w << 16); }
 __device__ inline float bf16_hi(uint32_t w) { return __builtin_bit_cast(float, w & 0xFFFF0000u); }
 
+// ---- the draft head's projection (headgemm.hip's variant 13 tiles, fused_tail.hip's weight stream) ----
+using bf16x8 = __bf16 __attribute__((ext_vector_type(8)));
+using f32x4  = float __attribute__((ext_vector_type(4)));
+constexpr int GEMM_TILE = 16;            // a wave a 16-row tile of the head shard
+constexpr int GEMM_V    = 8;             // 16 B vectors a lane an iteration
+constexpr int GEMM_STEP = 4 * 8 * GEMM_V; // K an iteration (256)
+constexpr int GEMM_GAP  = 32;
+constexpr int WROW_LD   = 512 + 16; // a row's bytes in a wave's LDS tile, padded
+constexpr int HEAD_ROWS = 6, MAX_HEAD_K = 5120; // the x rows in LDS beside the waves' weight tiles
+constexpr int HEAD_LDS  = HEAD_ROWS * MAX_HEAD_K * 2 + (THREADS / WAVE) * GEMM_TILE * WROW_LD;
+
+struct WChunk {
+    bf16x8 v[GEMM_V];
+};
+
+// a wave's 16 weight rows of an iteration (16 x 512 B), non-temporal, whole 128 B lines: load j takes rows 2j and
+// 2j + 1, 32 lanes a row
+__device__ inline WChunk load_wchunk(__amdgpu_buffer_rsrc_t w, const int (&off)[GEMM_V], int it) {
+    WChunk c;
+#pragma unroll
+    for (int j = 0; j < GEMM_V; ++j) {
+        c.v[j] = __builtin_bit_cast(bf16x8, __builtin_amdgcn_raw_buffer_load_b128(w, off[j] + it * GEMM_STEP * 2, 0, 2));
+    }
+    return c;
+}
+
+// this block's tiles of the base logits: tile slot (wave % tiles_per_block), the K part wave / tiles_per_block of
+// the 8 / tiles_per_block parts; the parts summed in order, rounded once, stored tagged into base
+__device__ inline void head_tiles(const Params &p, unsigned char *smem, uint32_t tag) {
+    bfloat16 *xs = reinterpret_cast<bfloat16 *>(smem);
+    const int wave = threadIdx.x / WAVE, lane = threadIdx.x % WAVE;
+    const int K = p.K, M = p.gamma;
+    {
+        const uint32x4 *src = reinterpret_cast<const uint32x4 *>(p.x);
+        uint32x4       *dst = reinterpret_cast<uint32x4 *>(xs);
+        for (int i = threadIdx.x; i < M * K / 8; i += THREADS) dst[i] = src[i];
+    }
+    const int parts = (THREADS / WAVE) / p.tiles_per_block, slot = wave % p.tiles_per_block;
+    const int part  = wave / p.tiles_per_block;
+    const int tile  = slot * p.gemm_blocks + static_cast<int>(blockIdx.x);
+    const int n0 = tile * GEMM_TILE, col = lane % GEMM_TILE, grp = lane / GEMM_TILE;
+    const bool live = tile < p.tiles;
+    const __amdgpu_buffer_rsrc_t wr = __builtin_amdgcn_make_buffer_rsrc(
+        const_cast<bfloat16 *>(p.w), 0, static_cast<int>(int64_t(p.width) * p.w_stride * 2), 0x00020000);
+    const int iters = K / GEMM_STEP / parts, it0 = part * iters;
+    int woff[GEMM_V];
+#pragma unroll
+    for (int j = 0; j < GEMM_V; ++j) {
+        woff[j] = static_cast<int>((int64_t(min(n0 + 2 * j + lane / 32, p.width - 1)) * p.w_stride) * 2 + (lane % 32) * 16);
+    }
+    unsigned char *wl = smem + size_t(HEAD_ROWS) * MAX_HEAD_K * 2 + size_t(wave) * GEMM_TILE * WROW_LD;
+    WChunk buf[2];
+    if (live) { // iters is even (draft_head's check)
+        buf[0] = load_wchunk(wr, woff, it0);
+        buf[1] = load_wchunk(wr, woff, it0 + 1);
+    }
+    __syncthreads();
+    f32x4 acc = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (live) {
+        const bool      mrow = col < M;
+        const bfloat16 *xrow = xs + (mrow ? col : 0) * K + grp * 8;
+        for (int it = 0; it < iters; it += 2) {
+#pragma unroll
+            for (int d = 0; d < 2; ++d) { // the two buffers by constant index: they stay in registers
+                const int i = it + d;
+#pragma unroll
+                for (int j = 0; j < GEMM_V; ++j) {
+                    *reinterpret_cast<bf16x8 *>(wl + (2 * j + lane / 32) * WROW_LD + (lane % 32) * 16) = buf[d].v[j];
+                }
+                if (i + 2 < iters) buf[d] = load_wchunk(wr, woff, it0 + i + 2);
+                WChunk wb, xa;
+#pragma unroll
+                for (int j = 0; j < GEMM_V; ++j) {
+                    wb.v[j] = *reinterpret_cast<const bf16x8 *>(wl + col * WROW_LD + j * 64 + grp * 16);
+                    xa.v[j] = mrow ? *reinterpret_cast<const bf16x8 *>(xrow + (it0 + i) * GEMM_STEP + j * GEMM_GAP)
+                                   : bf16x8{};
+                }
+#pragma unroll
+                for (int j = 0; j < GEMM_V; ++j) {
+                    acc = __builtin_amdgcn_mfma_f32_16x16x32_bf16(xa.v[j], wb.v[j], acc, 0, 0, 0);
+                }
+            }
+        }
+    }
+    // the K parts through LDS (over the x rows, done), part 0 adds them in order
+    __syncthreads();
+    float *red = reinterpret_cast<float *>(smem);
+    if (part > 0) {
+#pragma unroll
+        for (int r = 0; r < 4; ++r) red[((part - 1) * p.tiles_per_block + slot) * 256 + r * WAVE + lane] = acc[r];
+    }
+    __syncthreads();
+    if (part == 0 && live) {
+        for (int q = 1; q < parts; ++q) {
+#pragma unroll
+            for (int r = 0; r < 4; ++r) acc[r] += red[((q - 1) * p.tiles_per_block + slot) * 256 + r * WAVE + lane];
+        }
+        const int n = n0 + col;
+#pragma unroll
+        for (int r = 0; r < 4; ++r) {
+            const int row = 4 * grp + r;
+            if (row < M && n < p.width) {
+                const uint32_t bits = __builtin_bit_cast(uint16_t, static_cast<bfloat16>(acc[r]));
+                __hip_atomic_store(p.base + static_cast<int64_t>(row) * p.padded + n,
+                                   static_cast<uint64_t>(tag) << 32 | bits, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+            }
+        }
+    }
+}
+
 // the whole block in one launch, the grid co-resident (a block a CU at most, two waves an EU):
 // a block keeps BLOCK_ROWS rows of the shard in registers (bf16) for every step; each step every block stores its
 // best key into its slot of every rank's records and reads every rank's blocks' records from its own buffer: the
 // grid barrier and the ranks' swap at once, one cross-GPU trip a step, no atomics. ONE: one sequence, its own build
 // (the batched sequences' registers are not held through its steps): each step's dots and scores without a barrier
 // between them, the token's embedding row read by wave 0 and handed to the block through LDS
-template <bool ONE>
+template <bool ONE, bool FUSED = false>
 __global__ __launch_bounds__(THREADS) __attribute__((amdgpu_waves_per_eu(2))) void
 markov_block_kernel(const Params p) {
+    static_assert(ONE || !FUSED, "the fused head serves one sequence");
     const int nseq = ONE ? 1 : p.nseq;
-    __shared__ float    sv[MAX_SEQ][BLOCK_ROWS]; // the bias GEMV of each sequence
-    __shared__ float    sbase[MAX_STEPS][MAX_SEQ][BLOCK_ROWS]; // the block's rows' base logits of every step
-    __shared__ float    snoise[MAX_SEQ][BLOCK_ROWS]; // the sampled sequences' noise of this step
-    __shared__ float    wave_bestv[MAX_SEQ][BLOCK_ROWS / WAVE];
-    __shared__ int      wave_bi[MAX_SEQ][BLOCK_ROWS / WAVE];
+    constexpr int SEQS = ONE ? 1 : MAX_SEQ;
+    __shared__ float    sv[SEQS][BLOCK_ROWS]; // the bias GEMV of each sequence
+    __shared__ float    sbase[MAX_STEPS][SEQS][BLOCK_ROWS]; // the block's rows' base logits of every step
+    __shared__ float    snoise[SEQS][BLOCK_ROWS]; // the sampled sequences' noise of this step
+    __shared__ float    wave_bestv[SEQS][BLOCK_ROWS / WAVE];
+    __shared__ int      wave_bi[SEQS][BLOCK_ROWS / WAVE];
     __shared__ uint64_t wave_key[THREADS / WAVE]; // one sequence: each wave's best candidate key
     __shared__ __attribute__((aligned(16))) bfloat16 erow[DIM]; // one sequence: the step's token's embedding row
-    __shared__ uint64_t top_key[MAX_SEQ][THREADS / WAVE];
-    __shared__ int64_t  prev[MAX_SEQ];
-    __shared__ float    stemp[MAX_SEQ]; // the sequences' temperatures, read once
+    __shared__ uint64_t top_key[SEQS][THREADS / WAVE];
+    __shared__ int64_t  prev[SEQS];
+    __shared__ float    stemp[SEQS]; // the sequences' temperatures, read once
     __shared__ uint32_t s_count;
     const int           lane = threadIdx.x % ROW_LANES, grp = threadIdx.x / ROW_LANES;
     const int           row  = blockIdx.x * BLOCK_ROWS + threadIdx.x; // scoring: a row a thread of the first 256
@@ -253,8 +376,37 @@ markov_block_kernel(const Params p) {
             h[ps][4] = hi.x, h[ps][5] = hi.y, h[ps][6] = hi.z, h[ps][7] = hi.w;
         }
     }
-    // every step's base logits at the start: no step waits for a load of them
-    if (scorer && row < p.padded) {
+    if constexpr (FUSED) {
+        // this launch's base logits: every block's tiles, tagged with the launch count; the Markov blocks (the
+        // first p.blocks) hold their rows of the shard in registers meanwhile
+        extern __shared__ __align__(16) unsigned char smem[];
+        const uint32_t launch = p.counts[blockIdx.x];
+        head_tiles(p, smem, 1 + launch % static_cast<uint32_t>(TAG_MASK));
+        if (static_cast<int>(blockIdx.x) >= p.blocks) {
+            __syncthreads();
+            if (threadIdx.x == 0) p.counts[blockIdx.x] = launch + 1;
+            return;
+        }
+        if (scorer && row < p.padded) {
+            const uint32_t want = 1 + launch % static_cast<uint32_t>(TAG_MASK);
+            for (int step = 0; step < p.gamma; ++step) {
+                uint64_t v, t0 = 0;
+                for (int n = 1;; ++n) {
+                    v = __hip_atomic_load(p.base + static_cast<int64_t>(step) * p.padded + row, __ATOMIC_RELAXED,
+                                          __HIP_MEMORY_SCOPE_AGENT);
+                    if (static_cast<uint32_t>(v >> 32) == want) break;
+                    __builtin_amdgcn_s_sleep(1);
+                    if (n % 1024 == 0) { // past the deadline the launch traps, stopping this rank's step
+                        const uint64_t now = __builtin_amdgcn_s_memrealtime();
+                        if (t0 == 0) t0 = now;
+                        else if (now - t0 > p.deadline_ticks) __builtin_trap();
+                    }
+                }
+                sbase[step][0][threadIdx.x] = __builtin_bit_cast(float, static_cast<uint32_t>(v) << 16);
+            }
+        }
+    } else if (scorer && row < p.padded) {
+        // every step's base logits at the start: no step waits for a load of them
         for (int step = 0; step < p.gamma; ++step) {
             for (int seq = 0; seq < nseq; ++seq) {
                 sbase[step][seq][threadIdx.x] =
@@ -268,6 +420,7 @@ markov_block_kernel(const Params p) {
     if (threadIdx.x < nseq) {
         prev[threadIdx.x]  = p.anchor[threadIdx.x * p.anchor_stride];
         stemp[threadIdx.x] = p.temps[threadIdx.x];
+        if (blockIdx.x == 0 && p.verify != nullptr) p.verify[threadIdx.x * p.verify_stride] = prev[threadIdx.x];
     }
     if (ONE && threadIdx.x < WAVE) { // a lane 4 values of the anchor's embedding row
         reinterpret_cast<uint2 *>(erow)[threadIdx.x] =
@@ -381,9 +534,6 @@ markov_block_kernel(const Params p) {
                 }
             }
         }
-        if (step + 1 == p.gamma) { // every step's logits stored before the last step's records: the gather reads them
-            asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
-        }
         __syncthreads();
         MARKOV_STAMP(2 + 5 * step);
         if constexpr (ONE) {
@@ -453,6 +603,7 @@ markov_block_kernel(const Params p) {
                     prev[0]           = tok;
                     if (blockIdx.x == 0) {
                         p.out[step] = tok;
+                        if (p.verify != nullptr) p.verify[1 + step] = tok;
                     }
                 }
             }
@@ -539,6 +690,7 @@ markov_block_kernel(const Params p) {
                 prev[threadIdx.x] = tok;
                 if (blockIdx.x == 0) {
                     p.out[threadIdx.x * p.out_stride + step] = tok;
+                    if (p.verify != nullptr) p.verify[threadIdx.x * p.verify_stride + 1 + step] = tok;
                 }
             }
             __syncthreads();
@@ -554,24 +706,24 @@ markov_block_kernel(const Params p) {
             p.offset[0] = offset + 1;
         }
     }
-    // the last step's records came after every rank's step logits: gather the sampled sequences' rows
-    for (int seq = 0; seq < nseq; ++seq) {
-        if (p.temps[seq] == 0.0f) {
-            continue;
-        }
-        for (int rs = 0; rs < p.gamma * p.tp; ++rs) {
-            const int       step = rs / p.tp, src = rs % p.tp;
-            const int       start = src * p.part;
-            const int       quads = min(p.part, p.vocab - start) / 4;
-            const uint32x4 *from  = reinterpret_cast<const uint32x4 *>(
-                                       static_cast<const char *>(p.recv[src]) + EXCHANGE_BYTES) +
-                                   (static_cast<int64_t>(seq) * p.gamma + step) * (p.part / 4);
-            uint32x4 *to = reinterpret_cast<uint32x4 *>(p.whole + seq * p.whole_seq_stride +
-                                                        step * p.whole_step_stride + start);
-            for (int i = blockIdx.x * THREADS + threadIdx.x; i < quads; i += p.blocks * THREADS) {
-                to[i] = load_nt(from + i);
-            }
-        }
+}
+
+// every rank's shard of the sampled sequences' step logits (each rank's exchange buffer, past EXCHANGE_BYTES, as the
+// Markov launch left them) into the whole rows
+__global__ __launch_bounds__(THREADS) void gather_kernel(const Params p) {
+    const int row = blockIdx.y; // (sequence, step, source rank)
+    const int seq = row / (p.gamma * p.tp), step = (row / p.tp) % p.gamma, src = row % p.tp;
+    if (p.temps[seq] == 0.0f) {
+        return;
+    }
+    const int       start = src * p.part;
+    const int       quads = min(p.part, p.vocab - start) / 4;
+    const uint32x4 *from  = reinterpret_cast<const uint32x4 *>(static_cast<const char *>(p.recv[src]) + EXCHANGE_BYTES) +
+                           (static_cast<int64_t>(seq) * p.gamma + step) * (p.part / 4);
+    uint32x4 *to = reinterpret_cast<uint32x4 *>(p.whole + seq * p.whole_seq_stride + step * p.whole_step_stride + start);
+    const int i  = blockIdx.x * THREADS + threadIdx.x;
+    if (i < quads) {
+        to[i] = load_nt(from + i);
     }
 }
 
@@ -582,47 +734,43 @@ void check(const at::Tensor &t, const at::Tensor &ref, at::ScalarType dtype, con
                 " must have unit inner stride");
 }
 
-// base [nseq, gamma, padded] bf16 (unit inner stride), embed [vocab, 256], head [width, 256] bf16, anchor / tok
-// [nseq] int64, temps [nseq] f32, offset [1] int64 (advanced once), out int64 (sequence s's step t token at
-// s * out_stride + t), control int32 [blocks] (zeroed once), peers [tp] int64 on the host: every
-// rank's exchange buffer; whole [nseq, gamma, vocab] f32 (any outer strides): a sampled sequence's step logits,
-// every rank's shard of part columns
-void markov_block(const at::Tensor &base, const at::Tensor &embed, const at::Tensor &head, const at::Tensor &anchor,
-                  const at::Tensor &temps, at::Tensor &offset, int64_t key, int64_t vocab_start, at::Tensor &out,
-                  int64_t out_stride, at::Tensor &tok, at::Tensor &control, const at::Tensor &peers, int64_t rank,
-                  at::Tensor &whole, int64_t part, double deadline_s) {
-    const int64_t nseq  = base.size(0);
+// the Markov block's launch parameters: nseq sequences of gamma steps over padded columns (base logits at logits, or
+// the launch's own); embed [vocab, 256], head [width, 256] bf16, anchor / tok [nseq] int64, temps [nseq] f32, offset
+// [1] int64 (advanced once), out int64 (sequence s's step t token at s * out_stride + t), control int32 [blocks]
+// (zeroed once), peers [tp] int64 on the host: every rank's exchange buffer; whole [nseq, gamma, vocab] f32 (any
+// outer strides): the rows gather_step_logits fills, every rank's shard of part columns
+Params markov_params(int64_t nseq, int64_t gamma, int64_t padded, const at::Tensor &ref, const at::Tensor &embed,
+                     const at::Tensor &head, const at::Tensor &anchor, const at::Tensor &temps, at::Tensor &offset,
+                     int64_t key, int64_t vocab_start, at::Tensor &out, int64_t out_stride, at::Tensor &tok,
+                     at::Tensor &control, const at::Tensor &peers, int64_t rank, at::Tensor &whole, int64_t part,
+                     double deadline_s, const c10::optional<at::Tensor> &verify) {
     const int64_t width = head.size(0);
-    TORCH_CHECK(base.dim() == 3 && nseq >= 1 && nseq <= MAX_SEQ && base.size(1) >= 1 && base.size(1) <= MAX_STEPS,
-                "base [1 .. ", MAX_SEQ, " sequences, 1 .. ", MAX_STEPS, " steps, padded]");
+    TORCH_CHECK(nseq >= 1 && nseq <= MAX_SEQ && gamma >= 1 && gamma <= MAX_STEPS,
+                "1 .. ", MAX_SEQ, " sequences, 1 .. ", MAX_STEPS, " steps");
     TORCH_CHECK(head.dim() == 2 && head.size(1) == DIM && head.is_contiguous() && embed.dim() == 2 &&
-                    embed.size(1) == DIM && embed.is_contiguous() && width <= base.size(2),
+                    embed.size(1) == DIM && embed.is_contiguous() && width <= padded,
                 "head [width, 256], embed [vocab, 256] contiguous");
-    check(base, base, at::kBFloat16, "base");
-    check(embed, base, at::kBFloat16, "embed");
-    check(head, base, at::kBFloat16, "head");
-    TORCH_CHECK(anchor.device() == base.device() && anchor.scalar_type() == at::kLong && anchor.dim() == 1 &&
+    check(embed, ref, at::kBFloat16, "embed");
+    check(head, ref, at::kBFloat16, "head");
+    TORCH_CHECK(anchor.device() == ref.device() && anchor.scalar_type() == at::kLong && anchor.dim() == 1 &&
                     anchor.size(0) >= nseq,
                 "anchor [nseq] int64 (any stride)");
-    check(temps, base, at::kFloat, "temps");
-    check(offset, base, at::kLong, "offset");
-    check(out, base, at::kLong, "out");
-    check(tok, base, at::kLong, "tok");
-    check(control, base, at::kInt, "control");
-    check(whole, base, at::kFloat, "whole");
+    check(temps, ref, at::kFloat, "temps");
+    check(offset, ref, at::kLong, "offset");
+    check(out, ref, at::kLong, "out");
+    check(tok, ref, at::kLong, "tok");
+    check(control, ref, at::kInt, "control");
+    check(whole, ref, at::kFloat, "whole");
     TORCH_CHECK(peers.device().is_cpu() && peers.scalar_type() == at::kLong && peers.numel() >= 1 &&
                     peers.numel() <= MAX_TP,
                 "peers: every rank's exchange buffer (int64, host)");
-    const int64_t gamma = base.size(1), vocab = whole.size(2);
+    const int64_t vocab = whole.size(2);
     TORCH_CHECK(whole.dim() == 3 && whole.size(0) >= nseq && whole.size(1) == gamma, "whole [nseq, gamma, vocab]");
     TORCH_CHECK(part % 4 == 0 && vocab % 4 == 0 && whole.stride(0) % 4 == 0 && whole.stride(1) % 4 == 0 &&
-                    reinterpret_cast<uintptr_t>(whole.data_ptr()) % 16 == 0 && base.size(2) <= part,
+                    reinterpret_cast<uintptr_t>(whole.data_ptr()) % 16 == 0 && padded <= part,
                 "16 B aligned rows and shards, the padded shard within part");
     TORCH_CHECK(peers.numel() * part >= vocab && (peers.numel() - 1) * part < vocab, "the shards tile the vocab");
     Params p{};
-    p.logits        = static_cast<const bfloat16 *>(base.data_ptr());
-    p.logits_stride = base.stride(0);
-    p.step_stride   = base.stride(1);
     p.embed         = static_cast<const bfloat16 *>(embed.data_ptr());
     p.head          = static_cast<const bfloat16 *>(head.data_ptr());
     p.anchor        = anchor.data_ptr<int64_t>();
@@ -633,10 +781,10 @@ void markov_block(const at::Tensor &base, const at::Tensor &embed, const at::Ten
     p.key_hi        = static_cast<uint32_t>(static_cast<uint64_t>(key) >> 32);
     p.vocab_start   = static_cast<int>(vocab_start);
     p.width         = static_cast<int>(width);
-    p.padded        = static_cast<int>(base.size(2));
+    p.padded        = static_cast<int>(padded);
     p.gamma         = static_cast<int>(gamma);
     p.nseq          = static_cast<int>(nseq);
-    p.blocks        = static_cast<int>((base.size(2) + BLOCK_ROWS - 1) / BLOCK_ROWS);
+    p.blocks        = static_cast<int>((padded + BLOCK_ROWS - 1) / BLOCK_ROWS);
     TORCH_CHECK(p.blocks <= MAX_BLOCKS && control.numel() >= p.blocks, "control [blocks] int32, at most ",
                 MAX_BLOCKS, " blocks");
     TORCH_CHECK(nseq * peers.numel() * p.blocks <= 4 * THREADS, "a step's records at most 4 a thread");
@@ -647,6 +795,13 @@ void markov_block(const at::Tensor &base, const at::Tensor &embed, const at::Ten
     p.vocab            = static_cast<int>(vocab);
     p.out              = out.data_ptr<int64_t>();
     p.out_stride       = out_stride;
+    if (verify.has_value()) {
+        check(*verify, ref, at::kLong, "verify");
+        TORCH_CHECK(verify->dim() == 2 && verify->size(0) >= nseq && verify->size(1) == gamma + 1,
+                    "verify [nseq, gamma + 1] int64: [anchor | tokens]");
+        p.verify        = verify->data_ptr<int64_t>();
+        p.verify_stride = verify->stride(0);
+    }
     p.tok              = tok.data_ptr<int64_t>();
     p.counts           = reinterpret_cast<uint32_t *>(control.data_ptr<int>());
     p.whole            = whole.data_ptr<float>();
@@ -656,13 +811,107 @@ void markov_block(const at::Tensor &base, const at::Tensor &embed, const at::Ten
     for (int r = 0; r < p.tp; ++r) {
         p.recv[r] = reinterpret_cast<void *>(peers.data_ptr<int64_t>()[r]);
     }
+    return p;
+}
+
+// base [nseq, gamma, padded] bf16 (unit inner stride), then markov_params' arguments
+void markov_block(const at::Tensor &base, const at::Tensor &embed, const at::Tensor &head, const at::Tensor &anchor,
+                  const at::Tensor &temps, at::Tensor &offset, int64_t key, int64_t vocab_start, at::Tensor &out,
+                  int64_t out_stride, at::Tensor &tok, at::Tensor &control, const at::Tensor &peers, int64_t rank,
+                  at::Tensor &whole, int64_t part, double deadline_s,
+                  const c10::optional<at::Tensor> &verify) {
+    TORCH_CHECK(base.dim() == 3, "base [sequences, steps, padded]");
+    check(base, base, at::kBFloat16, "base");
+    Params p = markov_params(base.size(0), base.size(1), base.size(2), base, embed, head, anchor, temps, offset, key,
+                             vocab_start, out, out_stride, tok, control, peers, rank, whole, part, deadline_s, verify);
+    p.logits        = static_cast<const bfloat16 *>(base.data_ptr());
+    p.logits_stride = base.stride(0);
+    p.step_stride   = base.stride(1);
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA guard(base.device());
     const hipStream_t stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA(base.device().index()).stream();
-    if (nseq == 1) {
+    if (p.nseq == 1) {
         markov_block_kernel<true><<<p.blocks, THREADS, 0, stream>>>(p);
     } else {
         markov_block_kernel<false><<<p.blocks, THREADS, 0, stream>>>(p);
     }
+    C10_HIP_KERNEL_LAUNCH_CHECK();
+}
+
+// one sequence's draft head and Markov block in one launch: x [gamma, K] bf16 (the normed rows, contiguous), w
+// [width, K] bf16 (this rank's head rows, unit inner stride), base [gamma * width] int64 (the tagged base logits,
+// zeroed once), control int32 [MAX_BLOCKS] (this launch's own, zeroed once), then markov_params' arguments
+void draft_head(const at::Tensor &x, const at::Tensor &w, at::Tensor &base, const at::Tensor &embed,
+                const at::Tensor &head, const at::Tensor &anchor, const at::Tensor &temps, at::Tensor &offset,
+                int64_t key, int64_t vocab_start, at::Tensor &out, int64_t out_stride, at::Tensor &tok,
+                at::Tensor &control, const at::Tensor &peers, int64_t rank, at::Tensor &whole, int64_t part,
+                double deadline_s, const c10::optional<at::Tensor> &verify) {
+    const int64_t gamma = x.size(0), K = x.size(1), width = head.size(0);
+    check(x, x, at::kBFloat16, "x");
+    check(w, x, at::kBFloat16, "w");
+    TORCH_CHECK(x.dim() == 2 && x.is_contiguous() && gamma <= HEAD_ROWS && K <= MAX_HEAD_K && K % (2 * GEMM_STEP) == 0,
+                "x [<= 6, K] contiguous, K a multiple of 512 up to 5120");
+    TORCH_CHECK(w.dim() == 2 && w.size(0) == width && w.size(1) == K && w.stride(0) % 8 == 0 &&
+                    width * w.stride(0) * 2 < (int64_t{1} << 31),
+                "w [width, K]");
+    TORCH_CHECK(base.scalar_type() == at::kLong && base.is_contiguous() && base.numel() >= gamma * width, "base");
+    Params p = markov_params(1, gamma, width, x, embed, head, anchor, temps, offset, key, vocab_start, out, out_stride,
+                             tok, control, peers, rank, whole, part, deadline_s, verify);
+    p.x = static_cast<const bfloat16 *>(x.data_ptr());
+    p.w = static_cast<const bfloat16 *>(w.data_ptr());
+    p.w_stride = w.stride(0);
+    p.base = reinterpret_cast<uint64_t *>(base.data_ptr<int64_t>());
+    p.K = static_cast<int>(K);
+    p.tiles = static_cast<int>((width + GEMM_TILE - 1) / GEMM_TILE);
+    p.gemm_blocks = MAX_BLOCKS;
+    p.tiles_per_block = (p.tiles + p.gemm_blocks - 1) / p.gemm_blocks;
+    while ((THREADS / WAVE) % p.tiles_per_block != 0) ++p.tiles_per_block;
+    TORCH_CHECK(p.tiles_per_block <= THREADS / WAVE && control.numel() >= p.gemm_blocks,
+                "at most 8 tiles a block, control [256]");
+    TORCH_CHECK(K / GEMM_STEP % (2 * ((THREADS / WAVE) / p.tiles_per_block)) == 0, "K parts of an even count of iterations");
+    static bool wide = false; // the LDS past 64 KB, set once a process
+    if (!wide) {
+        C10_HIP_CHECK(hipFuncSetAttribute(reinterpret_cast<const void *>(&markov_block_kernel<true, true>),
+                                          hipFuncAttributeMaxDynamicSharedMemorySize, HEAD_LDS));
+        wide = true;
+    }
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA guard(x.device());
+    const hipStream_t stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA(x.device().index()).stream();
+    markov_block_kernel<true, true><<<p.gemm_blocks, THREADS, HEAD_LDS, stream>>>(p);
+    C10_HIP_KERNEL_LAUNCH_CHECK();
+}
+
+// temps [nseq] f32, peers [tp] int64 on the host (every rank's exchange buffer), whole [nseq, gamma, vocab] f32 (any
+// outer strides): the sampled sequences' step logits, every rank's shard of part columns
+void gather_step_logits(const at::Tensor &temps, const at::Tensor &peers, at::Tensor &whole, int64_t part) {
+    check(temps, whole, at::kFloat, "temps");
+    check(whole, whole, at::kFloat, "whole");
+    const int64_t nseq = whole.size(0), gamma = whole.size(1), vocab = whole.size(2);
+    TORCH_CHECK(whole.dim() == 3 && nseq >= 1 && nseq <= MAX_SEQ && gamma >= 1 && gamma <= MAX_STEPS &&
+                    temps.numel() >= nseq,
+                "whole [1 .. 4, gamma, vocab], temps [nseq]");
+    TORCH_CHECK(peers.device().is_cpu() && peers.scalar_type() == at::kLong && peers.numel() >= 1 &&
+                    peers.numel() <= MAX_TP,
+                "peers: every rank's exchange buffer (int64, host)");
+    TORCH_CHECK(part % 4 == 0 && vocab % 4 == 0 && whole.stride(0) % 4 == 0 && whole.stride(1) % 4 == 0 &&
+                    reinterpret_cast<uintptr_t>(whole.data_ptr()) % 16 == 0,
+                "16 B aligned rows and shards");
+    TORCH_CHECK(peers.numel() * part >= vocab && (peers.numel() - 1) * part < vocab, "the shards tile the vocab");
+    Params p{};
+    p.temps             = temps.data_ptr<float>();
+    p.gamma             = static_cast<int>(gamma);
+    p.nseq              = static_cast<int>(nseq);
+    p.tp                = static_cast<int>(peers.numel());
+    p.part              = static_cast<int>(part);
+    p.vocab             = static_cast<int>(vocab);
+    p.whole             = whole.data_ptr<float>();
+    p.whole_seq_stride  = whole.stride(0);
+    p.whole_step_stride = whole.stride(1);
+    for (int r = 0; r < p.tp; ++r) {
+        p.recv[r] = reinterpret_cast<void *>(peers.data_ptr<int64_t>()[r]);
+    }
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA guard(whole.device());
+    const hipStream_t stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA(whole.device().index()).stream();
+    gather_kernel<<<dim3((part / 4 + THREADS - 1) / THREADS, nseq * gamma * p.tp), THREADS, 0, stream>>>(p);
     C10_HIP_KERNEL_LAUNCH_CHECK();
 }
 
@@ -675,6 +924,13 @@ void markov_block(const at::Tensor &base, const at::Tensor &embed, const at::Ten
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
     m.def("markov_block(Tensor base, Tensor embed, Tensor head, Tensor anchor, Tensor temps, Tensor(a!) offset, "
           "int key, int vocab_start, Tensor(b!) out, int out_stride, Tensor(c!) tok, Tensor(d!) control, "
-          "Tensor peers, int rank, Tensor(e!) whole, int part, float deadline_s) -> ()");
+          "Tensor peers, int rank, Tensor(e!) whole, int part, float deadline_s, Tensor(f!)? verify=None) -> ()");
     m.impl("markov_block", at::kCUDA, &markov_block);
+    m.def("draft_head(Tensor x, Tensor w, Tensor(a!) base, Tensor embed, Tensor head, Tensor anchor, Tensor temps, "
+          "Tensor(b!) offset, int key, int vocab_start, Tensor(c!) out, int out_stride, Tensor(d!) tok, "
+          "Tensor(e!) control, Tensor peers, int rank, Tensor(f!) whole, int part, float deadline_s, "
+          "Tensor(g!)? verify=None) -> ()");
+    m.impl("draft_head", at::kCUDA, &draft_head);
+    m.def("gather_step_logits(Tensor temps, Tensor peers, Tensor(a!) whole, int part) -> ()");
+    m.impl("gather_step_logits", at::kCUDA, &gather_step_logits);
 }
