@@ -174,8 +174,8 @@ WORD = 16  # a tagged word's bytes: three data words, then the launch tag
 
 def tagged_x8b(d: Dims, s: int) -> bool:
     """Whether wo_a hands X8B to wo_b as tagged words (no store-completion wait, no
-    flag): on TP8 at one token tile."""
-    return d.tp == 8 and s <= TILE
+    flag): on TP4 and TP8 at one token tile."""
+    return d.tp in (4, 8) and s <= TILE
 
 
 def tagged_q_split(d: Dims, s: int, tok_par: bool = False) -> bool:
