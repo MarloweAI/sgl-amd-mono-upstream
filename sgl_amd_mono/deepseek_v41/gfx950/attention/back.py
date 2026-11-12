@@ -79,6 +79,7 @@ from .plan import (
     Dims,
     cdiv,
     comb_parts,
+    q_words,
     split_keys,
     tagged_x8b,
     tile_rows,
@@ -396,6 +397,77 @@ def await_k1(c, unit, t):
     c["k1_seen"](unit)
 
 
+def q_flag_load(qt, krdy, words: dict, tid, t, s: int, d: Dims, pred=None):
+    """A load of this thread's words of ``await_q``: thread u < 256 token t's tagged q
+    words u, u + 256, u + 512 (``front.stage_wqb``), then row u's record flag (u < s) or
+    t's key-table flag. ``words``: ``vrdy``'s i32 offset from ``krdy``'s. ``pred``
+    false: the load touches no memory."""
+    assert q_words(d) == 3 * 256
+    u = fx.min(tid, 255)
+    rec = words["vrdy"] + 2 * fx.min(u, s - 1) * FLAG_STRIDE
+    w = (u < s).select(rec, 2 * t)
+    nb = None if pred is None else pred.select(fx.Int64(0xFFFFFFFF), fx.Int64(0))
+
+    def load():
+        out = []
+        for i in range_constexpr(3):
+            v = fx.Vector(
+                bo.buffer_load(
+                    rsrc(qt, nb),
+                    (t * q_words(d) + u + 256 * i) * 4,
+                    vec_width=4,
+                    dtype=T.i32,
+                    cache_modifier=CM_DEV,
+                )
+            )
+            out += [v[e] for e in range(4)]
+        f = fx.Vector(
+            bo.buffer_load(
+                rsrc(krdy, nb), w, vec_width=2, dtype=T.i32, cache_modifier=CM_DEV
+            )
+        )
+        return fx.Vector.from_elements(out + [f[0], f[1]], fx.Int32)
+
+    return load
+
+
+@flyc.jit
+def _store_q_word(sl, w, v, i):
+    # word w of a token's tagged q (task w // 3, its dims 6 (w % 3) ..) into the split's
+    # q rows, a head a row
+    task, j = w // 3, w % 3
+    at = (
+        sl["q"] + (task // (HEAD_DIM // ROWS)) * Q_ROW + (task % (HEAD_DIM // ROWS)) * 8
+    )
+    at = at + 3 * j
+    fx.ptr_store(v[4 * i], at)
+    fx.ptr_store(v[4 * i + 1], at + 1)
+    if j < 2:
+        fx.ptr_store(v[4 * i + 2], at + 2)
+
+
+@flyc.jit
+def await_q(c, unit, t):
+    """One launch per layer with tagged q (``tagged_q_split``): token t's q words, each CTA's
+    (every CTA stored them past its epoch read), into the split's q rows, with every row's
+    record flag (``vrdy``) and t's key table (``krdy``), on the waves without keys; the
+    first loads went out as K1's half ended (``c["k1_first"]``). ``c["k1_seen"](unit)``
+    runs once they are in."""
+    tag = c["mb"].tag
+    tid = c["tid"]
+    load = q_flag_load(c["qt"], c["krdy"], c["k1_words"], tid, t, c["S"], c["d"])
+
+    def pending(v):
+        return (v[3] != tag) | (v[7] != tag) | (v[11] != tag) | (v[13] != tag)
+
+    if tid < 256:
+        v = _spin(load, pending, first=c["k1_first"])
+        for i in range_constexpr(3):
+            _store_q_word(c["sl"], tid + 256 * i, v, i)
+    gpu.barrier()
+    c["k1_seen"](unit)
+
+
 def staged(d: Dims, s: int) -> bool:
     """Whether a split unit's keys take half the waves (``key_wave``), their records staged
     in the L2 before wq_b (``EarlyKeys``): on TP8 (on TP4 it slows the front)."""
@@ -561,9 +633,14 @@ def stage_split(c, unit):
     # one launch per layer: K1's half of this launch wrote q and the records; the old
     # keys' records are in flight since K1's end (``EarlyKeys``)
     one = "qb" in c
+    # tagged q (one launch a layer): q comes in the wait itself, into the LDS
+    tq = "qt" in c
     if const_expr(one):
         pre = c["pre"]
-        await_k1(c, unit, t)
+        if const_expr(tq):
+            await_q(c, unit, t)
+        else:
+            await_k1(c, unit, t)
         kv_len = pre["kv_len"]
         data, sc, okv = key_addr(a, c["ratio"], pre["val"])
         assert NOPE // 64 == 7 and ROPE // 32 == 2
@@ -579,7 +656,7 @@ def stage_split(c, unit):
     qrow = d.heads * HEAD_DIM // 8
     qpad = d.tile_heads * HEAD_DIM // 8  # with the head tile's padding rows
     qv = []
-    for i in range_constexpr(cdiv(qrow, THREADS)):
+    for i in range_constexpr(0 if const_expr(tq) else cdiv(qrow, THREADS)):
         u = fresh(tid) + THREADS * i
         qv.append(
             fx.Vector(
@@ -607,7 +684,7 @@ def stage_split(c, unit):
             scw, nope, rope = got[0], list(got[1:8]), list(got[8:])
         else:
             scw, nope, rope = key_loads(data, sc, g)
-        for i in range_constexpr(cdiv(qrow, THREADS)):
+        for i in range_constexpr(0 if const_expr(tq) else cdiv(qrow, THREADS)):
             u = fresh(tid) + THREADS * i
             if u < qrow:
                 fx.ptr_store(

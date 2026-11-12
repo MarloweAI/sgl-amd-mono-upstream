@@ -178,6 +178,19 @@ def tagged_x8b(d: Dims, s: int) -> bool:
     return d.tp == 8 and s <= TILE
 
 
+def tagged_q_split(d: Dims, s: int, tok_par: bool = False) -> bool:
+    """Whether, in one launch a layer, wq_b hands q to the split as tagged words
+    (``q_words``: no q flag), each row's KV record behind a flag of its own: on TP8 at
+    one token tile, not token parallel."""
+    return d.tp == 8 and s <= TILE and not tok_par
+
+
+def q_words(d: Dims) -> int:
+    """Tagged q's words a token (``tagged_q_split``): three a wq_b task,
+    its 16 bf16 dims as 6, 6 and 4."""
+    return d.wqb_tasks * 3
+
+
 def x8b_words(d: Dims, s: int) -> int:
     """Tagged X8B's words: three a (token, wo_a task), its 32 e4m3 and E8M0 code."""
     return s * d.woa_tasks * 3
