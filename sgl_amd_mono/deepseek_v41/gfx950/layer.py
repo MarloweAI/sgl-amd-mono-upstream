@@ -560,6 +560,7 @@ def run_k1(key: MonoBuild, sl, front, a: dict, ep, k2=None, early=None):
             index_query.run_cp(c, c["args"], own_n, CP0, c["xl"], key.cp)
         if const_expr(early is not None):
             early.entries()
+            early.touch()
 
     mb_front.run_front(
         c,
