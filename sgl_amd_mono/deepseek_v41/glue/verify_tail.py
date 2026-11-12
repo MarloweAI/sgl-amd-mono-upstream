@@ -36,7 +36,8 @@ SGLANG_READS = {
         "_static_accept_tail",
         "verify_shard",
         "simulate_fold",
-        "_tail_broadcasts",
+        "_tp_sync",
+        "SpecTpSyncSite",
         "simulated_correct_len",
         "sim_temperatures_buf",
         "sim_seed_buf",
@@ -69,7 +70,7 @@ SGLANG_READS = {
         "_future_relay_rows",
         "_post_fold",
         "req_pool_indices",
-        "deferred_commit",
+        "deferred_draft_kv",
         # the sampled accept on the shard
         "sampled_accept_on_shard",
         "_static_sampled_tail",
@@ -77,6 +78,7 @@ SGLANG_READS = {
         "_static_sampled_tail(temperatures)",
         "_static_sampled_tail(rejection_noise)",
     ),
+    "srt/speculative/spec_tp_sync.py": ("DSPARK_ACCEPT_GRAPH",),
     "kernels/ops/speculative/dspark/blockwise_rejection.py": (
         "RejectionNoise",
         "key",
@@ -154,7 +156,7 @@ def _why_not(epi, shard, logits, candidates) -> str | None:
 
     if shard is None:
         return "whole logits"
-    if epi._tail_broadcasts:
+    if _tail_broadcasts(epi):
         return "the accept-site TP broadcast"
     bs, t = candidates.shape
     if logits.dtype != torch.bfloat16 or logits.stride(1) != 1 or logits.dim() != 2:
@@ -199,6 +201,12 @@ def _tail(epi, shard, part: int):
     return got
 
 
+def _tail_broadcasts(epi) -> bool:
+    """Whether the epilogue's accept-site TP broadcast runs."""
+    site = importlib.import_module(VERIFY).SpecTpSyncSite.DSPARK_ACCEPT_GRAPH
+    return epi._tp_sync.enabled(site)
+
+
 def _epilogue(lp):
     """The verify epilogue whose accept reads ``lp``'s shard (defer_greedy_verify_gather)."""
     found = [e for e in _EPILOGUES if e.target_logits_processor is lp]
@@ -222,7 +230,7 @@ def _fused_why_not(lm, forward_batch, x) -> str | None:
     if not lp.defer_greedy_verify_gather:
         return "the logits processor gathers the greedy verify's logits"
     epi = _epilogue(lp)
-    if epi is None or epi._tail_broadcasts:
+    if epi is None or _tail_broadcasts(epi):
         return "no epilogue accept on the shard"
     lpm = importlib.import_module(LOGITS)
     weight = getattr(head, "weight", None)
@@ -470,7 +478,7 @@ def _static_sampled_tail(orig, self, *, candidates, logits, draft_logits, temper
 def _run_static(orig, self, io, *, accept, gate, kv_projected=False):
     # kv_projected: a deferred commit's projection already joined (without one, the commit projects here)
     _COMMITS[id(self)] = (
-        None if kv_projected and self.deferred_commit is not None else io.hidden
+        None if kv_projected and self.deferred_draft_kv is not None else io.hidden
     )
     _SLOTS[id(self)] = io.req_pool_indices
     if (

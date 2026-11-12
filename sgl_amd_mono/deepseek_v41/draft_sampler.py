@@ -48,12 +48,12 @@ SGLANG_READS = {
     ),
     "srt/models/dspark.py": ("vocab_shard", "vocab_size"),
     "srt/speculative/dspark_components/dspark_draft.py": ("key", "offset"),
-    "srt/speculative/dspark_components/dspark_draft_sampler.py": (
+    "srt/kernel_plugins/nvidia/dspark_binding.py": (
         '"verify_ids"',
         '"writes_verify_ids"',
         '"gather_step_logits"',
-        "whole_step_logits",
     ),
+    "srt/speculative/dspark_components/dspark_draft_sampler.py": ("whole_step_logits",),
 }
 
 

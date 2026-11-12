@@ -80,7 +80,7 @@ SGLANG_READS = {
         "inject_target_hidden",
     ),
     "srt/speculative/dspark_components/dspark_verify.py": (
-        "deferred_commit",
+        "deferred_draft_kv",
         "commit_ctx",
         "kv_injector",
     ),
@@ -150,7 +150,7 @@ def _projection_why(epilogue, hidden) -> str | None:
 
     if not flag(ENV) or not _EXCHANGE:
         return "no split main_proj"
-    if epilogue.deferred_commit is not None:
+    if epilogue.deferred_draft_kv is not None:
         return "the commit's KV is deferred"
     injector = epilogue.commit_ctx.kv_injector
     pool = injector.draft_model_runner.token_to_kv_pool
