@@ -1005,18 +1005,22 @@ def ug_pass(c, e, part0, first, count, col):
 
 
 @flyc.jit
-def load_x8_rows(c, words_mb, codes_mb, xl, xsl, token_of, live):
-    """Wait on each token's X8RDY, then load its MXFP8 row into LDS."""
+def load_x8_rows(c, words_mb, codes_mb, xl, xsl, token_of, live, ahead=False):
+    """Wait on each token's X8RDY, then load its MXFP8 row into LDS. ``ahead``: every
+    load issued before the first store (a row past ``live`` reads the last row's), so the
+    loads overlap instead of a round trip each."""
     tid = c["tid"]
     if tid < TILE:
         c["poll"]([(c["x8rdy"], token_of(fx.min(tid, live - 1)) * FLAG_STRIDE, 1)])
     gpu.barrier()
-    for mb, width, dst in ((words_mb, X8_WORDS, xl), (codes_mb, HIDDEN // 32, xsl)):
-        quads = width // 4
-        for i in range_constexpr(-(-TILE * quads // THREADS)):
-            q = tid + THREADS * i
-            row = q // quads
-            if (q < TILE * quads) & (row < live):
+    if const_expr(ahead):
+        parts = ((words_mb, X8_WORDS, xl), (codes_mb, HIDDEN // 32, xsl))
+        got = []
+        for mb, width, dst in parts:
+            quads = width // 4
+            for i in range_constexpr(-(-TILE * quads // THREADS)):
+                q = tid + THREADS * i
+                row = fx.min(q // quads, live - 1)
                 v = fx.Vector(
                     bo.buffer_load(
                         rsrc(c[mb].value),
@@ -1026,7 +1030,28 @@ def load_x8_rows(c, words_mb, codes_mb, xl, xsl, token_of, live):
                         cache_modifier=CM_DEV,
                     )
                 )
+                got.append((q, quads, width, dst, v))
+        for q, quads, width, dst, v in got:
+            row = q // quads
+            if (q < TILE * quads) & (row < live):
                 fx.ptr_store(v, dst + (row * lds_row(width) + q % quads * 4))
+    else:
+        for mb, width, dst in ((words_mb, X8_WORDS, xl), (codes_mb, HIDDEN // 32, xsl)):
+            quads = width // 4
+            for i in range_constexpr(-(-TILE * quads // THREADS)):
+                q = tid + THREADS * i
+                row = q // quads
+                if (q < TILE * quads) & (row < live):
+                    v = fx.Vector(
+                        bo.buffer_load(
+                            rsrc(c[mb].value),
+                            token_of(row) * width + q % quads * 4,
+                            vec_width=4,
+                            dtype=T.i32,
+                            cache_modifier=CM_DEV,
+                        )
+                    )
+                    fx.ptr_store(v, dst + (row * lds_row(width) + q % quads * 4))
     gpu.barrier()
 
 
@@ -2438,7 +2463,11 @@ def run_moe(c, key, bid, before_ug=None):
         else:
             t0 = unit // shared_tasks * TILE
             n = fx.min(fx.Int32(TILE), s - t0)
-            load_x8_rows(c, "x8", "x8s", c["x8l"], c["x8sl"], lambda j: t0 + j, n)
+            # the rows' loads all in flight at once: the CTA reaches ug only past its unit
+            ahead = c["rs"].tp < 8
+            load_x8_rows(
+                c, "x8", "x8s", c["x8l"], c["x8sl"], lambda j: t0 + j, n, ahead=ahead
+            )
             stage_shared(c, unit % shared_tasks, gops, uops, t0, n)
     stamp(c, 22)
     if const_expr(before_ug is not None):
