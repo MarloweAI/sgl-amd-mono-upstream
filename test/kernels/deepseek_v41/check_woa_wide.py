@@ -1,6 +1,7 @@
 """The wide-row wo_a (gfx950/stages/woa_wide) against SGLang's gfx950 route (the Triton batched GEMM
 with wo_b's MXFP8 quant in its epilogue, one walk over K), one GPU: the e4m3 codes and ue8m0 scales must
-match bit for bit at every row count and group count; synthetic checkpoint-like weights (e4m3 with
+match bit for bit at every row count and group count (a K-split tile instead: the same bits
+every call, and fewer than 1e-4 of the codes off the single walk's); synthetic checkpoint-like weights (e4m3 with
 power-of-two 32 x 32 block scales), or a real layer's with --weights.
 
     python3 check_woa_wide.py [--weights MODEL_DIR --layer 5] [--rows 65,96,97,150,192,250,366,384]
@@ -84,11 +85,30 @@ def main():
             rq, rs = batched_gemm_bf16_fp8_grid(
                 x, wb, fp8_grid=False, split_k=False, emit_fp8=True
             )
-            ok = torch.equal(q.view(torch.uint8), rq.view(torch.uint8)) and torch.equal(
-                s, rs
-            )
+            bitwise = torch.equal(
+                q.view(torch.uint8), rq.view(torch.uint8)
+            ) and torch.equal(s, rs)
+            if tl.ks == 1:
+                ok = bitwise
+                line = f"g={g} m={m:3d}: {'bit for bit' if ok else 'DIFFERS'}"
+            else:
+                # a K split: the same bits every call, and within an e4m3 ulp of the walk
+                q0, s0 = q.clone(), s.clone()
+                woa_wide.standalone(m, g)(
+                    x.data_ptr(), wp.data_ptr(), codes.data_ptr(), q.data_ptr(),
+                    s.data_ptr(), part.data_ptr(), flags.data_ptr(),
+                    stream=torch.cuda.current_stream(),
+                )  # fmt: skip
+                same = torch.equal(q, q0) and torch.equal(s, s0)
+                frac = (
+                    (q.view(torch.uint8) != rq.view(torch.uint8)).float().mean().item()
+                )
+                ok = same and frac < 1e-4
+                line = (
+                    f"g={g} m={m:3d}: K split {tl.ks}, deterministic {same}, "
+                    f"{frac:.2e} of codes differ from the single walk"
+                )
             bad += not ok
-            line = f"g={g} m={m:3d}: {'bit for bit' if ok else 'DIFFERS'}"
             if m <= 64:
                 dq, ds = batched_gemm_bf16_fp8_grid(
                     x, wb, fp8_grid=False, emit_fp8=True

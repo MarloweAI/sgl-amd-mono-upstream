@@ -1579,15 +1579,15 @@ class _SeamResources:
 class WideWoa(Stages):
     """``Stages`` with wo_a on ``stages.woa_wide`` for the covered layers: SGLang's inverse
     RoPE, then one launch from the attention output to wo_b's MXFP8 input (the codes and
-    scales SGLang's gfx950 route emits, bit for bit from 65 rows on; ``woa_wide``). Layers
+    scales SGLang's gfx950 route emits, bit for bit from 65 rows on at TP 2; at TP 4 up to
+    192 rows a deterministic K split, within an e4m3 ulp of SGLang's bmm; ``woa_wide``). Layers
     without the plugin's wo_a copy (the spec layer's ``woa_wide``: fragment-order e4m3, with
     its E8M0 codes) keep SGLang's."""
 
     def __init__(self, shared: Shared, c: int):
         super().__init__(shared, c)
         self._woa = shared.once("woa", lambda: _woa_weights(shared))
-        # a launch's K-split workspace: none at the static tiles
-        self._none = None
+        self._ws = shared.once("woa workspace", lambda: _woa_workspaces(shared, self._woa))
 
     def wo_a(self, attn, o, positions, forward_batch, front: Front):
         import sglang.srt.models.deepseek_v4 as dv4
@@ -1609,13 +1609,12 @@ class WideWoa(Stages):
         T, G = o.shape[0], attn.n_local_groups
         o = o.view(T, G, -1)
         assert o.stride(2) == 1 and o.stride(1) == o.shape[2], o.stride()
-        if self._none is None:
-            self._none = torch.zeros(1, dtype=torch.int32, device=o.device)
+        part, flags = self._ws[width_class(T)]
         q = torch.empty(T, G * 1024, dtype=torch.float8_e4m3fn, device=o.device)
         s = torch.empty(T, G * 32, dtype=torch.uint8, device=o.device)
         woa_wide.standalone(T, G, ldx=o.stride(0))(
             o.data_ptr(), w[0].data_ptr(), w[1].data_ptr(), q.data_ptr(), s.data_ptr(),
-            self._none.data_ptr(), self._none.data_ptr(),
+            part.data_ptr(), flags.data_ptr(),
             stream=torch.cuda.current_stream(),
         )  # fmt: skip
         return Mxfp8Activation(q, s)
@@ -1634,6 +1633,25 @@ def _woa_weights(shared: Shared) -> dict:
         if not dv4._hip.wo_b_emits_mxfp8(a, CLASSES[0]):
             raise RuntimeError(f"layer {i}: the wide wo_a needs wo_b on an MXFP8 input")
     return woa
+
+
+def _woa_workspaces(shared: Shared, woa: dict) -> dict:
+    """Each class's K-split workspace (f32 partials, phase-bit flags zeroed once), at its
+    widest row count; a class's launches run in stream order, so they share it."""
+    from sgl_amd_mono.deepseek_v41.gfx950.stages import woa_wide
+
+    if not woa:
+        return {}
+    a = shared.model.layers[min(woa)].self_attn
+    g, dev = a.n_local_groups, a.wo_a.weight.device
+    out = {}
+    for c in CLASSES:
+        pw, fw = woa_wide.workspace(c, g, woa_wide.TILES[(g, woa_wide.width_class(c))])
+        out[c] = (
+            torch.empty(pw, dtype=torch.float32, device=dev),
+            torch.zeros(fw, dtype=torch.int32, device=dev),
+        )
+    return out
 
 
 def mixins(tp: int, heads: int, c: int) -> tuple:

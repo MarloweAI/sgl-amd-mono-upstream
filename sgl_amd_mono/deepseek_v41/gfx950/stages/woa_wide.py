@@ -108,8 +108,10 @@ TILES = {
     (4, 96): Tile(48, 32, 3, 1, 4),
     (4, 192): Tile(48, 64, 3, 1, 4),
     (4, 384): Tile(96, 64, 3, 1, 2),
-    (2, 96): Tile(32, 32, 2, 1, 4),
-    (2, 192): Tile(48, 32, 3, 1, 4),
+    # TP 4 up to 192 rows: W on its own wave and a deterministic K split (SGLang's TP 4
+    # route is a hipBLASLt bmm there, not the single walk the unsplit tiles reproduce)
+    (2, 96): Tile(96, 64, 6, 1, 4, False, 8, 4, 1, 2),
+    (2, 192): Tile(96, 64, 6, 1, 4, False, 4, 8, 1, 2),
     (2, 384): Tile(48, 64, 3, 1, 4),
 }
 
