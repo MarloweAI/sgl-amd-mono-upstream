@@ -1122,10 +1122,11 @@ def back_context(key, lds, args: dict, scratch, tag, layout: dict) -> dict:
 
 
 @flyc.jit
-def run_back(c, key, bid, idle=None):
+def run_back(c, key, bid, idle=None, before_wob=None):
     """The attention back's stages on this CTA: split, combine, wo_a, wo_b.
     ``idle``: work for the CTAs past their attention units, after the attention work and
-    before their GEMV weights load."""
+    before their GEMV weights load. ``before_wob``: work after the GEMV weights and wo_a,
+    before the wait on wo_a's flags; its result is returned."""
     s = key.tokens
     dd = Dims(key.tp)
     # plain ints: a Python object read inside traced control flow is carried
@@ -1239,6 +1240,7 @@ def run_back(c, key, bid, idle=None):
     if const_expr(not early_wob):
         wops = wob_weights()
     stamp(c, 11)
+    early = before_wob() if const_expr(before_wob is not None) else None
     also = c.get("ardy_also")
     if const_expr(woa_spread):
         # this tile's wo_a units
@@ -1308,3 +1310,4 @@ def run_back(c, key, bid, idle=None):
             if has_wob:
                 wob_tile_run(ti)
     stamp(c, 4)
+    return early
