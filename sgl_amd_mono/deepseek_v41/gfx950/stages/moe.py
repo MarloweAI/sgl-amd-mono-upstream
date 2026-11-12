@@ -71,6 +71,7 @@ from sgl_amd_mono.deepseek_v41.gfx950.stages.dims import UG_PART
 from sgl_amd_mono.deepseek_v41.gfx950.stages.gemv import (
     ROWS,
     TILE,
+    _fp8_step_load,
     _fp8_step_mfma,
     gemv_fp8_loads,
     gemv_fp8_mfmas,
@@ -554,6 +555,57 @@ def stage_shared(c, task, gops, uops, t0, n):
     if task % 2 == 1:
         smid_quant(c, task, t0, n)
     gpu.barrier()
+
+
+def shared_loads(c, unit, per, i=0, gate=True, up=True):
+    """Shared unit ``unit``'s task i's gate and up weight loads (``gemv_fp8_loads``), or the one of them
+    ``gate`` / ``up`` keep: task ``unit`` at ``per`` 1 (one token tile: the unit's own task, its index
+    taken for each), else task ``unit * per + i``."""
+    a, tasks = c["args"], c["d"].shared_tasks
+    ops = []
+    for half, want in ((0, gate), (tasks, up)):
+        if const_expr(want):
+            rg = unit % tasks if const_expr(per == 1) else unit * per + i
+            row = rg if const_expr(half == 0) else half + rg
+            ops.append(
+                gemv_fp8_loads(c, a["sgu"], a["sgu_s"], HIDDEN, row, row_major=True)
+            )
+    return ops if len(ops) > 1 else ops[0]
+
+
+@flyc.jit
+def stage_shared_unit(c, unit, per, gops, uops):
+    """``stage_shared`` of a unit's ``per`` tasks one after the other, on one token tile (TP4's per-row
+    MoE): the next task's gate weights go out past this task's gate MFMAs and its up weights past the
+    up MFMAs, so the CTA's weight stream does not stop between tasks."""
+    s, tid, red, d = c["S"], c["tid"], c["red"], c["d"]
+    assert per % 2 == 0  # a unit's tasks pair into SMQ's groups
+    for i in range_constexpr(per):
+        task = unit * per + i
+        more = i + 1 < per
+        gemv_fp8_mfmas(c, HIDDEN, c["xl"], c["xsl"], red, gops)
+        gpu.barrier()
+        if const_expr(more):
+            gops = shared_loads(c, unit, per, i + 1, up=False)
+        gate = fx.Float32(0.0)
+        if tid < ROWS * s:
+            gate = row_sum(red, tid % ROWS, tid // ROWS)
+        gpu.barrier()
+        gemv_fp8_mfmas(c, HIDDEN, c["xl"], c["xsl"], red, uops)
+        gpu.barrier()
+        if const_expr(more):
+            uops = shared_loads(c, unit, per, i + 1, gate=False)
+        if tid < ROWS * s:
+            r = tid % ROWS
+            t = tid // ROWS
+            up = row_sum(red, r, t)
+            v = fx.Float32(_silu_mul(bf16_round(gate), bf16_round(up)).to(fx.BFloat16))
+            c["put"](c["smid"], t * d.sh_inter + task * ROWS + r, v)
+            fx.ptr_store(v, c["pair"] + tid)
+        gpu.barrier()
+        if const_expr(i % 2 == 1):
+            smid_quant(c, task, 0, s)
+        gpu.barrier()
 
 
 @flyc.jit
@@ -1353,11 +1405,26 @@ def reduce_pair(c, task, idx):
 
 
 # ---------------------------------------------------------------- per-row MoE (``RouteShape.row_moe``)
-# a CTA's ug units at most: a row's topk x 18 (16 gate + 16 up rows) units over its 38-40 CTAs
-ROW_UNITS = 3
 ROW_TILES = 8  # a CTA's down: hidden rows 128 slice .. of its row, 8 tiles of 16
 ROW_SCALE_WORDS = 1024  # a slot wave's down scale blocks in LDS: 4 of 256 words
 ROW_UG_AHEAD = 3  # ug rounds a wave keeps in flight (2 KB a round)
+# the shared down slice's weights in LDS, loaded beside the routing, up to this size (TP8's 36 KB);
+# past it (TP4's 72 KB) each shared wave streams its tiles from HBM at the down
+ROW_SW_LDS_BYTES = 40 * 1024
+# shared down tiles a wave keeps in flight when it streams them: one, so its loads do not crowd the
+# slot waves' bursts in the CU's queue
+ROW_SW_AHEAD = 1
+
+
+def row_units(d) -> int:
+    """A CTA's ug units at most: a row's topk x ``row_halves`` units over its 38-40 CTAs by XCD class
+    (``row_slots``): 3 at TP8 (18 halves), 6 at TP4 (36)."""
+    return {18: 3, 36: 6}[row_halves(d)]
+
+
+def row_sw_lds(d) -> bool:
+    """Whether the CTA's shared down slice goes through LDS (``ROW_SW_LDS_BYTES``)."""
+    return ROW_TILES * ROWS * d.sh_inter <= ROW_SW_LDS_BYTES
 
 
 def row_of(bid):
@@ -1403,11 +1470,33 @@ def await_slot(c, k):
 
 
 @flyc.jit
+def row_route(c, bid):
+    """``row_inputs``' top-k alone (wave 0), for a row CTA without ug units: its down reads the slots
+    and weights in ``tab``."""
+    lane, tid, topk, tab = c["lane"], c["tid"], c["rs"].topk, c["tab"]
+    r, _ = row_of(bid)
+    if tid < topk:
+        fx.ptr_store(fx.Int32(-1), tab + tid)
+    lds_barrier()
+    if uniform(c["wave"]) == 0:
+        my_id, my_w, scale = route_topk(c, r, lambda k, e: put_slot(c, k, e))
+        if lane < topk:
+            fx.ptr_store((my_w * scale).bitcast(fx.Int32), tab + (topk + lane))
+    gpu.barrier()
+
+
+def row_route_early(rs) -> bool:
+    """Whether the row CTAs without ug units route their row before their shared unit: where a unit
+    is several tasks (TP4), which would put the routing past the row's MIDs."""
+    return rs.row_moe and rs.shared_unit_tasks > 1
+
+
+@flyc.jit
 def row_inputs(c, bid):
     """The CTA's row's top-k (``route_topk``) on wave 0 into LDS ``tab`` (each id as its slot is
     found, then the weights as f32 bits), while the other waves load its X8R row
-    (``load_x8_rows``' one row) and its slice's shared down weights into LDS. No barrier at
-    the end: the ug's waves wait on each slot they need (``await_slot``)."""
+    (``load_x8_rows``' one row) and its slice's shared down weights into LDS (``row_sw_lds``). No
+    barrier at the end: the ug's waves wait on each slot they need (``await_slot``)."""
     lane, tid, topk, tab, d = c["lane"], c["tid"], c["rs"].topk, c["tab"], c["d"]
     r, sl = row_of(bid)
     if tid < topk:
@@ -1437,47 +1526,66 @@ def row_inputs(c, bid):
                 )
                 fx.ptr_store(v, dst + q * 4)
             at += width // 4
-        quads = ROW_TILES * ROWS * d.sh_inter // 16
-        base = ROW_TILES * ROWS * sl * (d.sh_inter // 4)
-        w = rsrc(c["args"]["sw2"])
-        for m in range_constexpr(-(-quads // (THREADS - 64))):
-            u = i + (THREADS - 64) * m
-            if u < quads:
-                v = fx.Vector(bo.buffer_load(w, base + 4 * u, vec_width=4, dtype=T.i32))
-                fx.ptr_store(v, c["rsw"] + 4 * u)
+        if const_expr(row_sw_lds(d)):
+            quads = ROW_TILES * ROWS * d.sh_inter // 16
+            base = ROW_TILES * ROWS * sl * (d.sh_inter // 4)
+            w = rsrc(c["args"]["sw2"])
+            for m in range_constexpr(-(-quads // (THREADS - 64))):
+                u = i + (THREADS - 64) * m
+                if u < quads:
+                    v = fx.Vector(
+                        bo.buffer_load(w, base + 4 * u, vec_width=4, dtype=T.i32)
+                    )
+                    fx.ptr_store(v, c["rsw"] + 4 * u)
 
 
-# a row's ug units by CTA class (CTA % 8, one XCD in every row): unit (slot k, half h < 16) of expert e
-# goes to class (h + 3 e) % 8, so every row's copy of a (expert, half) shares one L2; half 17 of slots
-# x, x + 2, x + 4 to class x < 2, half 16 of slots x - 2, x + 2 to class x in 2..5 (5 CTAs a class in
-# every row, 4 in classes 6 and 7 of a 38-CTA row: 3 units a CTA at most)
+# a row's ug units by CTA class (CTA % 8, one XCD in every row): unit (slot k, half h) of expert e with
+# h below the last multiple of 8 goes to class (h + 3 e) % 8, so every row's copy of a (expert, half)
+# shares one L2. The rest, balanced over the classes (5 CTAs a class in every row, 4 in classes 6 and
+# 7 of a 38-CTA row):
+# - TP8 (18 halves): half 17 of slots x, x + 2, x + 4 to class x < 2, half 16 of slots x - 2, x + 2 to
+#   class x in 2..5 (3 units a CTA at most);
+# - TP4 (36 halves): halves 32..35 of slot x to class x < 6 (6 units a CTA at most).
 def row_slots(c, bid):
-    """This CTA's ug units of its row, [(slot, entry, live)] x ``ROW_UNITS``: entries q, q + n, q + 2 n of
-    its class's list, the CTA the q-th of the row's n CTAs of its class. The list: each slot's two halves
-    below 16 in slot order, then the class's halves 16 or 17."""
-    rs = c["rs"]
+    """This CTA's ug units of its row, [(slot, entry, live)] x ``row_units``: entries q, q + n, q + 2 n
+    .. of its class's list, the CTA the q-th of the row's n CTAs of its class. The list: each slot's
+    halves below the last multiple of 8 in slot order, then the class's others."""
+    rs, d = c["rs"], c["d"]
     r, sl = row_of(bid)
-    assert rs.topk == 6 and row_halves(c["d"]) == 18
+    halves = row_halves(d)
+    assert rs.topk == 6 and halves in (18, 36)
     ctas = fx.min(fx.Int32(ROW_SLICES), rs.row_ug_ctas - r * ROW_SLICES)
     x, q = sl % 8, sl // 8
     n = (ctas - x + 7) // 8
-    low = x < 2
-    entries = 12 + low.select(fx.Int32(3), (7 - x) // 2)
     slots = []
-    for i in range(ROW_UNITS):
-        j = q + n * i
-        t = j - 12
-        k = (j < 12).select(j // 2, low.select(x + 2 * t, x - 2 + 4 * t))
-        k = fx.min(fx.max(k, fx.Int32(0)), fx.Int32(rs.topk - 1))
-        slots.append((k, j, j < entries))
+    if const_expr(halves == 18):
+        low = x < 2
+        entries = 12 + low.select(fx.Int32(3), (7 - x) // 2)
+        for i in range(row_units(d)):
+            j = q + n * i
+            t = j - 12
+            k = (j < 12).select(j // 2, low.select(x + 2 * t, x - 2 + 4 * t))
+            k = fx.min(fx.max(k, fx.Int32(0)), fx.Int32(rs.topk - 1))
+            slots.append((k, j, j < entries))
+    else:
+        entries = (x < 6).select(fx.Int32(28), fx.Int32(24))
+        for i in range(row_units(d)):
+            j = q + n * i
+            k = (j < 24).select(j // 4, x)
+            k = fx.min(k, fx.Int32(rs.topk - 1))
+            slots.append((k, j, j < entries))
     return slots
 
 
-def row_half(bid, j, e):
+def row_half(d, bid, j, e):
     """Entry j's half of its slot's expert e (``row_slots``' list)."""
     x = row_of(bid)[1] % 8
     h1 = (x - 3 * e) & 7
-    return (j < 12).select(h1 + 8 * (j % 2), (x < 2).select(fx.Int32(17), fx.Int32(16)))
+    if const_expr(row_halves(d) == 18):
+        return (j < 12).select(
+            h1 + 8 * (j % 2), (x < 2).select(fx.Int32(17), fx.Int32(16))
+        )
+    return (j < 24).select(h1 + 8 * (j % 4), j + 8)
 
 
 def row_unit(c, units, u):
@@ -1537,10 +1645,11 @@ def ug_row_rounds(c, ks):
     """The stream's rounds, [(unit, round)]: the units' rounds interleaved, so every CTA streams each of
     its units over the whole stage and the rows' copies of a unit on one XCD are read at about the
     same time."""
+    units = row_units(c["d"])
     return [
         (p, rd)
         for rd in ug_rounds(HIDDEN, ks, c["rs"].ug_k_slices)
-        for p in range(ROW_UNITS)
+        for p in range(units)
     ]
 
 
@@ -1606,24 +1715,25 @@ def stage_row_ug(c, bid):
     early = min(ROW_UG_AHEAD, len(rounds))
     slots = row_slots(c, bid)
     units, chains, ops = [], [], {}
-    for p in range_constexpr(ROW_UNITS):
+    nu = row_units(d)
+    for p in range_constexpr(nu):
         k, j, live = slots[p]
         e = await_slot(c, k)
-        h = row_half(bid, j, e)
+        h = row_half(d, bid, j, e)
         units.append((k, h, live))
         chains.append((live.select(e, fx.Int32(rs.experts)), h))
-        for i in range_constexpr(p, early, ROW_UNITS):
+        for i in range_constexpr(p, early, nu):
             ops[i] = ug_row_issue(c, rw, rws, rounds, chains, t, i)
     lds_barrier()
     accs = ug_row_stream(c, rw, rws, chains, t, q, c["x8rl"], c["x8rsl"], ops)
     red = c["rred"]
-    for u in range_constexpr(ROW_UNITS):
+    for u in range_constexpr(nu):
         fx.ptr_store(
             accs[u].bitcast(fx.Int32), red + (((u * 2 + t) * 4 + q) * 64 + lane) * 4
         )
     gpu.barrier()
-    # thread x < 24: unit x // 8, columns 2 (x % 8) and + 1 of its 16
-    if tid < ROW_UNITS * 8:
+    # thread x < 8 x units: unit x // 8, columns 2 (x % 8) and + 1 of its 16
+    if tid < nu * 8:
         u = tid // 8
         m2 = tid % 8
         k, h, live = row_unit(c, units, u)
@@ -1649,6 +1759,15 @@ def stage_row_ug(c, bid):
         if live:
             pick = r * rs.topk + k
             c["put_bf"](c["midb"], 2 * (pick * row_mid_pairs(d) + 8 * h + m2), vs)
+
+
+def row_shared_loads(c, r_w, r_ws, t):
+    """Shared down tile t's K steps from HBM (``gemv_fp8_loads``' row-major operands)."""
+    sh = c["d"].sh_inter
+    return [
+        _fp8_step_load(c, r_w, r_ws, sh, t, st, row_major=True)
+        for st in range(-(-sh // 128))
+    ]
 
 
 @flyc.jit
@@ -1685,28 +1804,33 @@ def row_down_slot(c, bid, k):
     # MXFP8 MID as ``ug_epilogue`` quantizes it: lanes 4 g .. 4 g + 3 hold group g's 32 values,
     # 8 each; the group's amax across its 4 lanes
     mq = c["rmq"] + k * d.mid_words
-    mqs = c["rmqs"] + k * 16
-    g, m = lane // 4, lane % 4
+    mqs = c["rmqs"] + k * row_mqs_words(d)
     groups = d.inter_real // 32
-    w4 = fx.ptr_load(
-        mb + fx.min(g, groups - 1) * 16 + m * 4,
-        result_type=fx.Vector.make_type(4, fx.Int32),
-    )
-    vs = [f(w4[q]) for q in range(4) for f in (bf_lo, bf_hi)]
-    amax = abs(vs[0])
-    for v in vs[1:]:
-        amax = fx.max(amax, abs(v))
-    amax = fx.max(butterfly(amax, (1, 2), fx.max), fx.Float32(1e-10))
-    code = code_ceil(amax * fx.Float32(1.0 / FP8_MAX))
-    inv = rcp_pow2(code)
-    q8 = [clamp_fp8(v * inv) for v in vs]
-    words = fx.Vector.from_elements(
-        [fp8_pack4(*q8[4 * h : 4 * h + 4]) for h in range(2)], fx.Int32
-    )
-    if g < groups:
-        fx.ptr_store(words, mq + (g * 8 + m * 2))
-        if m == 0:
-            fx.ptr_store(code, mqs + mid_code_index(d, 0, g))
+    # 16 groups a pass (TP4's 18: two)
+    for p in range_constexpr(-(-groups // 16)):
+        if const_expr(p == 0):
+            g, m = lane // 4, lane % 4
+        else:
+            g = lane // 4 + 16 * p
+        w4 = fx.ptr_load(
+            mb + fx.min(g, groups - 1) * 16 + m * 4,
+            result_type=fx.Vector.make_type(4, fx.Int32),
+        )
+        vs = [f(w4[q]) for q in range(4) for f in (bf_lo, bf_hi)]
+        amax = abs(vs[0])
+        for v in vs[1:]:
+            amax = fx.max(amax, abs(v))
+        amax = fx.max(butterfly(amax, (1, 2), fx.max), fx.Float32(1e-10))
+        code = code_ceil(amax * fx.Float32(1.0 / FP8_MAX))
+        inv = rcp_pow2(code)
+        q8 = [clamp_fp8(v * inv) for v in vs]
+        words = fx.Vector.from_elements(
+            [fp8_pack4(*q8[4 * h : 4 * h + 4]) for h in range(2)], fx.Int32
+        )
+        if g < groups:
+            fx.ptr_store(words, mq + (g * 8 + m * 2))
+            if m == 0:
+                fx.ptr_store(code, mqs + mid_code_index(d, 0, g))
     bvs, sbs = mid_operands_lds(c, mq, mqs)
     scl = c["rsc"] + c["wave"] * ROW_SCALE_WORDS
     sw = down_scale_words(d)
@@ -1739,6 +1863,16 @@ def row_down_slot(c, bid, k):
                     outs[i][qq].bitcast(fx.Int32),
                     con + (ROWS * i + 4 * (lane // 16) + qq),
                 )
+
+
+def row_mqs_words(d) -> int:
+    """A pick's MXFP8 codes in LDS (``mid_code_index``'s row)."""
+    return max(16, d.inter // 32)
+
+
+def row_sx_words(d) -> tuple[int, int]:
+    """A shared wave's SMID row in LDS: (words, codes): its K steps' reach, at least TP8's 128 and 16."""
+    return max(128, 32 * -(-d.sh_inter // 128)), max(16, -(-d.sh_inter // 32 // 8) * 8)
 
 
 def mid_operands_lds(c, mq, mqs):
@@ -1789,23 +1923,32 @@ def row_shared_ops(c, r_ws, rg, i, st):
 @flyc.jit
 def row_down_shared(c, bid, half):
     """The shared down of tiles 128 slice + 64 half .. (4 tasks) for the CTA's row on one wave:
-    each K step's MFMA as ``gemv_fp8_mfmas``' wave, summed as ``row_sum``; into ``rsdl``."""
+    each K step's MFMA as ``gemv_fp8_mfmas``' wave, summed as ``row_sum``; into ``rsdl``. The
+    weights from the slice's copy in LDS (``row_sw_lds``), or ``gemv_fp8_loads``' from HBM,
+    ``ROW_SW_AHEAD`` tiles in flight."""
     lane, d, a = c["lane"], c["d"], c["args"]
     r, sl = row_of(bid)
     sh = d.sh_inter
     steps = (sh + 127) // 128
     r_ws = rsrc(a["sw2_s"])
     tasks = [ROW_TILES * sl + ROW_TILES // 2 * half + i for i in range(ROW_TILES // 2)]
-    ops = [
-        [
-            row_shared_ops(c, r_ws, t, ROW_TILES // 2 * half + i, st)
-            for st in range(steps)
+    if const_expr(row_sw_lds(d)):
+        ops = [
+            [
+                row_shared_ops(c, r_ws, t, ROW_TILES // 2 * half + i, st)
+                for st in range(steps)
+            ]
+            for i, t in enumerate(tasks)
         ]
-        for i, t in enumerate(tasks)
-    ]
+        ahead = len(tasks)
+    else:
+        r_w = rsrc(a["sw2"])
+        ahead = ROW_SW_AHEAD
+        ops = [row_shared_loads(c, r_w, r_ws, t) for t in tasks[:ahead]]
     # this wave's copy of the row's SMID
-    xl = c["shared_xl"] + half * 128
-    xsl = c["shared_xsl"] + half * 16
+    xw, xg = row_sx_words(d)
+    xl = c["shared_xl"] + half * xw
+    xsl = c["shared_xsl"] + half * xg
     words, groups = sh // 4, sh // 32
     specs = [
         (c["smq"], r * words + fx.min(lane + 64 * i, words - 1), 1)
@@ -1832,6 +1975,8 @@ def row_down_shared(c, bid, half):
                     tot = tot + fx.Float32(0.0)
                 at = ROWS * (ROW_TILES // 2 * half + i) + 4 * (lane // 16) + qq
                 fx.ptr_store(bf16_round(tot).bitcast(fx.Int32), c["rsdl"] + at)
+        if const_expr(i + ahead < len(tasks)):
+            ops.append(row_shared_loads(c, r_w, r_ws, tasks[i + ahead]))
 
 
 @flyc.jit
@@ -1886,7 +2031,11 @@ def run_row_moe(c, bid):
     rs = c["rs"]
     r, _ = row_of(bid)
     if bid < rs.tokens * ROW_SLICES:
-        row_inputs(c, bid)
+        if const_expr(row_route_early(rs)):
+            if bid < rs.row_ug_ctas:
+                row_inputs(c, bid)
+        else:
+            row_inputs(c, bid)
         stamp(c, 21)
         if bid < rs.row_ug_ctas:
             stage_row_ug(c, bid)
@@ -1909,21 +2058,22 @@ def row_stage_lds(s, rs):
     wsl = WAVES * wsl_words(d)
     x8r = wsl + lds_row(X8_WORDS)
     rred = x8r + lds_row(HIDDEN // 32)
-    ug = rred + ROW_UNITS * 2 * 4 * 64 * 4
+    ug = rred + row_units(d) * 2 * 4 * 64 * 4
     # past the ug's: the down starts while wave 0 still runs the ug epilogue
     down = {
         "rsc": rs.topk * ROW_SCALE_WORDS,
         "rmb": rs.topk * lds_row(row_mid_pairs(d)),
         "rmq": rs.topk * d.mid_words,
-        "rmqs": rs.topk * 16,
+        "rmqs": rs.topk * row_mqs_words(d),
         "rcon": rs.topk * ROW_TILES * ROWS,
         "rsdl": ROW_TILES * ROWS,
         "rpair": ROW_TILES * ROWS,
-        "shared_xl": 2 * 128,
-        "shared_xsl": 2 * 16,
-        # the shared down's weights of the CTA's 128 rows, loaded beside the routing
-        "rsw": ROW_TILES * ROWS * d.sh_inter // 4,
+        "shared_xl": 2 * row_sx_words(d)[0],
+        "shared_xsl": 2 * row_sx_words(d)[1],
     }
+    if row_sw_lds(d):
+        # the shared down's weights of the CTA's 128 rows, loaded beside the routing
+        down["rsw"] = ROW_TILES * ROWS * d.sh_inter // 4
     offsets = {"x8l": 0, "x8sl": x8, "wsl": 0, "x8rl": wsl, "x8rsl": x8r, "rred": rred}
     at = ug
     for name, n in down.items():
@@ -2048,23 +2198,21 @@ def run_moe(c, key, bid, before_ug=None):
     # one shared unit a CTA at most: straight-line code, so LLVM does not hoist its loads
     assert c["rs"].shared_units <= BLOCKS
     unit = first_task(bid, shared0)
+    # a unit's first task's gate and up weights in flight before x's wait: one CTA streams both
+    per = c["rs"].shared_unit_tasks
+    assert per == 1 or not multi
     if unit < c["rs"].shared_units:
-        # the gate's and the up's weights in flight before x's wait: one CTA streams both
-        a = c["args"]
-        gops = gemv_fp8_loads(
-            c, a["sgu"], a["sgu_s"], HIDDEN, unit % shared_tasks, row_major=True
-        )
-        uops = gemv_fp8_loads(
-            c,
-            a["sgu"],
-            a["sgu_s"],
-            HIDDEN,
-            shared_tasks + unit % shared_tasks,
-            row_major=True,
-        )
+        gops, uops = shared_loads(c, unit, per)
+        if const_expr(row_route_early(c["rs"])):
+            # its weights in flight: the row's top-k (a row CTA without ug units) before x's wait
+            if (bid >= c["rs"].row_ug_ctas) & (bid < s * ROW_SLICES):
+                row_route(c, bid)
         if const_expr(not multi):
             load_x8_rows(c, "x8", "x8s", c["x8l"], c["x8sl"], lambda j: j, s)
-            stage_shared(c, unit, gops, uops, 0, s)
+            if const_expr(per == 1):
+                stage_shared(c, unit, gops, uops, 0, s)
+            else:
+                stage_shared_unit(c, unit, per, gops, uops)
         else:
             t0 = unit // shared_tasks * TILE
             n = fx.min(fx.Int32(TILE), s - t0)
