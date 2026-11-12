@@ -190,36 +190,35 @@ def cp_cols(ratio: int) -> int:
     return CP_DIM * ratio
 
 
-def _cp_chain(c, x, w, t0, n, k0, ct):
-    """One wave's partial of columns 16 ct .. of x [T, HIDDEN] bf16 against w [cols,
-    HIDDEN] bf16, rows t0 .. t0 + n, K k0 .. k0 + CP_WAVE_K in 32-K MFMA steps, every
-    step's loads issued first. Returns the accumulator (``_iw_chain``'s layout)."""
+def _cp_x_load(c, x, t0, n, k, nb=None):
+    """A 32-K MFMA step's ``x`` [T, HIDDEN] bf16 operand: rows t0 .. t0 + n, K k + its lane's
+    8 (``nb``: the buffer's bytes; 0 reads nothing)."""
     lane = c["lane"]
-    row = lane % 16
-    k8 = 8 * (lane // 16)
-    live = row < n
-    t = plus(t0, fx.min(row, n - 1))
-    xs, ws = [], []
-    for st in range_constexpr(CP_WAVE_K // 32):
-        k = k0 + st * 32 + k8
-        xs.append(
-            fx.Vector(
-                bo.buffer_load(
-                    rsrc(x), (t * HIDDEN + k) // 2, vec_width=4, dtype=T.i32,
-                    cache_modifier=CM_DEV,
-                )
-            )
-        )  # fmt: skip
-        ws.append(
-            fx.Vector(
-                bo.buffer_load(
-                    rsrc(w),
-                    ((16 * ct + row) * HIDDEN + k) // 2,
-                    vec_width=4,
-                    dtype=T.i32,
-                )
-            )
+    t = plus(t0, fx.min(lane % 16, n - 1))
+    return fx.Vector(
+        bo.buffer_load(
+            rsrc(x, nb), (t * HIDDEN + k + 8 * (lane // 16)) // 2, vec_width=4,
+            dtype=T.i32, cache_modifier=CM_DEV,
         )
+    )  # fmt: skip
+
+
+def _cp_w_load(c, w, k, ct, nb=None):
+    """A 32-K MFMA step's ``w`` [cols, HIDDEN] bf16 operand: columns 16 ct .., K k + its
+    lane's 8."""
+    lane = c["lane"]
+    return fx.Vector(
+        bo.buffer_load(
+            rsrc(w, nb), ((16 * ct + lane % 16) * HIDDEN + k + 8 * (lane // 16)) // 2,
+            vec_width=4, dtype=T.i32,
+        )
+    )  # fmt: skip
+
+
+def _cp_mfmas(c, xs, ws, n):
+    """The wave's partial from its steps' operands: the accumulator (``_iw_chain``'s
+    layout)."""
+    live = c["lane"] % 16 < n
     acc = fx.Vector.filled(4, 0.0, fx.Float32)
     zero = fx.Vector.filled(4, 0, fx.Int32)
     for st in range_constexpr(CP_WAVE_K // 32):
@@ -228,20 +227,34 @@ def _cp_chain(c, x, w, t0, n, k0, ct):
     return acc
 
 
+def _cp_chain(c, x, w, t0, n, k0, ct):
+    """One wave's partial of columns 16 ct .. of x [T, HIDDEN] bf16 against w [cols,
+    HIDDEN] bf16, rows t0 .. t0 + n, K k0 .. k0 + CP_WAVE_K in 32-K MFMA steps, every
+    step's loads issued first. Returns the accumulator (``_iw_chain``'s layout)."""
+    xs, ws = [], []
+    for st in range_constexpr(CP_WAVE_K // 32):
+        xs.append(_cp_x_load(c, x, t0, n, k0 + st * 32))
+        ws.append(_cp_w_load(c, w, k0 + st * 32, ct))
+    return _cp_mfmas(c, xs, ws, n)
+
+
 def cp_pair(tile, ct, ctiles, part, r, h):
     """Part ``part``'s pair of row r, column 16 ct + h of token tile ``tile`` in CPP."""
     return ((tile * ctiles + ct) * CP_PARTS + part) * 256 + r * 16 + h
 
 
 @flyc.jit
-def stage_cp(c, a, t0, n, tile, ct, ctiles, part, lds, ratio):
+def stage_cp(c, a, t0, n, tile, ct, ctiles, part, lds, ratio, ops=None):
     """Part ``part`` (K quarter) of compressor columns 16 ct .. of rows t0 .. t0 + n: a
     K range a wave, the waves' partials summed in wave order. The other parts put theirs
     in CPP; part 0 adds them in part order and writes ``cp_out`` (f32 at ratio 2, bf16
-    at ratio 1)."""
+    at ratio 1). ``ops``: the wave's operands, issued already (``cp_issue``)."""
     tid, lane, wave = c["tid"], c["lane"], c["wave"]
-    k0 = part * (HIDDEN // CP_PARTS) + wave * CP_WAVE_K
-    acc = _cp_chain(c, a["normed_out"], a["cp_w"], t0, n, k0, ct)
+    if const_expr(ops is None):
+        k0 = part * (HIDDEN // CP_PARTS) + wave * CP_WAVE_K
+        acc = _cp_chain(c, a["normed_out"], a["cp_w"], t0, n, k0, ct)
+    else:
+        acc = _cp_mfmas(c, *ops, n)
     for q in range_constexpr(4):
         r = 4 * (lane // 16) + q
         fx.ptr_store(acc[q].bitcast(fx.Int32), lds + (wave * 16 + r) * 16 + lane % 16)
@@ -296,25 +309,75 @@ def stage_cp(c, a, t0, n, tile, ct, ctiles, part, lds, ratio):
         c["mb"].put(c["cprdy"], tile * ctiles + ct, fx.Int32(1))
 
 
+def cp_issue(c, a, rows, cp0, ratio, seen=None):
+    """One token tile (``rows`` <= 16), whose tasks fit the grid: this CTA's projection
+    task of ``run_cp`` (at most one), its operands issued, weights first. Past the wqkv
+    GEMV: the CTA has seen a flag of every row (``run_front``'s X8 wait), and a row's norm
+    publishes both its flags once all of it landed. ``seen``: whether this CTA waited on
+    X8 (None: every CTA did); one that did not issues nothing here (``run_cp``)."""
+    assert rows <= 16
+    ctiles = cp_cols(ratio) // 16
+    total = ctiles * CP_PARTS
+    assert total <= BLOCKS, ratio
+    task = first_task(c["bid"], cp0)
+    t = fx.min(task, fx.Int32(total - 1))
+    part, ct = t % CP_PARTS, t // CP_PARTS
+    live = task < total
+    go = live if seen is None else live & seen
+    # a CTA without a task reads through a zero-size buffer (``iq_weights``)
+    nb = go.select(fx.Int64(0xFFFFFFFF), fx.Int64(0))
+    k0 = part * (HIDDEN // CP_PARTS) + c["wave"] * CP_WAVE_K
+    ws = [
+        _cp_w_load(c, a["cp_w"], k0 + st * 32, ct, nb) for st in range(CP_WAVE_K // 32)
+    ]
+    xs = [
+        _cp_x_load(c, a["normed_out"], 0, rows, k0 + st * 32, nb)
+        for st in range(CP_WAVE_K // 32)
+    ]
+    return {"live": live, "seen": seen, "part": part, "ct": ct, "xs": xs, "ws": ws}
+
+
 @flyc.jit
-def run_cp(c, a, rows, cp0, lds, ratio):
+def run_cp(c, a, rows, cp0, lds, ratio, issued=None):
     """An index KV source's compressor projection (SGLang's ``project_fused`` at ratio 2,
     f32, ``wkv`` at ratio 1, rounded to bf16) of rows 0 .. rows -> ``cp_out``, a (token
     tile, 16-column tile, K quarter) a CTA from CTA ``cp0``, once its rows' norms
-    published them."""
+    published them. ``issued``: one token tile's task, its operands issued (``cp_issue``)."""
     tiles = -(-rows // 16)
     ctiles = cp_cols(ratio) // 16
-    for task in range(first_task(c["bid"], cp0), tiles * ctiles * CP_PARTS, BLOCKS):
-        tile = task // (ctiles * CP_PARTS)
-        t0 = tile * 16
-        n = fx.min(fx.Int32(16), rows - t0)
-        if c["tid"] < 2 * n:
-            c["mb"].poll([(c["xrdy"], 2 * t0 + fx.min(c["tid"], 2 * n - 1), 1)])
-        gpu.barrier()
-        stage_cp(
-            c, a, t0, n, tile, (task // CP_PARTS) % ctiles, ctiles, task % CP_PARTS, lds,
-            ratio,
-        )  # fmt: skip
+    if const_expr(issued is not None and issued["seen"] is None):
+        if issued["live"]:
+            stage_cp(
+                c, a, 0, rows, 0, issued["ct"], ctiles, issued["part"], lds, ratio,
+                (issued["xs"], issued["ws"]),
+            )  # fmt: skip
+    elif const_expr(issued is not None):
+        if issued["live"]:
+            if issued["seen"]:
+                stage_cp(
+                    c, a, 0, rows, 0, issued["ct"], ctiles, issued["part"], lds, ratio,
+                    (issued["xs"], issued["ws"]),
+                )  # fmt: skip
+            else:
+                # a CTA that skipped the X8 wait: its rows' flags, then its operands
+                if c["tid"] < 2 * rows:
+                    c["mb"].poll([(c["xrdy"], fx.min(c["tid"], 2 * rows - 1), 1)])
+                gpu.barrier()
+                stage_cp(
+                    c, a, 0, rows, 0, issued["ct"], ctiles, issued["part"], lds, ratio
+                )  # fmt: skip
+    else:
+        for task in range(first_task(c["bid"], cp0), tiles * ctiles * CP_PARTS, BLOCKS):
+            tile = task // (ctiles * CP_PARTS)
+            t0 = tile * 16
+            n = fx.min(fx.Int32(16), rows - t0)
+            if c["tid"] < 2 * n:
+                c["mb"].poll([(c["xrdy"], 2 * t0 + fx.min(c["tid"], 2 * n - 1), 1)])
+            gpu.barrier()
+            stage_cp(
+                c, a, t0, n, tile, (task // CP_PARTS) % ctiles, ctiles, task % CP_PARTS,
+                lds, ratio,
+            )  # fmt: skip
 
 
 def kc_context(c, ratio):
