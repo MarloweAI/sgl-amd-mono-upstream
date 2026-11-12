@@ -76,6 +76,7 @@ from sgl_amd_mono.deepseek_v41.gfx950.stages.gemv import (
     gemv_fp8_loads,
     gemv_fp8_mfmas,
     ld_f32,
+    lds_at,
     lds_row,
     lds_tail,
     plus,
@@ -173,6 +174,9 @@ def scratch_layout(key: MoeBuild) -> dict[str, tuple[int, int]]:
     if rs.row_moe:
         # the per-row MoE's silu x up: a pick's real intermediate as tagged bf16 pairs
         pairs["midb"] = rs.picks * d.inter_real // 2
+        if not row_sw_lds(d):
+            # the shared down's sums of every row as tagged bf16 pairs (``row_down_shared_split``)
+            pairs["sdx"] = tokens * HIDDEN // 2
     return pair_layout(pairs.items())
 
 
@@ -1409,11 +1413,8 @@ ROW_TILES = 8  # a CTA's down: hidden rows 128 slice .. of its row, 8 tiles of 1
 ROW_SCALE_WORDS = 1024  # a slot wave's down scale blocks in LDS: 4 of 256 words
 ROW_UG_AHEAD = 3  # ug rounds a wave keeps in flight (2 KB a round)
 # the shared down slice's weights in LDS, loaded beside the routing, up to this size (TP8's 36 KB);
-# past it (TP4's 72 KB) each shared wave streams its tiles from HBM at the down
+# past it (TP4's 72 KB) a slice's row CTAs split its tiles, each for every row (``row_down_shared_split``)
 ROW_SW_LDS_BYTES = 40 * 1024
-# shared down tiles a wave keeps in flight when it streams them: one, so its loads do not crowd the
-# slot waves' bursts in the CU's queue
-ROW_SW_AHEAD = 1
 
 
 def row_units(d) -> int:
@@ -1875,6 +1876,34 @@ def row_sx_words(d) -> tuple[int, int]:
     return max(128, 32 * -(-d.sh_inter // 128)), max(16, -(-d.sh_inter // 32 // 8) * 8)
 
 
+def row_sdx_words(d, s) -> tuple[int, int]:
+    """A split shared wave's SMID rows of ``s`` tokens in LDS (``lds_row`` strides): (words, codes),
+    the last row's K steps' reach, in 16-byte units."""
+    w = (s - 1) * lds_row(d.sh_inter // 4) + 32 * -(-d.sh_inter // 128)
+    g = (s - 1) * lds_row(d.sh_inter // 32) + d.sh_inter // 32
+    return -(-w // 4) * 4, -(-g // 4) * 4
+
+
+def row_sd_deal(rs, r, sl):
+    """The split shared down's share of row ``r``'s CTA in slice ``sl``: (first tile, tiles) of the
+    slice's ``ROW_TILES``, dealt over the slice's rows whose CTA holds no shared unit (the last row's
+    CTAs past ``row_ug_ctas``), the first rows one tile more."""
+    s = rs.tokens
+
+    def deal(n):
+        q, m = ROW_TILES // n, ROW_TILES % n
+        first = r * q + fx.min(r, fx.Int32(m))
+        count = (r < m).select(fx.Int32(q + 1), fx.Int32(q))
+        return first, (r < n).select(count, fx.Int32(0))
+
+    first, count = deal(s)
+    if const_expr(s * ROW_SLICES > rs.row_ug_ctas):
+        f1, c1 = deal(s - 1)
+        held = sl >= rs.row_ug_ctas - (s - 1) * ROW_SLICES
+        first, count = held.select(f1, first), held.select(c1, count)
+    return first, count
+
+
 def mid_operands_lds(c, mq, mqs):
     """``mid_operands`` of one pick from its MXFP8 row in LDS (words ``mq``, codes ``mqs``)."""
     lane, d = c["lane"], c["d"]
@@ -1924,27 +1953,21 @@ def row_shared_ops(c, r_ws, rg, i, st):
 def row_down_shared(c, bid, half):
     """The shared down of tiles 128 slice + 64 half .. (4 tasks) for the CTA's row on one wave:
     each K step's MFMA as ``gemv_fp8_mfmas``' wave, summed as ``row_sum``; into ``rsdl``. The
-    weights from the slice's copy in LDS (``row_sw_lds``), or ``gemv_fp8_loads``' from HBM,
-    ``ROW_SW_AHEAD`` tiles in flight."""
+    weights from the slice's copy in LDS (``row_sw_lds``)."""
     lane, d, a = c["lane"], c["d"], c["args"]
     r, sl = row_of(bid)
     sh = d.sh_inter
     steps = (sh + 127) // 128
     r_ws = rsrc(a["sw2_s"])
     tasks = [ROW_TILES * sl + ROW_TILES // 2 * half + i for i in range(ROW_TILES // 2)]
-    if const_expr(row_sw_lds(d)):
-        ops = [
-            [
-                row_shared_ops(c, r_ws, t, ROW_TILES // 2 * half + i, st)
-                for st in range(steps)
-            ]
-            for i, t in enumerate(tasks)
+    assert row_sw_lds(d)
+    ops = [
+        [
+            row_shared_ops(c, r_ws, t, ROW_TILES // 2 * half + i, st)
+            for st in range(steps)
         ]
-        ahead = len(tasks)
-    else:
-        r_w = rsrc(a["sw2"])
-        ahead = ROW_SW_AHEAD
-        ops = [row_shared_loads(c, r_w, r_ws, t) for t in tasks[:ahead]]
+        for i, t in enumerate(tasks)
+    ]
     # this wave's copy of the row's SMID
     xw, xg = row_sx_words(d)
     xl = c["shared_xl"] + half * xw
@@ -1975,8 +1998,66 @@ def row_down_shared(c, bid, half):
                     tot = tot + fx.Float32(0.0)
                 at = ROWS * (ROW_TILES // 2 * half + i) + 4 * (lane // 16) + qq
                 fx.ptr_store(bf16_round(tot).bitcast(fx.Int32), c["rsdl"] + at)
-        if const_expr(i + ahead < len(tasks)):
-            ops.append(row_shared_loads(c, r_w, r_ws, tasks[i + ahead]))
+
+
+@flyc.jit
+def row_down_shared_split(c, bid, half):
+    """The shared down split over a slice's row CTAs (past ``row_sw_lds``): tile ``half`` of this CTA's
+    share (``row_sd_deal``) for every row on one wave, each K step's MFMA as ``row_down_shared``'s
+    against the rows' SMID (an MFMA column a row), summed in its order; the sums into SDX as tagged
+    bf16 pairs. Then the 64 rows ``half`` of the CTA's own row from SDX (every share's CTA), into
+    ``rsdl``."""
+    lane, d, a, rs = c["lane"], c["d"], c["args"], c["rs"]
+    r, sl = row_of(bid)
+    s, sh = rs.tokens, d.sh_inter
+    steps = (sh + 127) // 128
+    first, count = row_sd_deal(rs, r, sl)
+    if half < count:
+        rg = ROW_TILES * sl + first + half
+        ops = row_shared_loads(c, rsrc(a["sw2"]), rsrc(a["sw2_s"]), rg)
+        # this wave's copy of every row's SMID
+        xw, xg = row_sdx_words(d, s)
+        xl = c["shared_xl"] + half * xw
+        xsl = c["shared_xsl"] + half * xg
+        words, groups = sh // 4, sh // 32
+        spans = ((c["smq"], s * words, xl, words), (c["smc"], s * groups, xsl, groups))
+        specs = [
+            (mb, fx.min(lane + 64 * i, n - 1), 1)
+            for mb, n, _, _ in spans
+            for i in range(-(-n // 64))
+        ]
+        got = c["poll"](specs)
+        at = 0
+        for _, n, dst, row in spans:
+            for i in range_constexpr(-(-n // 64)):
+                u = lane + 64 * i
+                if u < n:
+                    fx.ptr_store(got[at][0], dst + lds_at(u, row))
+                at += 1
+        zero = fx.Vector.filled(4, 0.0, fx.Float32)
+        ps = [
+            _fp8_step_mfma(c, sh, xl, xsl, fx.Int32(st), ops[st], zero, rows=s)
+            for st in range(steps)
+        ]
+        vs = []
+        for qq in range_constexpr(4):
+            tot = fx.Float32(0.0)
+            for st in range_constexpr(steps):
+                tot = tot + ps[st][qq]
+            if const_expr(steps < WAVES):
+                tot = tot + fx.Float32(0.0)
+            vs.append(bf16_round(tot))
+        # lane n + 16 j: column n (row n), hidden rows 16 rg + 4 j ..
+        if lane % 16 < s:
+            c["put_bf"](c["sdx"], (lane % 16) * HIDDEN + 16 * rg + 4 * (lane // 16), vs)
+    # the CTA's own row: lane u < 32 the pair of hidden rows 2 u, + 1 of the half
+    u = fx.min(lane, fx.Int32(31))
+    base = (r * HIDDEN + ROW_TILES * ROWS * sl) // 2 + 32 * half
+    w = c["poll"]([(c["sdx"], base + u, 1)])[0][0]
+    if lane < 32:
+        at = 64 * half + 2 * lane
+        fx.ptr_store(bf_lo(w).bitcast(fx.Int32), c["rsdl"] + at)
+        fx.ptr_store(bf_hi(w).bitcast(fx.Int32), c["rsdl"] + (at + 1))
 
 
 @flyc.jit
@@ -1990,7 +2071,10 @@ def stage_row_down(c, bid):
     if wave < topk:
         row_down_slot(c, bid, wave)
     if wave >= WAVES - 2:
-        row_down_shared(c, bid, wave - (WAVES - 2))
+        if const_expr(row_sw_lds(d)):
+            row_down_shared(c, bid, wave - (WAVES - 2))
+        else:
+            row_down_shared_split(c, bid, wave - (WAVES - 2))
     gpu.barrier()
     width = ROW_TILES * ROWS
     if tid < width:
@@ -2070,8 +2154,10 @@ def row_stage_lds(s, rs):
         "rcon": rs.topk * ROW_TILES * ROWS,
         "rsdl": ROW_TILES * ROWS,
         "rpair": ROW_TILES * ROWS,
-        "shared_xl": 2 * row_sx_words(d)[0],
-        "shared_xsl": 2 * row_sx_words(d)[1],
+        "shared_xl": 2
+        * (row_sx_words(d) if row_sw_lds(d) else row_sdx_words(d, rs.tokens))[0],
+        "shared_xsl": 2
+        * (row_sx_words(d) if row_sw_lds(d) else row_sdx_words(d, rs.tokens))[1],
     }
     if row_sw_lds(d):
         # the shared down's weights of the CTA's 128 rows, loaded beside the routing
