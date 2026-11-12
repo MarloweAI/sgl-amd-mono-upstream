@@ -2,7 +2,8 @@
 """A greedy-variant static verify's head and accept on gfx950 in one launch (``fused_tail.hip``):
 this rank's vocab projection of the head's normed rows (bf16 MFMAs, the logits shard in the
 head's output dtype), the shard's row keys, their exchange between the ranks and SGLang's
-static accept tail."""
+static accept tail; with the draft's main_proj of the commit rows in the same launch where the
+commit takes it (``fused_tail_proj``)."""
 
 from __future__ import annotations
 
@@ -31,6 +32,10 @@ def ops():
     from sgl_amd_mono.common.hip_ext import load
 
     sources = {p.name: p.read_text() for p in sorted(_HERE.glob("*.hip"))}
+    proj = (
+        _HERE.parents[1] / "inject" / "proj" / "main_proj.h"
+    )  # main_proj's CTAs, for fused_tail_proj
+    sources[proj.name] = proj.read_text()
     return load("sgl_amd_mono_dsv41_ftail", sources, "gfx950")
 
 
@@ -78,21 +83,32 @@ class FusedTail:
 
     def __call__(self, x, weight, candidates, seq_lens, verify_lens, gate, *, sim, temps, seed,
                  correct_out, bonus_out, cap_trim_out, commit_out, new_seq_out, out_tokens,
-                 gated_out=None, target_out=None, commit=None):  # fmt: skip
+                 gated_out=None, target_out=None, proj=None, commit=None):  # fmt: skip
         """The logits shard [M, part] of the verify's normed rows ``x`` [M = bs * T, K] on
         this rank's head shard ``weight``, and static_accept_tail's outputs (rows [:bs]) in
         the out tensors; ``sim`` the simulated length [1] (with ``temps`` [bs] and ``seed``
-        [1]), or None. ``commit``: (history, slots, relay_lens, relay_tokens), SGLang's
-        engram_commit_history of the accept in the same launch (relay rows None: none stored)."""
+        [1]), or None. ``proj``: (x, w, ws, exchange), the draft's main_proj of rows ``x`` on
+        this rank's columns ``w``, ``ws`` in the same launch, into ``exchange.out``
+        (``gfx950/inject/proj``'s Exchange of this group). ``commit``: (history, slots,
+        relay_lens, relay_tokens), SGLang's engram_commit_history of the accept in the same
+        launch (relay rows None: none stored)."""
         logits = torch.empty(
             (x.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device
         )
-        self.ops.fused_tail(
+        args = (
             x, weight, logits, candidates, seq_lens, verify_lens, gate, sim, temps, seed,
             correct_out, bonus_out, cap_trim_out, commit_out, new_seq_out, out_tokens,
             gated_out, target_out, self.counts, self.peers, self.scratch, self.rank,
             self.vocab_start, self.width, self.vocab, self.deadline_s,
-            *(commit if commit is not None else (None,) * 4),
+        )  # fmt: skip
+        tail = commit if commit is not None else (None,) * 4
+        if proj is None:
+            self.ops.fused_tail(*args, *tail)
+            return logits
+        px, w, ws, ex = proj
+        assert ex.rank == self.rank
+        self.ops.fused_tail_proj(
+            *args, px, w, ws, ex.out, ex.state, ex.work, ex.peers, ex.deadline_s, *tail
         )  # fmt: skip
         return logits
 

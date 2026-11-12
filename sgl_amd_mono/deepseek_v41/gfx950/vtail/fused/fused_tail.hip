@@ -7,7 +7,10 @@
 //   request's row at that length, Gumbel-noised at the request's temperature as SGLang's simulated bonus: vtail.hip's
 //   arithmetic) and pushes each row's best (value, global index) to every rank as a launch-tagged record;
 // - each rank's last block (the fewest tiles) takes every rank's blocks' records and runs SGLang's static accept
-//   tail on the bests (the lowest index among the maxima), as vtail.hip does.
+//   tail on the bests (the lowest index among the maxima), as vtail.hip does;
+// - in fused_tail_proj, past their tiles the first blocks run the draft's main_proj (main_proj.h), two of its CTAs a
+//   block on the LDS the projection is done with: its input rows are ready before the launch, and its stream and
+//   exchanges run while the accept waits on the ranks' records.
 #include <climits>
 #include <cstdint>
 
@@ -17,6 +20,8 @@
 #include <c10/hip/HIPException.h>
 #include <hip/hip_runtime.h>
 #include <torch/library.h>
+
+#include "main_proj.h"
 
 #ifndef C10_HIP_KERNEL_LAUNCH_CHECK
 #define C10_HIP_KERNEL_LAUNCH_CHECK() C10_CUDA_KERNEL_LAUNCH_CHECK()
@@ -220,7 +225,11 @@ __device__ inline void gather_records(const uint64_t *rec, int parity, int keys,
     }
 }
 
-__global__ __launch_bounds__(THREADS) void fused_tail_kernel(const Params p) {
+// main_proj's CTAs a block (main_proj.h's THREADS each), on the block's LDS past the projection
+constexpr int PROJ_CTAS = THREADS / main_proj::THREADS;
+static_assert(PROJ_CTAS * main_proj::THREADS == THREADS);
+
+template <bool PROJ> __device__ inline void fused_tail_body(const Params &p, const main_proj::Params &q) {
     extern __shared__ __align__(16) unsigned char smem[];
     bfloat16 *xs = reinterpret_cast<bfloat16 *>(smem);
     __shared__ uint64_t s_key[NWAVES][MAX_M];
@@ -390,6 +399,18 @@ __global__ __launch_bounds__(THREADS) void fused_tail_kernel(const Params p) {
     if (threadIdx.x == 0) {
         p.counts[blockIdx.x] = count + 1;
     }
+    if constexpr (PROJ) {
+        const int grid = q.tiles * main_proj::UNITS;
+        if (static_cast<int>(blockIdx.x) * PROJ_CTAS < grid) { // the block's CTAs, every one of its threads
+            const int      part = threadIdx.x / main_proj::THREADS;
+            unsigned char *l    = smem + part * main_proj::LDS_BYTES; // the projection's LDS, past the barrier above
+            main_proj::run(q, static_cast<int>(blockIdx.x) * PROJ_CTAS + part, grid,
+                           static_cast<int>(threadIdx.x) % main_proj::THREADS,
+                           reinterpret_cast<uint8_t(*)[main_proj::SLICE]>(l),
+                           reinterpret_cast<uint8_t(*)[main_proj::SLICE / 32]>(l + main_proj::MAX_ROWS * main_proj::SLICE),
+                           *reinterpret_cast<int *>(l + main_proj::LDS_BYTES - 16));
+        }
+    }
     if (static_cast<int>(blockIdx.x) != p.blocks - 1) {
         return;
     }
@@ -455,6 +476,14 @@ __global__ __launch_bounds__(THREADS) void fused_tail_kernel(const Params p) {
     }
 }
 
+__global__ __launch_bounds__(THREADS) void fused_tail_kernel(const Params p) {
+    fused_tail_body<false>(p, main_proj::Params{});
+}
+
+__global__ __launch_bounds__(THREADS) void fused_tail_proj_kernel(const Params p, const main_proj::Params q) {
+    fused_tail_body<true>(p, q);
+}
+
 void check(const at::Tensor &t, const at::Tensor &ref, at::ScalarType dtype, const char *name) {
     TORCH_CHECK(t.device() == ref.device() && t.scalar_type() == dtype, name, " must be ", dtype, " on ",
                 ref.device());
@@ -490,19 +519,17 @@ void commit_params(Params &p, const c10::optional<at::Tensor> &history, const c1
     }
 }
 
-// x [M, K] bf16 contiguous (the head's normed rows); weight [part, K] bf16 (this rank's head shard, 16 B aligned
-// rows); logits [M, part] bf16 out; candidates [bs, T] int64 and the accept's tensors as vtail.hip's verify_tail;
-// counts [256] int32 (zeroed once), peers [tp] int64 on the host: every rank's uncached scratch, scratch this rank's
-void fused_tail(const at::Tensor &x, const at::Tensor &weight, at::Tensor &logits, const at::Tensor &candidates,
-                const at::Tensor &seq_lens, const at::Tensor &verify_lens, const at::Tensor &gate,
-                const c10::optional<at::Tensor> &sim, const c10::optional<at::Tensor> &temps,
-                const c10::optional<at::Tensor> &seed, at::Tensor &correct_out, at::Tensor &bonus_out,
-                at::Tensor &cap_trim_out, at::Tensor &commit_out, at::Tensor &new_seq_out, at::Tensor &out_tokens,
-                const c10::optional<at::Tensor> &gated_out, const c10::optional<at::Tensor> &target_out,
-                at::Tensor &counts, const at::Tensor &peers, int64_t scratch, int64_t rank, int64_t vocab_start,
-                int64_t width, int64_t vocab, double deadline_s, const c10::optional<at::Tensor> &history,
-                const c10::optional<at::Tensor> &slots, const c10::optional<at::Tensor> &relay_lens,
-                const c10::optional<at::Tensor> &relay_tokens) {
+// the launch's parameters (fused_tail's arguments), the launch of the kernel with main_proj's q or without (null)
+void launch(const at::Tensor &x, const at::Tensor &weight, at::Tensor &logits, const at::Tensor &candidates,
+            const at::Tensor &seq_lens, const at::Tensor &verify_lens, const at::Tensor &gate,
+            const c10::optional<at::Tensor> &sim, const c10::optional<at::Tensor> &temps,
+            const c10::optional<at::Tensor> &seed, at::Tensor &correct_out, at::Tensor &bonus_out,
+            at::Tensor &cap_trim_out, at::Tensor &commit_out, at::Tensor &new_seq_out, at::Tensor &out_tokens,
+            const c10::optional<at::Tensor> &gated_out, const c10::optional<at::Tensor> &target_out,
+            at::Tensor &counts, const at::Tensor &peers, int64_t scratch, int64_t rank, int64_t vocab_start,
+            int64_t width, int64_t vocab, double deadline_s, const c10::optional<at::Tensor> &history,
+            const c10::optional<at::Tensor> &slots, const c10::optional<at::Tensor> &relay_lens,
+            const c10::optional<at::Tensor> &relay_tokens, const main_proj::Params *q) {
     const int64_t M = x.size(0), K = x.size(1), part = weight.size(0);
     const int64_t bs = candidates.size(0), T = candidates.size(1), tp = peers.numel();
     const int64_t tiles  = (part + TILE_N - 1) / TILE_N;
@@ -597,17 +624,68 @@ void fused_tail(const at::Tensor &x, const at::Tensor &weight, at::Tensor &logit
     }
     const size_t lds = static_cast<size_t>(M) * K * 2 + NWAVES * TILE_N * WROW_LD;
     TORCH_CHECK(lds <= size_t(MAX_M) * MAX_K * 2 + NWAVES * TILE_N * WROW_LD, "x [M, K] in LDS");
-    static bool wide = false; // the LDS past 64 KB, set once a process
-    if (!wide) {
-        C10_HIP_CHECK(hipFuncSetAttribute(reinterpret_cast<const void *>(&fused_tail_kernel),
-                                          hipFuncAttributeMaxDynamicSharedMemorySize,
+    if (q != nullptr) {
+        TORCH_CHECK(lds >= size_t(PROJ_CTAS) * main_proj::LDS_BYTES, "main_proj's CTAs in the projection's LDS");
+        TORCH_CHECK(int64_t(main_proj::grid(*q)) <= (blocks - 1) * PROJ_CTAS,
+                    "main_proj's CTAs on the blocks before the accept's");
+    }
+    static bool wide[2] = {false, false}; // the LDS past 64 KB, set once a process a kernel
+    const void *kernel = q != nullptr ? reinterpret_cast<const void *>(&fused_tail_proj_kernel)
+                                      : reinterpret_cast<const void *>(&fused_tail_kernel);
+    if (!wide[q != nullptr]) {
+        C10_HIP_CHECK(hipFuncSetAttribute(kernel, hipFuncAttributeMaxDynamicSharedMemorySize,
                                           static_cast<int>(int64_t(MAX_M) * MAX_K * 2 + NWAVES * TILE_N * WROW_LD)));
-        wide = true;
+        wide[q != nullptr] = true;
     }
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA guard(x.device());
     const hipStream_t stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA(x.device().index()).stream();
-    fused_tail_kernel<<<p.blocks, THREADS, lds, stream>>>(p);
+    if (q != nullptr) {
+        fused_tail_proj_kernel<<<p.blocks, THREADS, lds, stream>>>(p, *q);
+    } else {
+        fused_tail_kernel<<<p.blocks, THREADS, lds, stream>>>(p);
+    }
     C10_HIP_KERNEL_LAUNCH_CHECK();
+}
+
+// x [M, K] bf16 contiguous (the head's normed rows); weight [part, K] bf16 (this rank's head shard, 16 B aligned
+// rows); logits [M, part] bf16 out; candidates [bs, T] int64 and the accept's tensors as vtail.hip's verify_tail;
+// counts [256] int32 (zeroed once), peers [tp] int64 on the host: every rank's uncached scratch, scratch this rank's
+void fused_tail(const at::Tensor &x, const at::Tensor &weight, at::Tensor &logits, const at::Tensor &candidates,
+                const at::Tensor &seq_lens, const at::Tensor &verify_lens, const at::Tensor &gate,
+                const c10::optional<at::Tensor> &sim, const c10::optional<at::Tensor> &temps,
+                const c10::optional<at::Tensor> &seed, at::Tensor &correct_out, at::Tensor &bonus_out,
+                at::Tensor &cap_trim_out, at::Tensor &commit_out, at::Tensor &new_seq_out, at::Tensor &out_tokens,
+                const c10::optional<at::Tensor> &gated_out, const c10::optional<at::Tensor> &target_out,
+                at::Tensor &counts, const at::Tensor &peers, int64_t scratch, int64_t rank, int64_t vocab_start,
+                int64_t width, int64_t vocab, double deadline_s, const c10::optional<at::Tensor> &history,
+                const c10::optional<at::Tensor> &slots, const c10::optional<at::Tensor> &relay_lens,
+                const c10::optional<at::Tensor> &relay_tokens) {
+    launch(x, weight, logits, candidates, seq_lens, verify_lens, gate, sim, temps, seed, correct_out, bonus_out,
+           cap_trim_out, commit_out, new_seq_out, out_tokens, gated_out, target_out, counts, peers, scratch, rank,
+           vocab_start, width, vocab, deadline_s, history, slots, relay_lens, relay_tokens, nullptr);
+}
+
+// fused_tail and, in the same launch, main_proj of proj_x [rows, 15360] bf16 on this rank's columns w, ws into
+// proj_out (main_proj.h's arguments: proj_state, proj_work and proj_peers its exchange's)
+void fused_tail_proj(const at::Tensor &x, const at::Tensor &weight, at::Tensor &logits, const at::Tensor &candidates,
+                     const at::Tensor &seq_lens, const at::Tensor &verify_lens, const at::Tensor &gate,
+                     const c10::optional<at::Tensor> &sim, const c10::optional<at::Tensor> &temps,
+                     const c10::optional<at::Tensor> &seed, at::Tensor &correct_out, at::Tensor &bonus_out,
+                     at::Tensor &cap_trim_out, at::Tensor &commit_out, at::Tensor &new_seq_out,
+                     at::Tensor &out_tokens, const c10::optional<at::Tensor> &gated_out,
+                     const c10::optional<at::Tensor> &target_out, at::Tensor &counts, const at::Tensor &peers,
+                     int64_t scratch, int64_t rank, int64_t vocab_start, int64_t width, int64_t vocab,
+                     double deadline_s, const at::Tensor &proj_x, const at::Tensor &w, const at::Tensor &ws,
+                     at::Tensor &proj_out, at::Tensor &proj_state, at::Tensor &proj_work,
+                     const at::Tensor &proj_peers, double proj_deadline_s,
+                     const c10::optional<at::Tensor> &history, const c10::optional<at::Tensor> &slots,
+                     const c10::optional<at::Tensor> &relay_lens, const c10::optional<at::Tensor> &relay_tokens) {
+    TORCH_CHECK(proj_x.device() == x.device() && proj_peers.numel() == peers.numel(), "main_proj on the same group");
+    const main_proj::Params q =
+        main_proj::params(proj_x, w, ws, proj_out, proj_state, proj_work, proj_peers, rank, proj_deadline_s);
+    launch(x, weight, logits, candidates, seq_lens, verify_lens, gate, sim, temps, seed, correct_out, bonus_out,
+           cap_trim_out, commit_out, new_seq_out, out_tokens, gated_out, target_out, counts, peers, scratch, rank,
+           vocab_start, width, vocab, deadline_s, history, slots, relay_lens, relay_tokens, &q);
 }
 
 int64_t scratch_bytes() { return SCRATCH_BYTES; }
@@ -626,6 +704,15 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
           "int scratch, int rank, int vocab_start, int width, int vocab, float deadline_s, "
           "Tensor(x!)? history=None, Tensor? slots=None, Tensor(y!)? relay_lens=None, "
           "Tensor(z!)? relay_tokens=None) -> ()");
+    m.def("fused_tail_proj(Tensor x, Tensor weight, Tensor(a!) logits, Tensor candidates, Tensor seq_lens, "
+          "Tensor verify_lens, Tensor gate, Tensor? sim, Tensor? temps, Tensor? seed, Tensor(b!) correct_out, "
+          "Tensor(c!) bonus_out, Tensor(d!) cap_trim_out, Tensor(e!) commit_out, Tensor(f!) new_seq_out, "
+          "Tensor(g!) out_tokens, Tensor(h!)? gated_out, Tensor(i!)? target_out, Tensor(j!) counts, Tensor peers, "
+          "int scratch, int rank, int vocab_start, int width, int vocab, float deadline_s, Tensor proj_x, "
+          "Tensor w, Tensor ws, Tensor(k!) proj_out, Tensor(l!) proj_state, Tensor(m!) proj_work, "
+          "Tensor proj_peers, float proj_deadline_s, Tensor(x!)? history=None, Tensor? slots=None, "
+          "Tensor(y!)? relay_lens=None, Tensor(z!)? relay_tokens=None) -> ()");
     m.def("scratch_bytes() -> int", &scratch_bytes);
     m.impl("fused_tail", at::kCUDA, &fused_tail);
+    m.impl("fused_tail_proj", at::kCUDA, &fused_tail_proj);
 }
