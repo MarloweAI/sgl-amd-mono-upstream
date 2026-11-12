@@ -365,12 +365,25 @@ def stage_slice(c, task, pre=None):
     for pas in range_constexpr(0, s * COLS // 2, THREADS):
         slice_input(c, task, plus(pas, tid), pm[pas // THREADS])
     # sum of squares: token t on wave t % WAVES, two columns a lane
-    for t in range_constexpr(s):
-        if wave == t % WAVES:
-            x0 = fx.ptr_load(rl + (t * KT + 2 * lane))
-            x1 = fx.ptr_load(rl + (t * KT + 2 * lane + 1))
-            sq = butterfly(x0 * x0 + x1 * x1, (32, 16, 8, 4, 2, 1))
-            if lane == 0:
+    if const_expr(s <= WAVES or c["d"].tp == 8):
+        for t in range_constexpr(s):
+            if wave == t % WAVES:
+                x0 = fx.ptr_load(rl + (t * KT + 2 * lane))
+                x1 = fx.ptr_load(rl + (t * KT + 2 * lane + 1))
+                sq = butterfly(x0 * x0 + x1 * x1, (32, 16, 8, 4, 2, 1))
+                if lane == 0:
+                    c["put"](c["pmix"], (task * s + t) * PART + MIX, sq)
+    else:
+        # past a token a wave: each wave's tokens side by side, no branch between them
+        toks = [wave + WAVES * j for j in range(cdiv(s, WAVES))]
+        sqs = []
+        for t in toks:
+            tt = fx.min(t, s - 1)
+            x0 = fx.ptr_load(rl + (tt * KT + 2 * lane))
+            x1 = fx.ptr_load(rl + (tt * KT + 2 * lane + 1))
+            sqs.append(butterfly(x0 * x0 + x1 * x1, (32, 16, 8, 4, 2, 1)))
+        for t, sq in zip(toks, sqs):
+            if (lane == 0) & (t < s):
                 c["put"](c["pmix"], (task * s + t) * PART + MIX, sq)
     # mixes: fp32 MFMA 16x16x4, A = fn rows, B = R_new^T, a token tile at a time
     for t0, n in token_tiles(s):
