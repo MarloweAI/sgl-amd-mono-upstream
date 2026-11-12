@@ -136,18 +136,37 @@ class RouteShape(msgspec.Struct, frozen=True):
         return min(self.tokens * ROW_SLICES, self.shared0)
 
     @property
+    def shared_by_task(self) -> bool:
+        """Whether a shared task runs every token tile on one CTA, its weights read once and
+        held through the tiles, on the first router CTAs (they route no token, so the shared
+        weights go out as their router task ends): TP2 at three token tiles, where the tasks
+        fit the router's CTAs (216 one-tile units on 256 CTAs there). Else a (task, token
+        tile) a CTA, past the route's CTAs."""
+        return (
+            self.tp == 2
+            and len(token_tiles(self.tokens)) == 3
+            and self.dims.shared_tasks <= self.router_tasks
+        )
+
+    @property
     def shared0(self) -> int:
         if self.row_moe:
             # the last CTAs: past every row's ug units
             return BLOCKS - self.shared_units
+        if self.shared_by_task:
+            assert self.shared_units <= self.router_tasks
+            return self.router0
         return self.route0 + max(8, self.tokens)
 
     @property
     def shared_units(self) -> int:
-        """The shared expert's (task, token tile) units (``stage_shared``); the per-row MoE's are
-        ``ROW_SHARED`` units of ``shared_unit_tasks`` tasks."""
+        """The shared expert's units (``stage_shared``): a task each (``shared_by_task``), else a
+        (task, token tile) each; the per-row MoE's are ``ROW_SHARED`` units of
+        ``shared_unit_tasks`` tasks."""
         if self.row_moe:
             return ROW_SHARED
+        if self.shared_by_task:
+            return self.dims.shared_tasks
         return self.dims.shared_tasks * len(token_tiles(self.tokens))
 
     @property

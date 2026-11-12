@@ -953,13 +953,14 @@ def ug_tile_task(c, task):
 
 
 @flyc.jit
-def stage_ug_tile(c, task, total):
-    """Run ug task ``task`` of ``total`` for one pick tile, then the next queued task."""
+def stage_ug_tile(c, task, total, placed=BLOCKS):
+    """Run ug task ``task`` of ``total`` for one pick tile, then the next queued task
+    (tasks past the ``placed`` first round's come from the queue)."""
     tid, lane = c["tid"], c["lane"]
     e, part0, first, count = ug_tile_task(c, task)
     gather_x8r(c, first, count)
     ug_pass(c, e, part0, first, count, fx.min(lane % 16, count - 1))
-    nxt = (total > BLOCKS).select(take_ug_task(c) + BLOCKS, total)
+    nxt = (total > placed).select(take_ug_task(c) + placed, total)
     # the epilogue's MID stores done before the flag
     rocdl.s_waitcnt(vmcnt=0)
     gpu.barrier()
@@ -2460,6 +2461,14 @@ def run_moe(c, key, bid, before_ug=None):
                 stage_shared(c, unit, gops, uops, 0, s)
             else:
                 stage_shared_unit(c, unit, per, gops, uops)
+        elif const_expr(c["rs"].shared_by_task):
+            # the task's every token tile, its weights in registers through them
+            for t0 in range(fx.Int32(0), s, TILE):
+                n = fx.min(fx.Int32(TILE), s - t0)
+                load_x8_rows(
+                    c, "x8", "x8s", c["x8l"], c["x8sl"], lambda j: t0 + j, n, ahead=True
+                )
+                stage_shared(c, unit, gops, uops, t0, n)
         else:
             t0 = unit // shared_tasks * TILE
             n = fx.min(fx.Int32(TILE), s - t0)
@@ -2482,8 +2491,15 @@ def run_moe(c, key, bid, before_ug=None):
             n_tiles = c["rs"].tile_first(c["tab"], c["rs"].n_union(c["tab"], s))
             ug_total = mplan.ug_tasks(n_tiles, c["rs"].ug_parts)
             task = first_task(bid, c["rs"].ug0)
+            # the first round's tasks placed on the CTAs without a shared task where the
+            # shared tasks run by task (``shared_by_task``): those CTAs reach ug late and
+            # take queued tasks only
+            placed = BLOCKS - c["rs"].shared_units if c["rs"].shared_by_task else BLOCKS
+            if const_expr(placed < BLOCKS):
+                if task >= placed:
+                    task = take_ug_task(c) + placed
             while task < ug_total:
-                task = stage_ug_tile(c, task, ug_total)
+                task = stage_ug_tile(c, task, ug_total, placed)
         else:
             # one token tile: every task placed; shared-unit CTAs reach ug late, so take none (``ug0``)
             loaded = fx.Int32(0)
