@@ -4,7 +4,9 @@
 A routed decode or DSpark verify step runs ``_Built.forward``, which takes and returns
 what ``DeepseekV4ForCausalLM.forward`` does: SGLang's input preparation, the embedding,
 every layer in two launches, the head's combine and norm, and SGLang's logits
-processor, with SGLang's own modules where SGLang owns the state.
+processor, with SGLang's own modules where SGLang owns the state. That is the
+monokernel's forward, up to ``MAX_ROWS`` rows; a wider step (``wide.WIDTHS``) runs
+``wide.WideForward``, the same forward in stages on SGLang's kernels.
 
 - Every layer is K1, then K2. K1 runs the attention seam and front and writes the
   step's SWA KV records and K2's key table; K2 runs the attention core, wo_a, wo_b,
@@ -73,9 +75,11 @@ except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
     )
 
 from sgl_amd_mono.common.plan import BLOCKS
-from sgl_amd_mono.deepseek_v41 import CANDIDATES, HF_CONFIG, fused
+from sgl_amd_mono.deepseek_v41 import CANDIDATES, HF_CONFIG, fused, wide
 
 MAX_ROWS = 48  # the rows a launch takes at most (``layer.MAX_TOKENS``)
+# the widths the monokernel's launches serve; the spec's wider ones run ``wide``
+MONO_WIDTHS = tuple(range(1, MAX_ROWS + 1))
 # the ranks' meet after the build: a cold build of every launch on one rank
 BUILD_MEET_S = 3600
 
@@ -481,6 +485,7 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
             )
         reasons += _indexer_reasons(i=i, attn=a)
         reasons += attn_layout_reasons(f"layer {i}", a)
+    reasons += wide.reasons(model, covered)
     if shuffled_layout(model.model.layers[i].self_attn for i in covered) is None:
         reasons.append(
             "wqkv_a / wq_b / wo_b are aiter-preshuffled on some layers and row-major "
@@ -1113,6 +1118,7 @@ class _Built:
 
     def __init__(self, lm, runner, layers: dict):
         self.lm, self.model, self.runner, self._layers = lm, lm.model, runner, layers
+        self.wide = wide.WideForward(lm)
         self._normal_moe = lm.model.layers[min(layers)].mlp
         # DSpark's captures, [MAX_ROWS, layers * hidden]: K1 writes each layer's block
         self._packed: torch.Tensor | None = None
@@ -1121,9 +1127,13 @@ class _Built:
         self, plan, input_ids, positions, forward_batch, input_embeds=None, *_, **__
     ):
         """``DeepseekV4ForCausalLM.forward`` for a routed step: SGLang's input
-        preparation and logits processor around the backbone."""
+        preparation and logits processor around the backbone; a wide step's in stages."""
         from sglang.srt.layers.layer_boundary import get_attn_tp_context
 
+        if plan.key.rows > MAX_ROWS:
+            return self.wide.forward(
+                plan, input_ids, positions, forward_batch, input_embeds
+            )
         lm = self.lm
         input_ids, input_embeds = lm.prepare_language_model_inputs(
             input_ids, forward_batch, input_embeds
@@ -1747,7 +1757,7 @@ def _build(model, hf_config, ctx) -> _Built:
             for eg in {0, first.eg.tasks if first.eg is not None else 0}
         }
     # ranks share FlyDSL's disk cache (a lock per kernel), so each starts at its own slice
-    widths = list(ctx.widths)
+    widths = [m for m in ctx.widths if m <= MAX_ROWS]
     start = len(widths) * p.tp_rank // p.tp_size
     for m in widths[start:] + widths[:start]:
         runner.precompile(
@@ -1770,7 +1780,7 @@ SPEC = MonoSpec(
     name="deepseek_v41_hip",
     devices={
         "gfx950": DeviceLimits(
-            widths=tuple(range(1, MAX_ROWS + 1)),
+            widths=MONO_WIDTHS + wide.WIDTHS,
             tp_sizes=(2, 4, 8),
             resident_blocks=BLOCKS,
         )

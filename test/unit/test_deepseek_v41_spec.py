@@ -13,7 +13,7 @@ except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
     from sglang.srt.monokernels import spec as registry
 
 import sgl_amd_mono
-from sgl_amd_mono.deepseek_v41 import CANDIDATES, HF_CONFIG, draft
+from sgl_amd_mono.deepseek_v41 import CANDIDATES, HF_CONFIG, draft, wide
 from sgl_amd_mono.deepseek_v41 import spec as dsv41
 
 # DeepSeek-V4.1-Flash's layer structure (its config.json)
@@ -55,6 +55,21 @@ def test_the_plugin_registers_both_specs():
             model_type="deepseek_v41",
         )
         assert found is spec, why
+
+
+def test_wide_steps_take_stock_graphs():
+    from sglang.srt.kernel_plugins.amd.binding import covered_capture_sizes
+
+    widths = dsv41.SPEC.widths("gfx950")
+    assert widths[: dsv41.MAX_ROWS] == dsv41.MONO_WIDTHS == draft.SPEC.widths("gfx950")
+    assert widths[dsv41.MAX_ROWS :] == wide.WIDTHS and max(wide.WIDTHS) == 384
+    # SGLang's speculative decode graphs to 64 requests: a DSpark server keeps them all
+    stock = [*range(1, 9), *range(10, 33, 2), *range(40, 65, 4)]
+    for top in (16, 32, 64):
+        sizes = [b for b in stock if b <= top]
+        assert covered_capture_sizes(widths=widths, tokens_per_request=6, sizes=sizes) == sizes
+    rows = (60, 96, 108, 192, 240, 384)
+    assert [wide.width_class(r) for r in rows] == [96, 96, 192, 192, 384, 384]
 
 
 def test_kv_records_are_bit_exact():
