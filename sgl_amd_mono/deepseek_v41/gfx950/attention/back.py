@@ -1232,13 +1232,25 @@ def back_plan(key):
     return nchunk, n_split, n_comb, COMB0, WOA0, WOB0, early_wob
 
 
+def wob_by_task(key) -> bool:
+    """Whether wo_b runs each of its tasks over every token tile on one CTA, on the CTAs
+    without a wo_a unit alone (``wob_cta_count``): their weights land under the attention
+    work and stay in registers through the tiles, where a tile a CTA put wo_b tasks on the
+    wo_a CTAs too, whose weights went out only past wo_a. TP2 at three token tiles, where
+    wo_a's units do not spread over the tiles."""
+    s, d = key.tokens, Dims(key.tp)
+    return d.tp == 2 and len(token_tiles(s)) == 3 and woa_units(s, d) == d.woa_tasks
+
+
 def wob_cta_count(key) -> int:
-    """wo_b's CTAs from WOB0: on one token tile the CTAs without a wo_a unit where two
+    """wo_b's CTAs from WOB0: the CTAs without a wo_a unit on one token tile where two
     tasks each cover it (a wo_a CTA sees the last wo_a flag a poll later than one already
-    waiting), else all."""
+    waiting) and where wo_b runs by task (``wob_by_task``), else all."""
     s, d = key.tokens, Dims(key.tp)
     units = woa_units(s, d)
     one = len(token_tiles(s)) == 1
+    if wob_by_task(key):
+        return BLOCKS - units
     return BLOCKS - units if one and 2 * (BLOCKS - units) >= d.wob_tasks else BLOCKS
 
 
@@ -1368,10 +1380,15 @@ def run_back(c, key, bid, idle=None, before_wob=None):
     wob_unit = first_task(bid, WOB0)
     wob_ctas = wob_cta_count(key)
     has_wob = True if wob_ctas == BLOCKS else wob_unit < wob_ctas
+    by_task = wob_by_task(key)
     if const_expr(nt == 1):
         # one or two wo_b tasks a CTA, every one on the step's rows
         wob_tile = 0
         wob_ts = [wob_unit, wob_unit + wob_ctas]
+    elif const_expr(by_task):
+        # every tile of tasks wob_unit, + wob_ctas, ..
+        wob_tile = 0
+        wob_ts = [wob_unit + k * wob_ctas for k in range(cdiv(wob_tasks, wob_ctas))]
     else:
         # a tile a CTA (ROCm/ATOM's tile tasks): rows read once, every task's weights in flight
         wob_tile = wob_unit % nt
@@ -1380,6 +1397,11 @@ def run_back(c, key, bid, idle=None, before_wob=None):
         wob_ts = [wob_unit // nt + k * per_tile for k in range(most)]
 
     def wob_weights():
+        if const_expr(by_task):
+            return [
+                wob_loads(c, fx.min(t, wob_tasks - 1), pred=has_wob & (t < wob_tasks))
+                for t in wob_ts
+            ]
         # one tile on every CTA: the first task is every CTA's (BLOCKS < wob_tasks), unmasked
         return [
             wob_loads(c, t)
@@ -1522,7 +1544,8 @@ def run_back(c, key, bid, idle=None, before_wob=None):
         stamp(c, 13)
 
     for ti in range_constexpr(nt):
-        if wob_tile == ti:
+        # by task: every tile on each wo_b CTA
+        if True if by_task else wob_tile == ti:
             if has_wob:
                 wob_tile_run(ti)
     stamp(c, 4)
