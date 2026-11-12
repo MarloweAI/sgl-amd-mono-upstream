@@ -59,6 +59,7 @@ from sgl_amd_mono.common.plan import (
 from sgl_amd_mono.common.stamps import stamp
 from sgl_amd_mono.common.sync import (
     FLAG_STRIDE,
+    POLL_MAX,
     _spin,
     preg,
     publish,
@@ -117,6 +118,16 @@ PIPE_MIN_STEPS = 8
 # routed intermediate K steps up to which down round 0's weights fit beside the shared
 # down's (``down_round0_early``): TP4 and up
 DOWN_EARLY_STEPS = 5
+# the tile down's units: (group of DOWN_GROUP row tiles, pick tile), one MID load for the group's
+# MFMAs; the groups' units dealt over the CTAs in ranges, CTA b summing row tile b (and b + BLOCKS
+# below DOWN_TASKS - BLOCKS), its range in proportion to DOWN_SHARE[tp] (two tiles, one)
+DOWN_GROUP = 8
+DOWN_GROUPS = DOWN_TASKS // DOWN_GROUP
+DOWN_SHARE = {2: (13, 14), 4: (7, 8)}
+# routed weight bytes a CU keeps in flight across the tile down's units, and a unit's K
+# chunk: two chunks' weights, scales and MID in registers beside the group's chains
+DOWN_INFLIGHT = 64 * 1024
+DOWN_CHUNK = 1
 # a reduce task's columns: 32 keeps each thread's poll to 1-2 passes
 RED_COLS = 32
 RED_TASKS = HIDDEN // RED_COLS
@@ -181,6 +192,10 @@ def scratch_layout(key: MoeBuild) -> dict[str, tuple[int, int]]:
         if not row_sw_lds(d):
             # the shared down's sums of every row as tagged bf16 pairs (``row_down_shared_split``)
             pairs["sdx"] = tokens * HIDDEN // 2
+    if rs.tile_down:
+        # every row tile's routed contributions, a tagged f32 pair a (pick, row)
+        # (``stage_down_groups``)
+        pairs["dxc"] = DOWN_TASKS * rs.picks * ROWS
     return pair_layout(pairs.items())
 
 
@@ -1332,6 +1347,62 @@ def mid_operands(c, first, count):
     return bvs, sbs
 
 
+def mid_chunk_operands(c, first, count, st0, n):
+    """``mid_operands`` of K steps st0 .. st0 + n, a column past the picks reading past the
+    buffer's range (zeros, no memory request) instead of the last pick again."""
+    lane, d, rs = c["lane"], c["d"], c["rs"]
+    j = lane // 16
+    row = first + fx.min(lane % 16, count - 1)
+    mid_bytes = rs.picks * d.mid_words * 4
+    # a constant offset after an opaque lane word folds into the immediate (no extra VGPR)
+    lane_word = (lane % 16 < count).select(row * d.mid_words + j * 4, fx.Int32(mid_bytes // 4))
+    lane_word = fresh(lane_word)
+    bvs = []
+    for st in range_constexpr(st0, st0 + n):
+        halves = []
+        for h in range_constexpr(2):
+            v = fx.Vector(
+                bo.buffer_load(
+                    rsrc(c["mid"].value, mid_bytes),
+                    lane_word + (st * 32 + 16 * h),
+                    vec_width=4,
+                    dtype=T.i32,
+                    cache_modifier=CM_DEV,
+                )
+            )
+            if const_expr(st * 128 + 64 * h + 48 >= d.inter_real):
+                # MID past the real intermediate is stale: zero it, as NaN * a zero weight is NaN
+                past = st * 128 + 64 * h + 16 * j >= d.inter_real
+                v = past.select(fx.Vector.filled(4, 0, fx.Int32), v)
+            halves.append(v)
+        bvs.append(fp8_operand(halves))
+    # this lane's codes, one a K step, contiguous in MIDS: 4 a load
+    base = mid_code_index(d, row, j)
+    mids_bytes = rs.picks * (d.inter // 32) * 4
+    base = (lane % 16 < count).select(base, fx.Int32(mids_bytes // 4))
+    sbs = []
+    for w0 in range_constexpr(st0, st0 + n, 4):
+        m = min(4, st0 + n - w0)
+        v = bo.buffer_load(
+            rsrc(c["mids"].value, mids_bytes),
+            base + w0,
+            vec_width=m,
+            dtype=T.i32,
+            cache_modifier=CM_DEV,
+        )
+        if const_expr(m == 1):
+            sbs.append(fx.Int32(v))
+        else:
+            v = fx.Vector(v)
+            sbs += [v[k] for k in range(m)]
+    for st in range_constexpr(st0, st0 + n):
+        if const_expr((st + 1) * 128 > d.inter_real):
+            # a group past the real intermediate has no code written either
+            past = (4 * st + j) * 32 >= d.inter_real
+            sbs[st - st0] = past.select(fx.Int32(UNIT_SCALE), sbs[st - st0])
+    return bvs, sbs
+
+
 def mid_code_index(d, row, group):
     """Return the MIDS word of pick row ``row``'s MXFP8 group ``group``."""
     steps = d.inter // 128
@@ -1394,22 +1465,49 @@ def down_shared_tile(c, tasks, shops, t0, nn):
 
 
 @flyc.jit
-def down_combine(c, task, j, t0, n):
-    """Down task ``task`` for tokens t0 .. t0 + n: routed sum in top-k order plus shared, pushed to every rank."""
+def down_combine(c, task, j, t0, n, polled=False):
+    """Down task ``task`` for tokens t0 .. t0 + n: routed sum in top-k order plus shared, pushed to every rank
+    (``polled``: the tile down's, its contributions polled from DXC, every (token, row) of the n
+    tokens in one poll a thread)."""
     s, tid, d, tab = c["S"], c["tid"], c["d"], c["tab"]
     topk = c["rs"].topk
-    if tid < ROWS * n:
-        r = tid % ROWS
-        tl = tid // ROWS
-        t = plus(t0, tl)
-        shared = fx.ptr_load(c["sdl"] + ((j * s + t) * ROWS + r)).bitcast(fx.Float32)
-        # aiter's stage 2 rounds to bf16 at every add; here in top-k order
-        routed = fx.Float32(0.0)
-        for k in range_constexpr(topk):
-            w = c["rs"].route_w(tab, s, t, k)
-            v = contrib_load(c, j, (t * topk + k) * 16 + r)
-            routed = bf16_round(routed + bf16_round(v * w))
-        fx.ptr_store(bf16_round(routed + shared), c["pair"] + tid)
+    if const_expr(not polled):
+        if tid < ROWS * n:
+            r = tid % ROWS
+            tl = tid // ROWS
+            t = plus(t0, tl)
+            shared = fx.ptr_load(c["sdl"] + ((j * s + t) * ROWS + r)).bitcast(fx.Float32)
+            # aiter's stage 2 rounds to bf16 at every add; here in top-k order
+            routed = fx.Float32(0.0)
+            for k in range_constexpr(topk):
+                w = c["rs"].route_w(tab, s, t, k)
+                v = contrib_load(c, j, (t * topk + k) * 16 + r)
+                routed = bf16_round(routed + bf16_round(v * w))
+            fx.ptr_store(bf16_round(routed + shared), c["pair"] + tid)
+    else:
+        per = -(-ROWS * n // THREADS)
+        assert per * topk <= POLL_MAX
+        # (token, row) i = tid + THREADS q of tokens t0 ..; a thread past them repeats the last
+        idx = [fx.min(tid + THREADS * q, ROWS * n - 1) for q in range(per)]
+        xs = c["poll"](
+            [
+                (c["dxc"], (task * c["rs"].picks + plus(t0, i // ROWS) * topk + k) * 16 + i % ROWS, 1)
+                for i in idx
+                for k in range(topk)
+            ]
+        )
+        for q in range_constexpr(per):
+            i = idx[q]
+            r = i % ROWS
+            t = plus(t0, i // ROWS)
+            shared = fx.ptr_load(c["sdl"] + ((j * s + t) * ROWS + r)).bitcast(fx.Float32)
+            routed = fx.Float32(0.0)
+            for k in range_constexpr(topk):
+                w = c["rs"].route_w(tab, s, t, k)
+                v = xs[q * topk + k][0].bitcast(fx.Float32)
+                routed = bf16_round(routed + bf16_round(v * w))
+            if tid + THREADS * q < ROWS * n:
+                fx.ptr_store(bf16_round(routed + shared), c["pair"] + i)
     gpu.barrier()
     if tid < ROWS * n // 2:
         rp = tid % (ROWS // 2)
@@ -1429,6 +1527,196 @@ def down_combine(c, task, j, t0, n):
                     pair = region_pair(c["rank"], t - p * own, own, col)
                     c["put_bf"](dst, 2 * pair, [v0, v1])
     gpu.barrier()
+
+
+# ---------------------------------------------------------------- tile down
+@flyc.jit
+def stage_down_groups(c):
+    """The down as units (group of ``DOWN_GROUP`` row tiles, pick tile), every group's units in turn
+    dealt over the CTAs in ranges (``down_range``); wave w runs its CTA's units w, w + WAVES, ..,
+    each as K chunks of ``DOWN_CHUNK`` steps, a chunk's weights, scales and MID issued
+    ``down_ahead`` chunks before its MFMAs, once every ug flag of the step is seen. Contributions go
+    to DXC; CTA b runs the shared down of row tile b (and b + BLOCKS) first and sums the tile once
+    its contributions land."""
+    s, tab, d, rs, wave, tid, bid = c["S"], c["tab"], c["d"], c["rs"], c["wave"], c["tid"], c["bid"]
+    assert DOWN_TASKS % DOWN_GROUP == 0 and DOWN_GROUP % 2 == 0
+    n_tiles = rs.tile_first(tab, rs.n_union(tab, s))
+    lo, hi = down_range(n_tiles, bid, d.tp)
+    two = bid < DOWN_TASKS - BLOCKS
+    if two:
+        down_shared_all(c, [bid, BLOCKS + bid])
+    else:
+        down_shared_all(c, [bid])
+    # every ug flag of the step: the units' MID loads then wait on nothing but themselves
+    n_flags = n_tiles * rs.ug_parts
+    c["poll"](
+        [
+            (c["ugf"], fx.min(tid + THREADS * k, n_flags - 1), 1)
+            for k in range(-(-rs.max_tiles * rs.ug_parts // THREADS))
+        ]
+    )
+    gpu.barrier()
+    chunks = down_chunks(d)
+    ahead = down_ahead(d)
+    nc = len(chunks)
+
+    def loads(i, q, pipe):
+        return down_chunk_loads(c, n_tiles, hi, lo + wave + WAVES * i, chunks, q, pipe)
+
+    pipe = []
+    for q in range_constexpr(ahead):
+        pipe = pipe + [loads(q // nc, q % nc, pipe)]
+    for i in range(0, (hi - lo - wave + WAVES - 1) // WAVES, 1):
+        accs = [
+            [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(DOWN_CHAINS)]
+            for _ in range(DOWN_GROUP)
+        ]
+        for q in range_constexpr(nc):
+            unit, ws, svs, mid = pipe[0]
+            nq = q + ahead
+            pipe = pipe[1:] + [loads(i + nq // nc, nq % nc, pipe)]
+            rocdl.sched_barrier(0)
+            accs = down_chunk_mfma(chunks[q], ws, svs, mid, accs)
+        down_unit_store(c, unit, accs)
+    gpu.barrier()
+    if two:
+        down_sum_tiles(c, [bid, BLOCKS + bid])
+    else:
+        down_sum_tiles(c, [bid])
+
+
+@flyc.jit
+def down_shared_all(c, tasks):
+    """The shared down of row tiles ``tasks`` for every token, into LDS slots 0, 1, .."""
+    s, d = c["S"], c["d"]
+    shops = down_shared_loads(c, tasks)
+    for t0, nn in token_tiles(s):
+        load_smid_tile(c, t0, nn, d.sh_inter // 32)
+        down_shared_tile(c, tasks, shops, t0, nn)
+
+
+@flyc.jit
+def down_sum_tiles(c, tasks):
+    """``down_combine`` of row tiles ``tasks`` over every token (their shared downs in LDS slots
+    0, 1, ..), their contributions polled from DXC."""
+    for j in range_constexpr(len(tasks)):
+        down_combine(c, tasks[j], j, 0, c["S"], polled=True)
+
+
+def down_range(n_tiles, bid, tp):
+    """CTA bid's units [lo, hi) of the tile down's ``DOWN_GROUPS`` x n_tiles: ranges in proportion
+    to ``DOWN_SHARE[tp]``, the CTAs summing two row tiles first."""
+    w2, w1 = DOWN_SHARE[tp]
+    n2 = DOWN_TASKS - BLOCKS
+    total = DOWN_GROUPS * n_tiles
+    weight = w2 * n2 + w1 * (BLOCKS - n2)
+
+    def start(b):
+        w = w2 * fx.min(b, n2) + w1 * fx.max(b - n2, 0)
+        return total * w // weight
+
+    return start(bid), start(bid + 1)
+
+
+def down_chunks(d):
+    """A unit's K chunks (first step, steps), ``DOWN_CHUNK`` steps at most."""
+    steps = d.inter // 128
+    return [(st0, min(DOWN_CHUNK, steps - st0)) for st0 in range(0, steps, DOWN_CHUNK)]
+
+
+def down_ahead(d) -> int:
+    """The tile down's chunks in flight past the one computing: ``DOWN_INFLIGHT`` of weights a CU."""
+    st = min(DOWN_CHUNK, d.inter // 128)
+    return -(-DOWN_INFLIGHT // (WAVES * DOWN_GROUP * ROWS * 64 * st))
+
+
+def down_unit(c, n_tiles, hi, k):
+    """Unit k (a unit past ``hi`` is the CTA's last again, or unit 0 where the CTA has none):
+    (group, first pick, picks, live, expert)."""
+    s, tab, rs = c["S"], c["tab"], c["rs"]
+    kk = fx.max(fx.min(k, hi - 1), 0)
+    g, p = kk // n_tiles, kk % n_tiles
+    u = rs.tile_slot(tab, p)
+    first = mplan.tile_pick0(rs.slot_first(tab, u), p, rs.tile_first(tab, u))
+    count = fx.min(fx.Int32(TILE), rs.slot_first(tab, u + 1) - first)
+    return g, first, count, k < hi, rs.union_expert(tab, s, u)
+
+
+def down_chunk_loads(c, n_tiles, hi, k, chunks, q, pipe):
+    """Issue unit k's weights of its group's row tiles, their scales and the MID of its K chunk q (a
+    later chunk takes the unit from the chunk issued before it, last in ``pipe``): (unit, weights,
+    scale words, MID)."""
+    d, a = c["d"], c["args"]
+    chunk = chunks[q]
+    st0, n = chunk
+    unit = pipe[-1][0] if q else down_unit(c, n_tiles, hi, k)
+    g, first, count, _, e = unit
+    t0 = DOWN_GROUP * g
+    ws = [
+        fp4_tile_weights(c, a["w2"], e, HIDDEN, d.inter, t0 + t, st0, n, d.inter_real)
+        for t in range(DOWN_GROUP)
+    ]
+    svs = [down_scale_loads(c, e, t0 + t, chunk) for t in range(0, DOWN_GROUP, 2)]
+    mid = mid_chunk_operands(c, first, count, st0, n)
+    return unit, ws, svs, mid
+
+
+def down_scale_loads(c, e, task, chunk):
+    """Issue this lane's E8M0 scale words of expert e's row tile ``task`` (even) and the next for K
+    chunk ``chunk``: a word a pair of K steps, holding both steps' scales of the lane's row in both
+    tiles of their 32-row block (``scale_index``)."""
+    lane, d = c["lane"], c["d"]
+    st0, n = chunk
+    block = (e * HIDDEN + task * 16) // 32 * (d.down_scale_cols * 8)
+    return [
+        fx.Int32(
+            bo.buffer_load(
+                rsrc(c["args"]["w2_s"]),
+                block + 64 * i + lane,
+                vec_width=1,
+                dtype=T.i32,
+                cache_modifier=CM_NT,
+            )
+        )
+        for i in range(st0 // 2, (st0 + n - 1) // 2 + 1)
+    ]
+
+
+def down_chunk_mfma(chunk, ws, svs, mid, accs):
+    """``down_mfma``'s chains of the group's row tiles over K chunk ``chunk``, the scales from
+    ``down_scale_loads``' words (tile t: block t // 2, byte t % 2 of a step's half word)."""
+    st0, n = chunk
+    bvs, sbs = mid
+    accs = [list(a) for a in accs]
+    for i in range_constexpr(n):
+        st = st0 + i
+        h = st % DOWN_CHAINS
+        for t in range_constexpr(DOWN_GROUP):
+            word = svs[t // 2][st // 2 - st0 // 2]
+            sa = (word >> (8 * (t % 2) + (st % 2) * 16)) & 0xFF
+            accs[t][h] = mfma_scaled(ws[t][i], bvs[i], accs[t][h], sa, sbs[i], FP4, FP8)
+    return accs
+
+
+@flyc.jit
+def down_unit_store(c, unit, accs):
+    """A unit's contributions of its group's row tiles, each tile's chains summed in order, into
+    DXC as tagged pairs."""
+    lane, tab, rs = c["lane"], c["tab"], c["rs"]
+    g, first, count, live, _ = unit
+    jj = lane % 16
+    pick = rs.pick_at(tab, first + fx.min(jj, count - 1))
+    if live & (jj < count):
+        for t in range_constexpr(DOWN_GROUP):
+            acc = accs[t][0]
+            for h in range_constexpr(1, DOWN_CHAINS):
+                acc = acc + accs[t][h]
+            at = ((DOWN_GROUP * g + t) * rs.picks + pick) * 16 + 4 * (lane // 16)
+            # two pairs a store: 16 B, the widest buffer store
+            for q in range_constexpr(0, 4, 2):
+                c["put_words"](
+                    c["dxc"], at + q, [acc[q].bitcast(fx.Int32), acc[q + 1].bitcast(fx.Int32)]
+                )
 
 
 def push_ffn_cell(c, t, s, col, vs):
@@ -2522,7 +2810,9 @@ def run_moe(c, key, bid, before_ug=None):
         # every CTA its tile; the first DOWN_TASKS - BLOCKS CTAs to arrive take the extra tiles
         down_task = first_task(bid, DOWN0)
         rank = take_down_rank(c)
-        if rank < DOWN_TASKS - BLOCKS:
+        if const_expr(c["rs"].tile_down):
+            stage_down_groups(c)
+        elif rank < DOWN_TASKS - BLOCKS:
             stage_down(c, [down_task, BLOCKS + rank])
         else:
             stage_down(c, [down_task])

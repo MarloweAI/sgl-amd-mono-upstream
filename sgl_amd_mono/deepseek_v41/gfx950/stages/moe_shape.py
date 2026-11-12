@@ -131,6 +131,13 @@ class RouteShape(msgspec.Struct, frozen=True):
         )
 
     @property
+    def tile_down(self) -> bool:
+        """The down as a stream of (group of row tiles, pick tile) units a wave, each unit's loads in
+        flight under the previous unit's MFMAs, the units balanced over the CTAs
+        (``moe.stage_down_groups``): past one token tile at TP 2 and 4."""
+        return self.tp < 8 and self.multi and not self.row_moe
+
+    @property
     def row_ug_ctas(self) -> int:
         """The per-row MoE's ug CTAs: those below the shared units."""
         return min(self.tokens * ROW_SLICES, self.shared0)
