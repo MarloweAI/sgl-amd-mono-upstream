@@ -1333,7 +1333,13 @@ def run_back(c, key, bid, idle=None, before_wob=None):
     tiles = token_tiles(s)
     _, n_split, n_comb, COMB0, WOA0, WOB0, early_wob = back_plan(key)
     stamp(c, 0)
-    if const_expr(n_split <= BLOCKS):
+    split0 = c.get("split0", 0)
+    if const_expr(n_split <= BLOCKS and split0 != 0):
+        # a split unit a CTA at most, from CTA split0 (one launch a layer)
+        unit = first_task(bid, split0)
+        if unit < n_split:
+            stage_split(c, unit)
+    elif const_expr(n_split <= BLOCKS):
         # a split unit a CTA at most: CTA u runs unit u
         if bid < n_split:
             stage_split(c, bid)
