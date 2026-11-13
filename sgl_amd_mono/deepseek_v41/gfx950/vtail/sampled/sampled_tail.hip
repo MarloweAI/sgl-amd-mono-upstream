@@ -693,7 +693,7 @@ template <int T> __device__ inline void sampled_tail_body(const Params &p) {
     int64_t *tokens       = p.out_tokens + r * p.out_tokens_stride;
 #pragma unroll
     for (int j = 0; j < T; ++j) {
-        tokens[j] = j == correct ? bonus : (j < G ? s_cand[r][1 + j] : 0);
+        tokens[j] = j == correct ? bonus : (j < correct ? s_cand[r][1 + j] : 0); // rejected drafts zeroed, as SGLang
     }
     if (p.gated_out != nullptr) {
         p.gated_out[r] = min(commit, static_cast<int>(s_vlen[r])) * p.gate[0];

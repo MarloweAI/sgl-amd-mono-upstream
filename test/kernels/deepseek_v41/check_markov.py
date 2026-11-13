@@ -72,7 +72,9 @@ def against_sglang(rank, tp, cpu, dev, w1, w2, gamma, sharded=False) -> list:
         num_embeddings_per_partition=part, num_embeddings_padded=part * tp,
     )  # fmt: skip
     head._shard_group = group
-    head.vocab_shard = VocabShard(start=start, gather=NcclVocabGather(group))
+    head.vocab_shard = VocabShard(
+        start=start, width=part, gather=NcclVocabGather(group)
+    )
     model = SimpleNamespace(
         markov_head=head, lm_head=SimpleNamespace(num_embeddings_per_partition=part)
     )

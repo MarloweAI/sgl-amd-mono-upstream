@@ -260,7 +260,7 @@ __device__ inline void verify_tail_body(const Params &p) {
     p.new_seq_out[r]    = p.seq_lens[r] + commit;
     int64_t *tokens     = p.out_tokens + r * p.out_tokens_stride;
     for (int j = 0; j < p.T; ++j) {
-        tokens[j] = j == correct ? bonus : (j < gamma ? cand[1 + j] : 0);
+        tokens[j] = j == correct ? bonus : (j < correct ? cand[1 + j] : 0); // rejected drafts zeroed, as SGLang
     }
     if (p.gated_out != nullptr) {
         p.gated_out[r] = min(commit, static_cast<int>(p.verify_lens[r])) * p.gate[0];

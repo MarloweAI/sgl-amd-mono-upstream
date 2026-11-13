@@ -453,7 +453,7 @@ template <bool PROJ> __device__ inline void fused_tail_body(const Params &p, con
     p.new_seq_out[r]  = s_seq[r] + commit;
     int64_t *tokens   = p.out_tokens + r * p.out_tokens_stride;
     for (int j = 0; j < p.T; ++j) {
-        tokens[j] = j == correct ? bonus : (j < gamma ? cand[1 + j] : 0);
+        tokens[j] = j == correct ? bonus : (j < correct ? cand[1 + j] : 0); // rejected drafts zeroed, as SGLang
     }
     if (p.gated_out != nullptr) {
         p.gated_out[r] = min(commit, static_cast<int>(s_vlen[r])) * p.gate[0];

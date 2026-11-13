@@ -503,6 +503,7 @@ def main():
         print("ALL PASS" if int(flag) else "FAIL")
     launch.close()
     dist.destroy_process_group()
+    raise SystemExit(0 if int(flag) else 1)
 
 
 if __name__ == "__main__":
