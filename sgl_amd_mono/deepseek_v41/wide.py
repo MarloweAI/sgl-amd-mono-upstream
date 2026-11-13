@@ -917,7 +917,7 @@ SPAN_A_FRONT = {2: (), 4: ()}
 SPAN_A_WINDOW = {2: 40, 4: 80}
 # the token-parallel classes whose launch runs the front on the owners' rows and gathers its
 # compact outputs (the q norm's operand, the KV record) to every rank
-SPAN_A_GATHER = {2: (), 4: ()}
+SPAN_A_GATHER = {2: (384,), 4: (384,)}
 # per TP the width classes whose launch sums the previous MoE's output; the others take
 # SGLang's all-reduce (at TP 4 and 96 rows its two-stage kernel is faster than the launch's sum)
 SPAN_A_SUM = {2: (96, 192, 384), 4: (192, 384)}
