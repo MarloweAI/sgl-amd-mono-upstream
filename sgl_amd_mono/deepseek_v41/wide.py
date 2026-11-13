@@ -33,6 +33,12 @@ every rank the rows the next projection reads. The reduce-scatter sums an owner'
 in the all-reduce's order (``Exchange``), and every row-local kernel computes a row the
 same way at any row count, so each output is the same to the bit.
 
+At TP 2 and TP 4 each layer's span A runs as one launch (``SpanAStages``, ``stages.spana``): a
+layer whose post is deferred leaves its MoE output unsummed, and the next layer's launch sums
+it over the ranks (the all-reduce's bits, or the reduce-scatter's on a token-parallel step),
+runs the attention seam and the input norm and, on the classes of ``SPAN_A_FRONT``, the
+attention front up to the attention core.
+
 The forward reads what SGLang's backend builds for the step, except the low-ratio
 indexers' decode schedules: the spec declares them unread (the monokernel scores every
 index source itself), so ``prepare_step`` builds them here, in the graph, as the backend
@@ -123,6 +129,19 @@ SGLANG_READS = {
         "_forward_prepare_low_ratio_multi_stream",
         "_forward_prepare_multi_stream_hip",
         "_project_wo_b",
+        "hc_sinkhorn_iters",
+        "rms_norm_eps",
+        "hc_eps",
+        "input_layernorm",
+        "fuse_wqa_wkv",
+        "wqkv_a",
+        "wq_b",
+        "q_norm",
+        "kv_norm",
+        "eps",
+        "indexer",
+        "_low_ratio_sources_break",
+        "bcg_deepseek_v4_low_ratio_sources",
     ),
     "srt/models/deepseek_common/amd/deepseek_v4_hip.py": (
         "skip_head_pad",
@@ -130,6 +149,8 @@ SGLANG_READS = {
         "attention_inv_rope(wo_a_applies_inv_rope)",
         "wo_a_emits_fp8_grid",
         "wo_b_emits_mxfp8",
+        "fused_rmsnorm_fake_quant",
+        "_wqkv_a_native_consumer_checked",
     ),
     "srt/models/deepseek_common/amd/deepseek_v4_fused_mhc.py": (
         "hc_boundary",
@@ -182,7 +203,13 @@ SGLANG_READS = {
         "fake_quant_fp8_activation",
         "fp8_grid_quantize",
     ),
-    "srt/models/deepseek_common/amd/deepseek_v4_gfx95_dense.py": ("_hip_mxfp8_operand",),
+    "srt/models/deepseek_common/amd/deepseek_v4_gfx95_dense.py": (
+        "_hip_mxfp8_operand",
+        "_mxfp8_consumer",
+        "_wqkv_a_native_consumer",
+        "Mxfp8Activation",
+        "Fp8GridActivation",
+    ),
     "srt/layers/radix_attention.py": ("v_head_dim", "layer_id"),
     # the fused boundary's coefficients
     "kernels/ops/layernorm/mhc_boundary_hip.py": ("tensors",),
@@ -256,8 +283,29 @@ SGLANG_READS = {
         "fp4_low_ratio_decode_workspaces",
         "max_context_len",
         "token_to_kv_pool",
+        "get_swa_out_cache_loc",
+        "forward_low_ratio_sources",
     ),
-    "srt/mem_cache/deepseek_v4_memory_pool.py": ("low_ratio_index_k_page8_ratios",),
+    "srt/mem_cache/deepseek_v4_memory_pool.py": (
+        "low_ratio_index_k_page8_ratios",
+        # the span A launch's KV store (``SpanA``)
+        "get_swa_raw_buffer",
+        "uniform_fp8",
+        "kv_layout",
+        "swa_page_size",
+    ),
+    # the span A launch: its seam, its front's routes and the sources after it
+    "srt/layers/layernorm.py": ("variance_epsilon",),
+    "srt/layers/quantization/fp8.py": (
+        "Fp8LinearMethod",
+        "block_fp8_as_mxfp8",
+        "mxfp8_dense_backend",
+        "block_fp8_mxfp8_ready",
+    ),
+    "srt/layers/quantization/fp8_utils.py": ("is_gfx95_mxfp8_aiter",),
+    "srt/layers/quantization/fp8_hip.py": ('"weight_scale_mx_e8m0"', "mxfp8_aiter_preshuffled"),
+    "srt/layers/attention/dsv4/unified_kv_gate.py": ("is_unified_kv_triton",),
+    "srt/environ.py": ("SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE",),
 }
 
 # the wide steps' rows: SGLang's speculative decode graph sizes from 10 requests on
@@ -859,6 +907,493 @@ class TokenParallelStages(Stages):
 TOKEN_PARALLEL = {2: (384,), 4: (384,)}
 
 
+# ---------------------------------------------------------------- span A in one launch
+# the TP sizes the span A launch serves, and per TP the width classes whose launch also runs
+# the attention front (wqkv_a .. wq_b); the others end it at the seam
+SPAN_A_TPS = (2, 4)
+SPAN_A_FRONT = {2: (), 4: ()}
+# per TP the sum's pacing window (``stages.spana.Plan.window``): the early rows' sums land
+# first, so the seam overlaps the link's later rows
+SPAN_A_WINDOW = {2: 40, 4: 40}
+# the token-parallel classes whose launch runs the front on the owners' rows and gathers its
+# compact outputs (the q norm's operand, the KV record) to every rank
+SPAN_A_GATHER = {2: (), 4: ()}
+
+
+class _Owed(NamedTuple):
+    """A sublayer output owed its sum over the ranks: this rank's partial, which the next
+    layer's span launch sums (``SpanA``)."""
+
+    x: torch.Tensor
+
+
+def _fp8_route_why(linear) -> Optional[str]:
+    """Why ``linear`` is not on SGLang's gfx950 aiter MXFP8 route over its plain [N, K] e4m3
+    weight (the route whose GEMM the span launch runs), or None."""
+    from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+
+    method = getattr(linear, "quant_method", None)
+    if not (
+        isinstance(method, Fp8LinearMethod)
+        and method.block_fp8_as_mxfp8
+        and getattr(linear, "block_fp8_mxfp8_ready", False)
+        and method.mxfp8_dense_backend.is_gfx95_mxfp8_aiter()
+    ):
+        return "SGLang's gfx950 aiter MXFP8 route"
+    if getattr(linear, "mxfp8_aiter_preshuffled", False) or linear.bias is not None:
+        return "the plain [N, K] e4m3 weight and no bias"
+    return None
+
+
+def _front_why(layer, pool) -> Optional[str]:
+    """Why the span launch cannot run ``layer``'s attention front as SGLang's route does, or
+    None: the fused wqkv_a and wq_b on aiter's MXFP8 GEMM fed by the fake-quant norms, the
+    V4-layout SWA cache with 256-token pages, the query roped by the K store launch."""
+    import sglang.srt.models.deepseek_common.amd.deepseek_v4_gfx95_dense as dense
+    import sglang.srt.models.deepseek_common.amd.deepseek_v4_hip as hip
+    import sglang.srt.models.deepseek_v4 as dv4
+    from sglang.srt.layers.attention.dsv4.unified_kv_gate import is_unified_kv_triton
+
+    from sgl_amd_mono.deepseek_v41.gfx950.stages import spana
+
+    attn = layer.self_attn
+    if not (attn.fuse_wqa_wkv and attn.fused_rmsnorm_fake_quant):
+        return "the fused wqkv_a and the fake-quant q norm"
+    for lin in (attn.wqkv_a, attn.wq_b):
+        why = _fp8_route_why(lin)
+        if why is not None:
+            return why
+    if not (dense._mxfp8_consumer(attn.wqkv_a) and dense._mxfp8_consumer(attn.wq_b)):
+        return "MXFP8 operands into wqkv_a and wq_b"
+    if attn.q_head_norm or attn.use_mega_attention or not attn.is_dsv41:
+        return "V4.1's query without a head norm, outside the mega attention"
+    if not hip.skip_head_pad(attn):
+        return "the real head count in the attention core"
+    if attn.compress_ratio not in (0, 1, 2) or attn.head_dim != spana.HD:
+        return "a V4.1 layer (ratio 0, 1 or 2; 512-wide heads)"
+    if is_unified_kv_triton() or pool.uniform_fp8 or dv4.envs.SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE.get():
+        return "the plain V4 SWA store"
+    if str(pool.kv_layout).split(".")[-1] not in ("V4", "0") or pool.swa_page_size != 1 << spana.PAGE_BITS:
+        return "the V4 layout on 256-token pages"
+    return None
+
+
+class Mixes(NamedTuple):
+    """A boundary's mixes as computed tensors (``HcCoefficients``' readers)."""
+
+    pre: torch.Tensor
+    post: torch.Tensor
+    comb: torch.Tensor
+
+    def tensors(self):
+        return self.pre, self.post, self.comb
+
+
+class _FrontOut(NamedTuple):
+    """What the span launch's front left for ``attn_front``: the roped query and the q norm's
+    MXFP8 operand (the indexer reads it)."""
+
+    q: torch.Tensor
+    q_quant: Any
+
+
+class SpanA:
+    """The span launch's resources (``stages.spana``), shared by the width classes: a width's
+    plans (by the seam's form) and scratch, each layer's constants as the kernel reads them,
+    and the TP group's peer buffer, where each rank's MoE partial reaches the ranks that sum
+    it. A width's sum is the all-reduce's (one-shot at TP 2, reduce-scatter then all-gather at
+    TP 4), or, for the token-parallel classes (``TOKEN_PARALLEL``), the reduce-scatter's."""
+
+    def __init__(self, model, device):
+        from sglang.srt.runtime_context import get_parallel
+
+        from sgl_amd_mono.common.peer import PeerBuffer
+        from sgl_amd_mono.deepseek_v41.gfx950.stages import seam_wide, spana
+
+        parallel = get_parallel()
+        group = parallel.tp_group
+        self.tp, self.rank, self.device = group.world_size, group.rank_in_group, device
+        assert self.tp in SPAN_A_TPS, self.tp
+        token_parallel = TOKEN_PARALLEL.get(self.tp, ())
+        self.modes = {
+            m: "rs" if width_class(m) in token_parallel else ("oneshot" if self.tp == 2 else "rsag")
+            for m in WIDTHS
+        }
+        self.gathers = {
+            m: self.modes[m] == "rs" and width_class(m) in SPAN_A_GATHER.get(self.tp, ())
+            for m in WIDTHS
+        }
+        # the peer buffer's regions are a width's, whatever its seam's form: one plan a width
+        # with a stand-in form sizes them
+        form = seam_wide.Form(stage="seama")
+        nbytes, plans = spana.peer_layout(
+            self.tp,
+            {
+                m: spana.Plan(
+                    m=m, seam=form, tp=self.tp, mode=self.modes[m], tpar=self.modes[m] == "rs",
+                    front=self._stand_in_front(m) if self.gathers[m] else None,
+                    gather=self.gathers[m],
+                )
+                for m in WIDTHS
+            },
+        )
+        self.peers = {m: p.peer for m, p in plans.items()}
+        # collective: every rank builds it here, in the same order
+        self.peer = PeerBuffer(nbytes, group.cpu_group, self.rank, self.tp, device)
+        self.peer.bytes[spana.flag_region(self.tp) :].zero_()
+        self.scratch: dict = {}
+        self.consts: dict = {}
+        self.front_consts: dict = {}
+        self._sum_plan: dict = {}
+
+    def _stand_in_front(self, m):
+        """A front of the width's shape (the peer layout reads only its presence)."""
+        from sgl_amd_mono.deepseek_v41.gfx950.stages import spana
+
+        tq, tb = spana.front_tiles(m // self.tp if self.modes[m] == "rs" else m, self.tp)
+        return spana.Front(qkv=tq, wqb=tb, heads=64 // self.tp, q_eps=0.0, kv_eps=0.0)
+
+    def _layer(self, layer):
+        i = layer.self_attn.layer_id
+        got = self.consts.get(i)
+        if got is None:
+            norm = layer.input_layernorm
+            got = self.consts[i] = (
+                layer.hc_attn_fn.data.float().contiguous(),
+                layer.hc_attn_scale.data.float().contiguous(),
+                layer.hc_attn_base.data.float().contiguous(),
+                norm.weight.data.contiguous(),
+            )
+        return got
+
+    def _front(self, layer, pool):
+        from sgl_amd_mono.deepseek_v41.gfx950.stages import fp8_wide, spana
+
+        i = layer.self_attn.layer_id
+        got = self.front_consts.get(i)
+        if got is None:
+            why = _front_why(layer, pool)
+            if why is not None:
+                raise RuntimeError(f"layer {i}: the wide span A launch needs {why}")
+            attn = layer.self_attn
+            ws = []
+            for lin in (attn.wqkv_a, attn.wq_b):
+                n, k = lin.weight.shape
+                assert lin.weight.dtype == torch.float8_e4m3fn and lin.weight.is_contiguous()
+                ws += [lin.weight, fp8_wide.pack_scales(lin.weight_scale_mx_e8m0, n, k)]
+            assert ws[0].shape == (spana.QKV, spana.H) and ws[2].shape[1] == spana.QR
+            freqs = torch.view_as_real(attn.freqs_cis).flatten(-2).float().contiguous()
+            got = self.front_consts[i] = (
+                *ws,
+                attn.q_norm.weight.data.contiguous(),
+                attn.kv_norm.weight.data.contiguous(),
+                freqs,
+                (attn.q_norm.variance_epsilon, attn.eps, attn.n_local_heads),
+            )
+        return got
+
+    def plan(self, layer, m, x, pre, front):
+        """The launch's plan for layer ``layer`` at m rows: the seam's form (an owed post or
+        none, a previous pre or none; the norm's quant as SGLang's route picks it), the sum
+        (with an owed partial) and the front (``front``: its constants)."""
+        import sglang.srt.models.deepseek_common.amd.deepseek_v4_gfx95_dense as dense
+        import msgspec
+
+        from sgl_amd_mono.deepseek_v41.gfx950.stages import seam_wide, spana
+
+        if not layer._wqkv_a_native_consumer_checked:
+            layer._wqkv_a_native_consumer = dense._mxfp8_consumer(
+                layer.self_attn.wqkv_a if layer.self_attn.fuse_wqa_wkv else None
+            )
+            layer._wqkv_a_native_consumer_checked = True
+        owed = isinstance(x, _Owed)
+        form = seam_wide.Form(
+            post=x is not None,
+            combine=pre is not None,
+            quant="mxfp8" if layer._wqkv_a_native_consumer else "grid",
+            stage="seama",
+            rms_eps=layer.rms_norm_eps,
+            norm_eps=layer.input_layernorm.variance_epsilon,
+            hc_eps=layer.hc_eps,
+            iters=layer.hc_sinkhorn_iters,
+        )
+        mode = self.modes[m] if owed else None
+        fr = None
+        tpar = self.modes[m] == "rs"
+        if front is not None:
+            q_eps, kv_eps, heads = front[-1]
+            tq, tb = spana.front_tiles(m // self.tp if tpar else m, self.tp)
+            fr = spana.Front(qkv=tq, wqb=tb, heads=heads, q_eps=q_eps, kv_eps=kv_eps, variant=FRONT_VARIANT)
+        gather = fr is not None and self.gathers[m]
+        p = spana.Plan(
+            m=m, seam=form, tp=self.tp, mode=mode, front=fr, tpar=tpar, gather=gather,
+            window=SPAN_A_WINDOW[self.tp] if mode is not None else 0,
+        )  # fmt: skip
+        if mode is not None or gather:
+            p = msgspec.structs.replace(p, peer=self.peers[m])
+            # a width's sum flags in the peer buffer flip once a launch of its one summing plan
+            if self._sum_plan.setdefault(m, p) != p:
+                raise RuntimeError(f"layer {layer.self_attn.layer_id}: the span A launch needs one summing form a width")
+        return p
+
+    def __call__(self, layer, state, positions, forward_batch, with_front):
+        """Layer ``layer``'s span A for the step's rows: the owed MoE partial summed over the
+        ranks (an ``_Owed`` post), its mHC seam and input norm, and with ``with_front`` the
+        attention front. Returns (new residual streams, normed rows, their operand, ``Mixes``,
+        the ``_FrontOut`` or None)."""
+        import sglang.srt.models.deepseek_common.amd.deepseek_v4_gfx95_dense as dense
+        import sglang.srt.models.deepseek_v4 as dv4
+        from sglang.srt.model_executor.forward_context import get_attn_backend
+        from sglang.srt.models.deepseek_v4_mhc import HcPending
+
+        from sgl_amd_mono.common.peer import PeerBuffer
+        from sgl_amd_mono.deepseek_v41.gfx950.stages import seam_wide, spana
+
+        if isinstance(state.streams, HcPending):
+            x, residual, post, comb = state.streams
+        else:
+            x, residual, post, comb = None, state.streams, None, None
+        m = positions.shape[0]
+        attn = layer.self_attn
+        pool = dv4.get_token_to_kv_pool() if with_front else None
+        front = self._front(layer, pool) if with_front else None
+        p = self.plan(layer, m, x, state.pre, front)
+        n, dev = p.seam_rows, residual.device
+        fn, scale, base, norm_w = self._layer(layer)
+        residual = residual.contiguous()
+        assert residual.shape == (n, seam_wide.HC, seam_wide.H), (residual.shape, p)
+        scr = self.scratch.get(p)
+        if scr is None:
+            scr = self.scratch[p] = PeerBuffer(spana.scratch_bytes(p), None, self.rank, 1, dev)
+            lo, nb = spana.flag_bytes(p)
+            scr.bytes[lo : lo + nb].zero_()
+        lay = spana.scratch_layout(p)
+
+        def view(name, dtype, shape):
+            o, nb = lay[name]
+            return scr.bytes[o : o + nb].view(dtype)[: torch.Size(shape).numel()].view(shape)
+
+        res_out = torch.empty_like(residual) if x is not None else residual
+        normed = torch.empty((n, seam_wide.H), dtype=residual.dtype, device=dev)
+        q = qs = None
+        if front is not None:
+            q, qs = view("xq", torch.float8_e4m3fn, (n, seam_wide.H)), view("xs", torch.uint8, (n, seam_wide.H // 32))
+        elif p.seam.quant == "mxfp8":
+            q = torch.empty((n, seam_wide.H), dtype=torch.float8_e4m3fn, device=dev)
+            qs = torch.empty((n, seam_wide.H // 32), dtype=torch.uint8, device=dev)
+        else:
+            q = torch.empty((n, seam_wide.H), dtype=residual.dtype, device=dev)
+        mixes = Mixes(
+            torch.empty((n, seam_wide.HC), dtype=torch.float32, device=dev),
+            torch.empty((n, seam_wide.HC), dtype=torch.float32, device=dev),
+            torch.empty((n, seam_wide.HC, seam_wide.HC), dtype=torch.float32, device=dev),
+        )
+        x_in = x.x if isinstance(x, _Owed) else x
+        if x_in is not None:
+            x_in = x_in.contiguous()
+            assert x_in.shape == (m if p.mode is not None else n, seam_wide.H), (x_in.shape, p)
+
+        def ptr(t):
+            return 0 if t is None else t.data_ptr()
+
+        fargs = (0,) * 11
+        out = None
+        if front is not None:
+            wqkv, wqkv_s, wqb, wqb_s, qn_w, kvn_w, freqs, _ = front
+            backend = get_attn_backend()
+            loc = backend.get_swa_out_cache_loc(forward_batch)
+            cache = pool.get_swa_raw_buffer(attn.layer_id)
+            assert loc.dtype == torch.int32 and positions.dtype == torch.int64, (loc.dtype, positions.dtype)
+            assert cache.dtype == torch.uint8 and cache.stride(0) == spana.KV_PAGE, (cache.shape, cache.stride())
+            q_out = torch.empty((p.q_rows, p.front.heads, spana.HD), dtype=residual.dtype, device=dev)
+            fargs = (
+                wqkv.data_ptr(), wqkv_s.data_ptr(), qn_w.data_ptr(), kvn_w.data_ptr(),
+                wqb.data_ptr(), wqb_s.data_ptr(), freqs.data_ptr(), positions.contiguous().data_ptr(),
+                loc.contiguous().data_ptr(), cache.data_ptr(), q_out.data_ptr(),
+            )  # fmt: skip
+            if p.gather:
+                g, pb = p.peer, self.peer.bytes
+                qq = pb[g.gq : g.gq + m * spana.QR].view(torch.float8_e4m3fn).view(m, spana.QR)
+                qqs = pb[g.gqs : g.gqs + m * spana.QR // 32].view(m, spana.QR // 32)
+            else:
+                qq = view("qq", torch.float8_e4m3fn, (n, spana.QR))
+                qqs = view("qs", torch.uint8, (n, spana.QR // 32))
+            out = _FrontOut(q_out, dense.Mxfp8Activation(qq, qqs))
+        spana.build(p)(
+            ptr(x_in), scr.bytes.data_ptr(), self.peer.addresses.data_ptr(), self.peer.local,
+            self.rank, residual.data_ptr(), ptr(post), ptr(comb), ptr(state.pre), fn.data_ptr(),
+            scale.data_ptr(), base.data_ptr(), norm_w.data_ptr(), res_out.data_ptr(),
+            normed.data_ptr(), ptr(q), ptr(qs), mixes.pre.data_ptr(), mixes.post.data_ptr(),
+            mixes.comb.data_ptr(), *fargs, stream=torch.cuda.current_stream(),
+        )  # fmt: skip
+        if p.seam.quant == "mxfp8":
+            x_quant = dense.Mxfp8Activation(q, qs)
+        else:
+            x_quant = dense.Fp8GridActivation(q)
+        return res_out, normed, x_quant, mixes, out
+
+
+# the rounding variant of the KV row's norm and RoPE that gives the K store launch's bits
+FRONT_VARIANT = 0
+
+
+class SpanAStages(Stages):
+    """``Stages`` with span A in one launch a layer (``SpanA``): a layer whose post is
+    deferred leaves its MoE output unsummed (``_Owed``), and the next layer's launch sums it
+    over the ranks, runs its mHC seam and input norm, and on the classes of ``SPAN_A_FRONT``
+    its attention front up to the attention core. Every stage gives SGLang's bits."""
+
+    def __init__(self, span: SpanA, front: bool):
+        self.span, self.with_front = span, front
+        self._front_out = None
+
+    def seam_attn(self, layer, state, positions, forward_batch):
+        residual, x, x_quant, mixes, out = self.span(
+            layer, state, positions, forward_batch, self.with_front
+        )
+        self._front_out = out
+        return residual, x, x_quant, mixes
+
+    def attn_front(self, attn, x, positions, forward_batch, x_quant) -> Front:
+        import sglang.srt.models.deepseek_common.amd.deepseek_v4_hip as hip
+        import sglang.srt.models.deepseek_v4 as dv4
+        from sglang.srt.model_executor.forward_context import get_attn_backend
+
+        out, self._front_out = self._front_out, None
+        if out is None:
+            return super().attn_front(attn, x, positions, forward_batch, x_quant)
+        backend = get_attn_backend()
+        if attn.compressor is not None or attn.indexer is not None:
+            if dv4._low_ratio_sources_break(backend, forward_batch):
+                dv4.bcg_deepseek_v4_low_ratio_sources(attn, x, out.q_quant, positions)
+            else:
+                backend.forward_low_ratio_sources(
+                    layer=attn, x=x, q_lora=out.q_quant, positions=positions,
+                    forward_batch=forward_batch,
+                )  # fmt: skip
+        inv_rope = hip.attention_inv_rope(
+            attn,
+            positions,
+            forward_batch,
+            False,
+            wo_a_applies_inv_rope=attn.wo_a_fp8
+            and dv4._wo_a_fp8_mxscale_fused_invrope is not None,
+        )
+        return Front(
+            q=out.q,
+            k=out.q,
+            save_kv_cache=False,
+            sink=attn._local_attn_sink(attn.n_local_heads),
+            tp_slice=slice(None),
+            inv_rope=inv_rope,
+            dtype=x.dtype,
+        )
+
+    def moe_out(self, moe, routed, shared, return_moe_output):
+        import sglang.srt.models.deepseek_v2 as dv2
+
+        if not self._owe:
+            return super().moe_out(moe, routed, shared, return_moe_output)
+        # the routed scale and the shared add; the sum over the ranks is the next launch's
+        assert not return_moe_output and moe.reduce_results and not moe._shared_expert_tp1
+        return dv2.maybe_fuse_routed_scale_and_shared_add(
+            moe.experts, routed, shared, moe.routed_scaling_factor
+        )
+
+    def ffn(self, layer, x, forward_batch, input_ids, input_ids_global, return_moe_output):
+        out = super().ffn(layer, x, forward_batch, input_ids, input_ids_global, return_moe_output)
+        return _Owed(out) if self._owe else out
+
+    def whole_moe(self, moe, x) -> bool:
+        # SGLang's whole routes sum over the ranks themselves
+        assert not (self._owe and super().whole_moe(moe, x)), "an owed MoE runs in stages"
+        return super().whole_moe(moe, x)
+
+    _owe = False
+
+    def layer(self, wide, i, state, positions, input_ids, forward_batch, input_ids_global,
+              defer_post):  # fmt: skip
+        # a deferred post leaves the MoE's sum to the next layer's launch
+        self._owe = defer_post
+        try:
+            return super().layer(
+                wide, i, state, positions, input_ids, forward_batch, input_ids_global,
+                defer_post,
+            )  # fmt: skip
+        finally:
+            self._owe = False
+
+
+class TokenParallelSpanA(SpanAStages, TokenParallelStages):
+    """``TokenParallelStages`` with ``SpanAStages``' launch: the launch reduce-scatters the
+    owed MoE partial to the rows' owners and runs the seam on them; the input norm's rows
+    are gathered as before."""
+
+    def __init__(self, span: SpanA, exchange: Exchange, gather: bool):
+        SpanAStages.__init__(self, span, gather)
+        TokenParallelStages.__init__(self, exchange)
+        self._needs_x = False
+
+    def seam_attn(self, layer, state, positions, forward_batch):
+        attn = layer.self_attn
+        self._needs_x = attn.compressor is not None or attn.indexer is not None
+        return SpanAStages.seam_attn(self, layer, state, positions, forward_batch)
+
+    def gather_norm(self, x, x_quant):
+        """With the launch's gather the front is done on every row: only an index or KV
+        source layer's compressor and indexer still read the bf16 input norm of every row."""
+        if self._front_out is None:
+            return TokenParallelStages.gather_norm(self, x, x_quant)
+        return (self.x.all_gather(x) if self._needs_x else x), None
+
+    def layer(self, wide, i, state, positions, input_ids, forward_batch, input_ids_global,
+              defer_post):  # fmt: skip
+        self._owe = defer_post
+        try:
+            return TokenParallelStages.layer(
+                self, wide, i, state, positions, input_ids, forward_batch, input_ids_global,
+                defer_post,
+            )  # fmt: skip
+        finally:
+            self._owe = False
+
+    def ffn(self, layer, x, forward_batch, input_ids, input_ids_global, return_moe_output):
+        """Every row of the MoE input to the MoE; this rank's rows of its output, or with a
+        deferred post every row of its partial, owed (the next launch reduce-scatters it)."""
+        from sglang.srt.models.deepseek_common.moe_transport import MoeRowTransport
+
+        rows = self.x.all_gather(x)
+        operand = getattr(x, "_hip_mxfp8_operand", None)
+        if operand is not None:
+            rows._hip_mxfp8_operand = regrid(operand, rows)
+        prepared = MoeRowTransport(
+            layer.mlp, rows, forward_batch, input_ids, input_ids_global,
+            cp_return_contiguous=layer.config.model_type == "deepseek_v41",
+        )  # fmt: skip
+        assert not (
+            prepared._use_cp
+            or prepared._use_tp_moe_gather
+            or prepared._use_tp_attn_a2a_scatter
+        ), "a token-parallel step moves no MoE rows of its own"
+        with prepared.scope():
+            out = self.moe(
+                layer.mlp, prepared.input, forward_batch,
+                input_ids_global=prepared.input_ids_global,
+                skip_shared_experts=prepared.do_shared_local,
+                return_moe_output=False,
+                input_ids=prepared.input_ids,
+            )  # fmt: skip
+        prepared.input = None
+        out = prepared.return_output(out)
+        return _Owed(out) if self._owe else self.x.reduce_scatter(out)
+
+    def moe_out(self, moe, routed, shared, return_moe_output):
+        return TokenParallelStages.moe_out(self, moe, routed, shared, return_moe_output)
+
+    def whole_moe(self, moe, x) -> bool:
+        return TokenParallelStages.whole_moe(self, moe, x)
+
+
 class WideForward:
     """``DeepseekV4ForCausalLM.forward`` for a wide step, its layers in ``Stages``."""
 
@@ -870,10 +1405,20 @@ class WideForward:
         parallel = get_parallel()
         token_parallel = TOKEN_PARALLEL.get(parallel.tp_size, ())
         exchange = Exchange(parallel.tp_group) if token_parallel else None
-        self.stages: dict[int, Any] = {
-            c: TokenParallelStages(exchange) if c in token_parallel else Stages()
-            for c in CLASSES
-        }
+        if parallel.tp_size in SPAN_A_TPS:
+            span = SpanA(lm.model, next(lm.parameters()).device)
+            front = SPAN_A_FRONT.get(parallel.tp_size, ())
+            self.stages: dict[int, Any] = {
+                c: TokenParallelSpanA(span, exchange, c in SPAN_A_GATHER.get(parallel.tp_size, ()))
+                if c in token_parallel
+                else SpanAStages(span, c in front)
+                for c in CLASSES
+            }
+        else:
+            self.stages = {
+                c: TokenParallelStages(exchange) if c in token_parallel else Stages()
+                for c in CLASSES
+            }
 
     def forward(self, plan, input_ids, positions, forward_batch, input_embeds=None):
         from sglang.srt.layers.layer_boundary import get_attn_tp_context
@@ -1040,6 +1585,16 @@ def reasons(model, layers) -> list[str]:
                     f"layer {i}: token-parallel wide steps need the MoE's sum to be its "
                     "all-reduce (no TP1 shared expert, no all-to-all)"
                 )
+    if parallel.tp_size in SPAN_A_TPS:
+        for i in layers:
+            moe = m.layers[i].mlp
+            if not moe.reduce_results or moe._shared_expert_tp1 or moe._enable_a2a_moe:
+                out.append(
+                    f"layer {i}: the wide span A launch needs the MoE's sum to be its "
+                    "all-reduce (no TP1 shared expert, no all-to-all)"
+                )
+            if not getattr(m.layers[i], "fused_rmsnorm_fake_quant", False):
+                out.append(f"layer {i}: the wide span A launch runs gfx950's fake-quant input norm")
     for i in layers:
         a = m.layers[i].self_attn
         if getattr(a, "use_mega_attention", False):
