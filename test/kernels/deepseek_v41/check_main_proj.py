@@ -16,6 +16,55 @@ def same(a, b):
     return torch.equal(a.view(torch.uint8), b.view(torch.uint8))
 
 
+def flydsl_layer(w, ws, proj, rank) -> list:
+    """A main_proj layer as SGLang prepares it under SGLANG_OPT_HIP_FLYDSL_MXFP8: the weight and its E8M0
+    scales stay the tensors the split reads, and SGLang's route takes FlyDSL's GEMM only from more rows
+    than a commit has (else aiter's, the reference below)."""
+    from sglang.srt.layers.quantization import fp8_hip
+
+    from sgl_amd_mono.deepseek_v41.glue import inject
+
+    lin = torch.nn.Module()
+    lin.weight = torch.nn.Parameter(w.clone(), requires_grad=False)
+    lin.weight_scale_mx_e8m0 = torch.nn.Parameter(ws.clone(), requires_grad=False)
+    fp8_hip._prepare_flydsl_mxfp8(lin)
+    bad = []
+    if getattr(lin, "weight_scale_mx_flydsl", None) is None:
+        bad.append("no FlyDSL scale copy (FlyDSL unavailable)")
+    if not (same(lin.weight, w) and same(lin.weight_scale_mx_e8m0, ws)):
+        bad.append("the FlyDSL preparation changed the weight or its E8M0 scales")
+    if fp8_hip._FLYDSL_MXFP8_MIN_M <= proj.MAX_ROWS:
+        bad.append(
+            f"FlyDSL's GEMM from {fp8_hip._FLYDSL_MXFP8_MIN_M} rows, a commit has up to {proj.MAX_ROWS}"
+        )
+    model = type("M", (), {})()
+    stage = torch.nn.Module()
+    stage.main_proj = lin
+    lin.quant_method = type(
+        "Q",
+        (),
+        {
+            "mxfp8_dense_backend": type(
+                "B", (), {"is_gfx95_mxfp8_aiter": lambda self: True}
+            )()
+        },
+    )()
+    model.stages = [stage]
+    inject._EXCHANGE.append(object())
+    try:
+        why = inject._main_proj_why(model)
+    finally:
+        inject._EXCHANGE.pop()
+    if why is not None:
+        bad.append(f"the static rule refuses the FlyDSL-prepared layer: {why}")
+    if rank == 0:
+        print(
+            f"FlyDSL-prepared layer: {'PASS' if not bad else 'FAIL: ' + '; '.join(bad)}",
+            flush=True,
+        )
+    return ["flydsl layer"] if bad else []
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--seeds", type=int, default=4)
@@ -46,6 +95,8 @@ def main():
         ws = torch.randint(
             116, 124, (H // 32, K // 32), generator=g, device=dev, dtype=torch.uint8
         )
+        if seed == 0:
+            fails += flydsl_layer(w, ws, proj, rank)
         cols = x_.columns(w, ws)
         for rows in range(proj.MIN_ROWS, proj.MAX_ROWS + 1):
             x = (torch.randn(rows, K, generator=g, device=dev) * 2).bfloat16()

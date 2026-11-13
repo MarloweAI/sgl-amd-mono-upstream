@@ -119,11 +119,11 @@ def _main_proj_why(model) -> str | None:
     backend = getattr(method, "mxfp8_dense_backend", None)
     if backend is None or not backend.is_gfx95_mxfp8_aiter():
         return "not aiter's MXFP8 route"
-    if (
-        getattr(lin, "mxfp8_aiter_preshuffled", False)
-        or getattr(lin, "weight_scale_mx_flydsl", None) is not None
-    ):
-        return "a preshuffled or FlyDSL weight"
+    # A FlyDSL scale copy (SGLANG_OPT_HIP_FLYDSL_MXFP8) leaves the weight and its E8M0
+    # scales as they are, and SGLang takes FlyDSL's GEMM only from far more rows than a
+    # commit has; a preshuffled weight is another layout.
+    if getattr(lin, "mxfp8_aiter_preshuffled", False):
+        return "a preshuffled weight"
     if getattr(lin, "bias", None) is not None:
         return "a bias"
     w, ws = lin.weight, getattr(lin, "weight_scale_mx_e8m0", None)
