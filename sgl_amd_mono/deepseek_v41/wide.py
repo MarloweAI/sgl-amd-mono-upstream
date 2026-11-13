@@ -911,13 +911,16 @@ TOKEN_PARALLEL = {2: (384,), 4: (384,)}
 # the TP sizes the span A launch serves, and per TP the width classes whose launch also runs
 # the attention front (wqkv_a .. wq_b); the others end it at the seam
 SPAN_A_TPS = (2, 4)
-SPAN_A_FRONT = {2: (96, 192), 4: (96, 192)}
+SPAN_A_FRONT = {2: (), 4: ()}
 # per TP the sum's pacing window (``stages.spana.Plan.window``): the early rows' sums land
 # first, so the seam overlaps the link's later rows
-SPAN_A_WINDOW = {2: 40, 4: 40}
+SPAN_A_WINDOW = {2: 40, 4: 80}
 # the token-parallel classes whose launch runs the front on the owners' rows and gathers its
 # compact outputs (the q norm's operand, the KV record) to every rank
 SPAN_A_GATHER = {2: (), 4: ()}
+# per TP the width classes whose launch sums the previous MoE's output; the others take
+# SGLang's all-reduce (at TP 4 and 96 rows its two-stage kernel is faster than the launch's sum)
+SPAN_A_SUM = {2: (96, 192, 384), 4: (192, 384)}
 
 
 class _Owed(NamedTuple):
@@ -1162,11 +1165,13 @@ class SpanA:
         fn, scale, base, norm_w = self._layer(layer)
         residual = residual.contiguous()
         assert residual.shape == (n, seam_wide.HC, seam_wide.H), (residual.shape, p)
-        scr = self.scratch.get(p)
-        if scr is None:
-            scr = self.scratch[p] = PeerBuffer(spana.scratch_bytes(p), None, self.rank, 1, dev)
+        got = self.scratch.get(p)
+        if got is None:
+            scr = PeerBuffer(spana.scratch_bytes(p), None, self.rank, 1, dev)
             lo, nb = spana.flag_bytes(p)
             scr.bytes[lo : lo + nb].zero_()
+            got = self.scratch[p] = (scr, torch.zeros(spana.work_bytes(p), dtype=torch.uint8, device=dev))
+        scr, work = got
         lay = spana.scratch_layout(p)
 
         def view(name, dtype, shape):
@@ -1196,7 +1201,7 @@ class SpanA:
         def ptr(t):
             return 0 if t is None else t.data_ptr()
 
-        fargs = (0,) * 11
+        fargs = (0,) * 11 + (work.data_ptr(),)
         out = None
         if front is not None:
             wqkv, wqkv_s, wqb, wqb_s, qn_w, kvn_w, freqs, _ = front
@@ -1209,7 +1214,7 @@ class SpanA:
             fargs = (
                 wqkv.data_ptr(), wqkv_s.data_ptr(), qn_w.data_ptr(), kvn_w.data_ptr(),
                 wqb.data_ptr(), wqb_s.data_ptr(), freqs.data_ptr(), positions.contiguous().data_ptr(),
-                loc.contiguous().data_ptr(), cache.data_ptr(), q_out.data_ptr(),
+                loc.contiguous().data_ptr(), cache.data_ptr(), q_out.data_ptr(), work.data_ptr(),
             )  # fmt: skip
             if p.gather:
                 g, pb = p.peer, self.peer.bytes
@@ -1243,8 +1248,8 @@ class SpanAStages(Stages):
     over the ranks, runs its mHC seam and input norm, and on the classes of ``SPAN_A_FRONT``
     its attention front up to the attention core. Every stage gives SGLang's bits."""
 
-    def __init__(self, span: SpanA, front: bool):
-        self.span, self.with_front = span, front
+    def __init__(self, span: SpanA, front: bool, fold: bool):
+        self.span, self.with_front, self.fold = span, front, fold
         self._front_out = None
 
     def seam_attn(self, layer, state, positions, forward_batch):
@@ -1314,7 +1319,7 @@ class SpanAStages(Stages):
     def layer(self, wide, i, state, positions, input_ids, forward_batch, input_ids_global,
               defer_post):  # fmt: skip
         # a deferred post leaves the MoE's sum to the next layer's launch
-        self._owe = defer_post
+        self._owe = defer_post and self.fold
         try:
             return super().layer(
                 wide, i, state, positions, input_ids, forward_batch, input_ids_global,
@@ -1329,8 +1334,8 @@ class TokenParallelSpanA(SpanAStages, TokenParallelStages):
     owed MoE partial to the rows' owners and runs the seam on them; the input norm's rows
     are gathered as before."""
 
-    def __init__(self, span: SpanA, exchange: Exchange, gather: bool):
-        SpanAStages.__init__(self, span, gather)
+    def __init__(self, span: SpanA, exchange: Exchange, gather: bool, fold: bool):
+        SpanAStages.__init__(self, span, gather, fold)
         TokenParallelStages.__init__(self, exchange)
         self._needs_x = False
 
@@ -1348,7 +1353,7 @@ class TokenParallelSpanA(SpanAStages, TokenParallelStages):
 
     def layer(self, wide, i, state, positions, input_ids, forward_batch, input_ids_global,
               defer_post):  # fmt: skip
-        self._owe = defer_post
+        self._owe = defer_post and self.fold
         try:
             return TokenParallelStages.layer(
                 self, wide, i, state, positions, input_ids, forward_batch, input_ids_global,
@@ -1408,10 +1413,11 @@ class WideForward:
         if parallel.tp_size in SPAN_A_TPS:
             span = SpanA(lm.model, next(lm.parameters()).device)
             front = SPAN_A_FRONT.get(parallel.tp_size, ())
+            fold = SPAN_A_SUM.get(parallel.tp_size, ())
             self.stages: dict[int, Any] = {
-                c: TokenParallelSpanA(span, exchange, c in SPAN_A_GATHER.get(parallel.tp_size, ()))
+                c: TokenParallelSpanA(span, exchange, c in SPAN_A_GATHER.get(parallel.tp_size, ()), c in fold)
                 if c in token_parallel
-                else SpanAStages(span, c in front)
+                else SpanAStages(span, c in front, c in fold)
                 for c in CLASSES
             }
         else:

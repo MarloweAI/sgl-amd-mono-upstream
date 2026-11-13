@@ -282,8 +282,7 @@ def scratch_layout(p: Plan) -> dict[str, tuple[int, int]]:
         ("pushed", 4 * max(p.sum_tasks, 1)),
     ]
     if p.front is not None:
-        pw, fw = f8.workspace(ms, QKV, p.front.qkv)
-        items += [("pflags", 4 * fw), ("part", 4 * pw), ("xq", ms * H), ("xs", ms * H // 32),
+        items += [("xq", ms * H), ("xs", ms * H // 32),
                   ("qkv", ms * QKV * 2), ("qq", ms * QR), ("qs", ms * QR // 32)]
     items += [
         ("err", 4 * p.grid),
@@ -297,6 +296,20 @@ def scratch_layout(p: Plan) -> dict[str, tuple[int, int]]:
     return out
 
 
+def work_layout(p: Plan) -> dict[str, tuple[int, int]]:
+    """The cached workspace's regions -> (byte offset, bytes): wqkv_a's K-split flags (zeros
+    before the first launch) and its f32 partials. Only device-scope accesses read them, so they
+    stay in cached memory (an uncached round trip of the partials costs microseconds)."""
+    if p.front is None:
+        return {"pflags": (0, 4), "part": (LINE, 4)}
+    pw, fw = f8.workspace(p.seam_rows, QKV, p.front.qkv)
+    return {"pflags": (0, 4 * fw), "part": (_cdiv(4 * fw, LINE) * LINE, 4 * pw)}
+
+
+def work_bytes(p: Plan) -> int:
+    return max(o + n for o, n in work_layout(p).values())
+
+
 def scratch_bytes(p: Plan) -> int:
     return max(o + n for o, n in scratch_layout(p).values())
 
@@ -304,7 +317,7 @@ def scratch_bytes(p: Plan) -> int:
 def flag_bytes(p: Plan) -> tuple[int, int]:
     """(byte offset, bytes) of the scratch words that start as zeros: the flags."""
     lay = scratch_layout(p)
-    last = "pflags" if p.front is not None else "pushed"
+    last = "pushed"
     return 0, lay[last][0] + lay[last][1]
 
 
@@ -632,6 +645,7 @@ def qkv_cta(tid, j, p, a, lds, own, phase, c):
         f8.store_out(tid, tl, acc, QKV, ms, m0, n0, a["qkv"], lds)
     else:
         f8.split_reduce(tid, tl, acc, QKV, ms, m0, n0, a["qkv"], a["part"], a["pflags"], tile, split)
+    stamp(c, MARKS["qkv"] + 3)
 
 
 def _f32x8(w4):
@@ -943,6 +957,7 @@ def wqb_cta(tid, j, p, a, lds, own, local, phase, c):
     acc = f8.gemm_task(tid, tl, n, QR, ms, m0, n0, split, xq, xs, a["wqb"], a["wqb_s"], lds)
     stamp(c, MARKS["wqb"] + 2)
     store_out_rope(tid, tl, acc, n, ms, m0, n0, a["q_out"], lds, a["freqs"], a["pos"])
+    stamp(c, MARKS["wqb"] + 3)
 
 
 # ---------------------------------------------------------------- the launch
@@ -1010,7 +1025,7 @@ ARGS = (
     "x_in", "scratch", "peers", "local", "rank", "res", "post_in", "comb_in", "pre_in", "fn",
     "hc_scale", "hc_base", "norm_w", "res_out", "normed", "q", "qs", "pre_out", "post_out",
     "comb_out", "wqkv", "wqkv_s", "qn_w", "kvn_w", "wqb", "wqb_s", "freqs", "pos", "out_loc",
-    "kvcache", "q_out",
+    "kvcache", "q_out", "work",
 )  # fmt: skip
 
 _BUILDS: dict = {}
@@ -1027,7 +1042,8 @@ def build(p: Plan, timeline: bool = False):
     [1792, 5120] and codes (``fp8_wide.pack_scales``), the q and kv norm weights (bf16),
     wq_b's e4m3 [heads * 512, 1280] and codes, the RoPE table (f32 [positions, 64]: cos, sin
     a pair), the rows' positions (int64), cache slots (int32) and the layer's SWA cache, and
-    the query out (bf16 [rows, heads * 512]). ``timeline``: each CTA marks its stage
+    the query out (bf16 [rows, heads * 512]) and ``work``, a cached buffer of ``work_bytes(p)``
+    (its flags zeros before the first launch). ``timeline``: each CTA marks its stage
     (``MARKS``)."""
     key = (p, timeline)
     if key in _BUILDS:
@@ -1035,6 +1051,7 @@ def build(p: Plan, timeline: bool = False):
     assert (p.mode is not None or p.gather) == (p.peer is not None), p
     keyed = key_tuple({"p": p, "timeline": timeline}, SOURCES)
     lay = scratch_layout(p)
+    wlay = work_layout(p)
     ns = p.sum_tasks
     b = p.bases
     seam_end = ns + sum(p.seam_tasks)
@@ -1057,7 +1074,7 @@ def build(p: Plan, timeline: bool = False):
         hc_base: Int64, norm_w: Int64, res_out: Int64, normed: Int64, q: Int64, qs: Int64,
         pre_out: Int64, post_out: Int64, comb_out: Int64,
         wqkv: Int64, wqkv_s: Int64, qn_w: Int64, kvn_w: Int64, wqb: Int64, wqb_s: Int64,
-        freqs: Int64, pos: Int64, out_loc: Int64, kvcache: Int64, q_out: Int64,
+        freqs: Int64, pos: Int64, out_loc: Int64, kvcache: Int64, q_out: Int64, work: Int64,
     ):  # fmt: skip
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
@@ -1077,8 +1094,8 @@ def build(p: Plan, timeline: bool = False):
         if const_expr(fr is not None):
             q, qs = scratch + off("xq"), scratch + off("xs")
             fa = {
-                "xq": q, "xs": qs, "qkv": scratch + off("qkv"), "part": scratch + off("part"),
-                "pflags": scratch + off("pflags"), "qq": scratch + off("qq"),
+                "xq": q, "xs": qs, "qkv": scratch + off("qkv"), "part": work + fx.Int64(wlay["part"][0]),
+                "pflags": work + fx.Int64(wlay["pflags"][0]), "qq": scratch + off("qq"),
                 "qs": scratch + off("qs"), "wqkv": wqkv, "wqkv_s": wqkv_s, "qn_w": qn_w,
                 "kvn_w": kvn_w, "wqb": wqb, "wqb_s": wqb_s, "freqs": freqs, "pos": pos,
                 "out_loc": out_loc, "kvcache": kvcache, "q_out": q_out,
@@ -1130,14 +1147,14 @@ def build(p: Plan, timeline: bool = False):
         hc_base: Int64, norm_w: Int64, res_out: Int64, normed: Int64, q: Int64, qs: Int64,
         pre_out: Int64, post_out: Int64, comb_out: Int64,
         wqkv: Int64, wqkv_s: Int64, qn_w: Int64, kvn_w: Int64, wqb: Int64, wqb_s: Int64,
-        freqs: Int64, pos: Int64, out_loc: Int64, kvcache: Int64, q_out: Int64,
+        freqs: Int64, pos: Int64, out_loc: Int64, kvcache: Int64, q_out: Int64, work: Int64,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):  # fmt: skip
         _ = keyed
         spana_kernel(
             x_in, scratch, peers, local, rank, res, post_in, comb_in, pre_in, fn, hc_scale,
             hc_base, norm_w, res_out, normed, q, qs, pre_out, post_out, comb_out, wqkv,
-            wqkv_s, qn_w, kvn_w, wqb, wqb_s, freqs, pos, out_loc, kvcache, q_out,
+            wqkv_s, qn_w, kvn_w, wqb, wqb_s, freqs, pos, out_loc, kvcache, q_out, work,
         ).launch(grid=(p.grid,), block=(THREADS,), stream=stream)
 
     _BUILDS[key] = launch
