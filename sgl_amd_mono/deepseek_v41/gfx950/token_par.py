@@ -15,7 +15,7 @@ import flydsl.expr as fx
 from sgl_amd_mono.common.plan import pair_layout
 
 from .attention.plan import DATA, Q_RANK
-from .stages.seam import HC, HIDDEN
+from .stages.seam import HC, HIDDEN, acell_cells, ffn_cells
 
 # below this many rows the gathers' extra hop costs more than a rank's few rows save (ROCm/ATOM)
 TOKEN_PAR_FROM = 12
@@ -60,7 +60,9 @@ def peer_layout(s: int, tp: int) -> dict[str, tuple[int, int]]:
     ATTN and FFN hold the sublayers' partials ``[source rank][row][hidden / 2]``; the
     token-parallel gathers follow, ``[row][..]`` each: XG the MoE input rows, QG / QGS
     the q latent's MXFP8 words / codes, KG the window records, NBG and QRG an index
-    source's normed rows and qr, and IWG its index head weights (bf16 pairs)."""
+    source's normed rows and qr, and IWG its index head weights (bf16 pairs). ENG: the
+    Engram projection ``[row][25600]`` (bf16 pairs, ``stages.engram``). K2's cells
+    (``acell_region``) lie past every width's regions."""
     row = s * HIDDEN // 2
     return pair_layout(
         [
@@ -73,9 +75,27 @@ def peer_layout(s: int, tp: int) -> dict[str, tuple[int, int]]:
             ("nbg", row),
             ("qrg", s * Q_RANK // 2),
             ("iwg", s * 16),
+            ("eng", s * (HC + 1) * HIDDEN // 2),
         ],
         align=LINE,
     )
+
+
+def acell_region(tp: int, widths) -> tuple[int, int]:
+    """ACELL, K2's wo_b partials as cells (``seam.attn_cell``): (byte offset, bytes) in a
+    parity's half, past every width's regions. Its marks must see only cells: the regions
+    of a wider step overlap a narrower one's, and another region's words would read as
+    set marks."""
+    end = max(o + n for s in widths for o, n in peer_layout(s, tp).values())
+    return -(-end // LINE) * LINE, max(acell_cells(s, tp) for s in widths) * 8
+
+
+def fcell_region(tp: int, widths, row_widths) -> tuple[int, int]:
+    """FCELL, the per-row MoE's down sums as cells (``seam.ffn_cell``) at ``row_widths``:
+    (byte offset, bytes) in a parity's half, past ACELL; a region of its own for the reason
+    ACELL has one."""
+    off, n = acell_region(tp, widths)
+    return -(-(off + n) // LINE) * LINE, max(ffn_cells(s, tp) for s in row_widths) * 8
 
 
 def peer_offsets(s: int, tp: int) -> dict[str, int]:
@@ -92,4 +112,6 @@ def own_view(c: dict, t0, n: int) -> dict:
     }
     if "aux_out" in args:  # its rows ``aux_stride`` bf16 apart
         args["aux_out"] = args["aux_out"] + lo * fx.Int64(args["aux_stride"]) * 2
+    if "ids" in args:  # the first layer's token ids, ``ids_words`` words a row
+        args["ids"] = args["ids"] + lo * fx.Int64(args["ids_words"]) * 4
     return {**c, "S": n, "args": args}

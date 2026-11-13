@@ -13,17 +13,20 @@ from sgl_amd_mono.common.epoch import gstore
 from sgl_amd_mono.common.mx import clamp_fp8
 from sgl_amd_mono.common.ops import (
     bf16_round,
+    bf_hi,
+    bf_lo,
     butterfly,
     fp8_pack4,
     fresh,
     hw_rsq,
+    lane_gather,
     row_sum,
     rsrc,
     xshfl,
 )
 from sgl_amd_mono.common.plan import first_task
 from sgl_amd_mono.common.stamps import stamp
-from sgl_amd_mono.common.sync import preg
+from sgl_amd_mono.common.sync import FLAG_STRIDE, preg
 from sgl_amd_mono.deepseek_v41.gfx950.stages.gemv import (
     ld_f32,
     lds_row,
@@ -84,6 +87,7 @@ from .plan import (
     WQKV_TASKS,
     Dims,
     front_scratch,
+    q_words,
     wqkv_order,
     wqkv_split,
 )
@@ -123,31 +127,71 @@ def await_flags(c, region, n, index):
     gpu.barrier()
 
 
+@flyc.jit
+def hand_off(c, region, i):
+    """One launch per layer (``c["k2"]``): this CTA's stores visible device-wide, then
+    the layer's attention back's flag pair (``region``, i), with that half's tag."""
+    rocdl.s_waitcnt(vmcnt=0)
+    gpu.barrier()
+    if c["tid"] == 0:
+        h = c["k2"]
+        h["mb"].put(h[region], i, fx.Int32(1))
+
+
 # ---------------------------------------------------------------- kt
+
+
+def kt_inputs(a, t):
+    """Token t's key-table inputs as loaded: its slot word, window and top-k counts."""
+    return (
+        ld_i32(a["slot"], a["slot_words"] * t),
+        ld_i32(a["swa_lens"], t),
+        ld_i32(a["topk_lens"], t),
+    )
+
+
+def kt_lens(inputs, sw):
+    """(window keys, top-k keys) of a token's key table from its ``kt_inputs`` (0, 0 for
+    a pad row)."""
+    slot, swa_len, topk_len = inputs
+    live = slot >= 0
+    nswa = live.select(fx.min(swa_len, fx.Int32(sw)), fx.Int32(0))
+    ntopk = live.select(fx.min(topk_len, fx.Int32(TOPK)), fx.Int32(0))
+    return nswa, ntopk
+
+
+def kt_entry_loads(a, t, k, ntopk, sw):
+    """The input words key k's entry reads: its window slot and its top-k row."""
+    sidx = fx.min(fx.max(k - ntopk, 0), sw - 1)
+    s_slot = ld_i32(a["swa_idx"], t * sw + sidx)
+    local = ld_i32(a["topk"], t * TOPK + fx.min(k, TOPK - 1))
+    return s_slot, local
+
+
+def kt_entry(words, k, nswa, ntopk):
+    """``KT[t][k]`` from ``kt_entry_loads``: ``slot | 1 << 31`` for top-k compressed row k
+    (k < ntopk), the window slot of key k for k in [ntopk, ntopk + nswa), -1 past them or
+    for an invalid slot."""
+    s_slot, local = words
+    val = ((k < ntopk + nswa) & (s_slot >= 0)).select(s_slot, fx.Int32(-1))
+    c_val = (local >= 0).select(local | fx.Int32(-2147483648), fx.Int32(-1))
+    return (k < ntopk).select(c_val, val)
 
 
 @flyc.jit
 def stage_kt(c, t):
-    """Token t's keys for K2: ``KT[t][k] = slot | 1 << 31`` for its top-k compressed
-    rows (k < ntopk), its window slots for k in [ntopk, kv_len), -1 past them or
-    for an invalid slot; KLEN[t] = kv_len (0 for a pad row), KLEN[S + t] = ntopk.
-    ``dev``: device scope, for a table the same launch reads (K2's)."""
+    """Token t's keys for K2 (``kt_entry``): KT[t][k] for every k, KLEN[t] = kv_len (0 for
+    a pad row), KLEN[S + t] = ntopk. ``dev``: device scope, for a table the same launch
+    reads (K2's)."""
     tid = c["tid"]
     a = c["args"]
     cm = CM_DEV if const_expr(c.get("dev", False)) else 0
     sw = c.get("swa_width", WINDOW)
-    live = ld_i32(a["slot"], a["slot_words"] * t) >= 0
-    nswa = live.select(fx.min(ld_i32(a["swa_lens"], t), fx.Int32(sw)), fx.Int32(0))
-    ntopk = live.select(fx.min(ld_i32(a["topk_lens"], t), fx.Int32(TOPK)), fx.Int32(0))
+    nswa, ntopk = kt_lens(kt_inputs(a, t), sw)
     kv_len = ntopk + nswa
     for i in range_constexpr((KEYS + THREADS - 1) // THREADS):
         k = fresh(tid) + THREADS * i
-        sidx = fx.min(fx.max(k - ntopk, 0), sw - 1)
-        s_slot = ld_i32(a["swa_idx"], t * sw + sidx)
-        val = ((k < kv_len) & (s_slot >= 0)).select(s_slot, fx.Int32(-1))
-        local = ld_i32(a["topk"], t * TOPK + fx.min(k, TOPK - 1))
-        c_val = (local >= 0).select(local | fx.Int32(-2147483648), fx.Int32(-1))
-        val = (k < ntopk).select(c_val, val)
+        val = kt_entry(kt_entry_loads(a, t, k, ntopk, sw), k, nswa, ntopk)
         if k < KEYS:
             bo.buffer_store(val, rsrc(a["kt"]), t * KEYS + k, cache_modifier=cm)
     if tid == 0:
@@ -166,198 +210,257 @@ def stage_wqkv(c, ops, slots, n, halves):
 
 
 @flyc.jit
-def wqkv_publish(c, task, accs, slots, order, t0, n, live, part=None, s=0):
-    """Sum wqkv rows 16 task .. for tokens t0 .. t0 + n in SGLang's order into fp32 QKVP.
-    Split (``part``): part 0 sums the first half of ``order`` into QKVP's second region
-    (``s`` rows on), part 1 the rest onto that sum."""
+def wqkv_publish(c, task, accs, slots, order, t0, n, live, part=None, s=0, half=None):
+    """Sum wqkv rows 16 task .. for tokens t0 .. t0 + n in SGLang's order into QKVP, as
+    bf16 pairs (the qkv stage rounds the sums to bf16 first). Split (``part``): part 0
+    sums the first half of ``order`` into QKVP's second region (``s`` rows on, fp32),
+    part 1 the rest onto that sum. ``half``: rows 8 half .. + 8 of the tile alone."""
     tid, red = c["tid"], c["red"]
     chain_store(c, red, accs, slots)
     gpu.barrier()
+    if const_expr(half is not None):
+        live = live & ((tid % ROWS) // 8 == half)
     if (tid < ROWS * n) & live:
         r = tid % ROWS
         tl = tid // ROWS
         at = plus(t0, tl) * QKV_ROWS + task * ROWS + r
         if const_expr(part is None):
-            c["mb"].put(c["qkvp"], at, chain_sum(red, r, tl, order))
+            qkv_put(c, at, r, chain_sum(red, r, tl, order))
         else:
             h, mid = len(order) // 2, s * QKV_ROWS + at
             if part == 0:
                 c["mb"].put(c["qkvp"], mid, chain_sum(red, r, tl, order[:h]))
             else:
                 tot = c["mb"].poll([(c["qkvp"], mid, 1)])[0][0].bitcast(fx.Float32)
-                c["mb"].put(c["qkvp"], at, chain_sum(red, r, tl, order[h:], tot))
+                qkv_put(c, at, r, chain_sum(red, r, tl, order[h:], tot))
     gpu.barrier()
+
+
+@flyc.jit
+def qkv_put(c, at, r, v):
+    """Row r's sum ``v`` (QKVP element ``at``) and its neighbour's as one bf16 pair, by the
+    even row's lane."""
+    nb = xshfl(v, 1)
+    if r % 2 == 0:
+        c["mb"].put_bf(c["qkvp"], at, [v, nb])
 
 
 # ---------------------------------------------------------------- q / kv norms
 
 
 @flyc.jit
-def stage_qkv(c, t):
-    """Token t: q_norm to QX8, and kv_norm + RoPE to the fp8_ds_mla record at its slot."""
+def stage_qkv(c, t, part="qkv"):
+    """Token t: q_norm to QX8, and kv_norm + RoPE to the fp8_ds_mla record at its slot.
+    ``part``: "q" the q norm alone, "kv" the kv norm, RoPE and record alone."""
+    do_q = part != "kv"
+    do_kv = part != "q"
     tid, lane, wave, red = c["tid"], c["lane"], c["wave"], c["red"]
     a = c["args"]
     tt = fx.min(tid, 255)
     mine = tid < 256
-    qc = [fx.min(tt * 8 + j, Q_RANK - 1) for j in range(8)]
     # independent loads first: they overlap the partials' wait
-    qw = [c["ldbf"](a["qn_w"], qc[j]) for j in range(8)]
-    kw = [c["ldbf"](a["kvn_w"], tt * 2 + j) for j in range(2)]
+    if const_expr(do_q):
+        qc = [fx.min(tt * 8 + j, Q_RANK - 1) for j in range(8)]
+        qw = [c["ldbf"](a["qn_w"], qc[j]) for j in range(8)]
+    if const_expr(do_kv):
+        kw = [c["ldbf"](a["kvn_w"], tt * 2 + j) for j in range(2)]
     # token parallel: t is this rank's row, tg the step's
     tok_par = c.get("tok_par", False)
     tg = plus(c["t0"], t) if const_expr(tok_par) else t
-    pos = ld_i32(a["pos"], 2 * tg)
-    slot = ld_i32(a["slot"], a["slot_words"] * tg)
-    jr = tt - NOPE // 2
-    is_rope = jr >= 0
-    jj = fx.max(jr, 0)
-    cs = is_rope.select(ld_f32(a["cos_sin"], pos * ROPE + jj), fx.Float32(1.0))
-    sn = is_rope.select(ld_f32(a["cos_sin"], pos * ROPE + HALF + jj), fx.Float32(0.0))
-    specs = [(c["qkvp"], t * QKV_ROWS + qc[j], 1) for j in range(8)]
-    specs += [(c["qkvp"], t * QKV_ROWS + Q_RANK + tt * 2 + j, 1) for j in range(2)]
-    got = c["mb"].poll(specs)
-    vals = [bf16_round(got[j][0].bitcast(fx.Float32)) for j in range(10)]
-    xq = [((tt * 8 + j) < Q_RANK).select(vals[j], fx.Float32(0.0)) for j in range(8)]
-    xk = vals[8:10]
-    ssq = xq[0] * xq[0]
-    for j in range_constexpr(1, 8):
-        ssq = ssq + xq[j] * xq[j]
-    ssq = butterfly(ssq, (32, 16, 8, 4, 2, 1))
-    # kv's sum of squares in the order of SGLang's K store (fused_k_norm_rope_flashmla, gfx950)
-    ssk = butterfly(fma(xk[0], xk[0], xk[1] * xk[1]), (16, 8, 4, 2, 1))
-    if (lane == 0) & mine:
-        fx.ptr_store(ssq, red + wave)
-    if (lane % 32 == 0) & mine:
-        fx.ptr_store(ssk, red + 16 + tt // 32)
+    if const_expr(do_kv):
+        pos = ld_i32(a["pos"], 2 * tg)
+        slot = ld_i32(a["slot"], a["slot_words"] * tg)
+        jr = tt - NOPE // 2
+        is_rope = jr >= 0
+        jj = fx.max(jr, 0)
+        cs = is_rope.select(ld_f32(a["cos_sin"], pos * ROPE + jj), fx.Float32(1.0))
+        sn = is_rope.select(
+            ld_f32(a["cos_sin"], pos * ROPE + HALF + jj), fx.Float32(0.0)
+        )
+    # the sums as bf16 pairs (``qkv_put``): 8 q columns in 4 pairs (16 B loads), the kv
+    # pair in 1
+    q0 = fx.min(tt * 8, Q_RANK - 8)
+    specs = []
+    if const_expr(do_q):
+        specs += [(c["qkvp"], (t * QKV_ROWS + q0) // 2 + 2 * k, 2) for k in range(2)]
+    if const_expr(do_kv):
+        specs += [(c["qkvp"], (t * QKV_ROWS + Q_RANK + tt * 2) // 2, 1)]
+    pw = [w for g in c["mb"].poll(specs) for w in g]
+    nq = 4 if const_expr(do_q) else 0
+    if const_expr(do_q):
+        vals = [(bf_lo if j % 2 == 0 else bf_hi)(pw[j // 2]) for j in range(8)]
+        xq = [
+            ((tt * 8 + j) < Q_RANK).select(vals[j], fx.Float32(0.0)) for j in range(8)
+        ]
+        ssq = xq[0] * xq[0]
+        for j in range_constexpr(1, 8):
+            ssq = ssq + xq[j] * xq[j]
+        ssq = butterfly(ssq, (32, 16, 8, 4, 2, 1))
+    if const_expr(do_kv):
+        xk = [bf_lo(pw[nq]), bf_hi(pw[nq])]
+        # kv's sum of squares in the order of SGLang's K store (fused_k_norm_rope_flashmla,
+        # gfx950)
+        ssk = butterfly(fma(xk[0], xk[0], xk[1] * xk[1]), (16, 8, 4, 2, 1))
+    if const_expr(do_q):
+        if (lane == 0) & mine:
+            fx.ptr_store(ssq, red + wave)
+    if const_expr(do_kv):
+        if (lane % 32 == 0) & mine:
+            fx.ptr_store(ssk, red + 16 + tt // 32)
     gpu.barrier()
-    tq = (fx.ptr_load(red + 0) + fx.ptr_load(red + 1)) + (
-        fx.ptr_load(red + 2) + fx.ptr_load(red + 3)
-    )
-    pk = [fx.ptr_load(red + 16 + w) for w in range(8)]
-    tk = ((pk[0] + pk[4]) + (pk[2] + pk[6])) + ((pk[1] + pk[5]) + (pk[3] + pk[7]))
-    rq = hw_rsq(
-        div_rn(tq, fx.Float32(float(Q_RANK)), fx.Float32(1.0 / Q_RANK))
-        + fx.Float32(EPS)
-    )
-    rk = hw_rsq(
-        div_rn(tk, fx.Float32(float(KV_DIM)), fx.Float32(1.0 / KV_DIM))
-        + fx.Float32(EPS)
-    )
-    # q: bf16 normed row, then vLLM's MXFP8 (a 32-group = 4 threads)
-    ys = [bf16_round((xq[j] * rq) * qw[j]) for j in range(8)]
-    amax = abs(ys[0])
-    for y in ys[1:]:
-        amax = fx.max(amax, abs(y))
-    code = mx_code(butterfly(amax, (1, 2), fx.max))
-    mul = mx_mul(code)
-    if mine & (tt * 8 < Q_RANK):
-        w0 = fp8_pack4(*[clamp_fp8(ys[i] * mul) for i in range(4)])
-        w1 = fp8_pack4(*[clamp_fp8(ys[4 + i] * mul) for i in range(4)])
-        if const_expr(tok_par):
-            # to every rank's QG / QGS, at the step's row: wq_b reads every row's
-            for p in range_constexpr(c["d"].tp):
-                words_dst, codes_dst = c["q_dsts"][p]
-                c["mb"].put_words(words_dst, tg * QX_WORDS + 2 * tt, [w0, w1])
-                if tt % 4 == 0:
-                    c["mb"].put(codes_dst, tg * QX_GROUPS + tt // 4, code)
-        else:
-            bo.buffer_store(
-                fx.Vector.from_elements([w0, w1], fx.Int32),
-                rsrc(c["qx8"]),
-                t * QX_WORDS + 2 * tt,
-                cache_modifier=CM_DEV,
-            )
-            if tt % 4 == 0:
+    if const_expr(do_q):
+        tq = (fx.ptr_load(red + 0) + fx.ptr_load(red + 1)) + (
+            fx.ptr_load(red + 2) + fx.ptr_load(red + 3)
+        )
+    if const_expr(do_kv):
+        pk = [fx.ptr_load(red + 16 + w) for w in range(8)]
+        tk = ((pk[0] + pk[4]) + (pk[2] + pk[6])) + ((pk[1] + pk[5]) + (pk[3] + pk[7]))
+    if const_expr(do_q):
+        rq = hw_rsq(
+            div_rn(tq, fx.Float32(float(Q_RANK)), fx.Float32(1.0 / Q_RANK))
+            + fx.Float32(EPS)
+        )
+    if const_expr(do_kv):
+        rk = hw_rsq(
+            div_rn(tk, fx.Float32(float(KV_DIM)), fx.Float32(1.0 / KV_DIM))
+            + fx.Float32(EPS)
+        )
+    if const_expr(do_q):
+        # q: the bf16 normed row, then vLLM's MXFP8 (a 32-group = 4 threads)
+        ys = [bf16_round((xq[j] * rq) * qw[j]) for j in range(8)]
+        amax = abs(ys[0])
+        for y in ys[1:]:
+            amax = fx.max(amax, abs(y))
+        code = mx_code(butterfly(amax, (1, 2), fx.max))
+        mul = mx_mul(code)
+        if mine & (tt * 8 < Q_RANK):
+            w0 = fp8_pack4(*[clamp_fp8(ys[i] * mul) for i in range(4)])
+            w1 = fp8_pack4(*[clamp_fp8(ys[4 + i] * mul) for i in range(4)])
+            if const_expr(tok_par):
+                # to every rank's QG / QGS, at the step's row: wq_b reads every row's
+                for p in range_constexpr(c["d"].tp):
+                    words_dst, codes_dst = c["q_dsts"][p]
+                    c["mb"].put_words(words_dst, tg * QX_WORDS + 2 * tt, [w0, w1])
+                    if tt % 4 == 0:
+                        c["mb"].put(codes_dst, tg * QX_GROUPS + tt // 4, code)
+            else:
                 bo.buffer_store(
-                    code,
-                    rsrc(c["qx8s"]),
-                    t * (Q_RANK // 32) + tt // 4,
+                    fx.Vector.from_elements([w0, w1], fx.Int32),
+                    rsrc(c["qx8"]),
+                    t * QX_WORDS + 2 * tt,
                     cache_modifier=CM_DEV,
                 )
-    if const_expr(not tok_par):
-        # QRDY once QX8 landed: the qr and KV record stores after it are read only past
-        # this launch, and the publish's vmcnt(0) would wait on them too
-        publish(c, c["qrdy"], t)
-    if const_expr(c.get("index", False)):  # noqa: SIM102
-        # the bf16 qr, SGLang's indexer's input (an index source's K1)
-        if mine & (tt * 8 < Q_RANK):
-            words = [
-                fx.Vector.from_elements([ys[2 * i], ys[2 * i + 1]], fx.Float32)
-                .to(fx.BFloat16)
-                .bitcast(fx.Int32)[0]
-                for i in range(4)
-            ]
-            bo.buffer_store(
-                fx.Vector.from_elements(words, fx.Int32),
-                rsrc(a["qr_out"]),
-                tg * (Q_RANK // 2) + 4 * tt,
+                if tt % 4 == 0:
+                    bo.buffer_store(
+                        code,
+                        rsrc(c["qx8s"]),
+                        t * (Q_RANK // 32) + tt // 4,
+                        cache_modifier=CM_DEV,
+                    )
+        if const_expr(not tok_par):
+            # QRDY once QX8 landed: the qr and KV record stores after it are read only past
+            # this launch, and the publish's vmcnt(0) would wait on them too
+            publish(c, c["qrdy"], t * FLAG_STRIDE)
+        if const_expr(c.get("index", False)):  # noqa: SIM102
+            # the bf16 qr, SGLang's indexer's input (an index source's K1)
+            if mine & (tt * 8 < Q_RANK):
+                words = [
+                    fx.Vector.from_elements([ys[2 * i], ys[2 * i + 1]], fx.Float32)
+                    .to(fx.BFloat16)
+                    .bitcast(fx.Int32)[0]
+                    for i in range(4)
+                ]
+                bo.buffer_store(
+                    fx.Vector.from_elements(words, fx.Int32),
+                    rsrc(a["qr_out"]),
+                    tg * (Q_RANK // 2) + 4 * tt,
+                )
+                if const_expr(tok_par):
+                    for p in range_constexpr(c["d"].tp):
+                        if c["rank"] != p:
+                            # two pairs a store: a store moves 16 B at most
+                            for h in range_constexpr(2):
+                                c["mb"].put_words(
+                                    c["qr_dsts"][p],
+                                    tg * (Q_RANK // 2) + half_pair(Q_RANK // 2, tt, h),
+                                    words[2 * h : 2 * h + 2],
+                                )
+    if const_expr(do_kv):
+        # kv: this thread's pair (2 tt, 2 tt + 1), fp32 rounding as SGLang's V4 K store
+        kn = [(xk[j] * rk) * kw[j] for j in range(2)]
+        e0 = is_rope.select(fma(kn[0], cs, -(kn[1] * sn)), kn[0])
+        e1 = is_rope.select(fma(kn[0], sn, kn[1] * cs), kn[1])
+        # record quant of the nope dims: a 64-block = 32 threads (half a wave)
+        amax = butterfly(fx.max(abs(e0), abs(e1)), (1, 2, 4, 8, 16), fx.max)
+        rcode = ceil_exp(
+            div_rn(
+                fx.max(amax, fx.Float32(1e-4)),
+                fx.Float32(448.0),
+                fx.Float32(1.0 / 448.0),
             )
-            if const_expr(tok_par):
+        )
+        inv = mx_mul(rcode)
+        q0 = clamp_fp8(e0 * inv)
+        q1 = clamp_fp8(e1 * inv)
+        n0 = xshfl(q0, 1)
+        n1 = xshfl(q1, 1)
+        word = fp8_pack4(q0, q1, n0, n1)
+        rope_word = (
+            fx.Vector.from_elements([e0, e1], fx.Float32)
+            .to(fx.BFloat16)
+            .bitcast(fx.Int32)[0]
+        )
+        blk = a["swa_block"]
+        sblock = slot // blk
+        soff = slot % blk
+        base = a["swa"] + fx.Int64(sblock) * fx.Int64(a["swa_stride"])
+        rec = base + fx.Int64(soff * DATA)
+        if mine & (tt % 32 == 0) & (tt < NOPE // 2):
+            fx.ptr_store(rcode.bitcast(fx.Float32), red + 8 + tt // 32)
+        gpu.barrier()
+        # one launch per layer: device scope, for the attention back of this launch (this
+        # CTA's q flag, past its wq_b, or its record flag tells it the record landed)
+        dev = c.get("k2") is not None
+        if mine & (slot >= 0):
+            if tt < NOPE // 2:
+                if tt % 2 == 0:
+                    rec_store(rec, 2 * tt, word, 1, dev)
+            else:
+                rec_store(rec, NOPE + 4 * (tt - NOPE // 2), rope_word, 1, dev)
+            if tt == 0:
+                sc = base + fx.Int64(blk * DATA + soff * 8)
+                rec_store(
+                    sc, 0, fx.Vector.from_elements(record_scales(red), fx.Int32), 2, dev
+                )
+        if const_expr(tok_par):
+            # the record to every other rank's KG (``record_from``), a pad row's too
+            if mine:
+                nope = tt < NOPE // 2
+                w = nope.select(word, rope_word)
+                at = nope.select(tt // 2, DATA // 4 - ROPE // 2 + (tt - NOPE // 2))
                 for p in range_constexpr(c["d"].tp):
                     if c["rank"] != p:
-                        # two pairs a store: a store moves 16 B at most
-                        for h in range_constexpr(2):
+                        if (tt % 2 == 0) | (tt >= NOPE // 2):
+                            c["mb"].put_words(c["kv_dsts"][p], tg * KG_WORDS + at, [w])
+                        if tt == 0:
                             c["mb"].put_words(
-                                c["qr_dsts"][p],
-                                tg * (Q_RANK // 2) + half_pair(Q_RANK // 2, tt, h),
-                                words[2 * h : 2 * h + 2],
+                                c["kv_dsts"][p],
+                                tg * KG_WORDS + DATA // 4,
+                                record_scales(red),
                             )
-    # kv: this thread's pair (2 tt, 2 tt + 1), fp32 rounding as SGLang's V4 K store
-    kn = [(xk[j] * rk) * kw[j] for j in range(2)]
-    e0 = is_rope.select(fma(kn[0], cs, -(kn[1] * sn)), kn[0])
-    e1 = is_rope.select(fma(kn[0], sn, kn[1] * cs), kn[1])
-    # record quant of the nope dims: a 64-block = 32 threads (half a wave)
-    amax = butterfly(fx.max(abs(e0), abs(e1)), (1, 2, 4, 8, 16), fx.max)
-    rcode = ceil_exp(
-        div_rn(
-            fx.max(amax, fx.Float32(1e-4)), fx.Float32(448.0), fx.Float32(1.0 / 448.0)
-        )
-    )
-    inv = mx_mul(rcode)
-    q0 = clamp_fp8(e0 * inv)
-    q1 = clamp_fp8(e1 * inv)
-    n0 = xshfl(q0, 1)
-    n1 = xshfl(q1, 1)
-    word = fp8_pack4(q0, q1, n0, n1)
-    rope_word = (
-        fx.Vector.from_elements([e0, e1], fx.Float32)
-        .to(fx.BFloat16)
-        .bitcast(fx.Int32)[0]
-    )
-    blk = a["swa_block"]
-    sblock = slot // blk
-    soff = slot % blk
-    base = a["swa"] + fx.Int64(sblock) * fx.Int64(a["swa_stride"])
-    rec = base + fx.Int64(soff * DATA)
-    if mine & (tt % 32 == 0) & (tt < NOPE // 2):
-        fx.ptr_store(rcode.bitcast(fx.Float32), red + 8 + tt // 32)
-    gpu.barrier()
-    if mine & (slot >= 0):
-        if tt < NOPE // 2:
-            if tt % 2 == 0:
-                gstore(rec + fx.Int64(2 * tt), word, words=1)
-        else:
-            gstore(rec + fx.Int64(NOPE + 4 * (tt - NOPE // 2)), rope_word, words=1)
-        if tt == 0:
-            sc = base + fx.Int64(blk * DATA + soff * 8)
-            gstore(sc, fx.Vector.from_elements(record_scales(red), fx.Int32), words=2)
-    if const_expr(tok_par):
-        # the record to every other rank's KG (``record_from``), a pad row's too
-        if mine:
-            nope = tt < NOPE // 2
-            w = nope.select(word, rope_word)
-            at = nope.select(tt // 2, DATA // 4 - ROPE // 2 + (tt - NOPE // 2))
-            for p in range_constexpr(c["d"].tp):
-                if c["rank"] != p:
-                    if (tt % 2 == 0) | (tt >= NOPE // 2):
-                        c["mb"].put_words(c["kv_dsts"][p], tg * KG_WORDS + at, [w])
-                    if tt == 0:
-                        c["mb"].put_words(
-                            c["kv_dsts"][p],
-                            tg * KG_WORDS + DATA // 4,
-                            record_scales(red),
-                        )
-        gpu.barrier()
+            gpu.barrier()
+        if const_expr(c.get("qt") is not None):
+            # q goes to the attention back as tagged words, no q flag: the record's own
+            hand_off(c, "vrdy", t * FLAG_STRIDE)
+
+
+def rec_store(base, off, value, words, dev):
+    """``words`` of a KV record at byte ``off`` of ``base`` (alike across the CTA);
+    ``dev``: device scope, for a record this launch reads (one launch per layer)."""
+    if const_expr(dev):
+        bo.buffer_store(value, rsrc(base), off // 4, cache_modifier=CM_DEV)
+    else:
+        gstore(base + fx.Int64(off), value, words=words)
 
 
 def record_scales(red):
@@ -374,6 +477,7 @@ def record_from(c, kg, t):
     stores)."""
     tid = c["tid"]
     a = c["args"]
+    dev = c.get("k2") is not None
     if tid < KG_WORDS:
         (w,) = c["mb"].poll([(kg, t * KG_WORDS + tid, 1)])
         slot = ld_i32(a["slot"], a["slot_words"] * t)
@@ -385,7 +489,7 @@ def record_from(c, kg, t):
             off = data.select(
                 soff * DATA + 4 * tid, blk * DATA + soff * 8 + 4 * (tid - DATA // 4)
             )
-            gstore(base + fx.Int64(off), w[0], words=1)
+            rec_store(base, off, w[0], 1, dev)
 
 
 @flyc.jit
@@ -444,45 +548,93 @@ def stage_wqb(c, task0, bops, t0, n, rope):
     """Run the CTA's wq_b tasks: GEMV, bf16, GPT-J RoPE of dims 448.., store q."""
     tid, red, d = c["tid"], c["red"], c["d"]
     a = c["args"]
+    # one launch per layer: device scope, for the attention back of this launch
+    cm = CM_DEV if const_expr(c.get("k2") is not None) else 0
     nt = len(bops)
     for k in range_constexpr(nt):
         gemv_mfmas(c, Q_RANK, c["qxl"], c["qxsl"], red + k * RED, bops[k], rows=n)
     gpu.barrier()
     per = ROWS * n // 2  # bf16 pairs a task
-    if tid < nt * per:
-        k = tid // per
-        u = tid % per
-        rp = u % (ROWS // 2)
-        tl = u // (ROWS // 2)
-        t = plus(t0, tl)
-        r0 = (task0 + BLOCKS * k) * ROWS + 2 * rp
-        rk = red + k * RED
-        v0 = bf16_round(row_sum(rk, 2 * rp, tl))
-        v1 = bf16_round(row_sum(rk, 2 * rp + 1, tl))
-        is_rope = (task0 * ROWS) % HEAD_DIM + 2 * rp >= NOPE
-        cs, sn = rope
-        e0 = is_rope.select(v0 * cs - v1 * sn, v0)
-        e1 = is_rope.select(v0 * sn + v1 * cs, v1)
-        word = (
-            fx.Vector.from_elements([e0, e1], fx.Float32)
-            .to(fx.BFloat16)
-            .bitcast(fx.Int32)[0]
-        )
-        bo.buffer_store(word, rsrc(a["q"]), (t * d.q_rows + r0) // 2)
+    if const_expr(c.get("qt") is not None):
+        # q as tagged words for the attention back (one launch a layer): a task's dims
+        # 0 .. 5, 6 .. 11 and 12 .. 15 of a token, each word by its first pair's thread
+        assert nt == 1 and per <= THREADS
+        lane = c["lane"]
+        u = fx.min(tid, per - 1)
+        qp, qrp, qtl = wqb_pair(c, task0, 0, u, rope)
+        g1 = lane_gather(qp, fx.min(lane + 1, 63))
+        g2 = lane_gather(qp, fx.min(lane + 2, 63))
+        j = qrp // 3
+        if (tid < per) & (qrp % 3 == 0):
+            bo.buffer_store(
+                fx.Vector.from_elements(
+                    [qp, g1, (j == 2).select(fx.Int32(0), g2), c["k2"]["mb"].tag],
+                    fx.Int32,
+                ),
+                rsrc(c["qt"]),
+                (plus(t0, qtl) * q_words(d) + task0 * 3 + j) * 4,
+                cache_modifier=CM_DEV,
+            )
+        # K1's q output as in two launches; this launch reads the words
+        if tid < per:
+            r0 = task0 * ROWS + 2 * qrp
+            bo.buffer_store(qp, rsrc(a["q"]), (plus(t0, qtl) * d.q_rows + r0) // 2)
+    else:
+        if tid < nt * per:
+            wqb_store(c, a["q"], task0, tid // per, tid % per, t0, rope, cm)
     gpu.barrier()
+
+
+def wqb_store(c, q, task0, k, u, t0, rope, cm):
+    """Task k's bf16 pair u of ``stage_wqb`` into q."""
+    word, rp, tl = wqb_pair(c, task0, k, u, rope)
+    r0 = (task0 + BLOCKS * k) * ROWS + 2 * rp
+    bo.buffer_store(
+        word, rsrc(q), (plus(t0, tl) * c["d"].q_rows + r0) // 2, cache_modifier=cm
+    )
+
+
+def wqb_pair(c, task0, k, u, rope):
+    """Task k's bf16 pair u of ``stage_wqb``: the sums rounded to bf16, GPT-J RoPE of
+    dims 448..; (the pair as an i32, its pair in the row, its token in the tile)."""
+    rp = u % (ROWS // 2)
+    tl = u // (ROWS // 2)
+    rk = c["red"] + k * RED
+    v0 = bf16_round(row_sum(rk, 2 * rp, tl))
+    v1 = bf16_round(row_sum(rk, 2 * rp + 1, tl))
+    is_rope = (task0 * ROWS) % HEAD_DIM + 2 * rp >= NOPE
+    cs, sn = rope
+    e0 = is_rope.select(v0 * cs - v1 * sn, v0)
+    e1 = is_rope.select(v0 * sn + v1 * cs, v1)
+    word = (
+        fx.Vector.from_elements([e0, e1], fx.Float32)
+        .to(fx.BFloat16)
+        .bitcast(fx.Int32)[0]
+    )
+    return word, rp, tl
 
 
 # ---------------------------------------------------------------- kernel
 
 
+def red_floats(s: int, d: Dims) -> int:
+    """``red``: a wq_b task's accumulators each, or the wqkv chains' partials and a dead
+    wave's if more (TP8 has one wq_b task a CTA); split or not (``wqkv_split``)."""
+    waves = wqkv_order(s)[0]
+    chain_floats = max(
+        (waves + -(-chains // WAVES) * WAVES - chains) * 64 * 4
+        for chains in (waves, waves // 2)
+    )
+    return max(d.wqb_tasks // BLOCKS * RED, chain_floats)
+
+
 def front_lds(s: int, d: Dims):
     """K1's LDS (the attention front's stages)."""
     rows = tile_rows(s)
-    wqb_per_cta = d.wqb_tasks // BLOCKS
 
     @fx.struct
     class FrontLds:
-        red: fx.Array[fx.Float32, wqb_per_cta * RED + 16, 16]
+        red: fx.Array[fx.Float32, red_floats(s, d) + 16, 16]
         qxl: fx.Array[fx.Int32, rows * lds_row(QX_WORDS), 16]
         qxsl: fx.Array[fx.Int32, rows * lds_row(Q_RANK // 32), 16]
         xl: fx.Array[fx.Int32, rows * lds_row(X_WORDS), 16]
@@ -530,12 +682,23 @@ def run_front(
     after_wqkv=None,
     before_wqb=None,
     qkv_first=0,
+    row_halves=False,
+    before_wqb_weights=None,
+    kv_first=None,
 ):
     """Run the front's stages on this CTA; the seam publishes X8 before them.
-    ``qkv_first``: the first CTA of the q / kv norms."""
+    ``qkv_first``: the first CTA of the q / kv norms; ``row_halves``: where ``wqkv_split``
+    holds, each of a row tile's two CTAs takes 8 of its rows over all of K instead of half
+    of K, so no sum crosses CTAs. ``before_wqb_weights(seen)`` (one token tile): loads
+    issued past the wqkv GEMV, ahead of a wqkv CTA's wq_b weights; ``seen``: whether this
+    CTA waited on X8 (None: every CTA did). ``kv_first``: the first CTA of the kv norms,
+    where they run apart from the q norms (None: with them)."""
     s = key.tokens
     # the wqkv GEMV takes all of K from X8, which the seam publishes
     assert x8_given
+    # one launch per layer: the attention back of this launch reads q, the records and
+    # the key table (read before the traced loops: a dict a loop reads becomes loop state)
+    one = c.get("k2") is not None
     wqb_tasks = Dims(key.tp).wqb_tasks
     a = c["args"]
     tiles = token_tiles(s)
@@ -546,25 +709,29 @@ def run_front(
     assert wqb_tasks % BLOCKS == 0
     n_wqkv = WQKV_TASKS  # a row tile a CTA, all of K in SGLang's order
     QKV0 = qkv_first
+    kv_first = QKV0 if kv_first is None else kv_first
     WQB0 = 0
     waves, halves, order = wqkv_order(s)
     # a row tile's chains on two CTAs (``wqkv_split``): half its weights each land sooner
     split = len(wtiles) == 1 and wqkv_split(s, own)
+    # row halves: two CTAs a row tile as the split's, each with every chain
+    halved = split and row_halves
+    split = split and not row_halves
     chains = waves // 2 if split else waves
     dead = -(-chains // WAVES) * WAVES - chains
     # the chains' partials, and a dead wave's, fit ``red``
-    assert (waves + dead) * 64 * 4 <= wqb_per_cta * RED
+    assert (waves + dead) * 64 * 4 <= red_floats(s, Dims(key.tp))
 
     # loads complete in issue order: each CTA issues its latency-critical loads first
     wqb_task = first_task(bid, WQB0)
     if const_expr(len(wtiles) == 1):
-        units = 2 * n_wqkv if split else n_wqkv
+        units = 2 * n_wqkv if split or halved else n_wqkv
         wqkv_unit = first_task(bid, 0)
         has_wqkv = wqkv_unit < units
         unit = fx.min(wqkv_unit, units - 1)
         task, part = unit % n_wqkv, unit // n_wqkv
         # split: the key table past the norms', gates' and qkv's CTAs (``build_mono_k1``)
-        kt_from = QKV0 + own if split else n_wqkv
+        kt_from = QKV0 + own if split or halved else n_wqkv
         kt_step = BLOCKS - kt_from
     else:
         # a row tile's token tiles on CTAs task, task + n_wqkv, .. (ROCm/ATOM), not one in turn
@@ -592,12 +759,15 @@ def run_front(
 
     if const_expr(before_wqkv is not None):
         before_wqkv()
-    slots = chain_slots(c, HIDDEN // 128, waves, part * chains if split else 0, chains)
-    kops = chain_loads(
-        c, a["wqkv"], a["wqkv_s"], HIDDEN, task * ROWS, slots, has_wqkv, c["shuffled"]
-    )
+    # the seam norms (CTAs without a wqkv tile) poll ahead of the wqkv weight loads, which
+    # their CTAs issue masked off: those still queue ahead of a poll issued after them
     if const_expr(after_wqkv is not None):
         after_wqkv()
+    slots = chain_slots(c, HIDDEN // 128, waves, part * chains if split else 0, chains)
+    kops = chain_loads(
+        c, a["wqkv"], a["wqkv_s"], HIDDEN, task * ROWS, slots, has_wqkv, c["shuffled"],
+        *((part, QKV_ROWS) if halved else ()),
+    )  # fmt: skip
     # one token tile: the wq_b weights here on a CTA without a wqkv tile (the qkv stage's polls
     # behind them land by then); a wqkv CTA's past its GEMV, as its barriers wait on every load
     early_wqb = len(wtiles) == 1
@@ -608,10 +778,12 @@ def run_front(
         kt_first = bid - kt_from
         for t in range((kt_first >= 0).select(kt_first, fx.Int32(s)), s, kt_step):
             stage_kt(c, t)
+            if const_expr(one):
+                hand_off(c, "krdy", t)
     stamp(c, 35)
     poss = [wqb_pos(c, t0, n) for t0, n in tiles]
 
-    def x_loads(t0, n):
+    def x_loads(t0, n, parts=range(WQKV_KPARTS)):
         return [
             rows_loads(
                 c,
@@ -627,14 +799,14 @@ def run_front(
                 n,
                 pred=has_wqkv,
             )
-            for p in range(WQKV_KPARTS)
+            for p in parts
         ]
 
-    def x_store(regs, n):
-        for p in range_constexpr(WQKV_KPARTS):
+    def x_store(regs, n, parts=range(WQKV_KPARTS)):
+        for i, p in enumerate(parts):
             rows_store(
                 c,
-                regs[p],
+                regs[i],
                 KWORDS,
                 KGROUPS,
                 c["xl"] + p * KWORDS,
@@ -647,15 +819,41 @@ def run_front(
     if const_expr(len(wtiles) == 1):
         # wqkv_a: one row tile a CTA, all of K in LDS
         t0, n = wtiles[0]
-        await_flags(c, c["xrdy"], WQKV_KPARTS * own, lambda u: u)
-        regs = x_loads(t0, n)
-        x_store(regs, n)
-        accs = stage_wqkv(c, kops, slots, n, halves)
-        wqkv_publish(
-            c, task, accs, slots, order, t0, n, has_wqkv, part if split else None, s
-        )
-        if has_wqkv:
-            bops = wqb_weights()
+        # a split row tile's CTA waits on, loads and stores only its own K half of X8, where
+        # its chains' steps lie in that half (8 chains of 5 steps; not 16 of 3)
+        nsteps = HIDDEN // 128
+        own_half = split and chains * (-(-nsteps // waves)) * WQKV_KPARTS == nsteps
+        parts = [part] if own_half else range(WQKV_KPARTS)
+        nflags = own if own_half else WQKV_KPARTS * own
+
+        def kflag(u):
+            return WQKV_KPARTS * u + part if own_half else u
+
+        def wqkv_tile():
+            await_flags(c, c["xrdy"], nflags, kflag)
+            regs = x_loads(t0, n, parts)
+            x_store(regs, n, parts)
+            accs = stage_wqkv(c, kops, slots, n, halves)
+            wqkv_publish(
+                c, task, accs, slots, order, t0, n, has_wqkv, part if split else None, s,
+                part if halved else None,
+            )  # fmt: skip
+
+        if const_expr(key.tp in (4, 8)):
+            # a CTA without a tile (the norms', gates', qkv's) goes on to its next stage
+            if has_wqkv:
+                wqkv_tile()
+            if const_expr(before_wqb_weights is not None):
+                # only a CTA that waited on X8 has seen its rows' flags
+                before_wqb_weights(has_wqkv)
+            if has_wqkv:
+                bops = wqb_weights()
+        else:
+            wqkv_tile()
+            if const_expr(before_wqb_weights is not None):
+                before_wqb_weights(None)
+            if has_wqkv:
+                bops = wqb_weights()
     else:
         # wqkv_a: this CTA's tiles of its row tile, each on its own tokens' flags
         for ti in range_constexpr(len(wtiles)):
@@ -680,8 +878,15 @@ def run_front(
         bops = wqb_weights()
 
     stamp(c, 36)
-    for t in range(first_task(bid, QKV0), own, BLOCKS):
-        stage_qkv(c, t)
+    if const_expr(kv_first != QKV0):
+        # the q and kv norms on CTAs of their own
+        for t in range(first_task(bid, QKV0), own, BLOCKS):
+            stage_qkv(c, t, "q")
+        for t in range(first_task(bid, kv_first), own, BLOCKS):
+            stage_qkv(c, t, "kv")
+    else:
+        for t in range(first_task(bid, QKV0), own, BLOCKS):
+            stage_qkv(c, t)
     stamp(c, 37)
 
     # wq_b: every task's rows for one token tile at a time
@@ -699,6 +904,12 @@ def run_front(
 
         def iq_batch(b0):
             return iq_ops[b0 // index_query.IQ_BATCH]
+
+    def q_flag(ti):
+        # one launch per layer: this CTA's q rows of tile ti, for the attention back
+        # (tagged q carries its own)
+        if const_expr(one and c.get("qt") is None):
+            hand_off(c, "qb", (ti * BLOCKS + bid) * FLAG_STRIDE)
 
     def index_tile(ti, t0, n):
         if const_expr(chains is not None):
@@ -736,9 +947,10 @@ def run_front(
             if const_expr(ti == 0):
                 stamp(c, 38)
             stage_wqb(c, wqb_task, bops, t0, n, ropes[ti])
+            q_flag(ti)
             index_tile(ti, t0, n)
     else:
-        await_flags(c, c["qrdy"], s, lambda u: u)
+        await_flags(c, c["qrdy"], s, lambda u: u * FLAG_STRIDE)
         stamp(c, 38)
         qx = (c["qx8"], c["qx8s"], QX_WORDS, 0, QX_WORDS, Q_RANK // 32, 0, Q_RANK // 32)
         regs = rows_loads(c, *qx, *tiles[0])
@@ -748,6 +960,7 @@ def run_front(
             if const_expr(ti + 1 < len(tiles)):
                 regs = rows_loads(c, *qx, *tiles[ti + 1])
             stage_wqb(c, wqb_task, bops, t0, n, ropes[ti])
+            q_flag(ti)
             index_tile(ti, t0, n)
     if const_expr(chains is not None):
         index_query.run_iquant(c, a, s)

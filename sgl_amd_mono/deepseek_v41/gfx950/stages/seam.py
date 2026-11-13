@@ -18,7 +18,10 @@ from flydsl.expr.math import fma
 from flydsl.expr.typing import T
 
 from sgl_amd_mono.common.ops import (
+    CM_DEV,
+    CM_SYS,
     batched_rounds,
+    bf16_pair,
     bf16_round,
     bf_hi,
     bf_lo,
@@ -33,10 +36,13 @@ from sgl_amd_mono.common.ops import (
 from sgl_amd_mono.common.plan import (
     THREADS,
     WAVES,
+    cdiv,
     pair_layout,
 )
-from sgl_amd_mono.common.sync import preg
+from sgl_amd_mono.common.sync import _spin, preg
 from sgl_amd_mono.deepseek_v41.gfx950.stages.gemv import (
+    ROWS,
+    TILE,
     ld_bf,
     ld_f32,
     plus,
@@ -69,6 +75,51 @@ def scratch_layout(tokens: int) -> dict[str, tuple[int, int]]:
     return pair_layout(pairs.items())
 
 
+# ---------------------------------------------------------------- seam state
+# A launch can run the next layer's attention seam slice past its MoE reduce
+# (``MonoBuild.seam_next``): the next launch then reads that seam's R_new, its layer input
+# (LIN, bf16) and the mixes' partials (f32) as plain rows (``MonoBuild.seamed``).
+SEAM_MAX_TOKENS = (
+    8  # widths the slice's first loads fit in registers beside the MoE reduce's
+)
+
+
+def seam_state_layout(tokens: int) -> dict[str, tuple[int, int]]:
+    """A seam state's regions -> (byte offset, bytes)."""
+    out, off = {}, 0
+    for name, n in (
+        ("res", tokens * HC * HIDDEN * 2),
+        ("lin", tokens * HIDDEN * 2),
+        ("pmix", SLICES * tokens * PART * 4),
+    ):
+        out[name] = (off, n)
+        off = -(-(off + n) // 256) * 256
+    return out
+
+
+def seam_state_bytes(tokens: int) -> int:
+    return max(o + n for o, n in seam_state_layout(tokens).values())
+
+
+def plain_put(base, i, v):
+    """Word i := ``v`` (f32 or i32), a plain store the next launch reads."""
+    bits = v.bitcast(fx.Int32) if isinstance(v, fx.Float32) else fx.Int32(v)
+    bo.buffer_store(bits, rsrc(base), i)
+
+
+def plain_put_bf(base, i, vs):
+    """Elements i, i + 1 (i even) as one bf16 pair, a plain store the next launch reads."""
+    bo.buffer_store(bf16_pair(vs[0], vs[1]).bitcast(fx.Int32), rsrc(base), i // 2)
+
+
+def plain_loads(specs):
+    """``Mailbox.poll``'s result for words the previous launch stored (``plain_put``)."""
+    return [
+        [fx.Int32(bo.buffer_load(rsrc(b), fx.Int32(i), vec_width=1, dtype=T.i32))]
+        for b, i, _ in specs
+    ]
+
+
 def attn_peer_bytes(tokens: int, tp: int) -> int:
     """ATTN: ``[source rank][token][hidden / 2]`` bf16 pairs."""
     return tp * tokens * HIDDEN // 2 * 8
@@ -76,6 +127,76 @@ def attn_peer_bytes(tokens: int, tp: int) -> int:
 
 def attn_region_pair(src, t, s, col):
     return (src * s + t) * (HIDDEN // 2) + col // 2
+
+
+# ---------------------------------------------------------------- ATTN cells
+# K2's wo_b partials (not token parallel) cross as cells: 8 B, four bf16 values and no
+# tag, half a tagged pair's bytes. Each 4-B word is its own flag: a word not yet written
+# holds CELL_EMPTY (all ones), and a writer never stores it (a bf16 pair of 0xFFFF NaNs
+# goes out as 0xFFFE, 0xFFFF), so a cell is read only once both its words have landed,
+# whether its 8 B arrive at once or as two halves. The reduce stores both words back to
+# empty once read; the runner fills the region with it. Every cell a launch writes, its
+# reduce reads; every width's cells lie on one 8-B grid of a region of their own
+# (``token_par.acell_region``), so no other word reaches a cell.
+CELL_VALUES = 4
+CELL_EMPTY = -1  # each of a cell's two words
+WOB_TASKS = HIDDEN // ROWS
+
+
+def cells_tile(n: int) -> int:
+    """A wo_b task's cells over a token tile of n rows: [row][16 columns], 4 a cell."""
+    return cdiv(ROWS * n, CELL_VALUES)
+
+
+def cells_task(s: int) -> int:
+    """A wo_b task's cells over an s-row step, a token tile after another."""
+    return sum(cells_tile(n) for _, n in token_tiles(s))
+
+
+def acell_cells(s: int, tp: int) -> int:
+    """ACELL: ``[source rank][wo_b task][token tile][cell]``."""
+    return tp * WOB_TASKS * cells_task(s)
+
+
+def attn_cell(src, task, s, t0, u):
+    """Cell u of wo_b ``task`` on the token tile from row t0, from rank ``src``."""
+    return (src * WOB_TASKS + task) * cells_task(s) + t0 // TILE * cells_tile(TILE) + u
+
+
+# ---------------------------------------------------------------- FFN cells
+# The per-row MoE's down sums cross as cells too: [source rank][row][hidden / 4], four bf16
+# values a cell, empty as ATTN's (the reader stores them back to empty).
+def ffn_cells(s: int, tp: int) -> int:
+    """FCELL's cells."""
+    return tp * s * HIDDEN // CELL_VALUES
+
+
+def ffn_cell(src, t, s, col):
+    """The cell of rank ``src``'s down sums of row t at hidden column ``col`` (a multiple of 4)."""
+    return (src * s + t) * (HIDDEN // CELL_VALUES) + col // CELL_VALUES
+
+
+def cell_words(vs):
+    """Four values as a cell's two words, never an empty word: a pair of bf16 0xFFFF NaNs
+    goes out as 0xFFFE, 0xFFFF."""
+    ws = []
+    for k in range_constexpr(2):
+        w = bf16_pair(vs[2 * k], vs[2 * k + 1]).bitcast(fx.Int32)
+        ws.append((w == CELL_EMPTY).select(fx.Int32(CELL_EMPTY - 1), w))
+    return fx.Vector.from_elements(ws, fx.Int32)
+
+
+def sum_cells(addr, cells):
+    """Poll the TP ranks' cells at ``addr`` and sum each of the four values in fp32 in rank
+    order."""
+    ws = poll_cells(addr, cells)
+    out = []
+    for i in range_constexpr(CELL_VALUES):
+        acc = cell_value(ws[0], i)
+        for src in range_constexpr(1, len(cells)):
+            acc = acc + cell_value(ws[src], i)
+        out.append(acc)
+    return out
 
 
 def sigmoid(z):
@@ -91,10 +212,21 @@ def pend_value(c, t, col, cc):
 
 
 # ---------------------------------------------------------------- slice
+def slice_pre_loads(c):
+    """The pre mixes of this thread's token in each pass of ``slice_input``, loaded."""
+    s, tid = c["S"], c["tid"]
+    out = []
+    for pas in range(0, s * COLS // 2, THREADS):
+        t = fx.min(plus(pas, tid) // (COLS // 2), s - 1)
+        out.append([ld_f32(c["args"]["pre_in"], t * HC + h) for h in range(HC)])
+    return out
+
+
 @flyc.jit
-def slice_input(c, task, idx):
-    """Write thread ``idx``'s pair of the layer input to LIN; with ``aux_on``, also store
-    the pair's mean over the R_new streams, as DSpark captures a target layer."""
+def slice_input(c, task, idx, pre):
+    """Write thread ``idx``'s pair of the layer input to LIN (``pre``: its token's pre
+    mixes, ``slice_pre_loads``); with ``aux_on``, also store the pair's mean over the
+    R_new streams, as DSpark captures a target layer."""
     s, rl = c["S"], c["rl"]
     a = c["args"]
     # read before the dynamic branch: a method call on c inside one carries c
@@ -109,7 +241,7 @@ def slice_input(c, task, idx):
             total = fx.Float32(0.0)
             for h in range_constexpr(HC):
                 rb = fx.ptr_load(rl + (t * KT + h * COLS + cc + d))
-                acc = acc + ld_f32(a["pre_in"], t * HC + h) * rb
+                acc = acc + pre[h] * rb
                 # torch's mean over the streams: summed in order, then times 1/HC
                 total = rb if h == 0 else total + rb
             outs.append(acc)
@@ -134,6 +266,12 @@ def slice_loads(c, c0, e):
     """Element e's loads of ``stage_slice`` (e clamped into the step's)."""
     a = c["args"]
     t, o, col = slice_at(c0, e)
+    if const_expr(c.get("embed", False)):
+        # the first layer: every stream is the token's embedding row (SGLang's hc_broadcast)
+        row = fx.Int32(
+            bo.buffer_load(rsrc(a["ids"]), a["ids_words"] * t, vec_width=1, dtype=T.i32)
+        )
+        return (ld_bf(a["emb"], row * HIDDEN + col),)
     if const_expr(not c.get("fold", True)):
         return (ld_bf(a["res_in"], (t * HC + o) * HIDDEN + col),)
     r = [ld_bf(a["res_in"], (t * HC + h) * HIDDEN + col) for h in range(HC)]
@@ -176,12 +314,19 @@ def slice_fn_loads(c, task):
     return out
 
 
+def slice_prefetch_fits(s: int) -> bool:
+    """Whether a slice's first loads fit in registers through the FFN seam's reduce: up to
+    32 rows, where the reduce takes one pass."""
+    return s * COLS // 2 <= THREADS
+
+
 def slice_prefetch(c, task):
-    """Issue slice ``task``'s first loads, its rows' first batch and its mix weights,
-    ahead of a wait they do not depend on (the FFN seam's attention partials)."""
+    """Issue slice ``task``'s first loads, its pre mixes, its rows' first batch and its mix
+    weights, ahead of a wait they do not depend on (the FFN seam's attention partials)."""
     c0 = task * COLS
+    pm = slice_pre_loads(c)
     first = first_rounds(c["tid"], c["S"] * KT, lambda e: slice_loads(c, c0, e))
-    return first, slice_fn_loads(c, task)
+    return first, slice_fn_loads(c, task), pm
 
 
 @flyc.jit
@@ -191,7 +336,12 @@ def stage_slice(c, task, pre=None):
     s, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
     rl, fl = c["rl"], c["fl"]
     c0 = task * COLS
-    first, fn = (None, slice_fn_loads(c, task)) if pre is None else pre
+    if const_expr(pre is None):
+        # the pre mixes first: they return ahead of the rows (in issue order)
+        pm = slice_pre_loads(c)
+        first, fn = None, slice_fn_loads(c, task)
+    else:
+        first, fn, pm = pre
     batched_rounds(
         tid,
         s * KT,
@@ -206,7 +356,7 @@ def stage_slice(c, task, pre=None):
     gpu.barrier()
     # layer input: bf16 R_new times pre, products rounded, summed in order (as the Triton collapse)
     for pas in range_constexpr(0, s * COLS // 2, THREADS):
-        slice_input(c, task, plus(pas, tid))
+        slice_input(c, task, plus(pas, tid), pm[pas // THREADS])
     # sum of squares: token t on wave t % WAVES, two columns a lane
     for t in range_constexpr(s):
         if wave == t % WAVES:
@@ -272,10 +422,12 @@ def _row_max(v):
 
 @flyc.jit
 def stage_gate(c, t):
-    """Token t's slices, in slice order, -> post / comb / next pre."""
+    """Token t's slices, in slice order, -> post / comb / next pre (``dev``: device
+    scope, for mixes this launch reads)."""
     s, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
     red = c["red"]
     a = c["args"]
+    cm = CM_DEV if const_expr(c.get("dev", False)) else 0
     groups = SLICES // GATE_BLOCK
     if tid < groups * PART:
         g = tid // PART
@@ -307,11 +459,19 @@ def stage_gate(c, t):
         v = mix * hw_rsq(fma(sq, fx.Float32(1.0 / K_MIX), fx.Float32(EPS)))
         if lane < HC:
             pre = sigmoid(fma(v, sc[0], base))
-            bo.buffer_store(pre + fx.Float32(HC_EPS), rsrc(a["pre_out"]), t * HC + lane)
+            bo.buffer_store(
+                pre + fx.Float32(HC_EPS),
+                rsrc(a["pre_out"]),
+                t * HC + lane,
+                cache_modifier=cm,
+            )
         if (lane >= HC) & (lane < 2 * HC):
             post = sigmoid(fma(v, sc[1], base))
             bo.buffer_store(
-                post * fx.Float32(POST_MULT), rsrc(a["post_out"]), t * HC + lane - HC
+                post * fx.Float32(POST_MULT),
+                rsrc(a["post_out"]),
+                t * HC + lane - HC,
+                cache_modifier=cm,
             )
         cv = fma(v, sc[2], base)
         # Triton's exp: exp2 of (x - max) log2(e)
@@ -323,22 +483,40 @@ def stage_gate(c, t):
             cv = cv * hw_rcp(_row_sum(cv) + fx.Float32(HC_EPS))
             cv = cv * hw_rcp(_col_sum(cv) + fx.Float32(HC_EPS))
         if (lane >= COMB0) & (lane < COMB0 + HC * HC):
-            bo.buffer_store(cv, rsrc(a["comb_out"]), t * HC * HC + lane - COMB0)
+            bo.buffer_store(
+                cv, rsrc(a["comb_out"]), t * HC * HC + lane - COMB0, cache_modifier=cm
+            )
     gpu.barrier()
 
 
 # ---------------------------------------------------------------- norm
 @flyc.jit
 def stage_norm(c, t, store):
-    """Token t's RMSNorm: rstd = rsq(fma(sum, 1/H, eps)), bf16((x rstd) w), handed to ``store``."""
+    """Token t's RMSNorm: rstd = rsq(fma(sum, 1/H, eps)), bf16((x rstd) w), handed to ``store``.
+
+    Threads 0..255 poll and sum three 8-column chunks each (columns 8 u + 2048 ch); the
+    outputs are spread over every wave: column 8 tid for each thread (past 255, chunk 1
+    of thread tid - 256, handed over in LDS), and 4096 + 8 tid for threads 0..127."""
     tid, lane, wave, red = c["tid"], c["lane"], c["wave"], c["red"]
     a = c["args"]
     tt = fx.min(tid, 255)
     mine = tid < 256
     cols = [tt * 8 + 2048 * ch for ch in range(3)]
     at = [fx.min(cols[ch], HIDDEN - 8) for ch in range(3)]
-    # the norm weights first: they do not wait on the LIN rows
-    wts = [[ld_bf(a["norm_w"], at[ch] + j) for j in range(8)] for ch in range(3)]
+    own = tid * 8
+    # the outputs: column 8 tid (chunk 0 below 256, chunk 1's column past it), then
+    # 4096 + 8 tid below 128 (chunk 2)
+    out_cols = [own, fx.min(4096 + tid * 8, HIDDEN - 8)]
+    # the norm weights first: they do not wait on the LIN rows; a chunk's 8 in one 16 B load
+    wv = [
+        fx.Vector(
+            bo.buffer_load(
+                rsrc(a["norm_w"]), out_cols[k] // 2, vec_width=4, dtype=T.i32
+            )
+        )
+        for k in range(2)
+    ]
+    wts = [[f(wv[k][q]) for q in range(4) for f in (bf_lo, bf_hi)] for k in range(2)]
     words = c["poll"](
         [
             (c["lin"], (t * HIDDEN + at[ch]) // 2 + k, 1)
@@ -346,6 +524,11 @@ def stage_norm(c, t, store):
             for k in range(4)
         ]
     )
+    # chunk 1's words for thread tid + 256
+    fl = c["fl"]
+    if mine:
+        for k in range_constexpr(4):
+            fx.ptr_store(words[4 + k][0].bitcast(fx.Float32), fl + (tt * 4 + k))
     xs = []
     for ch in range_constexpr(3):
         v = []
@@ -353,22 +536,23 @@ def stage_norm(c, t, store):
             v += [bf_lo(words[4 * ch + k][0]), bf_hi(words[4 * ch + k][0])]
         xs.append([(cols[ch] < HIDDEN).select(x, fx.Float32(0.0)) for x in v])
     sgl = c.get("sgl", False)
-    if const_expr(sgl):
-        # SGLang's rmsnorm_fake_quant_row reduction tree, step for step
-        e = [
-            fma(xs[2][j], xs[2][j], fma(xs[0][j], xs[0][j], xs[1][j] * xs[1][j]))
-            for j in range(8)
-        ]
-        acc = ((e[0] + e[2]) + (e[4] + e[6])) + ((e[1] + e[3]) + (e[5] + e[7]))
-        acc = butterfly(acc, (8, 4, 2, 1, 16, 32))
-    else:
-        acc = fx.Float32(0.0)
-        for ch in range_constexpr(3):
-            for x in xs[ch]:
-                acc = acc + x * x
-        acc = butterfly(acc, (1, 2, 4, 8, 16, 32))
-    if (lane == 0) & mine:
-        fx.ptr_store(acc, red + wave)
+    if mine:
+        if const_expr(sgl):
+            # SGLang's rmsnorm_fake_quant_row reduction tree, step for step
+            e = [
+                fma(xs[2][j], xs[2][j], fma(xs[0][j], xs[0][j], xs[1][j] * xs[1][j]))
+                for j in range(8)
+            ]
+            acc = ((e[0] + e[2]) + (e[4] + e[6])) + ((e[1] + e[3]) + (e[5] + e[7]))
+            acc = butterfly(acc, (8, 4, 2, 1, 16, 32))
+        else:
+            acc = fx.Float32(0.0)
+            for ch in range_constexpr(3):
+                for x in xs[ch]:
+                    acc = acc + x * x
+            acc = butterfly(acc, (1, 2, 4, 8, 16, 32))
+        if lane == 0:
+            fx.ptr_store(acc, red + wave)
     gpu.barrier()
     if const_expr(sgl):
         # rstd = 1 / sqrt_rn(sum / K + eps), IEEE division and sqrt
@@ -378,19 +562,40 @@ def stage_norm(c, t, store):
     else:
         tot = butterfly(fx.ptr_load(red + lane % 4), (1, 2))
         r = hw_rsq(fma(tot, fx.Float32(1.0 / HIDDEN), fx.Float32(EPS)))
-    for ch in range_constexpr(3):
-        ys = [bf16_round((xs[ch][j] * r) * wts[ch][j]) for j in range(8)]
-        store(t, at[ch], ys, mine & (cols[ch] < HIDDEN))
+    # column 8 tid: chunk 0 below 256, else thread tid - 256's chunk 1
+    up = fx.max(tid - 256, 0) * 4
+    x1 = []
+    for k in range_constexpr(4):
+        w = fx.ptr_load(fl + (up + k)).bitcast(fx.Int32)
+        x1 += [bf_lo(w), bf_hi(w)]
+    x0 = [mine.select(xs[0][j], x1[j]) for j in range(8)]
+    ys = [bf16_round((x0[j] * r) * wts[0][j]) for j in range(8)]
+    store(t, out_cols[0], ys, own < HIDDEN)
+    if tid < 128:
+        y2 = [bf16_round((xs[2][j] * r) * wts[1][j]) for j in range(8)]
+        store(t, out_cols[1], y2, cols[2] < HIDDEN)
     gpu.barrier()
 
 
 # ---------------------------------------------------------------- reduce
 @flyc.jit
 def stage_reduce(c, task):
-    """Sum the TP ranks' attention partials at this slice's 32 columns in rank order into ``pend_lds``."""
+    """Sum the TP ranks' attention partials at this slice's 32 columns in rank order into
+    ``pend_lds``: K2's cells (``c["acell"]``) or the tagged pairs. ``c["cell0"]``: the cells'
+    first thread, a wave that pushed no wo_b cells (their reset then waits for
+    ``reset_attn_cells``)."""
     s, tid = c["S"], c["tid"]
-    for pas in range_constexpr(0, s * COLS // 2, THREADS):
-        reduce_attn_pair(c, task, plus(pas, tid))
+    first = c.get("cell0", 0)
+    if const_expr(c.get("acell") is not None):
+        units, reduce_unit = 2 * cells_task(s), reduce_attn_cell
+    else:
+        units, reduce_unit = s * COLS // 2, reduce_attn_pair
+    if const_expr(units <= THREADS - first):
+        reduce_unit(c, task, tid - first)
+    else:
+        # past one pass a traced loop: one pass's polls in flight at a time, not every pass's
+        for pas in range(0, units, THREADS):
+            reduce_unit(c, task, pas + tid)
     gpu.barrier()
 
 
@@ -412,6 +617,90 @@ def reduce_attn_pair(c, task, idx):
         lds = c["pend_lds"] + (t * COLS + col - c0)
         fx.ptr_store(bf16_round(acc0), lds)
         fx.ptr_store(bf16_round(acc1), lds + 1)
+
+
+@flyc.jit
+def reduce_attn_cell(c, task, idx):
+    """Thread ``idx``'s cell of the slice's two wo_b tasks: every rank's cell, once written,
+    summed value by value in rank order into ``pend_lds``; then the cells emptied (with
+    ``c["cell0"]``, by ``reset_attn_cells``)."""
+    s, tp, pend, acell = c["S"], c["d"].tp, c["pend_lds"], c["acell"]
+    per = cells_task(s)
+    full = cells_tile(TILE)
+    first = c.get("cell0", 0)
+    live = idx < 2 * per
+    if const_expr(first > 0):
+        live = (idx >= 0) & live
+    if live:
+        j = idx // per
+        at = idx % per  # the cell in the task's block: its tile, then the tile's cell
+        tile = at // full
+        u = at - tile * full
+        cells = slice_cells(c, task, idx)
+        ws = poll_cells(acell, cells)
+        for i in range_constexpr(CELL_VALUES):
+            acc = cell_value(ws[0], i)
+            for src in range_constexpr(1, tp):
+                acc = acc + cell_value(ws[src], i)
+            v = CELL_VALUES * u + i
+            at_lds = pend + ((tile * TILE + v // ROWS) * COLS + j * ROWS + v % ROWS)
+            fx.ptr_store(bf16_round(acc), at_lds)
+        if const_expr(first == 0):
+            empty_cells(acell, cells)
+
+
+def slice_cells(c, task, idx):
+    """Thread ``idx``'s cell of the slice's two wo_b tasks, from every rank."""
+    per = cells_task(c["S"])
+    return [
+        attn_cell(src, COLS // ROWS * task + idx // per, c["S"], 0, 0) + idx % per
+        for src in range(c["d"].tp)
+    ]
+
+
+def empty_cells(addr, cells):
+    """Store the cells at ``addr`` back to empty, once read."""
+    empty = fx.Vector.from_elements([fx.Int32(CELL_EMPTY)] * 2, fx.Int32)
+    for at in cells:
+        bo.buffer_store(empty, rsrc(addr), at * 2, cache_modifier=CM_SYS)
+
+
+@flyc.jit
+def reset_attn_cells(c, task):
+    """``stage_reduce``'s cells back to empty, past the slice (``c["cell0"]``)."""
+    idx = c["tid"] - c["cell0"]
+    if (idx >= 0) & (idx < 2 * cells_task(c["S"])):
+        empty_cells(c["acell"], slice_cells(c, task, idx))
+
+
+def cell_value(w, i):
+    """Value i of a cell's words (w0, w1): bf16 low then high, a word after the other."""
+    return (bf_lo(w[0]), bf_hi(w[0]), bf_lo(w[1]), bf_hi(w[1]))[i]
+
+
+def poll_cells(addr, cells):
+    """Load the cells at ``addr`` (system scope) until none is empty: [(w0, w1)]."""
+
+    def load_all():
+        words = []
+        for at in cells:
+            w = fx.Vector(
+                bo.buffer_load(
+                    rsrc(addr), at * 2, vec_width=2, dtype=T.i32, cache_modifier=CM_SYS
+                )
+            )
+            words += [w[0], w[1]]
+        return fx.Vector.from_elements(words, fx.Int32)
+
+    def pending(v):
+        # word by word: a cell whose 8 B land as two 4-B halves reads as pending until both do
+        bad = v[0] == CELL_EMPTY
+        for e in range_constexpr(1, 2 * len(cells)):
+            bad = bad | (v[e] == CELL_EMPTY)
+        return bad
+
+    v = _spin(load_all, pending)
+    return [(v[2 * k], v[2 * k + 1]) for k in range(len(cells))]
 
 
 @flyc.jit

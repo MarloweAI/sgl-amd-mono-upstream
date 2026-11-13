@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Adapted from AKLR (https://github.com/AMD-AGI/AKLR, MIT, Copyright (C) 2025-2026 Advanced Micro Devices, Inc.).
-// A sampled DSpark draft's Markov step on this rank's vocab shard as SGLang's MarkovSampleStep: the bias GEMV, the
-// Philox Gumbel-max scores and the shard's bests (step), then the ranks' bests swapped through peer buffers (finish).
+// A sampled DSpark draft's Markov block on this rank's vocab shard as SGLang's MarkovSampleStep, every step in one
+// launch: each step's bias GEMV, Philox Gumbel-max scores and the shard's bests, the ranks' bests swapped through
+// peer buffers. Each rank keeps its shard of the sampled sequences' step logits in its exchange buffer;
+// gather_step_logits copies every rank's shard into the whole rows, for a reader that needs them.
 #include <climits>
 #include <cstdint>
 
@@ -22,37 +24,55 @@ using bfloat16 = __bf16;
 using uint32x4 = uint32_t __attribute__((ext_vector_type(4)));
 
 constexpr int DIM           = 256;
-constexpr int THREADS       = 256;
+constexpr int THREADS       = 512;
 constexpr int ROW_LANES     = 16; // a vocab row's DIM by 16 lanes, 16 values each
 constexpr int ROWS_PER_PASS = THREADS / ROW_LANES;
-constexpr int PASSES        = 4;
-constexpr int BLOCK_ROWS    = ROWS_PER_PASS * PASSES;
-constexpr int FINISH        = 512;
+constexpr int PASSES        = 8;
+constexpr int BLOCK_ROWS    = ROWS_PER_PASS * PASSES; // 256: a block's rows, a row a thread when scored
+constexpr int WAVE          = 64;
 constexpr int MAX_SEQ       = 4;
 constexpr int MAX_TP        = 8;
-constexpr int SLOTS         = 16; // a sequence's packets: two halves by call parity, a rank's slot in each
-// the exchange buffer: every sequence's slots, 16 B each (markov.py's EXCHANGE_BYTES)
+constexpr int MAX_STEPS     = 8;
+constexpr int MAX_BLOCKS    = 256; // a block a CU at most: a TP2 shard's 64640 rows are 253
+constexpr int POLL_ONE      = 8;   // a step's records a lane of wave 0, one sequence (every rank's blocks: at most 512)
+// the exchange buffer: every block's step record, 8 B each [launch parity 2][step][sequence][source rank][block]
+// (markov.py's EXCHANGE_BYTES), then the rank's step logits [MAX_SEQ, gamma, part] f32
+constexpr int EXCHANGE_BYTES = 2 * MAX_STEPS * MAX_SEQ * MAX_TP * MAX_BLOCKS * 8;
+// a record: the candidate key (ordered score bits, then the inverted global index) above a 15-bit launch tag
+constexpr int      TAG_BITS = 15;
+constexpr uint64_t TAG_MASK = (1ull << TAG_BITS) - 1;
+constexpr int      IDX_BITS = 17; // the vocab (129280) below 2^17
+constexpr uint32_t IDX_MASK = (1u << IDX_BITS) - 1;
 
 struct Params {
-    const bfloat16 *logits; // this step's base logits, sequence s's row at logits + s * logits_stride
-    int64_t         logits_stride;
+    const bfloat16 *logits; // base logits, sequence s's step t row at logits + s * logits_stride + t * step_stride
+    int64_t         logits_stride, step_stride;
     const bfloat16 *embed; // markov_w1 [vocab, DIM]
     const bfloat16 *head;  // this rank's markov_w2 rows [width, DIM]
     const int64_t  *anchor; // sequence s's at anchor[s * anchor_stride]
     int64_t         anchor_stride;
-    float          *step_logits; // sequence s's row of this step at + s * sl_stride (null: none kept)
-    int64_t         sl_stride;
     const float    *temps; // [nseq]
-    const int64_t  *offset;
+    int64_t        *offset;
     uint32_t        key_lo, key_hi;
-    int             vocab_start, width, padded, step, nseq, blocks, rank, tp, bump_offset;
-    float          *part; // [nseq, blocks, 2]
-    int64_t        *out;  // sequence s's token of this step at out[s * out_stride + step]
+    int             vocab_start, width, padded, gamma, nseq, blocks, rank, tp, part, vocab;
+    int64_t        *out; // sequence s's token of step t at out[s * out_stride + t]
     int64_t         out_stride;
-    int64_t        *tok;   // [nseq] the previous step's token
-    int            *calls; // [nseq]
-    void           *recv[MAX_TP];
+    int64_t        *verify; // or null: sequence s's [anchor | tokens] at verify[s * verify_stride ...] (the verify's ids)
+    int64_t         verify_stride;
+    int64_t        *tok;      // [nseq] the last step's tokens
+    uint32_t       *counts; // [blocks] each block's launches
+    float          *whole; // sequence s's step t row at whole + s * whole_seq_stride + t * whole_step_stride, [vocab]
+    int64_t         whole_seq_stride, whole_step_stride;
+    void           *recv[MAX_TP]; // every rank's exchange buffer
     uint64_t        deadline_ticks;
+    // the draft head in the same launch (draft_head): x [gamma, K] bf16 (the normed rows), this rank's head rows w
+    // [width, K] bf16, base [gamma, padded] tagged bf16 (the base logits, a word a value), gemm_blocks blocks over
+    // tiles 16-row tiles, tiles_per_block of them a block
+    const bfloat16 *x;
+    const bfloat16 *w;
+    int64_t         w_stride;
+    uint64_t       *base;
+    int             K, tiles, tiles_per_block, gemm_blocks;
 };
 
 __device__ inline void keep_best(float &v, int &i, float v2, int i2) {
@@ -73,14 +93,6 @@ __device__ inline void load16f(const bfloat16 *src, float (&v)[16]) {
     }
 }
 
-template <int WIDTH> __device__ inline float lane_sum(float v) {
-#pragma unroll
-    for (int m = WIDTH / 2; m > 0; m /= 2) {
-        v += __shfl_xor(v, m, WIDTH);
-    }
-    return v;
-}
-
 // Philox4x32-10 (tl.philox's): the word k of the four
 __device__ inline uint32_t philox_word(uint32_t k0, uint32_t k1, uint32_t c0, uint32_t c1, uint32_t c2, uint32_t c3,
                                        int k) {
@@ -97,17 +109,18 @@ __device__ inline uint32_t philox_word(uint32_t k0, uint32_t k1, uint32_t c0, ui
     return k == 0 ? c0 : k == 1 ? c1 : k == 2 ? c2 : c3;
 }
 
-__device__ inline float select_key(const Params &p, int seq, int v, float value) {
-    const float t = p.temps[seq];
-    float       key = value;
-    if (t != 0.0f) {
-        const uint32_t g = static_cast<uint32_t>(p.vocab_start + v);
-        const uint32_t w = philox_word(p.key_lo, p.key_hi, g >> 2, static_cast<uint32_t>(seq),
-                                       static_cast<uint32_t>(p.step), static_cast<uint32_t>(p.offset[0]),
-                                       static_cast<int>(g & 3u));
-        const float u = (static_cast<float>(w) + 0.5f) * 2.3283064365386963e-10f;
-        key           = value / t - logf(-log1pf(-u));
-    }
+// the Gumbel noise of a sampled row (it does not depend on the tokens: computed ahead of its step)
+__device__ inline float gumbel(const Params &p, int seq, int step, int64_t offset, int v) {
+    const uint32_t g = static_cast<uint32_t>(p.vocab_start + v);
+    const uint32_t w = philox_word(p.key_lo, p.key_hi, g >> 2, static_cast<uint32_t>(seq), static_cast<uint32_t>(step),
+                                   static_cast<uint32_t>(offset), static_cast<int>(g & 3u));
+    const float u = (static_cast<float>(w) + 0.5f) * 2.3283064365386963e-10f;
+    return logf(-log1pf(-u));
+}
+
+// the row's selection key: its value at temperature 0, else value / t minus its noise
+__device__ inline float select_key(float t, float noise, float value) {
+    const float key = t != 0.0f ? value / t - noise : value;
     return key != key ? INFINITY : key;
 }
 
@@ -141,113 +154,576 @@ __device__ inline uint32x4 poll_tag(const uint32x4 *src, uint32_t tag, uint64_t 
     }
 }
 
-// a block BLOCK_ROWS rows of the shard, held in registers, against every sequence in turn
-__global__ __launch_bounds__(THREADS) void markov_sample_step_kernel(const Params p) {
-    __shared__ float sv[BLOCK_ROWS];
-    const int        lane = threadIdx.x % ROW_LANES, grp = threadIdx.x / ROW_LANES;
-    float            e[16], h[PASSES][16];
-    const auto prev_of = [&](int seq) { return p.step == 0 ? p.anchor[seq * p.anchor_stride] : p.tok[seq]; };
-    load16f(p.embed + prev_of(0) * DIM + lane * 16, e);
+// a step's candidate as one ordered word: the score's bits in order above the inverted global index, so the
+// larger key is the better score, then the lower index (the ranks' shards ascend: the lower rank); 0 is none
+__device__ inline uint64_t candidate_key(float score, int index) {
+    score               = score == 0.0f ? 0.0f : score; // -0 ties +0, as the float compare does
+    const uint32_t bits = __builtin_bit_cast(uint32_t, score);
+    const uint32_t ord  = (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
+    return (static_cast<uint64_t>(ord) << IDX_BITS) | static_cast<uint64_t>(IDX_MASK - static_cast<uint32_t>(index));
+}
+
+__device__ inline int64_t key_index(uint64_t key) {
+    return static_cast<int64_t>(IDX_MASK - static_cast<uint32_t>(key & IDX_MASK));
+}
+
+__device__ inline int64_t record_slot(int parity, int step, int seq, int src, int block) {
+    return ((((static_cast<int64_t>(parity) * MAX_STEPS + step) * MAX_SEQ + seq) * MAX_TP + src) * MAX_BLOCKS) + block;
+}
+
+#ifdef MARKOV_STAMPS // a timing build (tests only): thread 0's realtime ticks per block, past the launch counts
+constexpr int STAMPS = 2 + 5 * MAX_STEPS;
+#define MARKOV_STAMP(k)                                                                                               \
+    if (threadIdx.x == 0)                                                                                              \
+    reinterpret_cast<uint64_t *>(p.counts + MAX_BLOCKS)[blockIdx.x * STAMPS + (k)] = __builtin_amdgcn_s_memrealtime()
+#else
+#define MARKOV_STAMP(k)
+#endif
+
+// DPP moves within a 16-lane row (no LDS): row_ror 8 is lane ^ 8; row_ror 4 is lane ^ 4 once lanes l and l ^ 8 hold
+// equal values; the quad permutations are lane ^ 2 and lane ^ 1
+template <int CTRL> __device__ inline uint32_t dpp(uint32_t v) {
+    return static_cast<uint32_t>(__builtin_amdgcn_update_dpp(0, static_cast<int>(v), CTRL, 0xF, 0xF, false));
+}
+constexpr int ROR8 = 0x128, ROR4 = 0x124, XOR2 = 0x4E, XOR1 = 0xB1;
+
+// lane_sum<16>'s butterfly (xor 8, 4, 2, 1), the same pairs added in the same order: bitwise equal
+__device__ inline float row_sum16(float v) {
+    v += __builtin_bit_cast(float, dpp<ROR8>(__builtin_bit_cast(uint32_t, v)));
+    v += __builtin_bit_cast(float, dpp<ROR4>(__builtin_bit_cast(uint32_t, v)));
+    v += __builtin_bit_cast(float, dpp<XOR2>(__builtin_bit_cast(uint32_t, v)));
+    v += __builtin_bit_cast(float, dpp<XOR1>(__builtin_bit_cast(uint32_t, v)));
+    return v;
+}
+
+// the wave's best (score, index) by keep_best's order: within each row by DPP, then across the four rows
+__device__ inline void wave_best(float &v, int &i) {
+    keep_best(v, i, __builtin_bit_cast(float, dpp<ROR8>(__builtin_bit_cast(uint32_t, v))),
+              static_cast<int>(dpp<ROR8>(static_cast<uint32_t>(i))));
+    keep_best(v, i, __builtin_bit_cast(float, dpp<ROR4>(__builtin_bit_cast(uint32_t, v))),
+              static_cast<int>(dpp<ROR4>(static_cast<uint32_t>(i))));
+    keep_best(v, i, __builtin_bit_cast(float, dpp<XOR2>(__builtin_bit_cast(uint32_t, v))),
+              static_cast<int>(dpp<XOR2>(static_cast<uint32_t>(i))));
+    keep_best(v, i, __builtin_bit_cast(float, dpp<XOR1>(__builtin_bit_cast(uint32_t, v))),
+              static_cast<int>(dpp<XOR1>(static_cast<uint32_t>(i))));
+    keep_best(v, i, __shfl_xor(v, 16, WAVE), __shfl_xor(i, 16, WAVE));
+    keep_best(v, i, __shfl_xor(v, 32, WAVE), __shfl_xor(i, 32, WAVE));
+}
+
+// the wave's largest key: within each row by DPP, then across the four rows
+__device__ inline uint64_t wave_max(uint64_t x) {
+    const auto step = [&](uint64_t y) { return y > x ? y : x; };
+#define MK_DPP64(C) (static_cast<uint64_t>(dpp<C>(static_cast<uint32_t>(x >> 32))) << 32 | dpp<C>(static_cast<uint32_t>(x)))
+    x = step(MK_DPP64(ROR8));
+    x = step(MK_DPP64(ROR4));
+    x = step(MK_DPP64(XOR2));
+    x = step(MK_DPP64(XOR1));
+#undef MK_DPP64
+    x = step(__shfl_xor(x, 16, WAVE));
+    x = step(__shfl_xor(x, 32, WAVE));
+    return x;
+}
+
+__device__ inline float bf16_lo(uint32_t w) { return __builtin_bit_cast(float, w << 16); }
+__device__ inline float bf16_hi(uint32_t w) { return __builtin_bit_cast(float, w & 0xFFFF0000u); }
+
+// ---- the draft head's projection (headgemm.hip's variant 13 tiles, fused_tail.hip's weight stream) ----
+using bf16x8 = __bf16 __attribute__((ext_vector_type(8)));
+using f32x4  = float __attribute__((ext_vector_type(4)));
+constexpr int GEMM_TILE = 16;            // a wave a 16-row tile of the head shard
+constexpr int GEMM_V    = 8;             // 16 B vectors a lane an iteration
+constexpr int GEMM_STEP = 4 * 8 * GEMM_V; // K an iteration (256)
+constexpr int GEMM_GAP  = 32;
+constexpr int WROW_LD   = 512 + 16; // a row's bytes in a wave's LDS tile, padded
+constexpr int HEAD_ROWS = 6, MAX_HEAD_K = 5120; // the x rows in LDS beside the waves' weight tiles
+constexpr int HEAD_LDS  = HEAD_ROWS * MAX_HEAD_K * 2 + (THREADS / WAVE) * GEMM_TILE * WROW_LD;
+
+struct WChunk {
+    bf16x8 v[GEMM_V];
+};
+
+// a wave's 16 weight rows of an iteration (16 x 512 B), non-temporal, whole 128 B lines: load j takes rows 2j and
+// 2j + 1, 32 lanes a row
+__device__ inline WChunk load_wchunk(__amdgpu_buffer_rsrc_t w, const int (&off)[GEMM_V], int it) {
+    WChunk c;
+#pragma unroll
+    for (int j = 0; j < GEMM_V; ++j) {
+        c.v[j] = __builtin_bit_cast(bf16x8, __builtin_amdgcn_raw_buffer_load_b128(w, off[j] + it * GEMM_STEP * 2, 0, 2));
+    }
+    return c;
+}
+
+// this block's tiles of the base logits: tile slot (wave % tiles_per_block), the K part wave / tiles_per_block of
+// the 8 / tiles_per_block parts; the parts summed in order, rounded once, stored tagged into base
+__device__ inline void head_tiles(const Params &p, unsigned char *smem, uint32_t tag) {
+    bfloat16 *xs = reinterpret_cast<bfloat16 *>(smem);
+    const int wave = threadIdx.x / WAVE, lane = threadIdx.x % WAVE;
+    const int K = p.K, M = p.gamma;
+    {
+        const uint32x4 *src = reinterpret_cast<const uint32x4 *>(p.x);
+        uint32x4       *dst = reinterpret_cast<uint32x4 *>(xs);
+        for (int i = threadIdx.x; i < M * K / 8; i += THREADS) dst[i] = src[i];
+    }
+    const int parts = (THREADS / WAVE) / p.tiles_per_block, slot = wave % p.tiles_per_block;
+    const int part  = wave / p.tiles_per_block;
+    const int tile  = slot * p.gemm_blocks + static_cast<int>(blockIdx.x);
+    const int n0 = tile * GEMM_TILE, col = lane % GEMM_TILE, grp = lane / GEMM_TILE;
+    const bool live = tile < p.tiles;
+    const __amdgpu_buffer_rsrc_t wr = __builtin_amdgcn_make_buffer_rsrc(
+        const_cast<bfloat16 *>(p.w), 0, static_cast<int>(int64_t(p.width) * p.w_stride * 2), 0x00020000);
+    const int iters = K / GEMM_STEP / parts, it0 = part * iters;
+    int woff[GEMM_V];
+#pragma unroll
+    for (int j = 0; j < GEMM_V; ++j) {
+        woff[j] = static_cast<int>((int64_t(min(n0 + 2 * j + lane / 32, p.width - 1)) * p.w_stride) * 2 + (lane % 32) * 16);
+    }
+    unsigned char *wl = smem + size_t(HEAD_ROWS) * MAX_HEAD_K * 2 + size_t(wave) * GEMM_TILE * WROW_LD;
+    WChunk buf[2];
+    if (live) { // iters is even (draft_head's check)
+        buf[0] = load_wchunk(wr, woff, it0);
+        buf[1] = load_wchunk(wr, woff, it0 + 1);
+    }
+    __syncthreads();
+    f32x4 acc = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (live) {
+        const bool      mrow = col < M;
+        const bfloat16 *xrow = xs + (mrow ? col : 0) * K + grp * 8;
+        for (int it = 0; it < iters; it += 2) {
+#pragma unroll
+            for (int d = 0; d < 2; ++d) { // the two buffers by constant index: they stay in registers
+                const int i = it + d;
+#pragma unroll
+                for (int j = 0; j < GEMM_V; ++j) {
+                    *reinterpret_cast<bf16x8 *>(wl + (2 * j + lane / 32) * WROW_LD + (lane % 32) * 16) = buf[d].v[j];
+                }
+                if (i + 2 < iters) buf[d] = load_wchunk(wr, woff, it0 + i + 2);
+                WChunk wb, xa;
+#pragma unroll
+                for (int j = 0; j < GEMM_V; ++j) {
+                    wb.v[j] = *reinterpret_cast<const bf16x8 *>(wl + col * WROW_LD + j * 64 + grp * 16);
+                    xa.v[j] = mrow ? *reinterpret_cast<const bf16x8 *>(xrow + (it0 + i) * GEMM_STEP + j * GEMM_GAP)
+                                   : bf16x8{};
+                }
+#pragma unroll
+                for (int j = 0; j < GEMM_V; ++j) {
+                    acc = __builtin_amdgcn_mfma_f32_16x16x32_bf16(xa.v[j], wb.v[j], acc, 0, 0, 0);
+                }
+            }
+        }
+    }
+    // the K parts through LDS (over the x rows, done), part 0 adds them in order
+    __syncthreads();
+    float *red = reinterpret_cast<float *>(smem);
+    if (part > 0) {
+#pragma unroll
+        for (int r = 0; r < 4; ++r) red[((part - 1) * p.tiles_per_block + slot) * 256 + r * WAVE + lane] = acc[r];
+    }
+    __syncthreads();
+    if (part == 0 && live) {
+        for (int q = 1; q < parts; ++q) {
+#pragma unroll
+            for (int r = 0; r < 4; ++r) acc[r] += red[((q - 1) * p.tiles_per_block + slot) * 256 + r * WAVE + lane];
+        }
+        const int n = n0 + col;
+#pragma unroll
+        for (int r = 0; r < 4; ++r) {
+            const int row = 4 * grp + r;
+            if (row < M && n < p.width) {
+                const uint32_t bits = __builtin_bit_cast(uint16_t, static_cast<bfloat16>(acc[r]));
+                __hip_atomic_store(p.base + static_cast<int64_t>(row) * p.padded + n,
+                                   static_cast<uint64_t>(tag) << 32 | bits, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+            }
+        }
+    }
+}
+
+// the whole block in one launch, the grid co-resident (a block a CU at most, two waves an EU):
+// a block keeps BLOCK_ROWS rows of the shard in registers (bf16) for every step; each step every block stores its
+// best key into its slot of every rank's records and reads every rank's blocks' records from its own buffer: the
+// grid barrier and the ranks' swap at once, one cross-GPU trip a step, no atomics. ONE: one sequence, its own build
+// (the batched sequences' registers are not held through its steps): each step's dots and scores without a barrier
+// between them, the token's embedding row read by wave 0 and handed to the block through LDS
+template <bool ONE, bool FUSED = false>
+__global__ __launch_bounds__(THREADS) __attribute__((amdgpu_waves_per_eu(2))) void
+markov_block_kernel(const Params p) {
+    static_assert(ONE || !FUSED, "the fused head serves one sequence");
+    const int nseq = ONE ? 1 : p.nseq;
+    constexpr int SEQS = ONE ? 1 : MAX_SEQ;
+    __shared__ float    sv[SEQS][BLOCK_ROWS]; // the bias GEMV of each sequence
+    __shared__ float    sbase[MAX_STEPS][SEQS][BLOCK_ROWS]; // the block's rows' base logits of every step
+    __shared__ float    snoise[SEQS][BLOCK_ROWS]; // the sampled sequences' noise of this step
+    __shared__ float    wave_bestv[SEQS][BLOCK_ROWS / WAVE];
+    __shared__ int      wave_bi[SEQS][BLOCK_ROWS / WAVE];
+    __shared__ uint64_t wave_key[THREADS / WAVE]; // one sequence: each wave's best candidate key
+    __shared__ __attribute__((aligned(16))) bfloat16 erow[DIM]; // one sequence: the step's token's embedding row
+    __shared__ uint64_t top_key[SEQS][THREADS / WAVE];
+    __shared__ int64_t  prev[SEQS];
+    __shared__ float    stemp[SEQS]; // the sequences' temperatures, read once
+    __shared__ uint32_t s_count;
+    const int           lane = threadIdx.x % ROW_LANES, grp = threadIdx.x / ROW_LANES;
+    const int           row  = blockIdx.x * BLOCK_ROWS + threadIdx.x; // scoring: a row a thread of the first 256
+    const bool          scorer = threadIdx.x < BLOCK_ROWS;
+    float               e[16];
+    uint32_t            h[PASSES][8]; // 16 bf16 a pass, exact as f32
+    MARKOV_STAMP(0);
 #pragma unroll
     for (int ps = 0; ps < PASSES; ++ps) {
         const int v = blockIdx.x * BLOCK_ROWS + ps * ROWS_PER_PASS + grp;
         if (v < p.width) {
-            load16f(p.head + static_cast<int64_t>(v) * DIM + lane * 16, h[ps]);
+            const uint4 *src = reinterpret_cast<const uint4 *>(p.head + static_cast<int64_t>(v) * DIM + lane * 16);
+            const uint4  lo = src[0], hi = src[1];
+            h[ps][0] = lo.x, h[ps][1] = lo.y, h[ps][2] = lo.z, h[ps][3] = lo.w;
+            h[ps][4] = hi.x, h[ps][5] = hi.y, h[ps][6] = hi.z, h[ps][7] = hi.w;
         }
     }
-    for (int seq = 0; seq < p.nseq; ++seq) {
-        if (seq > 0) {
-            load16f(p.embed + prev_of(seq) * DIM + lane * 16, e);
+    if constexpr (FUSED) {
+        // this launch's base logits: every block's tiles, tagged with the launch count; the Markov blocks (the
+        // first p.blocks) hold their rows of the shard in registers meanwhile
+        extern __shared__ __align__(16) unsigned char smem[];
+        const uint32_t launch = p.counts[blockIdx.x];
+        head_tiles(p, smem, 1 + launch % static_cast<uint32_t>(TAG_MASK));
+        if (static_cast<int>(blockIdx.x) >= p.blocks) {
+            __syncthreads();
+            if (threadIdx.x == 0) p.counts[blockIdx.x] = launch + 1;
+            return;
         }
+        if (scorer && row < p.padded) {
+            const uint32_t want = 1 + launch % static_cast<uint32_t>(TAG_MASK);
+            for (int step = 0; step < p.gamma; ++step) {
+                uint64_t v, t0 = 0;
+                for (int n = 1;; ++n) {
+                    v = __hip_atomic_load(p.base + static_cast<int64_t>(step) * p.padded + row, __ATOMIC_RELAXED,
+                                          __HIP_MEMORY_SCOPE_AGENT);
+                    if (static_cast<uint32_t>(v >> 32) == want) break;
+                    __builtin_amdgcn_s_sleep(1);
+                    if (n % 1024 == 0) { // past the deadline the launch traps, stopping this rank's step
+                        const uint64_t now = __builtin_amdgcn_s_memrealtime();
+                        if (t0 == 0) t0 = now;
+                        else if (now - t0 > p.deadline_ticks) __builtin_trap();
+                    }
+                }
+                sbase[step][0][threadIdx.x] = __builtin_bit_cast(float, static_cast<uint32_t>(v) << 16);
+            }
+        }
+    } else if (scorer && row < p.padded) {
+        // every step's base logits at the start: no step waits for a load of them
+        for (int step = 0; step < p.gamma; ++step) {
+            for (int seq = 0; seq < nseq; ++seq) {
+                sbase[step][seq][threadIdx.x] =
+                    static_cast<float>(p.logits[seq * p.logits_stride + step * p.step_stride + row]);
+            }
+        }
+    }
+    if (threadIdx.x == 0) {
+        s_count = p.counts[blockIdx.x];
+    }
+    if (threadIdx.x < nseq) {
+        prev[threadIdx.x]  = p.anchor[threadIdx.x * p.anchor_stride];
+        stemp[threadIdx.x] = p.temps[threadIdx.x];
+        if (blockIdx.x == 0 && p.verify != nullptr) p.verify[threadIdx.x * p.verify_stride] = prev[threadIdx.x];
+    }
+    if (ONE && threadIdx.x < WAVE) { // a lane 4 values of the anchor's embedding row
+        reinterpret_cast<uint2 *>(erow)[threadIdx.x] =
+            *reinterpret_cast<const uint2 *>(p.embed + p.anchor[0] * DIM + threadIdx.x * 4);
+    }
+    const int64_t offset = p.offset[0];
+    // a step's noise: every row of every sampled sequence, two a thread at most (temps: the step's reads of the
+    // temperatures, p.temps before the first barrier, stemp after it)
+    const auto noise_of = [&](int step, const float *temps) {
+        for (int i = threadIdx.x; i < nseq * BLOCK_ROWS; i += THREADS) {
+            const int seq = i / BLOCK_ROWS, r = i % BLOCK_ROWS, v = blockIdx.x * BLOCK_ROWS + r;
+            if (temps[seq] != 0.0f && v < p.width) {
+                snoise[seq][r] = gumbel(p, seq, step, offset, v);
+            }
+        }
+    };
+    noise_of(0, p.temps);
+    __syncthreads();
+    const uint32_t count  = s_count;
+    const uint64_t tag    = 1 + count % static_cast<uint32_t>(TAG_MASK); // never 0; the launch two back differs
+    const int      parity = static_cast<int>(count & 1u);
+    float         *slab   = reinterpret_cast<float *>(static_cast<char *>(p.recv[p.rank]) + EXCHANGE_BYTES);
+    uint64_t      *mine   = static_cast<uint64_t *>(p.recv[p.rank]);
+    const int      polls  = nseq * p.tp * p.blocks; // records a step, at most 4 a thread
+    MARKOV_STAMP(1);
+    for (int step = 0; step < p.gamma; ++step) {
+        if constexpr (ONE) {
+            // the dots, then the scores without a barrier: a pass's row dot lands in all 16 lanes of its group,
+            // lane ps of the group keeps pass ps's, and lanes 0-7 then score their rows (row lane * 32 + group)
+            load16f(erow + lane * 16, e);
+            float own = 0.0f;
 #pragma unroll
-        for (int ps = 0; ps < PASSES; ++ps) {
-            const int v   = blockIdx.x * BLOCK_ROWS + ps * ROWS_PER_PASS + grp;
-            float     dot = 0.0f;
-            if (v < p.width) {
+            for (int ps = 0; ps < PASSES; ++ps) {
+                const int v   = blockIdx.x * BLOCK_ROWS + ps * ROWS_PER_PASS + grp;
+                float     dot = 0.0f;
+                if (v < p.width) {
 #pragma unroll
-                for (int i = 0; i < 16; ++i) {
-                    dot += e[i] * h[ps][i];
+                    for (int i = 0; i < 8; ++i) {
+                        dot += e[2 * i] * bf16_lo(h[ps][i]);
+                        dot += e[2 * i + 1] * bf16_hi(h[ps][i]);
+                    }
+                }
+                dot  = row_sum16(dot);
+                own = lane == ps ? dot : own;
+            }
+            float best = -INFINITY;
+            int   bi   = INT_MAX;
+            if (lane < PASSES) {
+                const int r = lane * ROWS_PER_PASS + grp, v = blockIdx.x * BLOCK_ROWS + r;
+                if (v < p.padded) {
+                    const float value = sbase[step][0][r] + (v < p.width ? round_bf16(own) : 0.0f);
+                    if (stemp[0] != 0.0f) { // a sampled sequence's step logits, for the gather
+                        slab[static_cast<int64_t>(step) * p.part + v] = value;
+                    }
+                    if (v < p.width) {
+                        best = select_key(stemp[0], snoise[0][r], value);
+                        bi   = v;
+                    }
                 }
             }
-            dot = lane_sum<ROW_LANES>(dot);
-            if (lane == 0) {
-                sv[ps * ROWS_PER_PASS + grp] = dot;
+            wave_best(best, bi);
+            if (threadIdx.x % WAVE == 0) {
+                wave_key[threadIdx.x / WAVE] = bi == INT_MAX ? 0ull : candidate_key(best, bi + p.vocab_start);
+            }
+            MARKOV_STAMP(5 + 5 * step);
+        } else {
+            // every sequence's bias rows, then one barrier
+            for (int seq = 0; seq < nseq; ++seq) {
+                load16f(p.embed + prev[seq] * DIM + lane * 16, e);
+#pragma unroll
+                for (int ps = 0; ps < PASSES; ++ps) {
+                    const int v   = blockIdx.x * BLOCK_ROWS + ps * ROWS_PER_PASS + grp;
+                    float     dot = 0.0f;
+                    if (v < p.width) {
+#pragma unroll
+                        for (int i = 0; i < 8; ++i) {
+                            dot += e[2 * i] * bf16_lo(h[ps][i]);
+                            dot += e[2 * i + 1] * bf16_hi(h[ps][i]);
+                        }
+                    }
+                    dot = row_sum16(dot);
+                    if (lane == 0) {
+                        sv[seq][ps * ROWS_PER_PASS + grp] = dot;
+                    }
+                }
+            }
+            MARKOV_STAMP(5 + 5 * step);
+            __syncthreads();
+            // the scores: two sequences at a time, the first four waves one and the last four the next
+            for (int pair = 0; pair < nseq; pair += THREADS / BLOCK_ROWS) {
+                const int seq = pair + threadIdx.x / BLOCK_ROWS, r = threadIdx.x % BLOCK_ROWS;
+                const int v   = blockIdx.x * BLOCK_ROWS + r;
+                if (seq < nseq) {
+                    float best = -INFINITY;
+                    int   bi   = INT_MAX;
+                    if (v < p.padded) {
+                        const float bias  = v < p.width ? round_bf16(sv[seq][r]) : 0.0f;
+                        const float value = sbase[step][seq][r] + bias;
+                        if (stemp[seq] != 0.0f) { // a sampled sequence's step logits, for the gather
+                            slab[(static_cast<int64_t>(seq) * p.gamma + step) * p.part + v] = value;
+                        }
+                        if (v < p.width) {
+                            best = select_key(stemp[seq], snoise[seq][r], value);
+                            bi   = v;
+                        }
+                    }
+                    wave_best(best, bi);
+                    if (r % WAVE == 0) {
+                        wave_bestv[seq][r / WAVE] = best, wave_bi[seq][r / WAVE] = bi;
+                    }
+                }
             }
         }
         __syncthreads();
-        // the first wave: a row a lane
-        if (threadIdx.x < BLOCK_ROWS) {
-            const int v    = blockIdx.x * BLOCK_ROWS + threadIdx.x;
-            float     best = -INFINITY;
-            int       bi   = INT_MAX;
-            if (v < p.padded) {
-                const float bias  = v < p.width ? round_bf16(sv[threadIdx.x]) : 0.0f;
-                const float value = static_cast<float>(p.logits[seq * p.logits_stride + v]) + bias;
-                if (p.step_logits != nullptr) {
-                    p.step_logits[seq * p.sl_stride + v] = value;
-                }
-                if (v < p.width) {
-                    best = select_key(p, seq, v, value);
-                    bi   = v;
+        MARKOV_STAMP(2 + 5 * step);
+        if constexpr (ONE) {
+            // one sequence: the exchange on wave 0 alone; waves 1-4 the next step's noise meanwhile
+            if (step + 1 < p.gamma && threadIdx.x >= WAVE && stemp[0] != 0.0f) {
+                const int r = threadIdx.x - WAVE, v = blockIdx.x * BLOCK_ROWS + r;
+                if (r < BLOCK_ROWS && v < p.width) {
+                    snoise[0][r] = gumbel(p, 0, step + 1, offset, v);
                 }
             }
+            if (threadIdx.x < WAVE) {
+                const int l = threadIdx.x;
+                // the block's key: the waves' keys, lane l holding wave l % 8's, maximum over each 16-lane row
+                uint64_t key = wave_key[l % (THREADS / WAVE)];
+                const auto take = [&](uint64_t y) { key = y > key ? y : key; };
+#define MK_DPP64(C) (static_cast<uint64_t>(dpp<C>(static_cast<uint32_t>(key >> 32))) << 32 | dpp<C>(static_cast<uint32_t>(key)))
+                take(MK_DPP64(ROR4));
+                take(MK_DPP64(XOR2));
+                take(MK_DPP64(XOR1));
+#undef MK_DPP64
+                // the block's record into every rank's slot, then every rank's blocks' records (one trip), up to
+                // POLL_ONE a lane in flight together until each carries the tag
+                if (l < p.tp) {
+                    __hip_atomic_store(static_cast<uint64_t *>(p.recv[l]) + record_slot(parity, step, 0, p.rank, blockIdx.x),
+                                       (key << TAG_BITS) | tag, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+                }
+                MARKOV_STAMP(3 + 5 * step);
+                uint64_t top = 0, t0 = 0;
+                uint32_t pending = 0;
 #pragma unroll
-            for (int m = BLOCK_ROWS / 2; m > 0; m /= 2) {
-                keep_best(best, bi, __shfl_xor(best, m, BLOCK_ROWS), __shfl_xor(bi, m, BLOCK_ROWS));
+                for (int k = 0; k < POLL_ONE; ++k) {
+                    pending |= (l + k * WAVE < p.tp * p.blocks ? 1u : 0u) << k;
+                }
+                for (int n = 1; pending; ++n) {
+                    uint64_t v[POLL_ONE];
+#pragma unroll
+                    for (int k = 0; k < POLL_ONE; ++k) {
+                        const int i = l + k * WAVE;
+                        if ((pending >> k) & 1u) {
+                            v[k] = __hip_atomic_load(mine + record_slot(parity, step, 0, i / p.blocks, i % p.blocks),
+                                                     __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+                        }
+                    }
+#pragma unroll
+                    for (int k = 0; k < POLL_ONE; ++k) {
+                        if (((pending >> k) & 1u) && (v[k] & TAG_MASK) == tag) {
+                            top = v[k] >> TAG_BITS > top ? v[k] >> TAG_BITS : top;
+                            pending &= ~(1u << k);
+                        }
+                    }
+                    if (pending && n % 1024 == 0) { // past the deadline the launch traps, stopping this rank's step
+                        const uint64_t now = __builtin_amdgcn_s_memrealtime();
+                        if (t0 == 0) {
+                            t0 = now;
+                        } else if (now - t0 > p.deadline_ticks) {
+                            __builtin_trap();
+                        }
+                    }
+                }
+                top = wave_max(top);
+                MARKOV_STAMP(6 + 5 * step);
+                const int64_t tok = key_index(top);
+                if (step + 1 < p.gamma) {
+                    reinterpret_cast<uint2 *>(erow)[l] = *reinterpret_cast<const uint2 *>(p.embed + tok * DIM + l * 4);
+                }
+                if (l == 0) {
+                    prev[0]           = tok;
+                    if (blockIdx.x == 0) {
+                        p.out[step] = tok;
+                        if (p.verify != nullptr) p.verify[1 + step] = tok;
+                    }
+                }
             }
-            if (threadIdx.x == 0) {
-                float *part = p.part + 2 * (static_cast<int64_t>(seq) * p.blocks + blockIdx.x);
-                part[0]     = best;
-                part[1]     = __int_as_float(bi);
+            __syncthreads();
+        } else {
+            // this block's record of each sequence into every rank's slot
+            if (threadIdx.x < nseq * p.tp) {
+                const int seq = threadIdx.x / p.tp, r = threadIdx.x % p.tp;
+                float     best = wave_bestv[seq][0];
+                int       bi   = wave_bi[seq][0];
+    #pragma unroll
+                for (int w = 1; w < BLOCK_ROWS / WAVE; ++w) {
+                    keep_best(best, bi, wave_bestv[seq][w], wave_bi[seq][w]);
+                }
+                const uint64_t key = bi == INT_MAX ? 0ull : candidate_key(best, bi + p.vocab_start);
+                __hip_atomic_store(static_cast<uint64_t *>(p.recv[r]) + record_slot(parity, step, seq, p.rank, blockIdx.x),
+                                   (key << TAG_BITS) | tag, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
             }
+            if (step + 1 < p.gamma) { // the next step's noise while the records cross (snoise's reads are behind a barrier)
+                noise_of(step + 1, stemp);
+            }
+            MARKOV_STAMP(3 + 5 * step);
+            // every rank's blocks' records of the step: each thread's (at most 4) in flight together until all carry the tag
+            uint64_t got[4] = {0, 0, 0, 0};
+            uint32_t pending = 0;
+    #pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                pending |= (threadIdx.x + k * THREADS < polls ? 1u : 0u) << k;
+            }
+            const auto slot_of = [&](int i) {
+                const int b = i % p.blocks, src = (i / p.blocks) % p.tp, seq = i / (p.blocks * p.tp);
+                return mine + record_slot(parity, step, seq, src, b);
+            };
+            uint64_t t0 = 0;
+            for (int n = 1; pending; ++n) {
+                uint64_t v[4];
+    #pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    if ((pending >> k) & 1u) {
+                        v[k] = __hip_atomic_load(slot_of(threadIdx.x + k * THREADS), __ATOMIC_RELAXED,
+                                                 __HIP_MEMORY_SCOPE_SYSTEM);
+                    }
+                }
+    #pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    if (((pending >> k) & 1u) && (v[k] & TAG_MASK) == tag) {
+                        got[k] = v[k] >> TAG_BITS;
+                        pending &= ~(1u << k);
+                    }
+                }
+                if (pending && n % 1024 == 0) { // past the deadline the launch traps, stopping this rank's step
+                    const uint64_t now = __builtin_amdgcn_s_memrealtime();
+                    if (t0 == 0) {
+                        t0 = now;
+                    } else if (now - t0 > p.deadline_ticks) {
+                        __builtin_trap();
+                    }
+                }
+            }
+            MARKOV_STAMP(6 + 5 * step);
+            // the best record of each sequence: a wave's maximum, then the waves'
+            for (int s = 0; s < nseq; ++s) {
+                uint64_t x = 0;
+    #pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    const int i = threadIdx.x + k * THREADS;
+                    if (i < polls && i / (p.blocks * p.tp) == s) {
+                        x = got[k] > x ? got[k] : x;
+                    }
+                }
+                x = wave_max(x);
+                if (threadIdx.x % WAVE == 0) {
+                    top_key[s][threadIdx.x / WAVE] = x;
+                }
+            }
+            __syncthreads();
+            if (threadIdx.x < nseq) {
+                uint64_t top = 0;
+    #pragma unroll
+                for (int w = 0; w < THREADS / WAVE; ++w) {
+                    top = top_key[threadIdx.x][w] > top ? top_key[threadIdx.x][w] : top;
+                }
+                const int64_t tok = key_index(top);
+                prev[threadIdx.x] = tok;
+                if (blockIdx.x == 0) {
+                    p.out[threadIdx.x * p.out_stride + step] = tok;
+                    if (p.verify != nullptr) p.verify[threadIdx.x * p.verify_stride + 1 + step] = tok;
+                }
+            }
+            __syncthreads();
         }
-        __syncthreads(); // sv free for the next sequence
+        MARKOV_STAMP(4 + 5 * step);
+    }
+    if (threadIdx.x == 0) {
+        p.counts[blockIdx.x] = count + 1;
+    }
+    if (blockIdx.x == 0 && threadIdx.x < nseq) {
+        p.tok[threadIdx.x] = prev[threadIdx.x];
+        if (threadIdx.x == 0) { // every block read the counter before its first record
+            p.offset[0] = offset + 1;
+        }
     }
 }
 
-// a block a sequence: the shard's best, then the ranks' swapped
-__global__ __launch_bounds__(FINISH) void markov_sample_finish_kernel(const Params p) {
-    __shared__ float sv[FINISH];
-    __shared__ int   si[FINISH];
-    const int        seq  = blockIdx.x;
-    const float     *part = p.part + 2 * static_cast<int64_t>(seq) * p.blocks;
-    float            best = -INFINITY;
-    int              bi   = INT_MAX;
-    for (int b = threadIdx.x; b < p.blocks; b += FINISH) {
-        keep_best(best, bi, part[2 * b], __float_as_int(part[2 * b + 1]));
-    }
-    sv[threadIdx.x] = best, si[threadIdx.x] = bi;
-    __syncthreads();
-    for (int half = FINISH / 2; half > 0; half /= 2) {
-        if (threadIdx.x < half) {
-            keep_best(sv[threadIdx.x], si[threadIdx.x], sv[threadIdx.x + half], si[threadIdx.x + half]);
-        }
-        __syncthreads();
-    }
-    if (threadIdx.x != 0) {
+// every rank's shard of the sampled sequences' step logits (each rank's exchange buffer, past EXCHANGE_BYTES, as the
+// Markov launch left them) into the whole rows
+__global__ __launch_bounds__(THREADS) void gather_kernel(const Params p) {
+    const int row = blockIdx.y; // (sequence, step, source rank)
+    const int seq = row / (p.gamma * p.tp), step = (row / p.tp) % p.gamma, src = row % p.tp;
+    if (p.temps[seq] == 0.0f) {
         return;
     }
-    uint32_t call = static_cast<uint32_t>(p.calls[seq]) + 1;
-    call          = call ? call : 1;
-    const auto slot = [&](int src) { return seq * SLOTS + static_cast<int>(call % 2) * 8 + src; };
-    const uint32x4 mine{__builtin_bit_cast(uint32_t, sv[0]), static_cast<uint32_t>(si[0] + p.vocab_start), 0, call};
-    for (int r = 0; r < p.tp; ++r) {
-        store_nt(static_cast<uint32x4 *>(p.recv[r]) + slot(p.rank), mine);
-    }
-    float   top = -INFINITY;
-    int64_t tok = INT_MAX;
-    for (int r = 0; r < p.tp; ++r) { // the best key, the lowest index (rank) on ties
-        const uint32x4 pk = poll_tag(static_cast<const uint32x4 *>(p.recv[p.rank]) + slot(r), call, p.deadline_ticks);
-        const float    v  = __builtin_bit_cast(float, pk.x);
-        if (r == 0 || v > top) {
-            top = v, tok = static_cast<int64_t>(pk.y);
-        }
-    }
-    p.out[seq * p.out_stride + p.step] = tok;
-    p.tok[seq]                         = tok;
-    p.calls[seq]                       = static_cast<int>(call);
-    if (p.bump_offset && seq == 0) { // the block's last step: every step kernel read the counter
-        const_cast<int64_t *>(p.offset)[0] += 1;
+    const int       start = src * p.part;
+    const int       quads = min(p.part, p.vocab - start) / 4;
+    const uint32x4 *from  = reinterpret_cast<const uint32x4 *>(static_cast<const char *>(p.recv[src]) + EXCHANGE_BYTES) +
+                           (static_cast<int64_t>(seq) * p.gamma + step) * (p.part / 4);
+    uint32x4 *to = reinterpret_cast<uint32x4 *>(p.whole + seq * p.whole_seq_stride + step * p.whole_step_stride + start);
+    const int i  = blockIdx.x * THREADS + threadIdx.x;
+    if (i < quads) {
+        to[i] = load_nt(from + i);
     }
 }
 
@@ -258,79 +734,184 @@ void check(const at::Tensor &t, const at::Tensor &ref, at::ScalarType dtype, con
                 " must have unit inner stride");
 }
 
-// logits [nseq, padded] bf16 (this step's rows), embed [vocab, 256], head [width, 256] bf16, anchor / tok [nseq]
-// int64, step_logits [nseq, >= padded] f32 rows or none, temps [nseq] f32, offset [1] int64, part [nseq, blocks, 2]
-// f32 scratch, out int64 (sequence s's step token at s * out_stride + step), calls [nseq] int32, peers [tp] int64 on
-// the host: every rank's exchange buffer
-void markov_sample_step(const at::Tensor &logits, const at::Tensor &embed, const at::Tensor &head,
-                        const at::Tensor &anchor, const std::optional<at::Tensor> &step_logits,
-                        const at::Tensor &temps, const at::Tensor &offset, int64_t key, int64_t vocab_start,
-                        int64_t step, at::Tensor &part, at::Tensor &out, int64_t out_stride, at::Tensor &tok,
-                        at::Tensor &calls, const at::Tensor &peers, int64_t rank, bool bump_offset,
-                        double deadline_s) {
-    const int64_t nseq  = logits.size(0);
+// the Markov block's launch parameters: nseq sequences of gamma steps over padded columns (base logits at logits, or
+// the launch's own); embed [vocab, 256], head [width, 256] bf16, anchor / tok [nseq] int64, temps [nseq] f32, offset
+// [1] int64 (advanced once), out int64 (sequence s's step t token at s * out_stride + t), control int32 [blocks]
+// (zeroed once), peers [tp] int64 on the host: every rank's exchange buffer; whole [nseq, gamma, vocab] f32 (any
+// outer strides): the rows gather_step_logits fills, every rank's shard of part columns
+Params markov_params(int64_t nseq, int64_t gamma, int64_t padded, const at::Tensor &ref, const at::Tensor &embed,
+                     const at::Tensor &head, const at::Tensor &anchor, const at::Tensor &temps, at::Tensor &offset,
+                     int64_t key, int64_t vocab_start, at::Tensor &out, int64_t out_stride, at::Tensor &tok,
+                     at::Tensor &control, const at::Tensor &peers, int64_t rank, at::Tensor &whole, int64_t part,
+                     double deadline_s, const c10::optional<at::Tensor> &verify) {
     const int64_t width = head.size(0);
-    TORCH_CHECK(logits.dim() == 2 && nseq >= 1 && nseq <= MAX_SEQ, "logits [1 .. ", MAX_SEQ, " sequences, padded]");
+    TORCH_CHECK(nseq >= 1 && nseq <= MAX_SEQ && gamma >= 1 && gamma <= MAX_STEPS,
+                "1 .. ", MAX_SEQ, " sequences, 1 .. ", MAX_STEPS, " steps");
     TORCH_CHECK(head.dim() == 2 && head.size(1) == DIM && head.is_contiguous() && embed.dim() == 2 &&
-                    embed.size(1) == DIM && embed.is_contiguous() && width <= logits.size(1),
+                    embed.size(1) == DIM && embed.is_contiguous() && width <= padded,
                 "head [width, 256], embed [vocab, 256] contiguous");
-    check(logits, logits, at::kBFloat16, "logits");
-    check(embed, logits, at::kBFloat16, "embed");
-    check(head, logits, at::kBFloat16, "head");
-    TORCH_CHECK(anchor.device() == logits.device() && anchor.scalar_type() == at::kLong && anchor.dim() == 1 &&
+    check(embed, ref, at::kBFloat16, "embed");
+    check(head, ref, at::kBFloat16, "head");
+    TORCH_CHECK(anchor.device() == ref.device() && anchor.scalar_type() == at::kLong && anchor.dim() == 1 &&
                     anchor.size(0) >= nseq,
                 "anchor [nseq] int64 (any stride)");
-    check(temps, logits, at::kFloat, "temps");
-    check(offset, logits, at::kLong, "offset");
-    check(part, logits, at::kFloat, "part");
-    check(out, logits, at::kLong, "out");
-    check(tok, logits, at::kLong, "tok");
-    check(calls, logits, at::kInt, "calls");
+    check(temps, ref, at::kFloat, "temps");
+    check(offset, ref, at::kLong, "offset");
+    check(out, ref, at::kLong, "out");
+    check(tok, ref, at::kLong, "tok");
+    check(control, ref, at::kInt, "control");
+    check(whole, ref, at::kFloat, "whole");
     TORCH_CHECK(peers.device().is_cpu() && peers.scalar_type() == at::kLong && peers.numel() >= 1 &&
                     peers.numel() <= MAX_TP,
                 "peers: every rank's exchange buffer (int64, host)");
+    const int64_t vocab = whole.size(2);
+    TORCH_CHECK(whole.dim() == 3 && whole.size(0) >= nseq && whole.size(1) == gamma, "whole [nseq, gamma, vocab]");
+    TORCH_CHECK(part % 4 == 0 && vocab % 4 == 0 && whole.stride(0) % 4 == 0 && whole.stride(1) % 4 == 0 &&
+                    reinterpret_cast<uintptr_t>(whole.data_ptr()) % 16 == 0 && padded <= part,
+                "16 B aligned rows and shards, the padded shard within part");
+    TORCH_CHECK(peers.numel() * part >= vocab && (peers.numel() - 1) * part < vocab, "the shards tile the vocab");
     Params p{};
-    p.logits        = static_cast<const bfloat16 *>(logits.data_ptr());
-    p.logits_stride = logits.stride(0);
     p.embed         = static_cast<const bfloat16 *>(embed.data_ptr());
     p.head          = static_cast<const bfloat16 *>(head.data_ptr());
     p.anchor        = anchor.data_ptr<int64_t>();
     p.anchor_stride = anchor.stride(0);
-    if (step_logits) {
-        check(*step_logits, logits, at::kFloat, "step_logits");
-        TORCH_CHECK(step_logits->dim() == 2 && step_logits->size(0) >= nseq && step_logits->size(1) >= logits.size(1),
-                    "step_logits [nseq, >= padded]");
-        p.step_logits = step_logits->data_ptr<float>();
-        p.sl_stride   = step_logits->stride(0);
+    p.temps         = temps.data_ptr<float>();
+    p.offset        = offset.data_ptr<int64_t>();
+    p.key_lo        = static_cast<uint32_t>(static_cast<uint64_t>(key) & 0xFFFFFFFFull);
+    p.key_hi        = static_cast<uint32_t>(static_cast<uint64_t>(key) >> 32);
+    p.vocab_start   = static_cast<int>(vocab_start);
+    p.width         = static_cast<int>(width);
+    p.padded        = static_cast<int>(padded);
+    p.gamma         = static_cast<int>(gamma);
+    p.nseq          = static_cast<int>(nseq);
+    p.blocks        = static_cast<int>((padded + BLOCK_ROWS - 1) / BLOCK_ROWS);
+    TORCH_CHECK(p.blocks <= MAX_BLOCKS && control.numel() >= p.blocks, "control [blocks] int32, at most ",
+                MAX_BLOCKS, " blocks");
+    TORCH_CHECK(nseq * peers.numel() * p.blocks <= 4 * THREADS, "a step's records at most 4 a thread");
+    TORCH_CHECK(nseq > 1 || peers.numel() * p.blocks <= POLL_ONE * WAVE, "one sequence's records on wave 0");
+    p.rank             = static_cast<int>(rank);
+    p.tp               = static_cast<int>(peers.numel());
+    p.part             = static_cast<int>(part);
+    p.vocab            = static_cast<int>(vocab);
+    p.out              = out.data_ptr<int64_t>();
+    p.out_stride       = out_stride;
+    if (verify.has_value()) {
+        check(*verify, ref, at::kLong, "verify");
+        TORCH_CHECK(verify->dim() == 2 && verify->size(0) >= nseq && verify->size(1) == gamma + 1,
+                    "verify [nseq, gamma + 1] int64: [anchor | tokens]");
+        p.verify        = verify->data_ptr<int64_t>();
+        p.verify_stride = verify->stride(0);
     }
-    p.temps       = temps.data_ptr<float>();
-    p.offset      = offset.data_ptr<int64_t>();
-    p.key_lo      = static_cast<uint32_t>(static_cast<uint64_t>(key) & 0xFFFFFFFFull);
-    p.key_hi      = static_cast<uint32_t>(static_cast<uint64_t>(key) >> 32);
-    p.vocab_start = static_cast<int>(vocab_start);
-    p.width       = static_cast<int>(width);
-    p.padded      = static_cast<int>(logits.size(1));
-    p.step        = static_cast<int>(step);
-    p.nseq        = static_cast<int>(nseq);
-    p.blocks      = static_cast<int>((logits.size(1) + BLOCK_ROWS - 1) / BLOCK_ROWS);
-    TORCH_CHECK(part.numel() >= 2 * nseq * p.blocks, "part [nseq, blocks, 2]");
-    p.rank           = static_cast<int>(rank);
-    p.tp             = static_cast<int>(peers.numel());
-    p.bump_offset    = bump_offset ? 1 : 0;
-    p.part           = part.data_ptr<float>();
-    p.out            = out.data_ptr<int64_t>();
-    p.out_stride     = out_stride;
-    p.tok            = tok.data_ptr<int64_t>();
-    p.calls          = calls.data_ptr<int>();
-    p.deadline_ticks = static_cast<uint64_t>(deadline_s * 1e8); // the 100 MHz realtime clock
+    p.tok              = tok.data_ptr<int64_t>();
+    p.counts           = reinterpret_cast<uint32_t *>(control.data_ptr<int>());
+    p.whole            = whole.data_ptr<float>();
+    p.whole_seq_stride = whole.stride(0);
+    p.whole_step_stride = whole.stride(1);
+    p.deadline_ticks   = static_cast<uint64_t>(deadline_s * 1e8); // the 100 MHz realtime clock
     for (int r = 0; r < p.tp; ++r) {
         p.recv[r] = reinterpret_cast<void *>(peers.data_ptr<int64_t>()[r]);
     }
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA guard(logits.device());
-    const hipStream_t stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA(logits.device().index()).stream();
-    markov_sample_step_kernel<<<p.blocks, THREADS, 0, stream>>>(p);
+    return p;
+}
+
+// base [nseq, gamma, padded] bf16 (unit inner stride), then markov_params' arguments
+void markov_block(const at::Tensor &base, const at::Tensor &embed, const at::Tensor &head, const at::Tensor &anchor,
+                  const at::Tensor &temps, at::Tensor &offset, int64_t key, int64_t vocab_start, at::Tensor &out,
+                  int64_t out_stride, at::Tensor &tok, at::Tensor &control, const at::Tensor &peers, int64_t rank,
+                  at::Tensor &whole, int64_t part, double deadline_s,
+                  const c10::optional<at::Tensor> &verify) {
+    TORCH_CHECK(base.dim() == 3, "base [sequences, steps, padded]");
+    check(base, base, at::kBFloat16, "base");
+    Params p = markov_params(base.size(0), base.size(1), base.size(2), base, embed, head, anchor, temps, offset, key,
+                             vocab_start, out, out_stride, tok, control, peers, rank, whole, part, deadline_s, verify);
+    p.logits        = static_cast<const bfloat16 *>(base.data_ptr());
+    p.logits_stride = base.stride(0);
+    p.step_stride   = base.stride(1);
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA guard(base.device());
+    const hipStream_t stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA(base.device().index()).stream();
+    if (p.nseq == 1) {
+        markov_block_kernel<true><<<p.blocks, THREADS, 0, stream>>>(p);
+    } else {
+        markov_block_kernel<false><<<p.blocks, THREADS, 0, stream>>>(p);
+    }
     C10_HIP_KERNEL_LAUNCH_CHECK();
-    markov_sample_finish_kernel<<<p.nseq, FINISH, 0, stream>>>(p);
+}
+
+// one sequence's draft head and Markov block in one launch: x [gamma, K] bf16 (the normed rows, contiguous), w
+// [width, K] bf16 (this rank's head rows, unit inner stride), base [gamma * width] int64 (the tagged base logits,
+// zeroed once), control int32 [MAX_BLOCKS] (this launch's own, zeroed once), then markov_params' arguments
+void draft_head(const at::Tensor &x, const at::Tensor &w, at::Tensor &base, const at::Tensor &embed,
+                const at::Tensor &head, const at::Tensor &anchor, const at::Tensor &temps, at::Tensor &offset,
+                int64_t key, int64_t vocab_start, at::Tensor &out, int64_t out_stride, at::Tensor &tok,
+                at::Tensor &control, const at::Tensor &peers, int64_t rank, at::Tensor &whole, int64_t part,
+                double deadline_s, const c10::optional<at::Tensor> &verify) {
+    const int64_t gamma = x.size(0), K = x.size(1), width = head.size(0);
+    check(x, x, at::kBFloat16, "x");
+    check(w, x, at::kBFloat16, "w");
+    TORCH_CHECK(x.dim() == 2 && x.is_contiguous() && gamma <= HEAD_ROWS && K <= MAX_HEAD_K && K % (2 * GEMM_STEP) == 0,
+                "x [<= 6, K] contiguous, K a multiple of 512 up to 5120");
+    TORCH_CHECK(w.dim() == 2 && w.size(0) == width && w.size(1) == K && w.stride(0) % 8 == 0 &&
+                    width * w.stride(0) * 2 < (int64_t{1} << 31),
+                "w [width, K]");
+    TORCH_CHECK(base.scalar_type() == at::kLong && base.is_contiguous() && base.numel() >= gamma * width, "base");
+    Params p = markov_params(1, gamma, width, x, embed, head, anchor, temps, offset, key, vocab_start, out, out_stride,
+                             tok, control, peers, rank, whole, part, deadline_s, verify);
+    p.x = static_cast<const bfloat16 *>(x.data_ptr());
+    p.w = static_cast<const bfloat16 *>(w.data_ptr());
+    p.w_stride = w.stride(0);
+    p.base = reinterpret_cast<uint64_t *>(base.data_ptr<int64_t>());
+    p.K = static_cast<int>(K);
+    p.tiles = static_cast<int>((width + GEMM_TILE - 1) / GEMM_TILE);
+    p.gemm_blocks = MAX_BLOCKS;
+    p.tiles_per_block = (p.tiles + p.gemm_blocks - 1) / p.gemm_blocks;
+    while ((THREADS / WAVE) % p.tiles_per_block != 0) ++p.tiles_per_block;
+    TORCH_CHECK(p.tiles_per_block <= THREADS / WAVE && control.numel() >= p.gemm_blocks,
+                "at most 8 tiles a block, control [256]");
+    TORCH_CHECK(K / GEMM_STEP % (2 * ((THREADS / WAVE) / p.tiles_per_block)) == 0, "K parts of an even count of iterations");
+    static bool wide = false; // the LDS past 64 KB, set once a process
+    if (!wide) {
+        C10_HIP_CHECK(hipFuncSetAttribute(reinterpret_cast<const void *>(&markov_block_kernel<true, true>),
+                                          hipFuncAttributeMaxDynamicSharedMemorySize, HEAD_LDS));
+        wide = true;
+    }
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA guard(x.device());
+    const hipStream_t stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA(x.device().index()).stream();
+    markov_block_kernel<true, true><<<p.gemm_blocks, THREADS, HEAD_LDS, stream>>>(p);
+    C10_HIP_KERNEL_LAUNCH_CHECK();
+}
+
+// temps [nseq] f32, peers [tp] int64 on the host (every rank's exchange buffer), whole [nseq, gamma, vocab] f32 (any
+// outer strides): the sampled sequences' step logits, every rank's shard of part columns
+void gather_step_logits(const at::Tensor &temps, const at::Tensor &peers, at::Tensor &whole, int64_t part) {
+    check(temps, whole, at::kFloat, "temps");
+    check(whole, whole, at::kFloat, "whole");
+    const int64_t nseq = whole.size(0), gamma = whole.size(1), vocab = whole.size(2);
+    TORCH_CHECK(whole.dim() == 3 && nseq >= 1 && nseq <= MAX_SEQ && gamma >= 1 && gamma <= MAX_STEPS &&
+                    temps.numel() >= nseq,
+                "whole [1 .. 4, gamma, vocab], temps [nseq]");
+    TORCH_CHECK(peers.device().is_cpu() && peers.scalar_type() == at::kLong && peers.numel() >= 1 &&
+                    peers.numel() <= MAX_TP,
+                "peers: every rank's exchange buffer (int64, host)");
+    TORCH_CHECK(part % 4 == 0 && vocab % 4 == 0 && whole.stride(0) % 4 == 0 && whole.stride(1) % 4 == 0 &&
+                    reinterpret_cast<uintptr_t>(whole.data_ptr()) % 16 == 0,
+                "16 B aligned rows and shards");
+    TORCH_CHECK(peers.numel() * part >= vocab && (peers.numel() - 1) * part < vocab, "the shards tile the vocab");
+    Params p{};
+    p.temps             = temps.data_ptr<float>();
+    p.gamma             = static_cast<int>(gamma);
+    p.nseq              = static_cast<int>(nseq);
+    p.tp                = static_cast<int>(peers.numel());
+    p.part              = static_cast<int>(part);
+    p.vocab             = static_cast<int>(vocab);
+    p.whole             = whole.data_ptr<float>();
+    p.whole_seq_stride  = whole.stride(0);
+    p.whole_step_stride = whole.stride(1);
+    for (int r = 0; r < p.tp; ++r) {
+        p.recv[r] = reinterpret_cast<void *>(peers.data_ptr<int64_t>()[r]);
+    }
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA guard(whole.device());
+    const hipStream_t stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA(whole.device().index()).stream();
+    gather_kernel<<<dim3((part / 4 + THREADS - 1) / THREADS, nseq * gamma * p.tp), THREADS, 0, stream>>>(p);
     C10_HIP_KERNEL_LAUNCH_CHECK();
 }
 
@@ -341,9 +922,15 @@ void markov_sample_step(const at::Tensor &logits, const at::Tensor &embed, const
 #endif
 
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
-    m.def("markov_sample_step(Tensor logits, Tensor embed, Tensor head, Tensor anchor, Tensor? step_logits, "
-          "Tensor temps, Tensor offset, int key, int vocab_start, int step, Tensor(a!) part, Tensor(b!) out, "
-          "int out_stride, Tensor(c!) tok, Tensor(d!) calls, Tensor peers, int rank, bool bump_offset, "
-          "float deadline_s) -> ()");
-    m.impl("markov_sample_step", at::kCUDA, &markov_sample_step);
+    m.def("markov_block(Tensor base, Tensor embed, Tensor head, Tensor anchor, Tensor temps, Tensor(a!) offset, "
+          "int key, int vocab_start, Tensor(b!) out, int out_stride, Tensor(c!) tok, Tensor(d!) control, "
+          "Tensor peers, int rank, Tensor(e!) whole, int part, float deadline_s, Tensor(f!)? verify=None) -> ()");
+    m.impl("markov_block", at::kCUDA, &markov_block);
+    m.def("draft_head(Tensor x, Tensor w, Tensor(a!) base, Tensor embed, Tensor head, Tensor anchor, Tensor temps, "
+          "Tensor(b!) offset, int key, int vocab_start, Tensor(c!) out, int out_stride, Tensor(d!) tok, "
+          "Tensor(e!) control, Tensor peers, int rank, Tensor(f!) whole, int part, float deadline_s, "
+          "Tensor(g!)? verify=None) -> ()");
+    m.impl("draft_head", at::kCUDA, &draft_head);
+    m.def("gather_step_logits(Tensor temps, Tensor peers, Tensor(a!) whole, int part) -> ()");
+    m.impl("gather_step_logits", at::kCUDA, &gather_step_logits);
 }

@@ -69,6 +69,7 @@ SGLANG_READS = {
         "hc_mult",
         "hc_pre_from_prev_sublayer",
         "sample_from_anchor",
+        "norm",
         '"dspark_n_routed_experts"',
         '"dspark_num_experts_per_tok"',
     ),
@@ -188,22 +189,29 @@ class _Draft:
 
         lm = self.lm
         x = input_embeds
+        # the first stage's launch reads the target's whole table itself where it is kept
+        first = None
         if x is None:  # ``forward_embed``, from the target's whole table
             if lm.embed_tokens is None:
                 raise ValueError(
                     "DeepseekV4ForCausalLMDSpark requires the target embed_tokens "
                     "(call attach_shared_modules first)."
                 )
-            x = target.embed(lm.embed_tokens, input_ids).unsqueeze(1)
-            x = x.repeat(1, lm.hc_mult, 1)
+            table = lm.embed_tokens.__dict__.get(target.FULL_EMBEDDING)
+            if table is not None:
+                first = (table, input_ids.contiguous())
+            else:
+                x = target.embed(lm.embed_tokens, input_ids).unsqueeze(1)
+                x = x.repeat(1, lm.hc_mult, 1)
         # a stage's post folds into the next stage's K1, the last stage's into the head's
         # combine (``fused.post_combine``)
         pending, pre = (None, x, None, None), None
         fuse = fused.enabled()
         for j, L in enumerate(self.stages):
             out = target._launch(
-                self.runner, L, plan, positions, forward_batch, pending, pre
-            )
+                self.runner, L, plan, positions, forward_batch, pending, pre,
+                embed=first if j == 0 else None,
+            )  # fmt: skip
             defer = j + 1 < len(self.stages) or fuse
             x, pre, post = target._boundary_out(L.module, defer, *out)
             pending = post if defer else (None, x, None, None)
@@ -211,7 +219,18 @@ class _Draft:
             # mhc_combine widens x on load: no f32 copy first
             x = mhc_combine(x.flatten(1), pre, lm.hc_mult, x.dtype)
         else:
-            _, x = fused.post_combine(self.stages[-1].module, pending, pre, lm.hc_mult)
+            last = self.stages[-1].module
+            norm = getattr(last, "norm", None)
+            if (
+                draft_sampler.head_input_folds(lm)
+                and norm is not None
+                and fused.post_combine_norm_fits(pending, pre, norm)
+            ):
+                # the sampler's base logits read the rows normed here, in the combine's launch
+                x, normed = fused.combine_and_norm(*pending, pre, norm)
+                draft_sampler.keep_head_input(x, normed)
+            else:
+                _, x = fused.post_combine(last, pending, pre, lm.hc_mult)
         return LogitsProcessorOutput(next_token_logits=None, hidden_states=x)
 
 
@@ -243,8 +262,10 @@ def _build(model, hf_config, ctx) -> _Draft:
     widths = list(ctx.widths)
     start = len(widths) * p.tp_rank // p.tp_size
     for m in widths[start:] + widths[:start]:
-        # K1 with and without an owed post; K2 on the window: no index source, no top-k
-        runner.precompile(m, k1={(False, False), (True, False)}, k2={(False, False)})
+        # with and without an owed post, on the window: no index source, no top-k
+        runner.precompile(
+            m, layer={(False, False, False), (True, False, False), (False, False, True)}
+        )
     draft_sampler.install(model, ctx.deadline_s)
     return _Draft(model, runner, stages)
 
@@ -254,7 +275,7 @@ SPEC = MonoSpec(
     devices={
         "gfx950": DeviceLimits(
             widths=tuple(range(1, target.MAX_ROWS + 1)),
-            tp_sizes=(2, 4),
+            tp_sizes=(2, 4, 8),
             resident_blocks=BLOCKS,
         )
     },

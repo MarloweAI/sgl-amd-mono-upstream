@@ -106,6 +106,11 @@ def _spin(load_all, pending, guarded=True, first=None):
     return v
 
 
+# a word many CTAs publish at once gets a 128-byte line of its own (16 pairs): stores
+# from many CUs into one line serialize where the line lives
+FLAG_STRIDE = 16
+
+
 class Space(Enum):
     SCRATCH = "scratch"  # this GPU's memory: device-scope hand-off between CTAs
     PEER = "peer"  # a peer-symmetric region: system-scope hand-off between GPUs

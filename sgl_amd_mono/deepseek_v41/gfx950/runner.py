@@ -17,20 +17,36 @@ from sgl_amd_mono.common.plan import BLOCKS
 
 from .attention.index_query import DIM as IQ_DIM
 from .attention.index_query import HEADS as IQ_HEADS
+from .attention.index_query import cp_cols
 from .attention.index_query import fused as iq_fused
 from .attention.plan import DATA, HEAD_DIM, KEYS, Q_RANK, TOPK, WINDOW, Dims
 from .layer import (
+    EG_ARGS,
     EPOCH_WORDS,
     HIDDEN,
+    K1_ARGS,
+    K1_CP_ARGS,
+    K1_KC_ARGS,
+    K2_ARGS,
+    K2_GLUE_ARGS,
+    K2_OF_LAYER,
+    LAYER_ARGS,
     MAX_TOKENS,
+    SEAM_ARGS,
     MonoBuild,
+    acell_offset,
+    acell_region_bytes,
     build_mono_ffn,
     build_mono_k1,
     build_mono_k2,
+    build_mono_layer,
+    fcell_offset,
+    fcell_region_bytes,
     peer_half_bytes,
     scratch_bytes,
     scratch_layout,
 )
+from .stages import engram, seam
 from .stages.dims import Dims as MoeDims
 from .stages.moe_shape import EXPERTS
 from .stages.moe_shape import TOPK as ROUTE_TOPK
@@ -43,11 +59,15 @@ __all__ = [
     "K1Weights",
     "K2Weights",
     "FFNWeights",
+    "EngramWeights",
 ]
 
 HC = 4
 # below this many rows an ug task takes one FP4 group (``route_at``)
 FINE_UG_ROWS = 7
+# TP8 holds 9 FP4 groups of an expert: two a task leave 5 parts, ~240 tasks at 8 rows
+# for 238 CTAs, and the CTAs with two run a second 328 KB round
+FINE_UG_ROWS_TP8 = 9
 RECORD = DATA + 8  # a token's KV record: 576 B of data, then 8 B of scales
 _LOG2E = 1.4426950408889634
 # a wait's deadline until the framework sets one from its watchdog timeout
@@ -192,6 +212,13 @@ class K1Weights(msgspec.Struct):
     iq_ws: torch.Tensor | None = None  # its E8M0 blocks [128, 40]
     iw_w: torch.Tensor | None = None  # weights_proj [32, 5120] bf16
     iw_scale: float = 0.0
+    # an index KV source's compressor (replicated), for K1's projection with the index
+    # query: wkv_gate [1024, 5120] bf16 at compress ratio 2, wkv [512, 5120] at ratio 1
+    cp_w: torch.Tensor | None = None
+    cp_ratio: int = 0
+    # its indexer's wk, for the rest of the compressor (``kc``): [128, 512] bf16 in KC's
+    # thread order (``compress.wk_order``)
+    kc_wk: torch.Tensor | None = None
 
     def check(self, d: Dims) -> None:
         """Raise unless the attention-front tensors have K1's layout."""
@@ -218,6 +245,8 @@ class K1Weights(msgspec.Struct):
                 "iq_ws": ((IQ_HEADS * IQ_DIM // 32, 1280 // 32), u8),
                 "iw_w": ((IQ_HEADS, HIDDEN), bf),
             }
+        if self.cp_w is not None:
+            want["cp_w"] = ((cp_cols(self.cp_ratio), HIDDEN), bf)
         _check_tensors(self, "K1", want)
         if not (
             self.norm.shape == (HIDDEN,)
@@ -263,6 +292,34 @@ class K2Weights(msgspec.Struct):
             raise RuntimeError(f"K2 cos_sin: {tuple(cs.shape)} {cs.dtype}")
 
 
+class EngramWeights(msgspec.Struct):
+    """A launch's share of a later Engram layer's projection on this rank
+    (``stages.engram``): rows ``row0`` .. of this rank's rows of ``wkv`` (an N shard, all
+    of K)."""
+
+    w: torch.Tensor  # [rows, 6144] e4m3 in the GEMV's tile order (``tile_order``)
+    ws: torch.Tensor  # [rows / 32, 192] E8M0 (32 x 32 blocks)
+    row0: int = 0
+
+    @property
+    def tasks(self) -> int:
+        return self.w.shape[0] // 16
+
+    def check(self, tp: int) -> None:
+        n = self.w.shape[0]
+        if not (
+            n % 32 == 0 and 0 <= self.row0 and self.row0 + n <= engram.rank_rows(tp)
+        ):
+            raise RuntimeError(
+                f"Engram rows {self.row0} + {n} of {engram.rank_rows(tp)}"
+            )
+        want = {
+            "w": ((n, engram.K), torch.float8_e4m3fn),
+            "ws": ((n // 32, engram.K // 32), torch.uint8),
+        }
+        _check_tensors(self, "Engram", want)
+
+
 class DSV41MonoRunner:
     """The mono decode runner of one TP rank (``group``: gloo, for the peer handle exchange).
 
@@ -302,7 +359,8 @@ class DSV41MonoRunner:
         if dev.index is None:
             dev = torch.device(dev.type, torch.cuda.current_device())
         self.device = dev
-        self._scratch: dict[int, torch.Tensor] = {}
+        self._scratch: dict = {}  # width -> its scratch's PeerBuffer
+        self._seam: dict = {}  # width -> its seam state (``seam_state``)
         # [epoch, the guard block (deadline, error words), a mark per CTA, the MoE's counters]
         self.epoch = torch.zeros(EPOCH_WORDS, dtype=torch.int32, device=dev)
         self.fault_site, self.fault_after = guard.fault_injection(rank) or (0, 0)
@@ -335,6 +393,11 @@ class DSV41MonoRunner:
         )
         self.iqs = torch.zeros(MAX_TOKENS, 1, 4, 16, 4, dtype=torch.uint8, device=dev)
         self.iw = torch.zeros(MAX_TOKENS, IQ_HEADS, dtype=torch.bfloat16, device=dev)
+        # an index KV source's compressor projection: [rows, 1024] f32 at compress ratio 2,
+        # [rows, 512] bf16 at ratio 1 (``cproj``)
+        self._cproj = torch.zeros(MAX_TOKENS, 1024, dtype=torch.float32, device=dev)
+        # an Engram layer's kv, where the layer launches before it project it (``layer(eg=)``)
+        self.egkv = torch.zeros(MAX_TOKENS, engram.N, dtype=torch.bfloat16, device=dev)
         # the record an absent key reads: zero data and scales, masked anyway
         self.zero_rec = torch.zeros(1024, dtype=torch.uint8, device=dev)
         self.qk_scale = (
@@ -346,6 +409,13 @@ class DSV41MonoRunner:
         half = peer_half_bytes(tp)
         self.peer = PeerBuffer(2 * half + guard.FLAG_BYTES, group, rank, tp, dev)
         self.peer.bytes.zero_()
+        # the cells start empty (``seam.attn_cell``, ``seam.ffn_cell``)
+        for cells, size in (
+            (acell_offset(tp), acell_region_bytes(tp)),
+            (fcell_offset(tp), fcell_region_bytes(tp)),
+        ):
+            for h in range(2):
+                self.peer.bytes[h * half + cells : h * half + cells + size].fill_(0xFF)
         self._kernels: dict = {}
         # the index sources' indexer (``enable_k2i``): the target's runner only
         self.k2i = None
@@ -367,19 +437,67 @@ class DSV41MonoRunner:
         self.epoch[guard.GUARD_DEADLINE + 1] = ticks >> 32
 
     def scratch(self, tokens: int) -> torch.Tensor:
-        """Return this width's scratch, allocated before graph capture."""
+        """Return this width's scratch, allocated before graph capture: uncached (a
+        one-rank ``PeerBuffer``), so the hand-offs between CTAs miss no cache, and
+        zeroed."""
+        from sgl_amd_mono.common.peer import PeerBuffer
+
         buf = self._scratch.get(tokens)
         if buf is None:
             no_capture(f"step width {tokens}")
-            buf = torch.zeros(
-                scratch_bytes(
-                    tokens, self.tp, self.timeline_on, **self.route_at(tokens)
-                ),
-                dtype=torch.uint8,
-                device=self.device,
+            nbytes = scratch_bytes(
+                tokens, self.tp, self.timeline_on, **self.route_at(tokens)
             )
+            buf = PeerBuffer(nbytes, None, self.rank, 1, self.device)
             self._scratch[tokens] = buf
+        return buf.bytes
+
+    def new_seam_state(self, tokens: int) -> torch.Tensor:
+        """A seam state of this width (``stages.seam.seam_state_layout``): the next layer's
+        attention R_new, LIN and mixes' partials, as a launch's tail writes them."""
+        return torch.zeros(
+            seam.seam_state_bytes(tokens), dtype=torch.uint8, device=self.device
+        )
+
+    def seam_state(self, tokens: int) -> torch.Tensor:
+        """This width's seam state, allocated before graph capture: a launch's tail writes
+        it (``layer(nxt=)``), the next launch reads it (``layer(seamed=True)``)."""
+        buf = self._seam.get(tokens)
+        if buf is None:
+            no_capture(f"seam state width {tokens}")
+            buf = self._seam[tokens] = self.new_seam_state(tokens)
         return buf
+
+    def _check_seam(self, state: torch.Tensor, tokens: int) -> None:
+        if not (
+            state.dtype == torch.uint8
+            and state.is_contiguous()
+            and state.numel() >= seam.seam_state_bytes(tokens)
+            and state.device == self.device
+        ):
+            raise RuntimeError(f"seam state: {tuple(state.shape)} {state.dtype}")
+
+    def _check_aux(self, aux: torch.Tensor, tokens: int) -> None:
+        if not (
+            aux.dtype == torch.bfloat16
+            and aux.shape[0] >= tokens
+            and aux.shape[-1] == HIDDEN
+            and aux.stride(-1) == 1
+            and aux.stride(0) % 8 == 0
+            and aux.device == self.device
+        ):
+            raise RuntimeError(f"aux: {tuple(aux.shape)} {aux.stride()} {aux.dtype}")
+
+    def seam_moves(self, tokens: int, tok_par: bool = False) -> bool:
+        """Whether a reuse layer's launch at this width runs the next reuse layer's
+        attention seam (``layer(nxt=)``): TP8 (the per-row MoE's), up to
+        ``SEAM_MAX_TOKENS`` rows, not token parallel."""
+        return self.tp == 8 and not tok_par and tokens <= seam.SEAM_MAX_TOKENS
+
+    def seam_res(self, state: torch.Tensor, tokens: int) -> torch.Tensor:
+        """The R_new rows [tokens, 4, 5120] bf16 of a seam state."""
+        off, n = seam.seam_state_layout(tokens)["res"]
+        return state[off : off + n].view(torch.bfloat16).view(tokens, HC, HIDDEN)
 
     def route_at(self, tokens: int) -> dict:
         """The route every launch and the scratch of this width share.
@@ -388,7 +506,8 @@ class DSV41MonoRunner:
         end closer together (ROCm/ATOM's fine ug); the draft fixes its own."""
         ug = self.ug_groups
         if ug is None:
-            ug = 1 if tokens < FINE_UG_ROWS else 2
+            fine = FINE_UG_ROWS_TP8 if self.tp >= 8 else FINE_UG_ROWS
+            ug = 1 if tokens < fine else 2
         return {**self.route, "ug_groups": ug}
 
     def timeline(self, tokens: int) -> torch.Tensor:
@@ -412,6 +531,23 @@ class DSV41MonoRunner:
     def supports(tokens: int) -> bool:
         return 1 <= tokens <= MAX_TOKENS
 
+    def cproj(self, rows: int, ratio: int) -> torch.Tensor:
+        """K1's compressor projection of ``rows`` rows at compress ratio ``ratio``, as SGLang's
+        compressor returns it: ``project_fused`` [rows, 1024] f32, or ``wkv`` [rows, 512] bf16."""
+        if ratio == 2:
+            return self._cproj[:rows]
+        return self._cproj.view(torch.bfloat16).view(-1)[: rows * 512].view(rows, 512)
+
+    def eg_fused(self, tokens: int, tok_par: bool) -> bool:
+        """Whether a layer launch at this width projects its share of a later Engram layer's rows (all
+        of the step's rows: not token parallel); else SGLang's projection does."""
+        return self.supports(tokens) and not tok_par
+
+    def cp_fused(self, tokens: int, tok_par: bool) -> bool:
+        """Whether an index KV source's K1 at this width computes its compressor projection
+        (with the index query, not token parallel); else SGLang's compressor does."""
+        return self.iq_fused(tokens, tok_par) and not tok_par
+
     def iq_fused(self, tokens: int, tok_par: bool = False) -> bool:
         """Whether an index source's K1 at this width computes its index query
         (``index_query``); else SGLang's chain does, after K1."""
@@ -423,13 +559,17 @@ class DSV41MonoRunner:
         fold: bool = True,
         index: bool = False,
         iq: bool = False,
+        cp: int = 0,
         tok_par: bool = False,
+        embed: bool = False,
     ):
         """K1 at this width; it writes K2's key table unless the layer is an index
         source (whose top-k comes after K1). ``iq``: the index query too, where
-        ``iq_fused``."""
+        ``iq_fused``; ``cp``: with it, an index KV source's compressor projection (its
+        compress ratio). ``embed``: the first layer, on the embedding table."""
         iq = iq and self.iq_fused(tokens, tok_par)
-        key = (tokens, "k1", fold, index, iq, tok_par)
+        cp = cp if iq and not tok_par else 0
+        key = (tokens, "k1", fold, index, iq, cp, tok_par, embed)
         if key not in self._kernels:
             no_capture(f"K1 width {tokens}")
             self._kernels[key] = build_mono_k1(
@@ -445,6 +585,8 @@ class DSV41MonoRunner:
                     timeline=self.timeline_on,
                     tok_par=tok_par,
                     iq=iq,
+                    embed=embed,
+                    cp=cp,
                     **self.route_at(tokens),
                 )
             )
@@ -455,21 +597,30 @@ class DSV41MonoRunner:
         tokens: int,
         k1=(),
         k2=(),
+        layer=(),
         ffn: bool = False,
         k2i: bool = False,
         tok_par: bool = False,
     ) -> None:
         """Allocate this width's scratch and compile its launches without running them.
 
-        K1 for each (fold, index, iq) in ``k1``, K2 for each (compressed, index) in
-        ``k2``, the FFN launch, and K2i (``enable_k2i`` first)."""
+        K1 for each (fold, index, iq, cp) in ``k1``, K2 for each (compressed, index, glue) in
+        ``k2``, the layer launch for each (fold, compressed, embed, eg) in ``layer``, the FFN
+        launch, and K2i (``enable_k2i`` first)."""
         self.scratch(tokens)
         kernels = [self.k1_kernel(tokens, *v, tok_par=tok_par) for v in sorted(k1)]
-        kernels += [self.k2_kernel(tokens, *v, tok_par=tok_par) for v in sorted(k2)]
+        kernels += [
+            self.k2_kernel(tokens, c, i, tok_par=tok_par, glue=g)
+            for c, i, g in sorted(k2)
+        ]
+        kernels += [
+            self.layer_kernel(tokens, *v, tok_par=tok_par) for v in sorted(layer)
+        ]
         if ffn:
             kernels.append(self.ffn_kernel(tokens))
         if k2i:
-            kernels.append(self.k2i.kernel(tokens))
+            # a producer's build keeps its block maxima too
+            kernels += [self.k2i.kernel(tokens), self.k2i.kernel(tokens, blocks=True)]
         for launch in kernels:
             compile_only(launch)
 
@@ -490,9 +641,10 @@ class DSV41MonoRunner:
         return self._kernels[key]
 
     def k2_kernel(
-        self, tokens: int, compressed: bool = True, index: bool = False, tok_par=False
-    ):
-        key = (tokens, "k2", compressed, index, tok_par)
+        self, tokens: int, compressed: bool = True, index: bool = False, tok_par=False,
+        glue: int = 0,
+    ):  # fmt: skip
+        key = (tokens, "k2", compressed, index, tok_par, glue)
         if key not in self._kernels:
             no_capture(f"K2 width {tokens}")
             self._kernels[key] = build_mono_k2(
@@ -507,6 +659,7 @@ class DSV41MonoRunner:
                     fault_after=self.fault_after,
                     timeline=self.timeline_on,
                     tok_par=tok_par,
+                    glue=glue,
                     **self.route_at(tokens),
                 )
             )
@@ -600,7 +753,7 @@ class DSV41MonoRunner:
         )
         return outs
 
-    def k1(
+    def _k1_args(
         self,
         w: K1Weights,
         x: torch.Tensor | None,  # [M, 5120] bf16: the prior layer's pending MoE output
@@ -616,25 +769,41 @@ class DSV41MonoRunner:
         index: bool = False,
         tok_par: bool = False,
         aux: torch.Tensor | None = None,  # [>= M, 5120] bf16, any row stride: a capture
+        embed: tuple | None = None,  # (table [vocab, 5120] bf16, ids [M] int32 / int64)
+        kc: tuple | None = None,  # ``K2iRunner.kc_args``: the source's compressor
     ):
-        """Run K1: the pending post, this layer's attention seam and the attention front.
-
-        It writes the step's SWA KV records and K2's key table, and returns (q, residual,
-        post, comb, pre) as views of the runner's buffers. ``x`` None: the residual
-        arrives settled, with no post to fold in (the first layer, after an Engram
-        write). ``index``: an index source, whose top-k comes after K1, so K1 writes
-        ``normed`` and ``qr`` for the indexer and leaves the key table to K2.
-        ``tok_par`` (``token_par``): the residual, post, comb and pre rows in and out
-        are this rank's alone. ``aux`` receives the residual streams' mean for DSpark."""
-        M = residual.shape[0]
+        """K1's launch arguments by name (``K1_ARGS``, ``K1_CP_ARGS``, ``K1_KC_ARGS``),
+        after the checks, and (rows, fold, iq, cp). ``embed``: the first layer, its streams each the
+        token's embedding row (``residual`` None)."""
+        bf, f32 = torch.bfloat16, torch.float32
+        ids, ids_words = None, 0
+        if embed is not None:
+            table, ids = embed
+            if residual is not None or x is not None:
+                raise RuntimeError("K1 on the embedding takes no residual and no post")
+            if not (
+                table.dtype == bf
+                and table.dim() == 2
+                and table.shape[1] == HIDDEN
+                and table.is_contiguous()
+                and table.device == self.device
+                # the seam's row loads take 32-bit byte offsets
+                and table.numel() * 2 < 2**31
+            ):
+                raise RuntimeError(f"K1 embedding: {tuple(table.shape)} {table.dtype}")
+            if not (
+                ids.dtype in SLOT_DTYPES and ids.dim() == 1 and ids.is_contiguous()
+            ):
+                raise RuntimeError(f"K1 token ids: {tuple(ids.shape)} {ids.dtype}")
+            ids_words = slot_words(ids)
+            residual = table
+        M = residual.shape[0] if ids is None else ids.shape[0]
         if not self.supports(M):
             raise RuntimeError(f"DSv4.1 mono decode: {M} rows")
-        bf, f32 = torch.bfloat16, torch.float32
         fold = x is not None
-        want = {
-            "residual": (residual, HC * HIDDEN, bf),
-            "pre": (pre, HC, f32),
-        }
+        want = {"pre": (pre, HC, f32)}
+        if ids is None:
+            want["residual"] = (residual, HC * HIDDEN, bf)
         if fold:
             want |= {
                 "x": (x, HIDDEN, bf),
@@ -684,56 +853,102 @@ class DSV41MonoRunner:
             else (0, 0, 0)
         )
         iw_bits = struct.unpack("<i", struct.pack("<f", w.iw_scale))[0]
+        cp = w.cp_ratio if iq and not tok_par and w.cp_w is not None else 0
+        args = {
+            "res_in": residual.data_ptr(),
+            "pend": x.data_ptr(),
+            "post_in": post.data_ptr(),
+            "comb_in": comb.data_ptr(),
+            "pre_in": pre.data_ptr(),
+            "hc_fn": w.hc_fn.data_ptr(),
+            "hc_scale": w.hc_scale.data_ptr(),
+            "hc_base": w.hc_base.data_ptr(),
+            "attn_w": w.norm.data_ptr(),
+            "res_out": self.res_mid.data_ptr(),
+            "aux_out": 0 if aux is None else aux.data_ptr(),
+            "aux_stride": HIDDEN if aux is None else aux.stride(0),
+            "post_out": self.post_a.data_ptr(),
+            "comb_out": self.comb_a.data_ptr(),
+            "pre_out": self.pre_a.data_ptr(),
+            "wqkv": w.wqkv.data_ptr(),
+            "wqkv_s": w.wqkv_s.data_ptr(),
+            "qn_w": w.q_norm.data_ptr(),
+            "kvn_w": w.kv_norm.data_ptr(),
+            "wqb": w.wqb.data_ptr(),
+            "wqb_s": w.wqb_s.data_ptr(),
+            "cos_sin": w.cos_sin.data_ptr(),
+            "pos": pos.data_ptr(),
+            "slot": slot.data_ptr(),
+            "slot_words": slot_words(slot),
+            "swa": swa.data_ptr(),
+            "swa_stride": swa.stride(0),
+            "swa_block": swa_block,
+            "swa_idx": swa_idx,
+            "swa_lens": swa_lens,
+            "topk": topk,
+            "topk_lens": topk_lens,
+            "kt": self.kt.data_ptr(),
+            "klen": self.klen.data_ptr(),
+            "q": self.q.data_ptr(),
+            "normed_out": self.normed.data_ptr(),
+            "qr_out": self.qr.data_ptr(),
+            **dict(zip(("iq_w", "iq_ws", "iw_w"), iqa)),
+            "iw_scale": iw_bits,
+            "num_pos": w.cos_sin.shape[0],
+            "iq_out": self.iq.data_ptr(),
+            "iqs_out": self.iqs.data_ptr(),
+            "iw_out": self.iw.data_ptr(),
+            "cp_w": w.cp_w.data_ptr() if cp else 0,
+            "cp_out": self._cproj.data_ptr(),
+            # no compressor: no live rows
+            **dict(zip(K1_KC_ARGS, kc if cp and kc else (0,) * len(K1_KC_ARGS))),
+            "scratch": self.scratch(M).data_ptr(),
+            "sym": self.peer.local,
+            "peers": self.peer.addresses.data_ptr(),
+            "rank": self.rank,
+            "epoch": self.epoch.data_ptr(),
+            "ids": 0 if ids is None else ids.data_ptr(),
+            "ids_words": ids_words,
+        }
+        return args, M, fold, iq, cp
+
+    def k1(
+        self,
+        w: K1Weights,
+        x: torch.Tensor | None,  # [M, 5120] bf16: the prior layer's pending MoE output
+        residual: torch.Tensor,  # [M, 4, 5120] bf16: its pending residual
+        post: torch.Tensor | None,  # [M, 4, 1] f32: its pending FFN post mix
+        comb: torch.Tensor | None,  # [M, 4, 4] f32
+        pre: torch.Tensor,  # [M, 4] f32: the incoming pre mix (its FFN pre mix)
+        pos: torch.Tensor,  # [>= M] int64 positions
+        slot: torch.Tensor,  # [>= M] int32 or int64 SWA cache slots
+        swa: torch.Tensor,  # the layer's SWA cache: uint8 [pages, page bytes]
+        swa_block: int,
+        keys: tuple,  # int32 [>= M, ...]: window slots, window lengths, top-k slots, top-k lengths
+        index: bool = False,
+        tok_par: bool = False,
+        aux: torch.Tensor | None = None,  # [>= M, 5120] bf16, any row stride: a capture
+        embed: tuple | None = None,
+        kc: tuple | None = None,  # ``K2iRunner.kc_args``: the source's compressor
+    ):
+        """Run K1: the pending post, this layer's attention seam and the attention front.
+
+        It writes the step's SWA KV records and K2's key table, and returns (q, residual,
+        post, comb, pre) as views of the runner's buffers. ``x`` None: the residual
+        arrives settled, with no post to fold in (the first layer, after an Engram
+        write). ``index``: an index source, whose top-k comes after K1, so K1 writes
+        ``normed`` and ``qr`` for the indexer and leaves the key table to K2.
+        ``tok_par`` (``token_par``): the residual, post, comb and pre rows in and out
+        are this rank's alone. ``aux`` receives the residual streams' mean for DSpark.
+        ``kc``: where K1 computes an index KV source's compressor projection, the rest
+        of that compressor, which K1 runs too (None: it compresses nothing)."""
+        args, M, fold, iq, cp = self._k1_args(
+            w, x, residual, post, comb, pre, pos, slot, swa, swa_block, keys, index,
+            tok_par, aux, embed, kc,
+        )  # fmt: skip
         _run_compiled(
-            self.k1_kernel(M, fold, index, iq, tok_par),
-            residual.data_ptr(),
-            x.data_ptr(),
-            post.data_ptr(),
-            comb.data_ptr(),
-            pre.data_ptr(),
-            w.hc_fn.data_ptr(),
-            w.hc_scale.data_ptr(),
-            w.hc_base.data_ptr(),
-            w.norm.data_ptr(),
-            self.res_mid.data_ptr(),
-            0 if aux is None else aux.data_ptr(),
-            HIDDEN if aux is None else aux.stride(0),
-            self.post_a.data_ptr(),
-            self.comb_a.data_ptr(),
-            self.pre_a.data_ptr(),
-            w.wqkv.data_ptr(),
-            w.wqkv_s.data_ptr(),
-            w.q_norm.data_ptr(),
-            w.kv_norm.data_ptr(),
-            w.wqb.data_ptr(),
-            w.wqb_s.data_ptr(),
-            w.cos_sin.data_ptr(),
-            pos.data_ptr(),
-            slot.data_ptr(),
-            slot_words(slot),
-            swa.data_ptr(),
-            swa.stride(0),
-            swa_block,
-            swa_idx,
-            swa_lens,
-            topk,
-            topk_lens,
-            self.kt.data_ptr(),
-            self.klen.data_ptr(),
-            self.q.data_ptr(),
-            self.normed.data_ptr(),
-            self.qr.data_ptr(),
-            *iqa,
-            iw_bits,
-            w.cos_sin.shape[0],
-            self.iq.data_ptr(),
-            self.iqs.data_ptr(),
-            self.iw.data_ptr(),
-            self.scratch(M).data_ptr(),
-            self.peer.local,
-            self.peer.addresses.data_ptr(),
-            self.rank,
-            self.epoch.data_ptr(),
+            self.k1_kernel(M, fold, index, iq, cp, tok_par, embed is not None),
+            *(args[n] for n in K1_ARGS + K1_CP_ARGS + K1_KC_ARGS),
             torch.cuda.current_stream(),
         )
         return (
@@ -744,7 +959,7 @@ class DSV41MonoRunner:
             self.pre_a[:M],
         )
 
-    def k2(
+    def _k2_args(
         self,
         aw: K2Weights,
         w: FFNWeights,
@@ -760,10 +975,7 @@ class DSV41MonoRunner:
         index: bool = False,
         tok_par: bool = False,
     ):
-        """Run K2 on K1's outputs: attention back, TP reduce, FFN seam, MoE and all-reduce.
-
-        ``comp`` None: a window-only layer. ``index``: an index source; K2 first builds
-        the key table from ``keys``, whose top-k the indexer selected after K1."""
+        """K2's launch arguments by name (``K2_ARGS``) and its outputs, after the checks."""
         M = rows
         if not self.supports(M):
             raise RuntimeError(f"DSv4.1 mono decode: {M} rows")
@@ -800,57 +1012,262 @@ class DSV41MonoRunner:
         else:  # unread
             table = (self.klen, self.klen, self.klen, self.no_topk, self.no_topk_lens)
         slot_ptr, *key_ptrs = (t.data_ptr() for t in table)
-        _run_compiled(
-            self.k2_kernel(M, compressed, index, tok_par),
-            self.q.data_ptr(),
-            swa.data_ptr(),
-            swa.stride(0),
+        args = {
+            "q": self.q.data_ptr(),
+            "swa": swa.data_ptr(),
+            "swa_stride": swa.stride(0),
+            "swa_block": swa_block,
+            "comp": comp.data_ptr(),
+            "comp_stride": comp.stride(0),
+            "comp_block": comp_block,
+            "kt": self.kt.data_ptr(),
+            "klen": self.klen.data_ptr(),
+            "slot": slot_ptr,
+            "slot_words": slot_words(table[0]),
+            **dict(zip(("swa_idx", "swa_lens", "topk", "topk_lens"), key_ptrs)),
+            "pos": pos.data_ptr(),
+            "sink": aw.sink.data_ptr(),
+            "qk_scale": self.qk_scale,
+            "cos_sin": aw.cos_sin.data_ptr(),
+            "woa": aw.woa.data_ptr(),
+            "woa_s": aw.woa_s.data_ptr(),
+            "wob": aw.wob.data_ptr(),
+            "wob_s": aw.wob_s.data_ptr(),
+            "zrec": self.zero_rec.data_ptr(),
+            "res_in": residual.data_ptr(),
+            "post_in": post.data_ptr(),
+            "comb_in": comb.data_ptr(),
+            "pre_in": pre.data_ptr(),
+            "hc_fn": w.hc_ffn_fn.data_ptr(),
+            "hc_scale": w.hc_ffn_scale.data_ptr(),
+            "hc_base": w.hc_ffn_base.data_ptr(),
+            "ffn_w": w.ffn_norm.data_ptr(),
+            "res_out": res_out.data_ptr(),
+            "post_out": post_out.data_ptr(),
+            "comb_out": comb_out.data_ptr(),
+            "pre_out": pre_out.data_ptr(),
+            "gate_w": w.gate_w.data_ptr(),
+            "bias": w.bias.data_ptr(),
+            "w13": w.w13.data_ptr(),
+            "w13_s": w.w13_s.data_ptr(),
+            "w2": w.w2.data_ptr(),
+            "w2_s": w.w2_s.data_ptr(),
+            "sgu": w.sgu.data_ptr(),
+            "sgu_s": w.sgu_s.data_ptr(),
+            "sw2": w.sw2.data_ptr(),
+            "sw2_s": w.sw2_s.data_ptr(),
+            "out": out.data_ptr(),
+            "scratch": self.scratch(M).data_ptr(),
+            "sym": self.peer.local,
+            "peers": self.peer.addresses.data_ptr(),
+            "rank": self.rank,
+            "epoch": self.epoch.data_ptr(),
+        }
+        return args, outs, compressed
+
+    def k2(
+        self,
+        aw: K2Weights,
+        w: FFNWeights,
+        rows: int,
+        pos: torch.Tensor,  # [>= rows] int64, K1's positions
+        swa: torch.Tensor,  # the layer's SWA cache: uint8 [pages, page bytes]
+        swa_block: int,
+        comp: torch.Tensor | None,  # its compressed cache, the same layout
+        comp_block: int,
+        outs: tuple | None = None,
+        slot: torch.Tensor | None = None,  # an index source's: K1's slots and keys
+        keys: tuple | None = None,
+        index: bool = False,
+        tok_par: bool = False,
+        glue: tuple | None = None,
+    ):
+        """Run K2 on K1's outputs: attention back, TP reduce, FFN seam, MoE and all-reduce.
+
+        ``comp`` None: a window-only layer. ``index``: an index source; K2 first builds
+        the key table from ``keys``, whose top-k the indexer selected after K1. ``glue``:
+        (kind, its tensors and ints by name), the selection's glue K2 also runs
+        (``K2iRunner.select``, ``stages.index_glue``)."""
+        args, outs, compressed = self._k2_args(
+            aw,
+            w,
+            rows,
+            pos,
+            swa,
             swa_block,
-            comp.data_ptr(),
-            comp.stride(0),
+            comp,
             comp_block,
-            self.kt.data_ptr(),
-            self.klen.data_ptr(),
-            slot_ptr,
-            slot_words(table[0]),
-            *key_ptrs,
-            pos.data_ptr(),
-            aw.sink.data_ptr(),
-            self.qk_scale,
-            aw.cos_sin.data_ptr(),
-            aw.woa.data_ptr(),
-            aw.woa_s.data_ptr(),
-            aw.wob.data_ptr(),
-            aw.wob_s.data_ptr(),
-            self.zero_rec.data_ptr(),
-            residual.data_ptr(),
-            post.data_ptr(),
-            comb.data_ptr(),
-            pre.data_ptr(),
-            w.hc_ffn_fn.data_ptr(),
-            w.hc_ffn_scale.data_ptr(),
-            w.hc_ffn_base.data_ptr(),
-            w.ffn_norm.data_ptr(),
-            res_out.data_ptr(),
-            post_out.data_ptr(),
-            comb_out.data_ptr(),
-            pre_out.data_ptr(),
-            w.gate_w.data_ptr(),
-            w.bias.data_ptr(),
-            w.w13.data_ptr(),
-            w.w13_s.data_ptr(),
-            w.w2.data_ptr(),
-            w.w2_s.data_ptr(),
-            w.sgu.data_ptr(),
-            w.sgu_s.data_ptr(),
-            w.sw2.data_ptr(),
-            w.sw2_s.data_ptr(),
-            out.data_ptr(),
-            self.scratch(M).data_ptr(),
-            self.peer.local,
-            self.peer.addresses.data_ptr(),
-            self.rank,
-            self.epoch.data_ptr(),
+            outs,
+            slot,
+            keys,
+            index,
+            tok_par,
+        )
+        kind, gl = glue if glue is not None else (0, {})
+        gargs = []
+        for n in K2_GLUE_ARGS:
+            v = gl.get(n, 0)
+            gargs.append(v.data_ptr() if isinstance(v, torch.Tensor) else int(v))
+        _run_compiled(
+            self.k2_kernel(rows, compressed, index, tok_par, kind),
+            *(args[n] for n in K2_ARGS),
+            *gargs,
+            torch.cuda.current_stream(),
+        )
+        return outs
+
+    def layer_kernel(
+        self,
+        tokens: int,
+        fold: bool = True,
+        compressed: bool = True,
+        embed: bool = False,
+        eg: int = 0,
+        tok_par: bool = False,
+        seamed: bool = False,
+        seam_next: bool = False,
+    ):
+        """A reuse layer's one launch at this width (``build_mono_layer``); ``embed``:
+        the first layer, on the embedding table; ``eg``: with this many tasks of a later
+        Engram layer's projection, where ``eg_fused`` (else none); ``seamed``,
+        ``seam_next``: ``MonoBuild``'s."""
+        eg = eg if self.eg_fused(tokens, tok_par) else 0
+        key = (tokens, "layer", fold, compressed, tok_par, embed, eg, seamed, seam_next)
+        if key not in self._kernels:
+            no_capture(f"layer launch width {tokens}")
+            self._kernels[key] = build_mono_layer(
+                MonoBuild(
+                    tokens,
+                    self.tp,
+                    kt=True,
+                    fold=fold,
+                    compressed=compressed,
+                    shuffled=self.shuffled,
+                    fault_site=self.fault_site,
+                    fault_after=self.fault_after,
+                    timeline=self.timeline_on,
+                    tok_par=tok_par,
+                    embed=embed,
+                    eg=eg,
+                    seamed=seamed,
+                    seam_next=seam_next,
+                    **self.route_at(tokens),
+                )
+            )
+        return self._kernels[key]
+
+    def layer(
+        self,
+        w: K1Weights,
+        aw: K2Weights,
+        fw: FFNWeights,
+        x: torch.Tensor | None,
+        residual: torch.Tensor,
+        post: torch.Tensor | None,
+        comb: torch.Tensor | None,
+        pre: torch.Tensor,
+        pos: torch.Tensor,
+        slot: torch.Tensor,
+        swa: torch.Tensor,
+        swa_block: int,
+        comp: torch.Tensor | None,
+        comp_block: int,
+        keys: tuple,
+        outs: tuple | None = None,
+        tok_par: bool = False,
+        aux: torch.Tensor | None = None,
+        embed: tuple | None = None,
+        eg: tuple | None = None,  # (rows [M, 6144] bf16, EngramWeights)
+        nxt: K1Weights | None = None,
+        nxt_aux: torch.Tensor | None = None,
+        seamed: bool = False,
+        seam_in: torch.Tensor | None = None,
+        seam_out: torch.Tensor | None = None,
+    ):
+        """Run a reuse layer (not an index source) in one launch: ``k1``, then ``k2`` on
+        its outputs, with their arguments; returns K2's outputs. ``eg``: a later Engram
+        layer's rows and this launch's share of its projection, into ``egkv``
+        (``eg_fused``).
+
+        ``nxt``: the next layer's weights; the launch ends with that layer's attention
+        seam (its capture into ``nxt_aux``) into the seam state ``seam_out`` (default
+        ``seam_state``), and its MoE output (K2's first output) is not written.
+        ``seamed``: the previous launch ran this layer's attention seam into ``seam_in``
+        (default ``seam_state``); x, residual, post, comb and pre are not read (None).
+        One state may be both a launch's ``seam_in`` and its ``seam_out``."""
+        if aw.cos_sin.data_ptr() != w.cos_sin.data_ptr():
+            raise RuntimeError("the layer launch takes K1's rope table for K2's too")
+        if seamed or nxt is not None:
+            # a seamed launch's rows: its positions' (the step's, as the caller slices them)
+            if seamed:
+                M = pos.shape[0]
+            else:
+                M = residual.shape[0] if embed is None else embed[1].shape[0]
+            if not self.seam_moves(M, tok_par) or (seamed and embed is not None):
+                raise RuntimeError(f"seam move at width {M}, token parallel {tok_par}")
+        if seamed:
+            if aux is not None:
+                raise RuntimeError("a seamed launch's capture is the previous launch's")
+            seam_in = self.seam_state(M) if seam_in is None else seam_in
+            self._check_seam(seam_in, M)
+            # the seam's outputs K1 would write: R_new from the state, the others unread
+            residual = self.seam_res(seam_in, M)
+            off, n = seam.seam_state_layout(M)["lin"]
+            x = seam_in[off : off + n].view(torch.bfloat16).view(M, HIDDEN)
+            post, comb, pre = self.post_a[:M], self.comb_a[:M], self.pre_a[:M]
+        a1, M, fold, _, _ = self._k1_args(
+            w, x, residual, post, comb, pre, pos, slot, swa, swa_block, keys, False,
+            tok_par, aux, embed,
+        )  # fmt: skip
+        if seamed:
+            a1["res_out"] = residual.data_ptr()
+        a2, outs, compressed = self._k2_args(
+            aw, fw, M, pos, swa, swa_block, comp, comp_block, outs, tok_par=tok_par
+        )
+        a2 |= dict.fromkeys(EG_ARGS, 0)
+        a2 |= dict.fromkeys(SEAM_ARGS, 0)
+        a2["nx_aux_stride"] = HIDDEN
+        a2["seam_in"] = seam_in.data_ptr() if seamed else 0
+        if nxt is not None:
+            seam_out = self.seam_state(M) if seam_out is None else seam_out
+            self._check_seam(seam_out, M)
+            if nxt_aux is not None:
+                self._check_aux(nxt_aux, M)
+            a2 |= {
+                "nx_fn": nxt.hc_fn.data_ptr(),
+                "nx_aux": 0 if nxt_aux is None else nxt_aux.data_ptr(),
+                "nx_aux_stride": HIDDEN if nxt_aux is None else nxt_aux.stride(0),
+                "seam_out": seam_out.data_ptr(),
+            }
+        if eg is not None:
+            rows, ew = eg
+            if not (
+                rows.dtype == torch.bfloat16
+                and tuple(rows.shape) == (M, engram.K)
+                and rows.is_contiguous()
+            ):
+                raise RuntimeError(f"Engram rows: {tuple(rows.shape)} {rows.dtype}")
+            a2 |= {
+                "eg_x": rows.data_ptr(),
+                "eg_w": ew.w.data_ptr(),
+                "eg_ws": ew.ws.data_ptr(),
+                "eg_kv": self.egkv.data_ptr(),
+                "eg_row0": ew.row0,
+            }
+        k2_name = {v: k for k, v in K2_OF_LAYER.items()}
+        _run_compiled(
+            self.layer_kernel(
+                M,
+                fold,
+                compressed,
+                embed is not None,
+                eg[1].tasks if eg else 0,
+                tok_par,
+                seamed,
+                nxt is not None,
+            ),
+            *(a1[n] for n in K1_ARGS),
+            *(a2[k2_name.get(n, n)] for n in LAYER_ARGS[len(K1_ARGS) :]),
             torch.cuda.current_stream(),
         )
         return outs

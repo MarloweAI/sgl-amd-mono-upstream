@@ -1,18 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
-"""A sampled DSpark draft's Markov block in two launches a step (``gfx950/markov``), offered
-through SGLang's draft sampler entry; checked against SGLang's ``draft_markov_block`` before
-capture on every rank. ``SGLANG_AMD_MONO_DSV41_MARKOV=0`` keeps SGLang's steps."""
+"""A sampled DSpark draft's Markov block, its step logits included, in one launch
+(``gfx950/markov``), offered through SGLang's draft sampler entry where the
+draft's Markov head and step logits have the layout the kernels read. Each rank keeps its
+shard of a sampled sequence's step logits (``step_logits_shard``, what the verify's sampled
+accept reads); SGLang's whole rows are gathered from every rank's shard only for a reader
+that needs them (``gather_step_logits``). A temperature-0 sequence's stay as SGLang's
+buffer holds them.
+``SGLANG_AMD_MONO_DSV41_MARKOV=0`` keeps SGLang's steps."""
 
 from __future__ import annotations
 
 import functools
 import logging
+import sys
 
 import torch
 
 _LOGGER = logging.getLogger(__name__)
 
 ENV = "SGLANG_AMD_MONO_DSV41_MARKOV"
+DRAFT = "sglang.srt.models.deepseek_v4_dspark"
 
 # by file under sglang/ (test_contract.py pins them)
 SGLANG_READS = {
@@ -30,27 +37,61 @@ SGLANG_READS = {
         "org_vocab_end",
         "_opt_markov_w2_bf16",
         "step_logits_dtype",
+        "vocab_size",
         "lm_head",
         "num_embeddings_per_partition",
+        "project_through_lm_head",
+        "hc_pre_from_prev_sublayer",
+        "_opt_markov_w2_tp_shard",
+        "_use_fp32_lm_head",
+        "_logits_from_x_post_hc",
     ),
-    "srt/models/dspark.py": ("vocab_shard",),
-    "srt/speculative/dspark_components/dspark_draft.py": (
-        "draft_markov_block",
-        "draft_markov_block(markov_head)",
-        "draft_markov_block(base_logits)",
-        "draft_markov_block(anchor_tokens)",
-        "draft_markov_block(draft_hidden)",
-        "draft_markov_block(step_temperatures)",
-        "draft_markov_block(noise)",
-        "draft_markov_block(tp_sync)",
-        "draft_markov_block(logits_out)",
-        "draft_markov_block(greedy_draft)",
-        "draft_markov_block(sharded_accept)",
-        "DraftNoise",
-        "key",
-        "offset",
+    "srt/models/dspark.py": ("vocab_shard", "vocab_size"),
+    "srt/speculative/dspark_components/dspark_draft.py": ("key", "offset"),
+    "srt/speculative/dspark_components/dspark_draft_sampler.py": (
+        '"verify_ids"',
+        '"writes_verify_ids"',
+        '"gather_step_logits"',
+        "whole_step_logits",
     ),
 }
+
+
+# per SGLang step-logits buffer (its address): the sampler whose launches keep their shards
+_SAMPLERS: dict = {}
+
+
+def step_logits_shard(step_logits: torch.Tensor, bs: int):
+    """This rank's columns of the last block's sampled step logits [bs, gamma, width] f32, where the
+    kernels' Markov block ran it (SGLang's whole ``step_logits`` buffer then holds no rows until
+    gathered), else None (SGLang's block wrote the whole rows)."""
+    sampler = _SAMPLERS.get(step_logits.data_ptr())
+    if sampler is None or bs not in sampler.ran:
+        return None
+    return sampler.ran[bs].slab[:bs, :, : sampler.width]
+
+
+# the draft forward's last (combined rows, their norm by the last stage's RMSNorm) from one launch
+# (``fused.combine_and_norm``): the sampler's base logits skip the norm for those rows. The reference
+# keeps the rows' memory from being reused by another tensor while it is held.
+_HEAD_INPUT: list = []
+
+
+def keep_head_input(combined: torch.Tensor, normed: torch.Tensor) -> None:
+    _HEAD_INPUT[:] = [combined, normed]
+
+
+def head_input_folds(model) -> bool:
+    """Whether the draft's base logits are the last stage's norm then the head on the forward's
+    output (V4.1's collapsed hidden, a TP-sharded bf16 head), so the norm can come with the combine."""
+    from sgl_amd_mono.deepseek_v41.glue import flag
+
+    return (
+        flag(ENV)
+        and getattr(model, "hc_pre_from_prev_sublayer", False)
+        and getattr(model, "_opt_markov_w2_tp_shard", False)
+        and not getattr(model, "_use_fp32_lm_head", True)
+    )
 
 
 class _Entries:
@@ -105,165 +146,182 @@ def _why_not(model, step_logits) -> str | None:
     part = int(model.lm_head.num_embeddings_per_partition)
     if step_logits is None or step_logits.dtype != torch.float32:
         return "no fp32 step logits"
-    if step_logits.shape[-1] != part:
-        return "step logits gathered whole, not on the shards"
+    if step_logits.shape[1] > markov.MAX_STEPS:
+        return f"{step_logits.shape[1]} draft steps, the kernel's at most {markov.MAX_STEPS}"
+    if step_logits.shape[-1] != head.vocab_size:
+        return f"step logits {step_logits.shape[-1]} wide, not the vocab's {head.vocab_size}"
+    if shard.org_vocab_start != group.rank_in_group * part or part % 4:
+        return f"vocab shards of {part} not at the ranks' multiples of the partition"
     return None
 
 
 class _Sampler:
     def __init__(
-        self, model, deadline_s, gamma, noise, draft_tokens, step_logits, temps
-    ):
+        self, model, deadline_s, gamma, noise, draft_tokens, step_logits, temps,
+        verify_ids=None,
+    ):  # fmt: skip
         from sgl_amd_mono.deepseek_v41.gfx950 import markov
 
         head = model.markov_head
         shard, group = head._tp_shard, head._shard_group
         self.model, self.gamma, self.noise = model, gamma, noise
         self.out, self.step_logits, self.temps = draft_tokens, step_logits, temps
+        # [max_bs, gamma + 1] the verify's ids ([anchor | tokens]), written by the launch, or None
+        self.verify_ids = verify_ids
         self.deadline_s = float(deadline_s)
         self.vocab_start = int(shard.org_vocab_start)
         self.embed = head.markov_w1.weight.contiguous()
         self.head = head.markov_w2.weight[shard.org_vocab_start : shard.org_vocab_end]
         assert self.head.is_contiguous()
         device = self.head.device
-        part = int(model.lm_head.num_embeddings_per_partition)
-        self.part = torch.empty(
-            markov.MAX_SEQUENCES,
-            markov.blocks(part),
-            2,
-            dtype=torch.float32,
-            device=device,
-        )
+        self.width = int(model.lm_head.num_embeddings_per_partition)
         self.exchange = markov.Exchange(
-            group.cpu_group, group.rank_in_group, group.world_size, device
+            group.cpu_group,
+            group.rank_in_group,
+            group.world_size,
+            device,
+            gamma,
+            self.width,
         )
         self.ops = markov.ops()
-
-    def block(self, base_logits, anchor, temps, noise, out, step_logits):
-        """Every step of a [bs, gamma, padded] base logits block: tokens to ``out``
-        ([bs * gamma]), the step logits to ``step_logits`` ([bs, gamma, padded])."""
-        x = self.exchange
-        for s in range(self.gamma):
-            self.ops.markov_sample_step(
-                base_logits[:, s], self.embed, self.head, anchor,
-                None if step_logits is None else step_logits[:, s], temps, noise.offset,
-                int(noise.key), self.vocab_start, s, self.part, out, self.gamma, x.tok,
-                x.calls, x.peers, x.rank, s == self.gamma - 1, self.deadline_s,
+        # per batch size: the exchange whose shard holds that block's step logits
+        self.ran: dict = {}
+        # one sequence's head and Markov block in one launch: its own exchange, launch counts and base logits
+        self.fused = None
+        if _head_folds(model, gamma, group.world_size):
+            self.fused = markov.Exchange(
+                group.cpu_group, group.rank_in_group, group.world_size, device, gamma, self.width,
+                control=markov.MAX_BLOCKS,
             )  # fmt: skip
+            self.base = torch.zeros(
+                gamma * self.width, dtype=torch.int64, device=device
+            )
+
+    def block(
+        self, base_logits, anchor, temps, noise, out, step_logits, verify_ids=None
+    ):
+        """Every step of a [bs, gamma, padded] base logits block: tokens to ``out``
+        ([bs * gamma]), the sampled sequences' step logits to ``step_logits``
+        ([bs, gamma, vocab])."""
+        x = self.exchange
+        self.ops.markov_block(
+            base_logits, self.embed, self.head, anchor, temps, noise.offset,
+            int(noise.key), self.vocab_start, out, self.gamma, x.tok, x.control, x.peers,
+            x.rank, step_logits, self.width, self.deadline_s, verify_ids,
+        )  # fmt: skip
 
     def step(self, hidden_states, anchor_tokens):
         """SGLang's base logits and Markov block of a bs-row draft block."""
-        base_logits, confidence_features = self.model.compute_base_logits(hidden_states)
+        from sgl_amd_mono.deepseek_v41.glue import chose
+
+        held = _HEAD_INPUT
+        normed = (
+            held
+            and held[0].data_ptr() == hidden_states.data_ptr()
+            and held[0].shape == hidden_states.shape
+            and head_input_folds(self.model)
+        )
         bs = anchor_tokens.shape[0]
+        if chose(
+            "draft_head",
+            self.fused is not None and normed and bs == 1 and held[1].is_contiguous(),
+        ):
+            # the head's projection of the normed rows and the Markov block in one launch
+            x = self.fused
+            self._ran(bs, x)
+            out, verify = (
+                self.out[: self.gamma],
+                None if self.verify_ids is None else self.verify_ids[:1],
+            )
+            self.ops.draft_head(
+                held[1], self.model.lm_head.weight, self.base, self.embed, self.head, anchor_tokens.long(),
+                self.temps[:1], self.noise.offset, int(self.noise.key), self.vocab_start, out, self.gamma,
+                x.tok, x.control, x.peers, x.rank, self.step_logits[:1], self.width, self.deadline_s, verify,
+            )  # fmt: skip
+            return out.view(1, self.gamma), hidden_states
+        if normed:
+            # _logits_from_x_post_hc on the rows normed in the combine's launch
+            project = sys.modules[DRAFT].project_through_lm_head
+            base_logits, confidence_features = (
+                project(held[1], self.model.lm_head),
+                hidden_states,
+            )
+        else:
+            base_logits, confidence_features = self.model.compute_base_logits(
+                hidden_states
+            )
         base = base_logits.view(bs, self.gamma, -1)
+        self._ran(bs, self.exchange)
         out = self.out[: bs * self.gamma]
+        verify = None if self.verify_ids is None else self.verify_ids[:bs]
         self.block(
             base, anchor_tokens.long(), self.temps[:bs], self.noise, out,
-            self.step_logits[:bs],
+            self.step_logits[:bs], verify,
         )  # fmt: skip
         return out.view(bs, self.gamma), confidence_features
 
-    def disagrees(self, max_bs: int) -> str | None:
-        """Why the kernels' block is not SGLang's on random inputs, or None."""
-        from sglang.srt.speculative.dspark_components.dspark_draft import (
-            DraftNoise,
-            draft_markov_block,
+    def _ran(self, bs, exchange):
+        held = self.ran.setdefault(bs, exchange)
+        if held is not exchange:
+            raise RuntimeError(
+                f"DSV4.1 Markov block: batch size {bs} ran on two exchanges"
+            )
+
+    def gather_step_logits(self, bs):
+        """SGLang's whole step-logits rows [:bs] of the last block, from every rank's shard."""
+        x = self.ran[bs]
+        self.ops.gather_step_logits(
+            self.temps[:bs], x.peers, self.step_logits[:bs], self.width
         )
 
-        class _NoSync:
-            def sync(self, site, value):
-                return value
 
-        head, gamma = self.model.markov_head, self.gamma
-        device = self.head.device
-        width = int(self.model.lm_head.num_embeddings_per_partition)
-        g = torch.Generator(device=device).manual_seed(1234)
-        for bs in range(1, max_bs + 1):
-            base = (
-                torch.randn(bs, gamma, width, generator=g, device=device) * 3
-            ).bfloat16()
-            anchor = torch.randint(
-                0, head.vocab_size, (bs,), generator=g, device=device
-            ).long()
-            temps = torch.tensor([1.0, 0.0, 0.7, 1.3][:bs], device=device)
-            offset = torch.randint(0, 1 << 30, (1,), generator=g, device=device)
-            want_logits = torch.empty(
-                bs, gamma, width, dtype=torch.float32, device=device
-            )
-            want, _ = draft_markov_block(
-                markov_head=head, base_logits=base, anchor_tokens=anchor,
-                draft_hidden=None, step_temperatures=temps,
-                noise=DraftNoise(key=int(self.noise.key), offset=offset.clone()),
-                tp_sync=_NoSync(), logits_out=want_logits, greedy_draft=False,
-                sharded_accept=True,
-            )  # fmt: skip
-            got_logits = torch.empty_like(want_logits)
-            got = torch.empty(bs * gamma, dtype=torch.int64, device=device)
-            noise = DraftNoise(key=int(self.noise.key), offset=offset.clone())
-            self.block(base, anchor, temps, noise, got, got_logits)
-            if not torch.equal(got.view(bs, gamma), want.long()):
-                return f"{bs} rows: tokens {got.tolist()} vs SGLang's {want.tolist()}"
-            # the bias GEMV sums in another order: a bf16 rounding flip of the bias now and then
-            bias = (want_logits - base.float()).abs()
-            apart = (got_logits - want_logits).abs()
-            if not (apart <= bias * 2**-7 + 1e-6).all():
-                return f"{bs} rows: step logits apart by {apart.max().item():.3g}"
-            if int(noise.offset.item()) != int(offset.item()) + 1:
-                return "the noise counter did not advance once"
-        return None
+def _head_folds(model, gamma: int, tp: int) -> bool:
+    """Whether one sequence's base logits run in the Markov block's launch: TP8 (at TP4 the
+    launch measured level with hipBLASLt + the Markov block), the head input folds
+    (``head_input_folds``), a bf16 head shard [width, 5120] of the kernel's shapes, at most 6 steps."""
+    w = getattr(model.lm_head, "weight", None)
+    return (
+        tp == 8
+        and head_input_folds(model)
+        and w is not None
+        and w.dtype == torch.bfloat16
+        and w.dim() == 2
+        and w.shape[1] == 5120
+        and w.stride(1) == 1
+        and w.shape[0] == int(model.lm_head.num_embeddings_per_partition)
+        and gamma <= 6
+    )
 
 
 def _factory(
     model, deadline_s, *, gamma, max_bs, greedy_draft, noise, draft_tokens,
-    step_logits, step_temperatures,
+    step_logits, step_temperatures, verify_ids=None,
 ):  # fmt: skip
-    """SGLang's draft sampler factory: bs -> the kernels' step, or None (SGLang's)."""
-    import torch.distributed as dist
-
+    """SGLang's draft sampler factory: bs -> the kernels' step, or None (SGLang's).
+    ``verify_ids`` ([max_bs, gamma + 1] int64): the step also writes the verify's ids
+    ([anchor | tokens]) there, and the steps say so (``writes_verify_ids``)."""
     from sgl_amd_mono.deepseek_v41.gfx950 import markov
 
-    def keep(why):
+    why = "a greedy draft" if greedy_draft else _why_not(model, step_logits)
+    if why is not None:
         _LOGGER.info("DSpark draft: SGLang's Markov block runs (%s)", why)
         return lambda bs: None
-
-    if greedy_draft:
-        return keep("a greedy draft")
-    why = _why_not(model, step_logits)
-    group = getattr(model.markov_head, "_shard_group", None)
-
-    def agree(ok: bool) -> bool:
-        if group is None:
-            return ok
-        flag = torch.tensor([int(ok)], dtype=torch.int32)
-        dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=group.cpu_group)
-        return bool(flag.item())
-
-    if not agree(why is None):
-        return keep(why or "another rank's Markov head")
-    sampler = None
-    try:
-        sampler = _Sampler(
-            model,
-            deadline_s,
-            gamma,
-            noise,
-            draft_tokens,
-            step_logits,
-            step_temperatures,
-        )
-    except Exception as e:  # noqa: BLE001 (every rank must still reach the agreement)
-        why = f"the kernels do not build: {type(e).__name__}: {e}"
-    if not agree(sampler is not None):
-        return keep(why or "the kernels did not build on another rank")
+    sampler = _Sampler(
+        model, deadline_s, gamma, noise, draft_tokens, step_logits, step_temperatures,
+        verify_ids,
+    )  # fmt: skip
     top = min(max_bs, markov.MAX_SEQUENCES)
-    why = sampler.disagrees(top)
-    if not agree(why is None):
-        sampler.exchange.close()
-        return keep(why or "the kernels disagree with SGLang on another rank")
-    if group.rank_in_group == 0:
+    if model.markov_head._shard_group.rank_in_group == 0:
         _LOGGER.info(
             "DSpark draft: the sampled Markov block in the gfx950 kernels at batch "
             "sizes 1 to %d",
             top,
         )
-    return lambda bs: sampler.step if 1 <= bs <= top else None
+
+    def steps(bs):
+        return sampler.step if 1 <= bs <= top else None
+
+    steps.writes_verify_ids = verify_ids is not None
+    steps.gather_step_logits = sampler.gather_step_logits
+    _SAMPLERS[step_logits.data_ptr()] = sampler
+    return steps

@@ -31,13 +31,16 @@ from sgl_amd_mono.common.mx import FP4, mfma_scaled
 from sgl_amd_mono.common.ops import (
     CM_DEV,
     global_load,
+    global_ptr,
     ld_i32,
     permlane_swap,
     rsrc,
+    xshfl,
 )
 from sgl_amd_mono.common.plan import BLOCKS, WAVES
 
 from . import index_plan as ip
+from .walk_plan import walk_task
 
 PAGE = ip.BLOCK_ROWS
 PAGE_BYTES = PAGE * ip.DIM // 2
@@ -58,6 +61,8 @@ ROW_WAVES = -(-ROW_WORDS // (4 * 64))
 DEPTH = 2  # steps of keys a wave has in flight
 OLDER_SHARE = 55  # percent of a SIMD pair's steps the older wave walks
 N_KV = 5  # a step's key buffer: four tiles and their scales
+# block lengths, then the compact widths, at this many rows apart
+LENS_ROWS = 64
 # a REINDEX task's fewest chunks: a step a wave
 REINDEX_TASK_CHUNKS = WAVES * ip.STEP // ip.CHUNK
 
@@ -252,8 +257,10 @@ def _first_keys(c, pages, nt):
 
 
 @flyc.jit
-def _step(c, rows, outs, kv, kvs, st, after_mfmas):
-    """Step st's logits of every row; ``after_mfmas`` once its keys are read."""
+def _step(c, rows, outs, blocks, kv, kvs, st, after_mfmas):
+    """Step st's logits of every row, and with ``blocks`` (whether the launch keeps block
+    maxima; the piece's lead) each row's 8-column block maxima of them; ``after_mfmas`` once
+    its keys are read."""
     lane = c["lane"]
     l, g = lane % 16, lane // 16
     zero = fx.Vector.filled(4, 0.0, fx.Float32)
@@ -289,16 +296,47 @@ def _step(c, rows, outs, kv, kvs, st, after_mfmas):
             sums.append(total)
         per_tile.append(sums)
     key = st * ip.STEP + l * 4 + g
+    logits = []
     for r in range_constexpr(len(rows)):
         p = [per_tile[nt][r] for nt in range(4)]
         lo = _swap_add(32, p[0], p[2])
         hi = _swap_add(32, p[1], p[3])
-        bo.buffer_store(_swap_add(16, lo, hi), outs[r], key, cache_modifier=CM_DEV)
+        logits.append(_swap_add(16, lo, hi))
+        bo.buffer_store(logits[r], outs[r], key, cache_modifier=CM_DEV)
+    keep, lead = blocks
+    if const_expr(keep):
+        _block_maxima(c, rows, logits, st, lead)
 
 
 @flyc.jit
-def _walk(c, lead, trow, count, step_of, init, rows_n):
-    """This wave's ``count`` steps ``step_of(k)`` of the piece's first ``rows_n`` rows.
+def _block_maxima(c, rows, logits, st, lead):
+    """Each row's maxima of step st's 8-column blocks over its columns, the
+    block of its newest column +inf: ``candidate_block_scores`` of SGLang's level one. Lane
+    (g, l) holds column 4 l + g, so block l // 2's are lanes l, l ^ 1 of each g."""
+    lane = c["lane"]
+    l, g = lane % 16, lane // 16
+    a = c["args"]
+    key = st * ip.STEP + l * 4 + g
+    blk = st * (ip.STEP // ip.BLOCK_ROWS) + l // 2
+    for r in range_constexpr(len(rows)):
+        bound = rows[r][0]
+        m = (key < bound).select(logits[r], fx.Float32(float("-inf")))
+        m = fx.max(m, xshfl(m, 1))
+        m = fx.max(m, xshfl(m, 16))
+        m = fx.max(m, xshfl(m, 32))
+        m = (blk == (bound - 1) // ip.BLOCK_ROWS).select(fx.Float32(float("inf")), m)
+        out = rsrc(
+            a["bmax"] + fx.Int64(lead + r) * fx.Int64(a["bstride"]) * 4,
+            (bound + ip.BLOCK_ROWS - 1) // ip.BLOCK_ROWS * 4,
+        )
+        if (g == 0) & (l % 2 == 0):
+            bo.buffer_store(m, out, blk, cache_modifier=CM_DEV)
+
+
+@flyc.jit
+def _walk(c, lead, trow, count, step_of, init, rows_n, keep):
+    """This wave's ``count`` steps ``step_of(k)`` of the piece's first ``rows_n`` rows
+    (``keep``: their block maxima too).
 
     DEPTH key buffers start from ``init``; each refills with the keys DEPTH steps on right after
     its step's MFMAs, and pages are read a trip further ahead."""
@@ -312,6 +350,7 @@ def _walk(c, lead, trow, count, step_of, init, rows_n):
         )
         for r in range(rows_n)
     ]
+    blocks = (keep, lead)
     # names bound out here must not be rebound in the loop, or the rewriter carries them as state
     trips = count // DEPTH
     for j, state in range(0, fx.Int64(trips), 1, init=init):
@@ -328,7 +367,7 @@ def _walk(c, lead, trow, count, step_of, init, rows_n):
                 pages.append(_page(c, trow, step_of(k + 2 * DEPTH)))
 
             mine = [state[i * N_KV + e] for e in range(N_KV)]
-            _step(c, rows, outs, mine[:4], mine[4], step_of(k), refill)
+            _step(c, rows, outs, blocks, mine[:4], mine[4], step_of(k), refill)
         out = []
         for b in bufs:
             out += b
@@ -339,7 +378,7 @@ def _walk(c, lead, trow, count, step_of, init, rows_n):
         if fx.Int32(i) < tail:
             mine = [carried[i * N_KV + e] for e in range(N_KV)]
             _step(
-                c, rows, outs, mine[:4], mine[4], step_of(trips * DEPTH + i),
+                c, rows, outs, blocks, mine[:4], mine[4], step_of(trips * DEPTH + i),
                 lambda: None,
             )  # fmt: skip
 
@@ -386,17 +425,20 @@ def stage_iscore4(c, lead, span, ch0, ch1, rows):
     rem = fx.min(ch1, top) * (ip.CHUNK // ip.STEP) - s_lo - pair
     steps = (rem > 0).select((rem + WAVES // 2 - 1) // (WAVES // 2), fx.Int32(0))
     count = older.select(fx.min(split, steps), fx.max(steps - split, 0))
+    # a producer's build keeps block maxima, of its pieces (not a REINDEX token's)
+    keep = c["blocks"] and rows > 1
     if count > 0:
-        _walk(c, lead, trow, count, step_of, init, rows)
+        _walk(c, lead, trow, count, step_of, init, rows, keep)
 
 
 @flyc.jit
 def run_scores4(c, s, bid):
     """The FP4 score stage: this CTA's task, if any.
 
-    A FULL layer's is its ``iplan`` row (lead, span, ch0, ch1; span 0 for none); a REINDEX
-    layer's comes from the CTA index alone (``index_plan.reindex_split``) and stops at the
-    token's bound, read with the first keys."""
+    A FULL layer's is its ``iplan`` row (lead, span, ch0, ch1; span 0 for none), which the
+    step's first launch of the ratio (``fill_plan``) works out and writes; a REINDEX layer's
+    comes from the CTA index alone (``index_plan.reindex_split``) and stops at the token's
+    bound, read with the first keys."""
     a = c["args"]
     _read_all(a.values())
     if a["reindex"] != 0:
@@ -406,5 +448,23 @@ def run_scores4(c, s, bid):
             stage_iscore4(c, bid // per, fx.Int32(1), ch0, ch1, 1)
     else:
         task = _sload4(a["iplan"] + fx.Int64(bid) * 16)
+        if a["fill_plan"] != 0:
+            task = walk_task(a, s, bid)
+            if c["tid"] == 0:
+                fx.ptr_store(
+                    fx.Vector.from_elements(task, fx.Int32),
+                    global_ptr(a["iplan"] + fx.Int64(bid) * 16, 4),
+                )
         if task[1] > 0:
             stage_iscore4(c, task[0], task[1], task[2], task[3], ip.WALK_ROWS)
+        # with block maxima, each row's blocks and compact width (SGLang's level-one lengths)
+        # from its CTA of the grid's last
+        if const_expr(c["blocks"]):
+            if (bid >= BLOCKS - s) & (c["tid"] == 0):
+                row = fx.Int32(BLOCKS - 1) - bid
+                blocks = (ld_i32(a["ibound"], row) + ip.BLOCK_ROWS - 1) // ip.BLOCK_ROWS
+                fx.ptr_store(blocks, global_ptr(a["blens"] + fx.Int64(row) * 4))
+                fx.ptr_store(
+                    fx.min(blocks, ip.TOPK_BLOCKS) * ip.BLOCK_ROWS,
+                    global_ptr(a["blens"] + fx.Int64(row + LENS_ROWS) * 4),
+                )

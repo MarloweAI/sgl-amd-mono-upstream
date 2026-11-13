@@ -77,9 +77,14 @@ def _fp8_step_load(c, r_w, r_ws, k, rg, st, row_major=False):
     j = lane // 16
     kg = k // 32
     if const_expr(row_major):
-        assert k % 64 == 0
+        assert k % 32 == 0
         row = rg * 16 + lane % 16
-        lo_at = row * (k // 4) + st * 32 + j * 4
+        if const_expr(k % 64 == 0):
+            lo_at = row * (k // 4) + st * 32 + j * 4
+        else:
+            # TP8's shared down (K 288): a last half step's upper lanes are masked;
+            # keep their address in the row, past the last row is past the tensor
+            lo_at = row * (k // 4) + fx.min(st * 32 + j * 4, k // 4 - 4)
         hi_at = row * (k // 4) + fx.min(2 * st + 1, k // 64 - 1) * 16 + j * 4
         lo = fx.Vector(
             bo.buffer_load(r_w, lo_at, vec_width=4, dtype=T.i32, cache_modifier=CM_NT)

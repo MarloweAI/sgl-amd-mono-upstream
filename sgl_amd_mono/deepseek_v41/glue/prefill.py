@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Prefill indexer kernels compiled once, not per context length: aiter's FP4 MQA logits with
-the block-table stride an argument (bitwise aiter's, checked at the first call), the schedule's
-Triton kernels unspecialized and prewarmed. ``SGLANG_AMD_MONO_DSV41_PREFILL_JIT=0`` keeps them."""
+the block-table stride an argument (bitwise aiter's), the schedule's Triton kernels
+unspecialized and prewarmed. ``SGLANG_AMD_MONO_DSV41_PREFILL_JIT=0`` keeps them."""
 
 from __future__ import annotations
 
@@ -111,44 +111,6 @@ def _strided_module():
     return module, None
 
 
-class _Checked:
-    """The strided launch, checked bitwise against aiter's at the first eager call."""
-
-    def __init__(self, strided, original):
-        self._strided, self._original = strided, original
-        self._checked, self.off = False, False
-
-    def __call__(self, *args, **kwargs):
-        if self.off:
-            return self._original(*args, **kwargs)
-        if self._checked or torch.cuda.is_current_stream_capturing():
-            return self._strided(*args, **kwargs)
-        self._checked = True
-        out = kwargs.pop("out", None)
-        want = self._original(*args, **kwargs, out=None if out is None else out.clone())
-        try:
-            got = self._strided(*args, **kwargs, out=out)
-        except Exception as e:  # noqa: BLE001
-            _LOGGER.warning(
-                "DSV4.1 prefill MQA logits: the strided kernel failed (%s); aiter's runs",
-                e,
-            )
-            got = None
-        # rows no CTA writes keep whatever they held, NaN too: compare the bits
-        if got is not None and torch.equal(
-            got.view(torch.int32), want.view(torch.int32)
-        ):
-            return got
-        self.off = True
-        _LOGGER.warning(
-            "DSV4.1 prefill MQA logits: the strided kernel differs; aiter's runs"
-        )
-        if out is not None:
-            out.copy_(want)
-            return out
-        return want
-
-
 def _unspecialized(kernel):
     import triton
 
@@ -180,9 +142,8 @@ def _patch_mqa_logits() -> str:
     module, why = _strided_module()
     if module is None:
         return why
-    flydsl_ops.flydsl_pa_mqa_logits_fp4_prefill = _Checked(
-        module.flydsl_pa_mqa_logits_fp4_prefill,
-        flydsl_ops.flydsl_pa_mqa_logits_fp4_prefill,
+    flydsl_ops.flydsl_pa_mqa_logits_fp4_prefill = (
+        module.flydsl_pa_mqa_logits_fp4_prefill
     )
     return "the block-table stride an argument"
 
@@ -231,11 +192,7 @@ def install() -> None:
         ("schedule", _patch_schedule),
         ("row_plan", _patch_row_plan),
     ):
-        try:
-            how = patch()
-        except Exception as e:  # noqa: BLE001
-            how = f"{type(e).__name__}: {e}"
-        _LOGGER.info("DSV4.1 prefill %s: %s", name, how)
+        _LOGGER.info("DSV4.1 prefill %s: %s", name, patch())
 
 
 def prewarm(device) -> None:

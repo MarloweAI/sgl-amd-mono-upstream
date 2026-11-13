@@ -330,7 +330,13 @@ def lanes_below(bal, lane):
 
 def load_ptr64(table, i):
     """Load entry ``i`` of an i64 table, wave-uniform."""
-    pw = fx.Vector(bo.buffer_load(rsrc(table), i * 2, vec_width=2, dtype=T.i32))
+    return ptr64(
+        fx.Vector(bo.buffer_load(rsrc(table), i * 2, vec_width=2, dtype=T.i32))
+    )
+
+
+def ptr64(pw):
+    """The wave-uniform i64 of a loaded (lo, hi) word pair."""
     return (fx.Int64(uniform(pw[1])) << 32) | fx.Int64(fx.Uint32(uniform(pw[0])))
 
 

@@ -9,7 +9,7 @@ from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T
 
-from sgl_amd_mono.common.ops import CM_NT, mfma_bf16, rsrc
+from sgl_amd_mono.common.ops import CM_DEV, CM_NT, mfma_bf16, rsrc
 from sgl_amd_mono.deepseek_v41.gfx950.stages.gemv import lds_row
 
 from .device import THREADS, WAVES, fp8x8_bf16, mfma_scaled, pow2, tile_map
@@ -42,13 +42,18 @@ def w_offset(row, k, col, shuffled):
     return row * k + col
 
 
-def _step_load(c, r_w, r_ws, k, row0, st, pred=None, shuffled=False):
-    """Load step ``st``'s weight operand of rows row0 .. +16 and its E8M0 byte (masked when not ``pred``)."""
+def _step_load(c, r_w, r_ws, k, row0, st, pred=None, shuffled=False, dead=None):
+    """Load step ``st``'s weight operand of rows row0 .. +16 and its E8M0 byte (masked when not ``pred``;
+    ``dead``: (lanes whose rows read zeros, the weight's bytes, the bound of ``r_w``))."""
     lane = c["lane"]
     j = lane // 16
     row = row0 + lane % 16
     col = 128 * st + 16 * j
     lo_at, hi_at = w_offset(row, k, col, shuffled), w_offset(row, k, col + 64, shuffled)
+    if const_expr(dead is not None):
+        # past the buffer's bound: zeros, no traffic
+        lo_at = dead[0].select(fx.Int32(dead[1]), lo_at)
+        hi_at = dead[0].select(fx.Int32(dead[1]), hi_at)
     # weights are read once a launch: nontemporal, so they do not evict KV or scratch
     lo = fx.Vector(
         bo.buffer_load(r_w, lo_at // 4, vec_width=4, dtype=T.i32, cache_modifier=CM_NT)
@@ -172,13 +177,19 @@ def chain_slots(c, nsteps, waves, first=0, count=None):
     return out
 
 
-def chain_loads(c, w, ws, k, row0, slots, pred, shuffled=False):
-    """Issue the weight loads of every step of ``slots`` (a dead step reads a zero-size buffer)."""
+def chain_loads(c, w, ws, k, row0, slots, pred, shuffled=False, half=None, nrows=0):
+    """Issue the weight loads of every step of ``slots`` (a dead step reads a zero-size buffer);
+    ``half``: only rows row0 + 8 half .. + 8 of the tile (``nrows``: the weight's rows), the
+    others read zeros."""
     out = []
+    dead = None
+    if const_expr(half is not None):
+        dead = ((c["lane"] % 16) // 8 != half, nrows * k)
     for _, steps in slots:
         ops = []
         for st, live in steps:
-            nb = (live & pred).select(fx.Int64(0xFFFFFFFF), fx.Int64(0))
+            top = 0xFFFFFFFF if half is None else nrows * k
+            nb = (live & pred).select(fx.Int64(top), fx.Int64(0))
             ops.append(
                 _step_load(
                     c,
@@ -188,6 +199,7 @@ def chain_loads(c, w, ws, k, row0, slots, pred, shuffled=False):
                     row0,
                     fx.min(st, k // 128 - 1),
                     shuffled=shuffled,
+                    dead=dead,
                 )
             )
         out.append(ops)
@@ -244,7 +256,8 @@ def rows_loads(
     n,
     pred=None,
 ):
-    """Issue loads of the published MXFP8 rows of tokens t0 .. t0 + n (masked when not ``pred``)."""
+    """Issue loads of the published MXFP8 rows of tokens t0 .. t0 + n (masked when not ``pred``),
+    device scope: rows another CTA of this launch wrote."""
     tid = c["tid"]
     nb = None if pred is None else pred.select(fx.Int64(0xFFFFFFFF), fx.Int64(0))
     out = []
@@ -263,7 +276,13 @@ def rows_loads(
                 row = fx.min(row, n - 1)
             regs.append(
                 fx.Vector(
-                    bo.buffer_load(r, row * stride + a0, vec_width=4, dtype=T.i32)
+                    bo.buffer_load(
+                        r,
+                        row * stride + a0,
+                        vec_width=4,
+                        dtype=T.i32,
+                        cache_modifier=CM_DEV,
+                    )
                 )
             )
         out.append(regs)
@@ -379,7 +398,8 @@ def bf16_gemv_mfmas(c, k, xl, ops, acc, h, rows):
 
 
 def words_loads(c, base, stride, off, words, t0, n):
-    """Issue loads of ``words`` 32-bit words of tokens t0 .. t0 + n's rows at ``off``."""
+    """Issue loads of ``words`` 32-bit words of tokens t0 .. t0 + n's rows at ``off``, device
+    scope: rows another CTA of this launch wrote."""
     tid = c["tid"]
     wq, rpr, rounds = span_items(words, n)
     row0, col = tile_map(tid, wq)
@@ -391,7 +411,15 @@ def words_loads(c, base, stride, off, words, t0, n):
         if (i + 1) * rpr > n or rpr * wq < THREADS:
             row = fx.min(row, n - 1)
         regs.append(
-            fx.Vector(bo.buffer_load(r, row * stride + a0, vec_width=4, dtype=T.i32))
+            fx.Vector(
+                bo.buffer_load(
+                    r,
+                    row * stride + a0,
+                    vec_width=4,
+                    dtype=T.i32,
+                    cache_modifier=CM_DEV,
+                )
+            )
         )
     return regs
 
