@@ -460,7 +460,7 @@ def build_glm5_monokernel(
     OUT_OFF = RED_OFF + RED_WORDS
     # UK writes its 128-row result straight from the reduction tile to q_lat;
     # all remaining stages need at most these compact output tiles.
-    OUT_WORDS = max(S * ROW_TILE, S * 2 * UG_TILE)
+    OUT_WORDS = max(S * ROW_TILE, S * 2 * UG_TILE, UV_TILE)
     WORK_WORDS = OUT_OFF + OUT_WORDS
     # Above 4 rows, with the paged indexer, the scoring layout (written once a CTA's
     # front tile is done, read at the scoring stage) sits ahead of the arena: the row
@@ -5257,9 +5257,10 @@ def build_glm5_monokernel(
                         UV_R,
                         acc,
                         emit_ptpc_scalar(UV_TILE, ld_f32(r_suv, 0)),
+                        1,
                     )
                 else:
-                    reduce_rows(UV_R, acc, emit_out(UV_TILE))
+                    reduce_rows(UV_R, acc, emit_out(UV_TILE), 1)
                 stamp("uv", tt, 3)
                 gpu.barrier()
                 if tid < UV_TILE // 4:
