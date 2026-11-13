@@ -71,6 +71,8 @@ def _backend(rng, *, reqs, ctx, qo, draft, device):
     pool.full_to_swa_index_mapping = torch.randint(
         0, 1 << 16, (slots + 1,), generator=rng, device=device
     )
+    # the allocator's trailing -1: an empty slot translates to -1
+    pool.full_to_swa_index_mapping[-1] = -1
     pool.request_window = None
     pool.swa_req_ring_size = None
     pool.unified_swa_pages = 0
@@ -86,7 +88,7 @@ def _backend(rng, *, reqs, ctx, qo, draft, device):
     b.page_size, b.MAX_SEQ_LEN_FOR_CAPTURE = 256, ctx
     b.target_verify_num_draft_tokens = qo
     b.need_compress, b.has_c4, b.has_c128 = not draft, False, False
-    b.low_ratios = () if draft else (1, 2)
+    b.present_ratios = b.low_ratios = () if draft else (1, 2)
     b.index_topk = 512
     b.cuda_int32_kwargs = dict(device=device, dtype=torch.int32)
     b.encoder_replay = False
@@ -400,6 +402,7 @@ def main():
             ),
             spec_info=SimpleNamespace(draft_token_num=6),
             batch_size=bs,
+            ragged_verify_layout=None,
         )
         why = why or differs(orig_req_rows(fb), held[2], "request rows")
         d = _backend(rng, reqs=8, ctx=ctx, qo=5, draft=True, device=device)

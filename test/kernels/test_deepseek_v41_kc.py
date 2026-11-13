@@ -68,14 +68,12 @@ def _buffers():
 
 
 def _forward_wk(latent, wk):
-    """The indexer's ``forward_wk``: SGLang's small GEMM where it takes the shape."""
-    from sglang.kernels.ops.gemm.small_gemm_bf16 import (
-        can_use_n128k512_gemm,
-        n128k512_gemm_bf16,
-    )
+    """The indexer's ``forward_wk``: SGLang's tiny GEMM where it takes the shape, else the linear."""
+    from sglang.kernels.ops.gemm.tiny_gemm import tiny_gemm_bf16
+    from sglang.srt.layers.attention.dsv4.dsv41_sparse import _tiny_gemm_max_m
 
-    if can_use_n128k512_gemm(wk.shape[0], latent.shape[-1], latent.shape[0]):
-        return n128k512_gemm_bf16(latent, wk)
+    if 0 < latent.shape[0] <= _tiny_gemm_max_m(wk.shape[0], latent.shape[-1]):
+        return tiny_gemm_bf16(latent, wk)
     return torch.nn.functional.linear(latent, wk)
 
 
