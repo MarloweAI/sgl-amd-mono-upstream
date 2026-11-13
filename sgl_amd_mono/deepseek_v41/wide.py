@@ -1026,15 +1026,15 @@ class SpanA:
             m: self.modes[m] == "rs" and width_class(m) in SPAN_A_GATHER.get(self.tp, ())
             for m in WIDTHS
         }
-        # the peer buffer's flag regions: a width's sum, and its gather with and without a sum
-        # (a layer after a settled post gathers without one); a stand-in form sizes them
-        form = seam_wide.Form(stage="seama")
+        # the peer buffer's flag regions: a width's sum, and a gather's for each shape a width's
+        # plans take (with a sum; without one, after a settled post or at the first layer)
         keyed = {}
         for m in WIDTHS:
-            for owed in (True, False) if self.gathers[m] else (True,):
-                keyed[(m, owed)] = spana.Plan(
-                    m=m, seam=form, tp=self.tp, mode=self.modes[m] if owed else None,
-                    tpar=self.modes[m] == "rs",
+            for key in self._shapes(m):
+                _, owed, post, combine = key
+                keyed[key] = spana.Plan(
+                    m=m, seam=seam_wide.Form(stage="seama", post=post, combine=combine), tp=self.tp,
+                    mode=self.modes[m] if owed else None, tpar=self.modes[m] == "rs",
                     front=self._stand_in_front(m) if self.gathers[m] else None,
                     gather=self.gathers[m],
                 )  # fmt: skip
@@ -1047,6 +1047,12 @@ class SpanA:
         self.consts: dict = {}
         self.front_consts: dict = {}
         self._gather_plan: dict = {}
+
+    def _shapes(self, m):
+        """The flag-region keys of width m: (m, with a sum, the seam's post, its combine)."""
+        if not self.gathers[m]:
+            return [(m, True, True, True)]
+        return [(m, True, True, True), (m, False, False, True), (m, False, False, False)]
 
     def _stand_in_front(self, m):
         """A front of the width's shape (the peer layout reads only its presence)."""
@@ -1132,10 +1138,10 @@ class SpanA:
             window=SPAN_A_WINDOW[self.tp] if mode is not None else 0,
         )  # fmt: skip
         if mode is not None or gather:
-            key = (m, mode is not None)
+            key = (m, mode is not None, form.post, form.combine) if gather else (m, True, True, True)
             p = msgspec.structs.replace(p, peer=self.peers[key])
-            # a gather's flags in the peer buffer flip once a launch of their one plan (the sum's
-            # carry the width's own phase, ``Plan.peer.sown``)
+            # a gather's flags in the peer buffer flip once a launch of their one plan, a region a
+            # plan shape (the sum's carry the width's own phase, ``Plan.peer.sown``)
             if gather and self._gather_plan.setdefault(key, p) != p:
                 raise RuntimeError(
                     f"layer {layer.self_attn.layer_id}: the span A launch's gather needs one plan a width: "
