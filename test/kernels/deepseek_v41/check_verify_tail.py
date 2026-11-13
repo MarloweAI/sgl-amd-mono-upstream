@@ -1,5 +1,5 @@
 """Check the static verify's accept from the ranks' bf16 logits shards (gfx950/vtail, one launch) against SGLang's
-chain on the gathered f32 logits (torchrun, TP2 to TP8): the row argmax (``row_argmax``), the simulated bonus
+chain on the gathered f32 logits (torchrun, TP2 to TP8): the row argmax (``sampling.argmax``), the simulated bonus
 (``simulated_bonus_partials_graph``) and the static accept tail (``static_accept_tail``), bitwise, at 1 to 8
 requests of 6 rows, greedy, a simulated length with argmax bonus, and a simulated length with temperature-sampled
 bonus; ties within and across ranks. SGLang's own shard path (``softcap_row_argmax`` on bf16,
@@ -77,7 +77,7 @@ def inputs(case, rank, tp, part, dev, seed):
     full[:, VOCAB:] = 0  # past the vocab: never read
     local = full[:, rank * part : (rank + 1) * part].contiguous()
     logits = full[:, :VOCAB].float()  # SGLang's gathered f32 logits
-    from sglang.kernels.ops.speculative.row_argmax import row_argmax
+    from sglang.kernels.ops.sampling import argmax as row_argmax
 
     target = row_argmax(logits).view(bs, T)
     cand = torch.empty(bs, T, dtype=torch.int64, device=dev)
@@ -127,13 +127,13 @@ def outs(bs, dev):
 
 def sglang_chain(x, bs, o):
     """The static epilogue's tail on the gathered logits (dspark_verify._static_accept_tail)."""
+    from sglang.kernels.ops.sampling import argmax as row_argmax
     from sglang.kernels.ops.speculative.dspark.simulated_bonus import (
         simulated_bonus_partials_graph,
     )
     from sglang.kernels.ops.speculative.dspark.static_accept_tail import (
         static_accept_tail,
     )
-    from sglang.kernels.ops.speculative.row_argmax import row_argmax
 
     target = parts = None
     if x["mode"] == "simt":

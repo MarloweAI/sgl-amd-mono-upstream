@@ -62,6 +62,7 @@ def against_sglang(rank, tp, cpu, dev, w1, w2, gamma, sharded=False) -> list:
     torch.nn.Module.__init__(head)
     head.vocab_size, head.markov_rank, head._is_dsv41 = VOCAB, DIM, True
     head._opt_markov_w2_bf16 = head._opt_markov_w2_tp_shard = True
+    head._fused_bias_gemv = False  # SGLang's bias GEMV, the reference the kernels match
     head.markov_w1 = torch.nn.Embedding(VOCAB, DIM, _weight=w1)
     head.markov_w2 = torch.nn.Linear(
         DIM, VOCAB, bias=False, dtype=torch.bfloat16, device=dev
