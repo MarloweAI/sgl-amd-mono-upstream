@@ -354,7 +354,7 @@ def _static_accept_tail(
                 f"({why or 'other tensors'})"
             )
         bs = candidates.shape[0]
-        self._log_accept_tail(bs, bonus_in=None, shard=shard)
+        self._log_accept_tail(bs, shard=shard)
         return self.gated_commit_lens_buf[:bs] if gated else None
     _COMMITTED.pop(id(self), None)
     if not chose("verify_tail", why is None, why):
@@ -369,7 +369,7 @@ def _static_accept_tail(
     # SGLang's tail draws a simulated length's bonus at the request's temperature under
     # simulate_fold, else takes that row's argmax
     temps = (self.sim_temperatures_buf if self.simulate_fold else zeros)[:bs]
-    self._log_accept_tail(bs, bonus_in=None, shard=shard)
+    self._log_accept_tail(bs, shard=shard)
     # the commit that follows in this forward: its main_proj in this launch
     hidden = _COMMITS.get(id(self))
     proj = inject.projection(self, hidden) if gated and hidden is not None else None
