@@ -30,6 +30,7 @@ SGLANG_READS = {
         "init_forward_metadata_dspark_draft_block(block_size)",
         "_uses_dspark_draft_window",
         "token_req_indices",
+        "_swa_loc_i32(out_cache_loc)",
         "DSV4AttnMetadata",
         "DSV4Metadata",
         "SWA_WINDOW",
@@ -381,6 +382,15 @@ def _translate(orig, self, kv_indices, *args, **kwargs):
     return orig(self, kv_indices, *args, **kwargs)
 
 
+def _swa_loc_i32(orig, self, out_cache_loc):
+    """The backend's int32 SWA locations of ``out_cache_loc`` (current SGLang looks them up
+    in one launch, past the pool's translate): the fused build's SWA slots, as ``_translate``."""
+    got = _slots(1, out_cache_loc)
+    if got is not None and chose("swa_slots", True):
+        return got if got.dtype == torch.int32 else got.to(torch.int32)
+    return orig(self, out_cache_loc)
+
+
 def _token_req_indices(orig, forward_batch, *args, **kwargs):
     got = None
     if (
@@ -584,4 +594,6 @@ def install() -> None:
     route(cls, "init_forward_metadata_in_graph", _in_graph)
     route(cls, "init_forward_metadata_dspark_draft_block", _draft_block_metadata)
     route(DeepSeekV4TokenToKVPool, "translate_loc_from_full_to_swa", _translate)
+    if hasattr(cls, "_swa_loc_i32"):  # SGLang with the one-launch SWA lookup
+        route(cls, "_swa_loc_i32", _swa_loc_i32)
     route(hip, "token_req_indices", _token_req_indices)
