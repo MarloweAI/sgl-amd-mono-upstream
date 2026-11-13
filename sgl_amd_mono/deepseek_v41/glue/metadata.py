@@ -41,6 +41,7 @@ SGLANG_READS = {
         "need_compress",
         "has_c4",
         "has_c128",
+        "present_ratios",
         "low_ratios",
         "index_topk",
         "page_size",
@@ -314,14 +315,25 @@ def _fused(backend, raw, inputs):
         swa_page_indices=swa,
         swa_topk_lengths=t["swa_topk_lengths"],
         index_topk=backend.index_topk,
+        present_ratios=backend.present_ratios,
         low_ratios=backend.low_ratios,
         request_window_layout=None,
     )
+    # the C4 / C128 fields only where the pool has those ratios, as SGLang's
+    # init_compression_metadata and init_flashmla_related leave them
+    c4_c128 = core.has_c4 or core.has_c128
     for name in _I32[3:13] + _I64[:4] + _NEG:
-        setattr(core, name, t[name])
-    core.c128_page_indices = c128_pi
-    for r in (0, 1, 2, 4, 128):
-        setattr(core, f"c{r}_flashmla_metadata", hip._create_flashmla_metadata())
+        if name.startswith("c4_sparse_"):
+            keep = core.has_c4
+        else:
+            keep = c4_c128 or not name.startswith(("c4_", "c128_"))
+        setattr(core, name, t[name] if keep else None)
+    core.c128_page_indices = c128_pi if c4_c128 else None
+    present = {0: True, 1: 1 in core.low_ratios, 2: 2 in core.low_ratios}
+    present |= {4: core.has_c4, 128: core.has_c128}
+    for r, on in present.items():
+        meta = hip._create_flashmla_metadata() if on else None
+        setattr(core, f"c{r}_flashmla_metadata", meta)
     slots = (raw.out_cache_loc, t["swa_slots"], t["req_rows"], raw.req_pool_indices)
     core.__dict__["_mono_slots"] = slots
     clamp1 = (t["c1_topk_lengths_clamp1"], t["c2_topk_lengths_clamp1"])
@@ -555,6 +567,7 @@ def _draft_fused(
         swa_page_indices=swa,
         swa_topk_lengths=swa_len,
         index_topk=self.index_topk,
+        present_ratios=self.present_ratios,
         low_ratios=self.low_ratios,
         request_window_layout=None,
     )
