@@ -38,15 +38,18 @@ def _toolchain() -> str:
     )
 
 
-def load(name: str, sources: Mapping[str, str], arch: str) -> object:
+def load(
+    name: str, sources: Mapping[str, str], arch: str, flags: tuple[str, ...] = ()
+) -> object:
     """``torch.ops.<name>`` of the extension built from ``sources`` (relative path ->
-    text of each .hip translation unit and .h header) for ``arch``; a build that
+    text of each .hip translation unit and .h header) for ``arch``, with ``flags`` past
+    the default ones; a build that
     fails, or a library that does not load, raises ``RuntimeError``."""
     import filelock
 
     key = hashlib.sha256(
         "".join(f"{k}\0{v}\0" for k, v in sorted(sources.items())).encode()
-        + f"{_toolchain()} {arch}".encode()
+        + f"{_toolchain()} {arch}{''.join(' ' + f for f in flags)}".encode()
     ).hexdigest()[:16]
     lib = f"{name}_{key}"
     root = cache_dir() / "hip" / lib
@@ -54,14 +57,16 @@ def load(name: str, sources: Mapping[str, str], arch: str) -> object:
     # beside the build directory: torch's own lock is in it
     with filelock.FileLock(str(root) + ".lock"):
         if not (root / _BUILT).is_file():
-            _build(lib, sources, root, arch)
+            _build(lib, sources, root, arch, flags)
             (root / _BUILT).touch()
         else:
             torch.ops.load_library(root / f"{lib}.so")
     return getattr(torch.ops, lib)
 
 
-def _build(lib: str, sources: Mapping[str, str], root: Path, arch: str) -> None:
+def _build(
+    lib: str, sources: Mapping[str, str], root: Path, arch: str, flags: tuple[str, ...]
+) -> None:
     from torch.utils import cpp_extension
 
     src = root / "src"
@@ -77,7 +82,7 @@ def _build(lib: str, sources: Mapping[str, str], root: Path, arch: str) -> None:
             name=lib,
             sources=[str(src / p) for p in sorted(sources) if p.endswith(".hip")],
             extra_include_paths=[str(src)],
-            extra_cuda_cflags=list(_FLAGS),
+            extra_cuda_cflags=[*_FLAGS, *flags],
             build_directory=str(root),
             is_python_module=False,
         )

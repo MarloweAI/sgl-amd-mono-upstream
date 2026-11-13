@@ -44,7 +44,7 @@ def scale_index(row, col, cols):
     return ((((r32 * (cols // 8) + c8) * 4 + e) * 16 + b) * 2 + d) * 2 + a
 
 
-def fp4_tile_load(r_w, base, rg, k, st, at):
+def fp4_tile_load(r_w, base, rg, k, st, at, cache_modifier=CM_NT):
     """Load a lane's 16 B of an FP4 weight's (16, 16)-shuffled row group at step ``st``."""
     return fx.Vector(
         bo.buffer_load(
@@ -52,7 +52,7 @@ def fp4_tile_load(r_w, base, rg, k, st, at):
             base + rg * (2 * k) + st * 256 + at,
             vec_width=4,
             dtype=T.i32,
-            cache_modifier=CM_NT,
+            cache_modifier=cache_modifier,
         )
     )
 

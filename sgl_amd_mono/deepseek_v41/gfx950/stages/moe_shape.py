@@ -24,6 +24,13 @@ from sgl_amd_mono.deepseek_v41.gfx950.stages.router import PARTS as ROUTER_PARTS
 EXPERTS, TOPK = 384, 6  # DeepSeek-V4.1-Flash routing
 ROUTER0 = 8  # the router's first task: past the xq tasks (a token each)
 MASK_WORDS = 2  # an expert's token bitmap in the route table: tokens <= 64
+ROW_SLICES = 40  # a token row's CTAs in the per-row MoE: 128 hidden rows each (``RouteShape.row_moe``)
+ROW_CTAS = 240  # the per-row MoE's CTAs at most: 6 rows
+ROW_SHARED = 18  # the per-row MoE's shared expert units: on the last CTAs, past every row's ug units
+# the per-row MoE's fewest rows a TP: a row's ug bytes a CTA are fixed (its topk experts' share over
+# its 40 CTAs), the deduplicated split's grow with the experts a step routes; at TP4 (twice TP8's
+# bytes a row) the per-row split is level from 4 rows
+ROW_MIN_TOKENS = {4: 4, 8: 1}
 # a route lane's experts sorted descending, ties in index order
 SORT_NETS = {
     2: [(0, 1)],
@@ -111,13 +118,45 @@ class RouteShape(msgspec.Struct, frozen=True):
         return self.router0 + self.router_tasks
 
     @property
+    def row_moe(self) -> bool:
+        """The MoE split per (token row, slot), TileRT's: no expert dedup, the routing on every CTA,
+        a CTA's down one (row, 128 hidden rows) of its row's picks. TP4 and TP8, one token tile, the
+        target's route."""
+        return (
+            self.tp in ROW_MIN_TOKENS
+            and self.tokens >= ROW_MIN_TOKENS[self.tp]
+            and not self.multi
+            and self.tokens * ROW_SLICES <= ROW_CTAS
+            and (self.experts, self.topk) == (EXPERTS, TOPK)
+        )
+
+    @property
+    def row_ug_ctas(self) -> int:
+        """The per-row MoE's ug CTAs: those below the shared units."""
+        return min(self.tokens * ROW_SLICES, self.shared0)
+
+    @property
     def shared0(self) -> int:
+        if self.row_moe:
+            # the last CTAs: past every row's ug units
+            return BLOCKS - self.shared_units
         return self.route0 + max(8, self.tokens)
 
     @property
     def shared_units(self) -> int:
-        """The shared expert's (task, token tile) units (``stage_shared``)."""
+        """The shared expert's (task, token tile) units (``stage_shared``); the per-row MoE's are
+        ``ROW_SHARED`` units of ``shared_unit_tasks`` tasks."""
+        if self.row_moe:
+            return ROW_SHARED
         return self.dims.shared_tasks * len(token_tiles(self.tokens))
+
+    @property
+    def shared_unit_tasks(self) -> int:
+        """A shared unit's tasks, run one after the other on its CTA (TP4's per-row MoE: two)."""
+        if self.row_moe:
+            assert self.dims.shared_tasks % ROW_SHARED == 0
+            return self.dims.shared_tasks // ROW_SHARED
+        return 1
 
     @property
     def ug0(self) -> int:
