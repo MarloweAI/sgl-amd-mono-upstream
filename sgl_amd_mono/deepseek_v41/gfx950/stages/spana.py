@@ -140,6 +140,8 @@ class PeerAt(msgspec.Struct, frozen=True):
     gqs: int = 0
     gkv: int = 0
     gflag: int = 0
+    # this rank's own word a sum task: the sum's phase, a width's whatever its plan
+    sown: int = 0
 
 
 QR = 1280  # q_lora_rank: wq_b's K
@@ -368,10 +370,12 @@ def _await_ranks(c, lane, p, r_flags, fidx, srcs, phase, site):
 
 
 @flyc.jit
-def sum_task(tid, p, j, x_in, bases, local, pushed, rank, phase, c):
+def sum_task(tid, p, j, x_in, bases, local, pushed, rank, phase, sphase, c):
     """Sum task j of the MoE output over the ranks as ``Plan.mode`` says (the module
     docstring): its owner's rows of it land in the peer buffer's x of every rank that reads
-    them (every rank, or with ``rs`` the owner). ``pushed``: the tasks' push flags here."""
+    them (every rank, or with ``rs`` the owner). ``pushed``: the tasks' push flags here (the
+    launch's ``phase``); the flags between the ranks carry ``sphase``, the width's sum phase,
+    which every plan of the width shares."""
     lane = tid % 64
     lay = p.peer
     nc = H // p.ac
@@ -428,15 +432,15 @@ def sum_task(tid, p, j, x_in, bases, local, pushed, rank, phase, c):
         for dd in range_constexpr(p.tp):
             if const_expr(oneshot):
                 if rank != dd:
-                    bo.buffer_store(phase, rsrc(bases[dd]), lay.rsf // 4 + rank * p.sum_flags + j, cache_modifier=CM_SYS)
+                    bo.buffer_store(sphase, rsrc(bases[dd]), lay.rsf // 4 + rank * p.sum_flags + j, cache_modifier=CM_SYS)
             else:
                 if (rank != dd) & (d == dd):
-                    bo.buffer_store(phase, rsrc(bases[dd]), lay.rsf // 4 + rank * p.sum_flags + j, cache_modifier=CM_SYS)
+                    bo.buffer_store(sphase, rsrc(bases[dd]), lay.rsf // 4 + rank * p.sum_flags + j, cache_modifier=CM_SYS)
     mine = True if oneshot else d == rank
     if mine:
         # every other rank's rows of this task here, then the sums
         if tid < 64:
-            _await_ranks(c, lane, p, rsrc(local + fx.Int64(lay.rsf)), j, lambda s: s != rank, phase, 1)
+            _await_ranks(c, lane, p, rsrc(local + fx.Int64(lay.rsf)), j, lambda s: s != rank, sphase, 1)
         gpu.barrier()
         for i in range_constexpr(per):
             grow, pc, ok = pcs[i]
@@ -462,12 +466,12 @@ def sum_task(tid, p, j, x_in, bases, local, pushed, rank, phase, c):
             if tid == 0:
                 for dd in range_constexpr(p.tp):
                     if rank != dd:
-                        bo.buffer_store(phase, rsrc(bases[dd]), lay.agf // 4 + rank * p.sum_flags + j, cache_modifier=CM_SYS)
+                        bo.buffer_store(sphase, rsrc(bases[dd]), lay.agf // 4 + rank * p.sum_flags + j, cache_modifier=CM_SYS)
     else:
         if const_expr(p.mode == "rsag"):
             # the owner's sums of these rows here
             if tid < 64:
-                _await_ranks(c, lane, p, rsrc(local + fx.Int64(lay.agf)), j, lambda s: s == d, phase, 2)
+                _await_ranks(c, lane, p, rsrc(local + fx.Int64(lay.agf)), j, lambda s: s == d, sphase, 2)
             gpu.barrier()
 
 
@@ -1104,7 +1108,13 @@ def build(p: Plan, timeline: bool = False):
             if bid < ns:
                 stamp(c, MARKS["ar"])
                 stamp(c, MARKS["ar"] + 1)
-                sum_task(tid, p, bid, x_in, peer_bases(peers, p.tp), local, scratch + off("pushed"), rank, phase, c)
+                r_so = rsrc(local + fx.Int64(p.peer.sown))
+                sphase = 1 - fx.Int32(bo.buffer_load(r_so, bid, vec_width=1, dtype=T.i32, cache_modifier=CM_DEV))
+                sum_task(tid, p, bid, x_in, peer_bases(peers, p.tp), local, scratch + off("pushed"), rank, phase, sphase, c)
+                rocdl.s_waitcnt(vmcnt=0)
+                gpu.barrier()
+                if tid == 0:
+                    bo.buffer_store(sphase, r_so, bid, cache_modifier=CM_DEV)
                 stamp(c, MARKS["ar"] + 2)
                 stamp(c, MARKS["ar"] + 3)
         if (bid >= ns) & (bid < seam_end):
@@ -1192,11 +1202,11 @@ def peer_layout(tp: int, plans: dict) -> tuple[int, dict]:
     ats = {}
     for key in sorted(plans):
         n = plans[key].sum_flags
-        ats[key] = (off, off + 4 * tp * n, off + 8 * tp * n)
-        off = _cdiv(off + 8 * tp * n + 4 * tp * GROW_CTAS, LINE) * LINE
+        ats[key] = (off, off + 4 * tp * n, off + 8 * tp * n, off + 8 * tp * n + 4 * tp * GROW_CTAS)
+        off = _cdiv(off + 8 * tp * n + 4 * tp * GROW_CTAS + 4 * n, LINE) * LINE
     out = {
         key: msgspec.structs.replace(
-            p, peer=PeerAt(slot, x, ats[key][0], ats[key][1], off, gq, gqs, gkv, ats[key][2])
+            p, peer=PeerAt(slot, x, ats[key][0], ats[key][1], off, gq, gqs, gkv, ats[key][2], ats[key][3])
         )
         if p.mode is not None or p.gather
         else p

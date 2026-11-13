@@ -1026,28 +1026,27 @@ class SpanA:
             m: self.modes[m] == "rs" and width_class(m) in SPAN_A_GATHER.get(self.tp, ())
             for m in WIDTHS
         }
-        # the peer buffer's regions are a width's, whatever its seam's form: one plan a width
-        # with a stand-in form sizes them
+        # the peer buffer's flag regions: a width's sum, and its gather with and without a sum
+        # (a layer after a settled post gathers without one); a stand-in form sizes them
         form = seam_wide.Form(stage="seama")
-        nbytes, plans = spana.peer_layout(
-            self.tp,
-            {
-                m: spana.Plan(
-                    m=m, seam=form, tp=self.tp, mode=self.modes[m], tpar=self.modes[m] == "rs",
+        keyed = {}
+        for m in WIDTHS:
+            for owed in (True, False) if self.gathers[m] else (True,):
+                keyed[(m, owed)] = spana.Plan(
+                    m=m, seam=form, tp=self.tp, mode=self.modes[m] if owed else None,
+                    tpar=self.modes[m] == "rs",
                     front=self._stand_in_front(m) if self.gathers[m] else None,
                     gather=self.gathers[m],
-                )
-                for m in WIDTHS
-            },
-        )
-        self.peers = {m: p.peer for m, p in plans.items()}
+                )  # fmt: skip
+        nbytes, plans = spana.peer_layout(self.tp, keyed)
+        self.peers = {key: p.peer for key, p in plans.items()}
         # collective: every rank builds it here, in the same order
         self.peer = PeerBuffer(nbytes, group.cpu_group, self.rank, self.tp, device)
         self.peer.bytes[spana.flag_region(self.tp) :].zero_()
         self.scratch: dict = {}
         self.consts: dict = {}
         self.front_consts: dict = {}
-        self._sum_plan: dict = {}
+        self._gather_plan: dict = {}
 
     def _stand_in_front(self, m):
         """A front of the width's shape (the peer layout reads only its presence)."""
@@ -1133,10 +1132,15 @@ class SpanA:
             window=SPAN_A_WINDOW[self.tp] if mode is not None else 0,
         )  # fmt: skip
         if mode is not None or gather:
-            p = msgspec.structs.replace(p, peer=self.peers[m])
-            # a width's sum flags in the peer buffer flip once a launch of its one summing plan
-            if self._sum_plan.setdefault(m, p) != p:
-                raise RuntimeError(f"layer {layer.self_attn.layer_id}: the span A launch needs one summing form a width")
+            key = (m, mode is not None)
+            p = msgspec.structs.replace(p, peer=self.peers[key])
+            # a gather's flags in the peer buffer flip once a launch of their one plan (the sum's
+            # carry the width's own phase, ``Plan.peer.sown``)
+            if gather and self._gather_plan.setdefault(key, p) != p:
+                raise RuntimeError(
+                    f"layer {layer.self_attn.layer_id}: the span A launch's gather needs one plan a width: "
+                    f"{self._gather_plan[key]} and {p}"
+                )
         return p
 
     def __call__(self, layer, state, positions, forward_batch, with_front):
