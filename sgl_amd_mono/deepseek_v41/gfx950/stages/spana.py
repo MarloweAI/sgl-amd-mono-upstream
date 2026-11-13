@@ -30,8 +30,10 @@ An owner sums in fp32 from its own partial, then ranks r + 1, r + 2, ... modulo 
 rounds once to bf16: the order of the custom all-reduce SGLang runs (one-shot at TP 2, its
 two-stage form at TP 4), so the sums are its bits. They land in the TP group's peer buffer.
 
-A hand-off is a flag a CTA flips once a launch (a phase bit), after its outputs are stored;
-a CTA reads the launch's phase from its own flag first. Waits are only on CTAs earlier in
+A hand-off is a flag a CTA sets once a launch to its launch count (an epoch), after its outputs
+are stored; a CTA reads the epoch from its own word first, and a waiter waits until a flag reaches
+it. Epochs only grow, so a rank a launch ahead (a graph capture's warm-ups have no other
+collective between the launches) never hides a flag a slower rank waits for. Waits are only on CTAs earlier in
 the grid or on peers' CTAs of the same or an earlier stage, so they always finish: the GPU
 dispatches a launch's CTAs in order. The scratch and the peer buffer are uncached, so a
 hand-off between CTAs on different XCDs or GPUs misses no cache.
@@ -366,7 +368,7 @@ def _await_ranks(c, lane, p, r_flags, fidx, srcs, phase, site):
             )
         )  # fmt: skip
 
-    _wait(c, load_all, lambda v: (v != phase) & srcs(src), site)
+    _wait(c, load_all, lambda v: (v < phase) & srcs(src), site)
 
 
 @flyc.jit
@@ -413,7 +415,7 @@ def sum_task(tid, p, j, x_in, bases, local, pushed, rank, phase, sphase, c):
                 def load_prev():
                     return fx.Int32(bo.buffer_load(r_p, j - p.window, vec_width=1, dtype=T.i32, cache_modifier=CM_DEV))
 
-                _wait(c, load_prev, lambda v: v != phase, 9)
+                _wait(c, load_prev, lambda v: v < phase, 9)
             gpu.barrier()
     # 1. this rank's rows of the task to the ranks that sum them
     for i in range_constexpr(per):
@@ -487,7 +489,7 @@ def _await_sums(c, lane, p, own, row0, rows, col, phase, last):
     def load_all():
         return fx.Int32(bo.buffer_load(r_o, cta, vec_width=1, dtype=T.i32, cache_modifier=CM_DEV))
 
-    _wait(c, load_all, lambda v: v != phase, 3)
+    _wait(c, load_all, lambda v: v < phase, 3)
 
 
 # ---------------------------------------------------------------- the seam
@@ -595,9 +597,9 @@ def _await_ctas(c, lane, own, ctas, phase, site=5):
         )
 
     def pending(v):
-        out = v[0] != phase
+        out = v[0] < phase
         for i in range(1, len(ctas)):
-            out = out | (v[i] != phase)
+            out = out | (v[i] < phase)
         return out
 
     _wait(c, load_all, pending, site)
@@ -861,9 +863,9 @@ def _await_rows(c, lane, p, own, local, lo, count, most, phase):
         )
 
     def pending(v):
-        out = v[0] != phase
+        out = v[0] < phase
         for i in range(1, len(idx)):
-            out = out | (v[i] != phase)
+            out = out | (v[i] < phase)
         return out
 
     _wait(c, load_all, pending, 8)
@@ -1094,7 +1096,7 @@ def build(p: Plan, timeline: bool = False):
         old = fx.Int32(
             bo.buffer_load(r_own, bid, vec_width=1, dtype=T.i32, cache_modifier=CM_DEV)
         )
-        phase = 1 - old
+        phase = old + 1  # this CTA's launch count: an epoch every rank counts alike
         if const_expr(fr is not None):
             q, qs = scratch + off("xq"), scratch + off("xs")
             fa = {
@@ -1109,7 +1111,7 @@ def build(p: Plan, timeline: bool = False):
                 stamp(c, MARKS["ar"])
                 stamp(c, MARKS["ar"] + 1)
                 r_so = rsrc(local + fx.Int64(p.peer.sown))
-                sphase = 1 - fx.Int32(bo.buffer_load(r_so, bid, vec_width=1, dtype=T.i32, cache_modifier=CM_DEV))
+                sphase = 1 + fx.Int32(bo.buffer_load(r_so, bid, vec_width=1, dtype=T.i32, cache_modifier=CM_DEV))
                 sum_task(tid, p, bid, x_in, peer_bases(peers, p.tp), local, scratch + off("pushed"), rank, phase, sphase, c)
                 rocdl.s_waitcnt(vmcnt=0)
                 gpu.barrier()
