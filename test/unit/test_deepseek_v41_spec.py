@@ -100,6 +100,7 @@ def _layer(i, **attn):
     experts = SimpleNamespace(w13_weight=SimpleNamespace(is_shuffled=True))
     return SimpleNamespace(
         hc_boundary_fused=True,
+        fused_rmsnorm_fake_quant=True,
         engram=None,
         self_attn=SimpleNamespace(**attn),
         mlp=SimpleNamespace(
@@ -137,6 +138,13 @@ def test_token_parallel_reasons(monkeypatch):
     monkeypatch.setattr(rc, "get_parallel", _parallel)
     layers[3].mlp._shared_expert_tp1 = True
     assert wide.reasons(model, range(40))[0].startswith("layer 3: token-parallel")
+    layers[3] = _layer(3)
+    # the span A launch runs gfx950's fake-quant input norm (``SpanAStages``)
+    layers[4].fused_rmsnorm_fake_quant = False
+    assert wide.reasons(model, range(40)) == [
+        "layer 4: the wide span A launch runs gfx950's fake-quant input norm"
+    ]
+    layers[4] = _layer(4)
     # TP8 has no token-parallel class
     monkeypatch.setattr(rc, "get_parallel", lambda: _parallel(tp_size=8, ca=False))
     assert wide.reasons(model, range(40)) == []
