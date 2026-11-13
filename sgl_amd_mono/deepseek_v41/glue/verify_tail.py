@@ -77,6 +77,7 @@ SGLANG_READS = {
         "_static_sampled_tail(draft_logits)",
         "_static_sampled_tail(temperatures)",
         "_static_sampled_tail(rejection_noise)",
+        "sampled_shard_serves",
     ),
     "srt/speculative/spec_tp_sync.py": ("DSPARK_ACCEPT_GRAPH",),
     "kernels/ops/speculative/dspark/blockwise_rejection.py": (
@@ -416,6 +417,14 @@ def _sampled_why_not(epi, shard, logits, candidates, draft_logits, noise) -> str
     return None
 
 
+def _sampled_shard_serves(orig, self, bs: int, rows_per_request: int) -> bool:
+    """The steps the sampled accept's launch takes (its request and row bounds); SGLang
+    gathers the whole logits for the others."""
+    from sgl_amd_mono.deepseek_v41.gfx950.vtail import sampled
+
+    return bs <= sampled.MAX_SEQ and rows_per_request <= sampled.MAX_T
+
+
 def _sampled(epi, shard, part: int):
     """The epilogue's sampled accept launch (built at the region's eager first step)."""
     got = _TAILS.get(("sampled", id(epi)))
@@ -549,6 +558,9 @@ def install() -> None:
     route(verify.DsparkVerifyEpilogue, "_commit_engram_history", _commit_engram_history)
     if hasattr(verify.DsparkVerifyEpilogue, "_static_sampled_tail"):
         route(verify.DsparkVerifyEpilogue, "_static_sampled_tail", _static_sampled_tail)
+        route(
+            verify.DsparkVerifyEpilogue, "sampled_shard_serves", _sampled_shard_serves
+        )
         verify.DsparkVerifyEpilogue.sampled_accept_on_shard = True
     route(
         importlib.import_module(LOGITS).LogitsProcessor,
