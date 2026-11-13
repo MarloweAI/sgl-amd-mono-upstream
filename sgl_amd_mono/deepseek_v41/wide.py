@@ -911,7 +911,7 @@ TOKEN_PARALLEL = {2: (384,), 4: (384,)}
 # the TP sizes the span A launch serves, and per TP the width classes whose launch also runs
 # the attention front (wqkv_a .. wq_b); the others end it at the seam
 SPAN_A_TPS = (2, 4)
-SPAN_A_FRONT = {2: (), 4: ()}
+SPAN_A_FRONT = {2: (96, 192), 4: (96, 192)}
 # per TP the sum's pacing window (``stages.spana.Plan.window``): the early rows' sums land
 # first, so the seam overlaps the link's later rows
 SPAN_A_WINDOW = {2: 40, 4: 40}
