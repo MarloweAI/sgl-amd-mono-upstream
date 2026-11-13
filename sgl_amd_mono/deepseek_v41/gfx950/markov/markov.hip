@@ -769,7 +769,9 @@ Params markov_params(int64_t nseq, int64_t gamma, int64_t padded, const at::Tens
     TORCH_CHECK(part % 4 == 0 && vocab % 4 == 0 && whole.stride(0) % 4 == 0 && whole.stride(1) % 4 == 0 &&
                     reinterpret_cast<uintptr_t>(whole.data_ptr()) % 16 == 0 && padded <= part,
                 "16 B aligned rows and shards, the padded shard within part");
-    TORCH_CHECK(peers.numel() * part >= vocab && (peers.numel() - 1) * part < vocab, "the shards tile the vocab");
+    // whole: the vocab's rows, or this rank's shard of them where SGLang keeps the shard (the launch reads neither)
+    TORCH_CHECK(vocab == part || (peers.numel() * part >= vocab && (peers.numel() - 1) * part < vocab),
+                "the shards tile the vocab, or whole is a shard");
     Params p{};
     p.embed         = static_cast<const bfloat16 *>(embed.data_ptr());
     p.head          = static_cast<const bfloat16 *>(head.data_ptr());

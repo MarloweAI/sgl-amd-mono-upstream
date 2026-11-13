@@ -148,8 +148,8 @@ def _why_not(model, step_logits) -> str | None:
         return "no fp32 step logits"
     if step_logits.shape[1] > markov.MAX_STEPS:
         return f"{step_logits.shape[1]} draft steps, the kernel's at most {markov.MAX_STEPS}"
-    if step_logits.shape[-1] != head.vocab_size:
-        return f"step logits {step_logits.shape[-1]} wide, not the vocab's {head.vocab_size}"
+    if step_logits.shape[-1] not in (head.vocab_size, part):
+        return f"step logits {step_logits.shape[-1]} wide, not the vocab's {head.vocab_size} or a shard's {part}"
     if shard.org_vocab_start != group.rank_in_group * part or part % 4:
         return f"vocab shards of {part} not at the ranks' multiples of the partition"
     return None
@@ -175,6 +175,8 @@ class _Sampler:
         assert self.head.is_contiguous()
         device = self.head.device
         self.width = int(model.lm_head.num_embeddings_per_partition)
+        # SGLang's step logits: whole rows, or this rank's vocab shard (SGLang's sharded accept)
+        self.whole_rows = step_logits.shape[-1] != self.width
         self.exchange = markov.Exchange(
             group.cpu_group,
             group.rank_in_group,
@@ -268,10 +270,12 @@ class _Sampler:
             )
 
     def gather_step_logits(self, bs):
-        """SGLang's whole step-logits rows [:bs] of the last block, from every rank's shard."""
+        """SGLang's step-logits rows [:bs] of the last block: the whole rows from every rank's shard,
+        or, where SGLang keeps the rank's vocab shard (its sharded accept), this rank's shard."""
         x = self.ran[bs]
+        peers = x.peers if self.whole_rows else x.peers[x.rank : x.rank + 1]
         self.ops.gather_step_logits(
-            self.temps[:bs], x.peers, self.step_logits[:bs], self.width
+            self.temps[:bs], peers, self.step_logits[:bs], self.width
         )
 
 

@@ -405,8 +405,10 @@ def _sampled_why_not(epi, shard, logits, candidates, draft_logits, noise) -> str
         or draft_logits.stride(2) != 1
     ):
         return "no f32 draft step logits"
+    # the draft's step logits: whole rows, or this rank's vocab shard as the verify's
+    # (SGLang's sharded accept)
     if (
-        draft_logits.shape[-1] != shard.vocab_size
+        draft_logits.shape[-1] not in (shard.vocab_size, logits.shape[1])
         or draft_logits.stride(1) % 4
         or draft_logits.data_ptr() % 16
     ):
@@ -453,10 +455,12 @@ def _static_sampled_tail(orig, self, *, candidates, logits, draft_logits, temper
     launch = _sampled(self, shard, logits.shape[1])
     bs = candidates.shape[0]
     start = launch.vocab_start
-    # the kernels' Markov block keeps this rank's columns; SGLang's writes the whole rows
+    # the kernels' Markov block keeps this rank's columns; SGLang's writes the whole rows or,
+    # with its sharded accept, this rank's shard of them
     draft = step_logits_shard(draft_logits, bs)
     if draft is None:
-        draft = draft_logits[:bs, :, start : start + launch.width]
+        first = start if draft_logits.shape[-1] == shard.vocab_size else 0
+        draft = draft_logits[:bs, :, first : first + launch.width]
     commit = _commit_args(self, _SLOTS.get(id(self)), candidates, bs, gate)
     sim = self.simulated_correct_len
     # the commit that follows in this forward: its main_proj in this launch

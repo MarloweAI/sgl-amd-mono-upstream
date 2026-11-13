@@ -28,12 +28,13 @@ class _Group:
         return torch.cat(every, dim=dim)
 
 
-def against_sglang(rank, tp, cpu, dev, w1, w2, gamma) -> list:
+def against_sglang(rank, tp, cpu, dev, w1, w2, gamma, sharded=False) -> list:
     """The draft sampler's block (``draft_sampler._Sampler``) vs SGLang's
     ``draft_markov_block`` on the head SGLang builds when markov_w2 is TP-sharded, at
     every batch size the kernels serve: tokens bitwise, the sampled rows' whole step logits
     within a bias rounding, a temperature-0 row's unwritten, the noise counter advanced
-    once. -> the failing batch sizes."""
+    once. ``sharded``: SGLang keeps the rank's vocab shard of the step logits (its sharded accept),
+    the sampler's gather then fills that shard. -> the failing batch sizes."""
     from sglang.srt.distributed.device_communicators.vocab_gather import (
         NcclVocabGather,
     )
@@ -77,7 +78,8 @@ def against_sglang(rank, tp, cpu, dev, w1, w2, gamma) -> list:
     )
     key, top = 0x0FED_CBA9_8765, markov.MAX_SEQUENCES
     noise = DraftNoise(key=key, offset=torch.zeros(1, dtype=torch.int64, device=dev))
-    step_logits = torch.zeros(top, gamma, VOCAB, dtype=torch.float32, device=dev)
+    width = part if sharded else VOCAB
+    step_logits = torch.zeros(top, gamma, width, dtype=torch.float32, device=dev)
     why = draft_sampler._why_not(model, step_logits)
     if why is not None:
         return [f"the static rules refuse the head: {why}"]
@@ -94,24 +96,30 @@ def against_sglang(rank, tp, cpu, dev, w1, w2, gamma) -> list:
         anchor = torch.randint(0, VOCAB, (bs,), generator=g, device=dev).long()
         temps = torch.tensor([1.0, 0.0, 0.7, 1.3][:bs], device=dev)
         offset = torch.randint(0, 1 << 30, (1,), generator=g, device=dev)
-        want_logits = torch.empty(bs, gamma, VOCAB, dtype=torch.float32, device=dev)
+        want_logits = torch.empty(bs, gamma, width, dtype=torch.float32, device=dev)
         want, _ = draft_markov_block(
             markov_head=head, base_logits=base, anchor_tokens=anchor, draft_hidden=None,
             step_temperatures=temps, noise=DraftNoise(key=key, offset=offset.clone()),
             tp_sync=_NoSync(), logits_out=want_logits, greedy_draft=False,
+            sharded_accept=sharded,
         )  # fmt: skip
-        got_logits = torch.zeros_like(want_logits)
+        got_logits = sampler.step_logits[:bs]
+        got_logits.zero_()
         got = torch.empty(bs * gamma, dtype=torch.int64, device=dev)
         n = DraftNoise(key=key, offset=offset.clone())
         sampler.block(base, anchor, temps, n, got, got_logits)
         torch.cuda.synchronize()
         dist.barrier()  # every rank's shard written
-        sampler.ops.gather_step_logits(
-            temps, sampler.exchange.peers, got_logits, sampler.width
-        )
+        sampler.ran[bs] = sampler.exchange
+        sampler.temps[:bs].copy_(temps)
+        sampler.gather_step_logits(bs)
         torch.cuda.synchronize()
         dist.barrier()  # every rank's shard read before the next launch writes it
-        whole = group.all_gather(base.float(), dim=-1)[..., :VOCAB]
+        whole = (
+            base.float()
+            if sharded
+            else group.all_gather(base.float(), dim=-1)[..., :VOCAB]
+        )
         sampled = temps != 0
         # the bias GEMV sums in another order: a bf16 rounding flip of the bias now and then
         bias = (want_logits - whole).abs()[sampled]
@@ -127,12 +135,12 @@ def against_sglang(rank, tp, cpu, dev, w1, w2, gamma) -> list:
             bad.append("the noise counter did not advance once")
         if rank == 0:
             print(
-                f"vs SGLang's draft_markov_block bs={bs} "
+                f"vs SGLang's draft_markov_block{' (sharded)' if sharded else ''} bs={bs} "
                 f"{'PASS' if not bad else 'FAIL: ' + '; '.join(bad)}",
                 flush=True,
             )
         if bad:
-            fails.append(f"draft_markov_block bs={bs}")
+            fails.append(f"draft_markov_block{' sharded' if sharded else ''} bs={bs}")
     sampler.exchange.close()
     return fails
 
@@ -274,6 +282,8 @@ def main():
     x.close()
     dist.barrier()
     fails += against_sglang(rank, tp, cpu, dev, w1, w2, gamma)
+    dist.barrier()
+    fails += against_sglang(rank, tp, cpu, dev, w1, w2, gamma, sharded=True)
     every = [None] * tp
     dist.all_gather_object(every, [str(f) for f in fails], group=cpu)
     fails = sorted({f for r in every for f in r})
