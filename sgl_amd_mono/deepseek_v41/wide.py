@@ -286,11 +286,21 @@ SGLANG_READS = {
         "fp4_low_ratio_decode_workspaces",
         "max_context_len",
         "token_to_kv_pool",
+        # the union core (``UnionStages``)
+        "softmax_scale",
+        "swa_page_indices",
+        "swa_topk_lengths",
+        "sparse_page_indices",
+        "sparse_topk_lengths",
         "get_swa_out_cache_loc",
         "forward_low_ratio_sources",
     ),
     "srt/mem_cache/deepseek_v4_memory_pool.py": (
         "low_ratio_index_k_page8_ratios",
+        # the union core's caches (``UnionStages``)
+        "get_swa_key_buffer_radix",
+        "get_extra_key_buffer",
+        "get_extra_key_page_size",
         # the span A launch's KV store (``SpanA``)
         "get_swa_raw_buffer",
         "uniform_fp8",
@@ -1654,6 +1664,101 @@ def _woa_workspaces(shared: Shared, woa: dict) -> dict:
     return out
 
 
+# the width classes whose core runs on the union kernel, by the rank's heads: where it is
+# measured faster than SGLang's (the 384-row class at TP4 and TP2)
+UNION_CLASSES = {16: (384,), 32: (384,)}
+
+
+class UnionStages(Stages):
+    """``Stages`` with the attention core on the plugin's union kernel
+    (``gfx950/attention/wide_core.py``): a request's six rows read its keys once.
+
+    The unions follow the step's index lists: the window union once a step (every layer
+    reads the same window), the top-k union at each index source (the layers after it
+    read its top-k until the next source). A window-only layer keeps SGLang's core (the
+    union kernel is slower there). A width class's launches take the class's buffers,
+    sized for its widest step."""
+
+    def __init__(self, shared: Shared, c: int):
+        super().__init__(shared, c)
+        self.rows = c
+        self.reqs = c // 6
+        self._bufs = None
+
+    def _buffers(self, dev, heads, b):
+        from sgl_amd_mono.deepseek_v41.gfx950.attention import wide_core as wc
+
+        if self._bufs is None:
+            i32 = dict(dtype=torch.int32, device=dev)
+            npart, nml, nflag = wc.workspace(b)
+            self._bufs = dict(
+                ws=torch.empty(self.reqs, 6 * 128, **i32),
+                wm=torch.empty(self.reqs, 6 * 128, **i32),
+                wn=torch.empty(self.reqs, **i32),
+                es=torch.empty(self.reqs, 6 * 512, **i32),
+                em=torch.empty(self.reqs, 6 * 512, **i32),
+                en=torch.empty(self.reqs, **i32),
+                part=torch.empty(npart, dtype=torch.float16, device=dev),
+                pml=torch.empty(nml, dtype=torch.float32, device=dev),
+                flags=torch.zeros(nflag, **i32),
+            )
+        return self._bufs
+
+    def attn_core(self, attn, front, forward_batch):
+        from sgl_amd_mono.deepseek_v41.gfx950.attention import wide_core as wc
+        from sglang.srt.model_executor.forward_context import get_attn_backend
+
+        backend = get_attn_backend()
+        md = backend.forward_metadata.core_attn_metadata
+        pool = backend.token_to_kv_pool
+        layer = attn.attn_mqa.layer_id
+        ratio = attn.compress_ratio
+        q = front.q
+        T, H = q.shape[0], q.shape[1]
+        reqs = T // 6
+        assert T % 6 == 0 and T <= self.rows and front.inv_rope is not None, (T, self.rows)
+        assert q.dtype == torch.bfloat16 and H % 16 == 0, (q.dtype, H)
+        freqs, positions = front.inv_rope
+        swa = pool.get_swa_key_buffer_radix(layer)
+        wcache = wc.Cache(page=pool.swa_page_size, stride=swa.stride(0) * swa.element_size())
+        ext = pool.get_extra_key_buffer(layer) if ratio else swa
+        ecache = (
+            wc.Cache(page=pool.get_extra_key_page_size(layer), stride=ext.stride(0) * ext.element_size())
+            if ratio
+            else wcache
+        )
+        b = wc.CoreBuild(
+            reqs=self.reqs, heads=H, splits=wc.splits_for(self.reqs, H), window=wcache,
+            extra=ecache, qs=q.stride(0), qh=q.stride(1), scale=backend.softmax_scale,
+            rope_stride=freqs.stride(0), pos_words=positions.element_size() // 4,
+        )  # fmt: skip
+        buf = self._buffers(q.device, H, b)
+        s = torch.cuda.current_stream()
+        if layer == 0:
+            win, win_n = md.swa_page_indices, md.swa_topk_lengths
+            wc.union_build(128, win.stride(0), swa.shape[0] * wcache.page)(
+                win.data_ptr(), win_n.data_ptr(), buf["ws"].data_ptr(), buf["wm"].data_ptr(),
+                buf["wn"].data_ptr(), reqs, stream=s,
+            )  # fmt: skip
+        if not ratio:
+            return super().attn_core(attn, front, forward_batch)
+        if getattr(attn, "indexer", None) is not None:
+            top, top_n = md.sparse_page_indices(ratio), md.sparse_topk_lengths(ratio)
+            wc.union_build(512, top.stride(0), ext.shape[0] * ecache.page)(
+                top.data_ptr(), top_n.data_ptr(), buf["es"].data_ptr(), buf["em"].data_ptr(),
+                buf["en"].data_ptr(), reqs, stream=s,
+            )  # fmt: skip
+        out = q.new_empty((T, H, 512))
+        wc.core_build(b)(
+            q.data_ptr(), swa.data_ptr(), ext.data_ptr(), buf["ws"].data_ptr(), buf["wm"].data_ptr(),
+            buf["wn"].data_ptr(), buf["es"].data_ptr(), buf["em"].data_ptr(),
+            buf["en"].data_ptr(), front.sink.data_ptr(), freqs.data_ptr(),
+            positions.data_ptr(), out.data_ptr(), buf["part"].data_ptr(), buf["pml"].data_ptr(),
+            buf["flags"].data_ptr(), reqs, wc.groups_per_xcd(reqs, H), stream=s,
+        )  # fmt: skip
+        return out[:, front.tp_slice, :]
+
+
 def mixins(tp: int, heads: int, c: int) -> tuple:
     """The stages of width class c at TP size ``tp`` (``heads`` attention heads a rank), in
     method resolution order: each kernel's stages ahead of SGLang's (``Stages``)."""
@@ -1665,6 +1770,8 @@ def mixins(tp: int, heads: int, c: int) -> tuple:
         out.append(TokenParallelStages)
     out.append(SeamStages)
     out.append(WideWoa)
+    if c in UNION_CLASSES.get(heads, ()):
+        out.append(UnionStages)
     return (*out, Stages)
 
 
