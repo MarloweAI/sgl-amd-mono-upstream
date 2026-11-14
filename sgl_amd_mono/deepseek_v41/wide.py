@@ -303,6 +303,8 @@ SGLANG_READS = {
         "_use_tp_attn_a2a_scatter",
     ),
     "srt/layers/moe/mega_moe.py": ("should_use_mega_moe",),
+    "srt/layers/moe/gluon_backend.py": ("should_use_gluon_moe",),
+    "srt/layers/moe/utils.py": ("get_moe_runner_backend", "is_marlowe_mix"),
     "kernels/ops/layernorm/mhc.py": ("hc_broadcast", "mhc_combine", "mhc_stream_mean"),
     "srt/layers/layer_boundary/adapters/attention.py": (
         "get_attn_tp_context",

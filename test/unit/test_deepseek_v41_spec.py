@@ -142,7 +142,8 @@ def test_token_parallel_reasons(monkeypatch):
     # the span A launch runs gfx950's fake-quant input norm (``SpanAStages``)
     layers[4].fused_rmsnorm_fake_quant = False
     assert wide.reasons(model, range(40)) == [
-        "layer 4: the wide span A launch runs gfx950's fake-quant input norm"
+        "layer 4: the wide span A launch runs gfx950's fake-quant input norm",
+        "layer 4: wide seams run gfx950's fake-quant input norm",
     ]
     layers[4] = _layer(4)
     # TP8 has no token-parallel class
