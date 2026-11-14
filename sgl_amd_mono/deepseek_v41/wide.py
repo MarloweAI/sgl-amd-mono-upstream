@@ -919,8 +919,8 @@ SPAN_A_WINDOW = {2: 40, 4: 80}
 # compact outputs (the q norm's operand, the KV record) to every rank
 SPAN_A_GATHER = {2: (384,), 4: (384,)}
 # per TP the width classes whose launch sums the previous MoE's output; the others take
-# SGLang's all-reduce (at TP 4 and 96 rows its two-stage kernel is faster than the launch's sum)
-SPAN_A_SUM = {2: (96, 192, 384), 4: (192, 384)}
+# SGLang's all-reduce or reduce-scatter (at TP 4 the launch's sum is no faster served)
+SPAN_A_SUM = {2: (96, 192, 384), 4: ()}
 
 
 class _Owed(NamedTuple):
@@ -1026,8 +1026,10 @@ class SpanA:
             m: self.modes[m] == "rs" and width_class(m) in SPAN_A_GATHER.get(self.tp, ())
             for m in WIDTHS
         }
+        self.sums = {m: width_class(m) in SPAN_A_SUM.get(self.tp, ()) for m in WIDTHS}
         # the peer buffer's flag regions: a width's sum, and a gather's for each shape a width's
-        # plans take (with a sum; without one, after a settled post or at the first layer)
+        # plans take (after a deferred post, with or without the sum; without one, after a
+        # settled post or at the first layer)
         keyed = {}
         for m in WIDTHS:
             for key in self._shapes(m):
@@ -1051,8 +1053,8 @@ class SpanA:
     def _shapes(self, m):
         """The flag-region keys of width m: (m, with a sum, the seam's post, its combine)."""
         if not self.gathers[m]:
-            return [(m, True, True, True)]
-        return [(m, True, True, True), (m, False, False, True), (m, False, False, False)]
+            return [(m, True, True, True)] if self.sums[m] else []
+        return [(m, self.sums[m], True, True), (m, False, False, True), (m, False, False, False)]
 
     def _stand_in_front(self, m):
         """A front of the width's shape (the peer layout reads only its presence)."""
