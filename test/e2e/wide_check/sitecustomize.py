@@ -399,8 +399,10 @@ def _install(mod, backbone):
             versus(c, "seam_ffn", seam_out(refs[0]), seam_out(refs[1]),
                    seam_out(stages.seam_ffn(layer, *ins(), None, fb)), one)  # fmt: skip
         h = x.new_empty(x.shape).copy_(x)  # the MoE stages on a normed-like row set
-        logits, partials = twice("route", stages.route, moe, h, None, False)
-        topk = twice("topk", stages.moe_prep, moe, h, logits, partials, kw["input_ids_global"], False)
+        logits, partials, pre = twice("route", stages.route, moe, h, None, False,
+                                      fb.moe_num_token_non_padded())  # fmt: skip
+        topk = twice("topk", stages.moe_prep, moe, h, logits, partials, kw["input_ids_global"],
+                     False, pre)  # fmt: skip
         # an in-place MoE writes its input: each run on its own copy
         twice("experts", lambda: stages.experts(moe, h.clone(), topk, None))
 

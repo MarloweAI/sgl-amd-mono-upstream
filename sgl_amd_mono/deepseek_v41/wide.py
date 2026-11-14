@@ -705,20 +705,26 @@ class Stages:
         x = _gfx95_dense_post_attention_norm(layer, x, ffn_co)
         return residual, x, ffn_co
 
-    def route(self, moe, x, zero_allocator, use_vision_topk):
-        """(router logits, the split-K router's partials or None)."""
+    def route(self, moe, x, zero_allocator, use_vision_topk, num_token_non_padded=None):
+        """(router logits, the split-K router's partials or None, the fused router's top-k
+        output or None)."""
         import sglang.srt.models.deepseek_v2 as dv2
 
         if dv2._is_hip:
             return dv2._hip_moe.forward_gate(
-                moe, x, zero_allocator, fused_gate=not use_vision_topk
-            )
-        return moe.gate(x, zero_allocator), None
+                moe, x, zero_allocator, fused_gate=not use_vision_topk,
+                num_token_non_padded=num_token_non_padded,
+            )  # fmt: skip
+        return moe.gate(x, zero_allocator), None, None
 
-    def moe_prep(self, moe, x, logits, partials, input_ids_global, use_vision_topk):
-        """The top-k experts and weights of each row (the fused shared expert among them)."""
+    def moe_prep(self, moe, x, logits, partials, input_ids_global, use_vision_topk,
+                 precomputed=None):  # fmt: skip
+        """The top-k experts and weights of each row (the fused shared expert among them):
+        the fused router's where it made them."""
         import sglang.srt.models.deepseek_v2 as dv2
 
+        if precomputed is not None:
+            return precomputed
         kwargs = {"input_ids": input_ids_global} if getattr(moe, "is_hash", False) else {}
         if partials is not None:
             kwargs["router_logits_partials"] = partials
@@ -827,8 +833,9 @@ class Stages:
         """``DeepseekV2MoE.forward``: its ``forward_normal`` in stages; the other routes
         (mega MoE, a2a, the dual-stream graph) SGLang's whole."""
         import sglang.srt.models.deepseek_v2 as dv2
+        from sglang.srt.layers.moe.utils import get_moe_runner_backend
 
-        use_vision_topk = moe.gate.e_score_correction_bias_vl is not None
+        use_vision_topk = moe.gate.e_score_correction_bias_vl is not None and not moe.is_hash
         if use_vision_topk and dv2._is_hip:
             use_vision_topk = dv2._hip_moe.batch_has_images(forward_batch)
         if self.whole_moe(moe, x):
@@ -843,12 +850,16 @@ class Stages:
         shared = None
         if not defer_shared and not skip_shared_experts:
             shared = moe._forward_shared_experts(x, None, pre_quant_input=pre_quant)
-        logits, partials = self.route(moe, x, None, use_vision_topk)
+        logits, partials, precomputed = self.route(
+            moe, x, None, use_vision_topk, forward_batch.moe_num_token_non_padded()
+        )
         topk_output = self.moe_prep(
-            moe, x, logits, partials, input_ids_global, use_vision_topk
+            moe, x, logits, partials, input_ids_global, use_vision_topk, precomputed
         )
         routed = self.experts(moe, x, topk_output, pre_quant)
-        if not (dv2._use_aiter and moe.routed_scaling_factor_fused_in_topk) or (
+        # aiter's and marlowe-mix's top-k fold the routed scale into the weights
+        aiter_topk = dv2._use_aiter or get_moe_runner_backend().is_marlowe_mix()
+        if not (aiter_topk and moe.routed_scaling_factor_fused_in_topk) or (
             isinstance(moe.experts.quant_method, dv2.KTEPWrapperMethod)
         ):
             routed *= moe.routed_scaling_factor
@@ -859,10 +870,12 @@ class Stages:
     def whole_moe(self, moe, x) -> bool:
         """Whether ``moe`` takes one of the routes SGLang runs whole."""
         import sglang.srt.models.deepseek_v2 as dv2
+        from sglang.srt.layers.moe.gluon_backend import should_use_gluon_moe
         from sglang.srt.layers.moe.mega_moe import should_use_mega_moe
 
         return (
-            should_use_mega_moe(moe, x)
+            should_use_gluon_moe(moe)
+            or should_use_mega_moe(moe, x)
             or moe._enable_a2a_moe
             or moe._can_dual_stream_graph(x)
             or (
