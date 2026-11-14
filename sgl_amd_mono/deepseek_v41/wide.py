@@ -48,7 +48,7 @@ would (``init_forward_metadata_in_graph``).
 from __future__ import annotations
 
 import functools
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import Any, NamedTuple, Optional
 
 import torch
@@ -200,6 +200,7 @@ SGLANG_READS = {
     "srt/layers/linear.py": ("RowParallelLinear.forward(skip_all_reduce)", "use_decode_attn_tp"),
     # the operand the next projection takes, rebuilt from the gathered norm
     "kernels/ops/quantization/mxfp8_amd_gfx95.py": (
+        "mxfp8_operand",
         "Fp8GridActivation",
         "Mxfp8Activation",
         "fake_quant_fp8_activation",
@@ -311,12 +312,24 @@ SGLANG_READS = {
     "srt/layers/layernorm.py": ("variance_epsilon",),
     "srt/layers/quantization/fp8.py": (
         "Fp8LinearMethod",
+        "w8a8_mxfp8_linear",
         "block_fp8_as_mxfp8",
         "mxfp8_dense_backend",
         "block_fp8_mxfp8_ready",
     ),
     "srt/layers/quantization/fp8_utils.py": ("is_gfx95_mxfp8_aiter",),
-    "srt/layers/quantization/fp8_hip.py": ('"weight_scale_mx_e8m0"', "mxfp8_aiter_preshuffled"),
+    "srt/layers/quantization/fp8_hip.py": (
+        "apply_dense",
+        '"weight_scale_mx_e8m0"',
+        "mxfp8_aiter_preshuffled",
+    ),
+    # the dense FP8 projections' route GEMM (``WideFp8``)
+    "kernels/ops/gemm/mxfp8_aiter_gfx95.py": (
+        "aiter_mxfp8_blockscaled_linear(input)",
+        "aiter_mxfp8_blockscaled_linear(weight_scale_ue8m0)",
+        "aiter_mxfp8_blockscaled_linear(input_scale)",
+        "aiter_mxfp8_blockscaled_linear(weight_preshuffled)",
+    ),
     "srt/layers/attention/dsv4/unified_kv_gate.py": ("is_unified_kv_triton",),
     "srt/environ.py": ("SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE",),
 }
@@ -1759,11 +1772,96 @@ class UnionStages(Stages):
         return out[:, front.tp_slice, :]
 
 
+FP8_PROJECTIONS = ("wqkv_a", "wq_b", "wo_b")
+
+
+class WideFp8(Stages):
+    """``Stages`` with the attention's dense FP8 projections (wqkv_a, wq_b, wo_b) on
+    ``stages.fp8_dense``: SGLang's front and wo_b run as they are, with the GEMM of their
+    route (``Fp8LinearMethod.w8a8_mxfp8_linear``, after its operand is unwrapped or
+    quantized) bound to aiter's FlyDSL GEMM, at the classes it is tuned for, while the stage
+    runs (one bf16 ulp at about 1e-8 of the outputs: ``fp8_dense``)."""
+
+    def __init__(self, shared: Shared, c: int):
+        super().__init__(shared, c)
+        self._gemm = shared.once("fp8 projections", lambda: _fp8_projections(shared.model))
+
+    @contextmanager
+    def _ours(self, rows, *linears):
+        """The linears' route GEMM on the FlyDSL GEMM inside the block, those it serves at
+        ``rows`` (``fp8_dense.served``)."""
+        from sgl_amd_mono.deepseek_v41.gfx950.stages import fp8_dense
+
+        linears = [lin for lin in linears if fp8_dense.served(*lin.weight.shape, rows)]
+        methods = [lin.quant_method for lin in linears]
+        saved = [m.w8a8_mxfp8_linear for m in methods]
+        for lin, m in zip(linears, methods):
+            m.w8a8_mxfp8_linear = self._gemm[lin]
+        try:
+            yield
+        finally:
+            for m, f in zip(methods, saved):
+                m.w8a8_mxfp8_linear = f
+
+    def attn_front(self, attn, x, positions, forward_batch, x_quant) -> Front:
+        with self._ours(x.shape[0], attn.wqkv_a, attn.wq_b):
+            return super().attn_front(attn, x, positions, forward_batch, x_quant)
+
+    def wo_b(self, attn, o, defer_all_reduce: bool):
+        # wo_a's output: bf16 rows, or wo_b's MXFP8 input (``Mxfp8Activation``)
+        rows = (o.q if hasattr(o, "q") else o).shape[0]
+        with self._ours(rows, attn.wo_b):
+            return super().wo_b(attn, o, defer_all_reduce)
+
+
+class _Fp8Linear:
+    """The route GEMM's call (``aiter_mxfp8_blockscaled_linear``'s arguments) on a
+    ``fp8_dense.Projection``: the operand as SGLang's route makes it (``mxfp8_operand``: an
+    fp8 x with its scale as is, a bf16 x quantized), then the FlyDSL GEMM."""
+
+    def __init__(self, proj):
+        self.proj = proj
+
+    def __call__(
+        self, input, weight, weight_scale_ue8m0, input_scale=None, bias=None,
+        weight_preshuffled=False,
+    ):  # fmt: skip
+        from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import mxfp8_operand
+
+        assert weight is self.proj.weight and bias is None and not weight_preshuffled
+        xq, xs = mxfp8_operand(input, input_scale)
+        out = self.proj(xq, xs.view(torch.uint8))
+        return out.view(*input.shape[:-1], self.proj.n)
+
+
+def _fp8_projections(model) -> dict:
+    """linear -> its route's GEMM on ``fp8_dense`` (``_Fp8Linear``), for the attention's
+    dense FP8 projections at the shapes a class serves (each over a preshuffled weight copy)."""
+    from sgl_amd_mono.deepseek_v41.gfx950.stages import fp8_dense
+
+    gemm = {}
+    for i in range(model.start_layer, model.end_layer):
+        a = model.layers[i].self_attn
+        if not a.fuse_wqa_wkv:
+            raise RuntimeError(f"layer {i}: the wide FP8 projections need wqkv_a")
+        for name in FP8_PROJECTIONS:
+            lin = getattr(a, name)
+            why = _fp8_route_why(lin)
+            if why is not None:
+                raise RuntimeError(f"layer {i} {name}: the wide FP8 projections need {why}")
+            if any(fp8_dense.served(*lin.weight.shape, c) for c in CLASSES):
+                gemm[lin] = _Fp8Linear(
+                    fp8_dense.Projection(lin.weight, lin.weight_scale_mx_e8m0)
+                )
+    return gemm
+
+
 def mixins(tp: int, heads: int, c: int) -> tuple:
     """The stages of width class c at TP size ``tp`` (``heads`` attention heads a rank), in
     method resolution order: each kernel's stages ahead of SGLang's (``Stages``)."""
     token_parallel = c in TOKEN_PARALLEL.get(tp, ())
-    out: list = []
+    # wrapping SGLang's projections, ahead of every class that runs one (token parallel: wo_b)
+    out: list = [WideFp8]
     if tp in SPAN_A_TPS:
         out.append(TokenParallelSpanA if token_parallel else SpanAStages)
     elif token_parallel:
