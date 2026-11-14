@@ -13,6 +13,8 @@ A request's rows mostly share candidate blocks, so their CTAs go to one XCD (who
 workgroups reach the XCDs round robin (CTA b on XCD b % 8), and each XCD takes a contiguous eighth
 of the step's tasks in row order."""
 
+import functools
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr.typing import Int32, Int64
@@ -35,8 +37,10 @@ def tasks_per_row(rows: int) -> int:
     return max(1, min(TARGET_CTAS // rows, ip.REINDEX_CHUNKS // REINDEX_TASK_CHUNKS))
 
 
+@functools.cache
 def build(cls: int):
-    """The launch for up to ``cls`` rows (a width class); the step's ``rows`` is an argument."""
+    """The launch for up to ``cls`` rows (a width class); the step's ``rows`` is an argument.
+    One a class: a graph capture must not drop (and so unload) a launch's module."""
     per = tasks_per_row(cls)
     assert cls * per % XCDS == 0, (cls, per)
     name = f"ds41_idx_wide_reindex_r{cls}_p{per}"
