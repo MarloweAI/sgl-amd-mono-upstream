@@ -283,6 +283,38 @@ def _install(mod, backbone):
             again = again + (_bits(x) != _bits(y)).sum()
         counter += torch.stack([one, 0 * one, again, 0 * one, n * one])
 
+    def seam_out(seam):
+        """A seam's outputs: its tensors, the quant's and the mixes (pre, post, comb)."""
+        out = []
+        for v in seam:
+            if hasattr(v, "tensors"):
+                out += [t.clone() for t in v.tensors()]
+            else:
+                out += [t.clone() for t in _flat(v)]
+                mx = getattr(v, "_hip_mxfp8_operand", None)
+                if mx is not None:
+                    out += [t.clone() for t in _flat(mx)]
+        return out
+
+    def versus(c, field, ref, again, got, one):
+        """``got`` against SGLang's ``ref`` and SGLang's rerun ``again`` of a stage on the
+        same inputs."""
+        counter = counters.get((c, field))
+        if counter is None:
+            assert not torch.cuda.is_current_stream_capturing(), "no eager step first"
+            counter = counters[c, field] = torch.zeros(5, dtype=torch.int64, device=one.device)
+        n = sum(x.numel() for x in ref)
+        if len(ref) != len(got) or any(x.shape != y.shape or x.dtype != y.dtype for x, y in zip(ref, got)):
+            counter += torch.stack([one, n * one, 0 * one, n * one, n * one])
+            return
+        diff = again_diff = wide_only = 0 * one
+        for x, y, z in zip(ref, again, got):
+            wd, ad = _bits(x) != _bits(z), _bits(x) != _bits(y)
+            diff = diff + wd.sum()
+            again_diff = again_diff + ad.sum()
+            wide_only = wide_only + (wd & ~ad).sum()
+        counter += torch.stack([one, diff, again_diff, wide_only, n * one])
+
     def stage_reruns(wide, stages, c, model, i, state, kw, one):
         """Each stage of the layer twice on the same inputs (``det_<stage>``): which
         kernels reproduce their own bits."""
@@ -297,7 +329,14 @@ def _install(mod, backbone):
 
         copies = [fresh(state) for _ in range(2)]
         seam = stages.seam_attn(layer, copies[0], pos, fb)
-        tally(c, "det_seam_attn", seam[:3], stages.seam_attn(layer, copies[1], pos, fb)[:3], one)
+        tally(c, "det_seam_attn", seam_out(seam), seam_out(stages.seam_attn(layer, copies[1], pos, fb)), one)
+        # a replaced seam against SGLang's on the same inputs (``field=seam_attn``)
+        sgl = mod.Stages
+        ref_seam = None
+        if type(stages).seam_attn is not sgl.seam_attn:
+            refs = [sgl.seam_attn(stages, layer, fresh(state), pos, fb) for _ in range(2)]
+            versus(c, "seam_attn", seam_out(refs[0]), seam_out(refs[1]), seam_out(seam), one)
+            ref_seam = refs[0]
         _, x, x_quant, _ = seam
         from sglang.srt.model_executor.forward_context import get_attn_backend
 
@@ -322,7 +361,14 @@ def _install(mod, backbone):
             a = stages.wo_a(attn, o.clone(), pos, fb, front)
             tally(c, "det_wo_a", [t.clone() for t in _flat(a)],
                   stages.wo_a(attn, o.clone(), pos, fb, front), one)  # fmt: skip
-            twice("wo_b", stages.wo_b, attn, a, True)
+            out_b = twice("wo_b", stages.wo_b, attn, a, False)
+        if ref_seam is not None and type(stages).seam_ffn is not sgl.seam_ffn:
+            # the FFN seam on the reference attention seam's streams and mixes
+            r_res, _, _, r_co = ref_seam
+            ins = lambda: (out_b.clone(), r_res.clone(), r_co)  # noqa: E731
+            refs = [sgl.seam_ffn(stages, layer, *ins(), None, fb) for _ in range(2)]
+            versus(c, "seam_ffn", seam_out(refs[0]), seam_out(refs[1]),
+                   seam_out(stages.seam_ffn(layer, *ins(), None, fb)), one)  # fmt: skip
         h = x.new_empty(x.shape).copy_(x)  # the MoE stages on a normed-like row set
         logits, partials = twice("route", stages.route, moe, h, None, False)
         topk = twice("topk", stages.moe_prep, moe, h, logits, partials, kw["input_ids_global"], False)

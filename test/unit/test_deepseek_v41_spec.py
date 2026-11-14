@@ -176,6 +176,11 @@ def test_model_reasons(monkeypatch):
     hashed = SimpleNamespace(**{**vars(FLASH), "num_hash_layers": 2})
     reasons = dsv41.SPEC.model_disable_reasons(model, hashed, seen)
     assert reasons[0].startswith("layers [0, 1]: no kernels"), reasons
+    # the wide seams run gfx950's fake-quant input norm (``SeamStages``)
+    layers[3] = SimpleNamespace(**{**vars(_layer(3)), "fused_rmsnorm_fake_quant": False})
+    reasons = dsv41.SPEC.model_disable_reasons(model, FLASH, seen)
+    assert any(r.startswith("layer 3: wide seams run gfx950's fake-quant input norm") for r in reasons), reasons
+    layers[3] = _layer(3)
     # K2i's indexers: the candidate blocks REINDEX layers score, SGLang's decode-row query path
     layers[1], layers[5] = _layer(1), _layer(5)
     seen |= {

@@ -134,6 +134,7 @@ SGLANG_READS = {
         "rms_norm_eps",
         "hc_eps",
         "input_layernorm",
+        "post_attention_layernorm",
         "fuse_wqa_wkv",
         "wqkv_a",
         "wq_b",
@@ -206,6 +207,7 @@ SGLANG_READS = {
     ),
     "srt/models/deepseek_common/amd/deepseek_v4_gfx95_dense.py": (
         "_hip_mxfp8_operand",
+        "_ffn_norm_emits_mxfp8",
         "_mxfp8_consumer",
         "_wqkv_a_native_consumer",
         "Mxfp8Activation",
@@ -1446,6 +1448,134 @@ class TokenParallelSpanA(SpanAStages, TokenParallelStages):
         return TokenParallelStages.whole_moe(self, moe, x)
 
 
+class SeamStages(Stages):
+    """``Stages`` with both mHC seams as one FlyDSL launch each (``stages.seam_wide``):
+    SGLang's boundary and norm launches, bit for bit, the norm's quant as SGLang's route
+    picks it for the layer. Where the span A launch runs the attention seam
+    (``SpanAStages``, ahead of this class) the FFN seam is this class's."""
+
+    def __init__(self, shared: Shared, c: int):
+        super().__init__(shared, c)
+        self.seam = shared.once("seam", lambda: _SeamResources(shared))
+
+    def _seam(self, layer, kind, x, residual, post, comb, pre, quant):
+        """One launch: (new streams, normed rows, quant (q, scale) or (q,) or None, Mixes)."""
+        r = self.seam
+        sw = r.sw
+        fn, scale, base, w, norm_eps = r.consts(layer, kind)
+        m = residual.shape[0]
+        form = sw.Form(
+            stage="seama" if kind == "attn" else "seamb",
+            post=x is not None,
+            combine=pre is not None,
+            quant=quant,
+            rms_eps=layer.rms_norm_eps,
+            norm_eps=norm_eps,
+            hc_eps=layer.hc_eps,
+            iters=layer.hc_sinkhorn_iters,
+        )
+        dev = residual.device
+        res_out = torch.empty_like(residual) if x is not None else residual
+        normed = torch.empty((m, sw.H), dtype=residual.dtype, device=dev)
+        q = qs = None
+        if quant == "mxfp8":
+            q = torch.empty((m, sw.H), dtype=torch.float8_e4m3fn, device=dev)
+            qs = torch.empty((m, sw.H // 32), dtype=torch.uint8, device=dev)
+        elif quant == "grid":
+            q = torch.empty((m, sw.H), dtype=residual.dtype, device=dev)
+        mixes = Mixes(
+            torch.empty((m, sw.HC), dtype=torch.float32, device=dev),
+            torch.empty((m, sw.HC), dtype=torch.float32, device=dev),
+            torch.empty((m, sw.HC, sw.HC), dtype=torch.float32, device=dev),
+        )
+        if x is not None:
+            x = x.contiguous()
+
+        def ptr(t):
+            return 0 if t is None else t.data_ptr()
+
+        sw.standalone(m, form)(
+            ptr(x), ptr(residual), ptr(post), ptr(comb), ptr(pre), ptr(fn), ptr(scale),
+            ptr(base), ptr(w), ptr(res_out if x is not None else None), ptr(normed), ptr(q),
+            ptr(qs), ptr(mixes.pre), ptr(mixes.post), ptr(mixes.comb), ptr(r.scratch),
+            ptr(r.flags[m]), stream=torch.cuda.current_stream(),
+        )  # fmt: skip
+        return res_out, normed, (q, qs), mixes
+
+    def seam_attn(self, layer, state, positions, forward_batch):
+        import sglang.srt.models.deepseek_common.amd.deepseek_v4_gfx95_dense as dense
+        from sglang.srt.models.deepseek_v4_mhc import HcPending
+
+        if isinstance(state.streams, HcPending):
+            x, residual, post, comb = state.streams
+        else:
+            x, residual, post, comb = None, state.streams, None, None
+        # the gfx950 fake-quant input norm (``input_norm_fake_quant``): its operand fp8 +
+        # ue8m0 where wqkv_a consumes them, else on the fp8 grid as bf16
+        if not layer._wqkv_a_native_consumer_checked:
+            layer._wqkv_a_native_consumer = dense._mxfp8_consumer(
+                layer.self_attn.wqkv_a if layer.self_attn.fuse_wqa_wkv else None
+            )
+            layer._wqkv_a_native_consumer_checked = True
+        quant = "mxfp8" if layer._wqkv_a_native_consumer else "grid"
+        residual, x, (q, qs), mixes = self._seam(
+            layer, "attn", x, residual, post, comb, state.pre, quant
+        )
+        x_quant = dense.Mxfp8Activation(q, qs) if quant == "mxfp8" else dense.Fp8GridActivation(q)
+        return residual, x, x_quant, mixes
+
+    def seam_ffn(self, layer, x, residual, co, fusion, forward_batch):
+        import sglang.srt.models.deepseek_common.amd.deepseek_v4_gfx95_dense as dense
+
+        assert fusion is None, "the all-reduce + post fusion runs at 8 rows at most"
+        mx = dense._ffn_norm_emits_mxfp8(layer, x.shape[0])
+        residual, x, (q, qs), mixes = self._seam(
+            layer, "ffn", x, residual, co.post, co.comb, co.pre, "mxfp8" if mx else None
+        )
+        if mx:
+            # the shared expert's gate_up takes it in place of its own quant
+            x._hip_mxfp8_operand = dense.Mxfp8Activation(q, qs)
+        return residual, x, mixes
+
+
+class _SeamResources:
+    """The seam launches' scratch (one for every launch: they run in stream order), their
+    flags a row count (every wide width and a token-parallel class's rows a rank), zeros once,
+    and each layer's constants as the kernel reads them."""
+
+    def __init__(self, shared: Shared):
+        from sgl_amd_mono.deepseek_v41.gfx950.stages import seam_wide as sw
+
+        token_parallel = TOKEN_PARALLEL.get(shared.tp, ())
+        rows = set(WIDTHS) | {m // shared.tp for m in WIDTHS if width_class(m) in token_parallel}
+        dev = shared.device
+        self.sw = sw
+        self.scratch = torch.zeros(sw.scratch_bytes(max(rows)), dtype=torch.uint8, device=dev)
+        self.flags = {m: torch.zeros(sw.flag_words(m), dtype=torch.int32, device=dev) for m in sorted(rows)}
+        self._consts: dict = {}
+
+    def consts(self, layer, kind):
+        """(fn, scale, base, norm weight, norm eps) of the layer's ``kind`` boundary, as the
+        kernel reads them (f32, f32, f32, bf16; contiguous)."""
+        key = (id(layer), kind)
+        got = self._consts.get(key)
+        if got is None:
+            fn, scale, base = (
+                (layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base)
+                if kind == "attn"
+                else (layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base)
+            )
+            norm = layer.input_layernorm if kind == "attn" else layer.post_attention_layernorm
+            got = self._consts[key] = (
+                fn.data.float().contiguous(),
+                scale.data.float().contiguous(),
+                base.data.float().contiguous(),
+                norm.weight.data.contiguous(),
+                norm.variance_epsilon,
+            )
+        return got
+
+
 def mixins(tp: int, heads: int, c: int) -> tuple:
     """The stages of width class c at TP size ``tp`` (``heads`` attention heads a rank), in
     method resolution order: each kernel's stages ahead of SGLang's (``Stages``)."""
@@ -1455,6 +1585,7 @@ def mixins(tp: int, heads: int, c: int) -> tuple:
         out.append(TokenParallelSpanA if token_parallel else SpanAStages)
     elif token_parallel:
         out.append(TokenParallelStages)
+    out.append(SeamStages)
     return (*out, Stages)
 
 
@@ -1652,6 +1783,8 @@ def reasons(model, layers) -> list[str]:
                 out.append(f"layer {i}: the wide span A launch runs gfx950's fake-quant input norm")
     for i in layers:
         a = m.layers[i].self_attn
+        if not getattr(m.layers[i], "fused_rmsnorm_fake_quant", False):
+            out.append(f"layer {i}: wide seams run gfx950's fake-quant input norm")
         if getattr(a, "use_mega_attention", False):
             out.append(f"layer {i}: wide steps open MQALayer's attention, not the mega one")
         if getattr(a, "wo_a_fp8", False):
