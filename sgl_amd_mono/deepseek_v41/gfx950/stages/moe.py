@@ -123,7 +123,7 @@ DOWN_EARLY_STEPS = 5
 # below DOWN_TASKS - BLOCKS), its range in proportion to DOWN_SHARE[tp] (two tiles, one)
 DOWN_GROUP = 8
 DOWN_GROUPS = DOWN_TASKS // DOWN_GROUP
-DOWN_SHARE = {2: (13, 14), 4: (7, 8)}
+DOWN_SHARE = {4: (7, 8)}
 # routed weight bytes a CU keeps in flight across the tile down's units, and a unit's K
 # chunk: two chunks' weights, scales and MID in registers beside the group's chains
 DOWN_INFLIGHT = 64 * 1024
