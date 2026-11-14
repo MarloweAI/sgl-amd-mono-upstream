@@ -76,7 +76,6 @@ class FusedTail:
         self._buffer = PeerBuffer(
             int(self.ops.scratch_bytes()), group, rank, tp, device
         )
-        self._buffer.bytes.zero_()
         self.peers = self._buffer.addresses.cpu()
         self.scratch = int(self._buffer.local)
         self.counts = torch.zeros(MAX_BLOCKS, dtype=torch.int32, device=device)

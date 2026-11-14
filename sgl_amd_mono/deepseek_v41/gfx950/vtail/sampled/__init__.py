@@ -66,7 +66,6 @@ class SampledTail:
         self.deadline_s = float(deadline_s)
         self.ops = ops()
         self._buffer = PeerBuffer(int(self.ops.record_bytes()), group, rank, tp, device)
-        self._buffer.bytes.zero_()
         self.peers = self._buffer.addresses.cpu()
         self.scratch = torch.zeros(
             int(self.ops.scratch_bytes()), dtype=torch.uint8, device=device

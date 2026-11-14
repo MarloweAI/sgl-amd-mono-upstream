@@ -54,7 +54,6 @@ class Exchange:
         self.rank, self.size = rank, size
         slab = MAX_SEQUENCES * gamma * part
         self._buffer = PeerBuffer(EXCHANGE_BYTES + 4 * slab, group, rank, size, device)
-        self._buffer.bytes.zero_()
         self.slab = (
             self._buffer.bytes[EXCHANGE_BYTES:]
             .view(torch.float32)

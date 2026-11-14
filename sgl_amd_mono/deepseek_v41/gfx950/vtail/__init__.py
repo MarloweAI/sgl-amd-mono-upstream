@@ -57,7 +57,6 @@ class VerifyTail:
         )
         self.deadline_s = float(deadline_s)
         self._buffer = PeerBuffer(RECORD_BYTES, group, rank, tp, device)
-        self._buffer.bytes.zero_()
         self.peers = self._buffer.addresses.cpu()
         self.counts = torch.zeros(MAX_BLOCKS, dtype=torch.int32, device=device)
         self.ops = ops()

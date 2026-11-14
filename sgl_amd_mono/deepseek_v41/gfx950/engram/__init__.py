@@ -51,7 +51,6 @@ class Rows:
         assert 1 <= layers <= MAX_LAYERS and 1 < size <= MAX_TP
         self.rank, self.size, self.deadline_s = rank, size, float(deadline_s)
         self._buffer = PeerBuffer(EXCHANGE_BYTES, group, rank, size, device)
-        self._buffer.bytes.zero_()
         self.peers = self._buffer.addresses.cpu()
         self.state = torch.zeros(MAX_CTAS, dtype=torch.int32, device=device)
         self.out = torch.zeros(

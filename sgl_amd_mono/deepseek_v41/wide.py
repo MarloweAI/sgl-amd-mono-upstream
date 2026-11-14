@@ -1213,7 +1213,6 @@ class SpanA:
         self.peers = {key: p.peer for key, p in plans.items()}
         # collective: every rank builds it here, in the same order
         self.peer = PeerBuffer(nbytes, group.cpu_group, self.rank, self.tp, device)
-        self.peer.bytes[spana.flag_region(self.tp) :].zero_()
         self.scratch: dict = {}
         self.consts: dict = {}
         self.front_consts: dict = {}

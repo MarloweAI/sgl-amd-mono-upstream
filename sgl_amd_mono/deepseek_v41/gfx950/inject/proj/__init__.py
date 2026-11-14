@@ -57,7 +57,6 @@ class Exchange:
 
         self.rank, self.size, self.deadline_s = rank, size, float(deadline_s)
         self._buffer = PeerBuffer(EXCHANGE_BYTES, group, rank, size, device)
-        self._buffer.bytes.zero_()
         self.peers = self._buffer.addresses.cpu()
         self.state = torch.zeros(STATE_INTS, dtype=torch.int32, device=device)
         self.work = torch.zeros(WORK_BYTES, dtype=torch.uint8, device=device)

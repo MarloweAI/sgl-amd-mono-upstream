@@ -121,16 +121,25 @@ class _DeviceBytes:
 
 class PeerBuffer:
     """One uncached buffer a rank and every peer's address (``addresses``, int64
-    on the device). ``group`` is a CPU (gloo) group of the ``npes`` ranks."""
+    on the device). ``group`` is a CPU (gloo) group of the ``npes`` ranks.
 
-    def __init__(self, nbytes: int, group, rank: int, npes: int, device: torch.device):
+    The buffer is zeros, then ``init(bytes)`` if given, on every rank before any rank
+    leaves the construction: a peer's kernel may write into it as soon as its rank
+    returns, so no rank may still have an initializing write queued behind it."""
+
+    def __init__(self, nbytes: int, group, rank: int, npes: int, device: torch.device,
+                 init=None):  # fmt: skip
         self.rank = rank
         self.local = _alloc_uncached(nbytes)
         # a view, not an owner of the memory under it
         self.bytes = torch.as_tensor(_DeviceBytes(self.local, nbytes), device=device)
+        if init is not None:
+            init(self.bytes)
         self._opened: list[int] = []
         addresses = [self.local]
         if npes > 1:
+            # the zeroing and ``init`` done before the handshake, which every rank joins
+            torch.cuda.synchronize(device)
             handles: list = [None] * npes
             dist.all_gather_object(handles, (nbytes, _handle(self.local)), group=group)
             addresses, failure = [], None

@@ -407,15 +407,19 @@ class DSV41MonoRunner:
         )
         # two parity halves, then the guard's flags: rank r's failed wait sets word r on every rank
         half = peer_half_bytes(tp)
-        self.peer = PeerBuffer(2 * half + guard.FLAG_BYTES, group, rank, tp, dev)
-        self.peer.bytes.zero_()
-        # the cells start empty (``seam.attn_cell``, ``seam.ffn_cell``)
-        for cells, size in (
-            (acell_offset(tp), acell_region_bytes(tp)),
-            (fcell_offset(tp), fcell_region_bytes(tp)),
-        ):
-            for h in range(2):
-                self.peer.bytes[h * half + cells : h * half + cells + size].fill_(0xFF)
+
+        def empty_cells(b):
+            """The cells start empty (``seam.attn_cell``, ``seam.ffn_cell``)."""
+            for cells, size in (
+                (acell_offset(tp), acell_region_bytes(tp)),
+                (fcell_offset(tp), fcell_region_bytes(tp)),
+            ):
+                for h in range(2):
+                    b[h * half + cells : h * half + cells + size].fill_(0xFF)
+
+        self.peer = PeerBuffer(
+            2 * half + guard.FLAG_BYTES, group, rank, tp, dev, init=empty_cells
+        )
         self._kernels: dict = {}
         # the index sources' indexer (``enable_k2i``): the target's runner only
         self.k2i = None
