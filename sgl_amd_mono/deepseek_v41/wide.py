@@ -47,6 +47,7 @@ would (``init_forward_metadata_in_graph``).
 
 from __future__ import annotations
 
+import functools
 from contextlib import nullcontext
 from typing import Any, NamedTuple, Optional
 
@@ -334,8 +335,35 @@ class Front(NamedTuple):
     dtype: torch.dtype  # the core's output, the layer input's
 
 
+class Shared:
+    """What the stages of every width class share, built once a process before any graph
+    capture: the model, the TP size, the spec's layers (``spec._Layer`` by layer) and each
+    kernel's resources (``once``)."""
+
+    def __init__(self, lm, layers: Optional[dict] = None):
+        from sglang.srt.runtime_context import get_parallel
+
+        self.model, self.layers = lm.model, layers or {}
+        self.tp, self.device = get_parallel().tp_size, next(lm.parameters()).device
+        self.heads = self.model.layers[self.model.start_layer].self_attn.n_local_heads
+        self._made: dict = {}
+
+    def once(self, key, make):
+        """The resource ``key``, made by ``make()`` at its first use (in class order: a
+        collective one is made in the same order on every rank)."""
+        got = self._made.get(key)
+        if got is None:
+            got = self._made[key] = make()
+        return got
+
+
 class Stages:
-    """One layer's stages, SGLang's own code in SGLang's order (the module docstring)."""
+    """One layer's stages, SGLang's own code in SGLang's order (the module docstring). A
+    kernel's stages are a subclass whose ``__init__(shared, c)`` (``Shared``, the width class)
+    calls its base's; ``mixins`` composes them per (TP size, class)."""
+
+    def __init__(self, shared: Optional[Shared] = None, c: int = 0):
+        pass
 
     # ---- the attention side ----
 
@@ -806,8 +834,11 @@ class TokenParallelStages(Stages):
       its merged output, and ``post`` on the owner's rows.
     """
 
-    def __init__(self, exchange: Exchange):
-        self.x = exchange
+    def __init__(self, shared: Shared, c: int):
+        from sglang.srt.runtime_context import get_parallel
+
+        super().__init__(shared, c)
+        self.x = shared.once("exchange", lambda: Exchange(get_parallel().tp_group))
 
     def own(self, rows: int) -> slice:
         return self.x.own(rows)
@@ -1260,8 +1291,11 @@ class SpanAStages(Stages):
     over the ranks, runs its mHC seam and input norm, and on the classes of ``SPAN_A_FRONT``
     its attention front up to the attention core. Every stage gives SGLang's bits."""
 
-    def __init__(self, span: SpanA, front: bool, fold: bool):
-        self.span, self.with_front, self.fold = span, front, fold
+    def __init__(self, shared: Shared, c: int):
+        super().__init__(shared, c)
+        self.span = shared.once("span", lambda: SpanA(shared.model, shared.device))
+        self.with_front = c in SPAN_A_FRONT.get(shared.tp, ())
+        self.fold = c in SPAN_A_SUM.get(shared.tp, ())
         self._front_out = None
 
     def seam_attn(self, layer, state, positions, forward_batch):
@@ -1346,9 +1380,10 @@ class TokenParallelSpanA(SpanAStages, TokenParallelStages):
     owed MoE partial to the rows' owners and runs the seam on them; the input norm's rows
     are gathered as before."""
 
-    def __init__(self, span: SpanA, exchange: Exchange, gather: bool, fold: bool):
-        SpanAStages.__init__(self, span, gather, fold)
-        TokenParallelStages.__init__(self, exchange)
+    def __init__(self, shared: Shared, c: int):
+        super().__init__(shared, c)
+        # the launch's front runs on the owners' rows of the gathering classes
+        self.with_front = c in SPAN_A_GATHER.get(shared.tp, ())
         self._needs_x = False
 
     def seam_attn(self, layer, state, positions, forward_batch):
@@ -1411,32 +1446,34 @@ class TokenParallelSpanA(SpanAStages, TokenParallelStages):
         return TokenParallelStages.whole_moe(self, moe, x)
 
 
+def mixins(tp: int, heads: int, c: int) -> tuple:
+    """The stages of width class c at TP size ``tp`` (``heads`` attention heads a rank), in
+    method resolution order: each kernel's stages ahead of SGLang's (``Stages``)."""
+    token_parallel = c in TOKEN_PARALLEL.get(tp, ())
+    out: list = []
+    if tp in SPAN_A_TPS:
+        out.append(TokenParallelSpanA if token_parallel else SpanAStages)
+    elif token_parallel:
+        out.append(TokenParallelStages)
+    return (*out, Stages)
+
+
+@functools.cache
+def _composed(bases: tuple) -> type:
+    """One class of ``bases``' stages."""
+    return type("Wide" + "".join(b.__name__ for b in bases), bases, {})
+
+
 class WideForward:
     """``DeepseekV4ForCausalLM.forward`` for a wide step, its layers in ``Stages``."""
 
-    def __init__(self, lm):
-        from sglang.srt.runtime_context import get_parallel
-
+    def __init__(self, lm, layers: Optional[dict] = None):
         self.lm, self.model = lm, lm.model
-        # one set of stages a width class: SGLang's until a kernel replaces one
-        parallel = get_parallel()
-        token_parallel = TOKEN_PARALLEL.get(parallel.tp_size, ())
-        exchange = Exchange(parallel.tp_group) if token_parallel else None
-        if parallel.tp_size in SPAN_A_TPS:
-            span = SpanA(lm.model, next(lm.parameters()).device)
-            front = SPAN_A_FRONT.get(parallel.tp_size, ())
-            fold = SPAN_A_SUM.get(parallel.tp_size, ())
-            self.stages: dict[int, Any] = {
-                c: TokenParallelSpanA(span, exchange, c in SPAN_A_GATHER.get(parallel.tp_size, ()), c in fold)
-                if c in token_parallel
-                else SpanAStages(span, c in front, c in fold)
-                for c in CLASSES
-            }
-        else:
-            self.stages = {
-                c: TokenParallelStages(exchange) if c in token_parallel else Stages()
-                for c in CLASSES
-            }
+        # one set of stages a width class: SGLang's but for the kernels that replace one
+        shared = Shared(lm, layers)
+        self.stages: dict[int, Any] = {
+            c: _composed(mixins(shared.tp, shared.heads, c))(shared, c) for c in CLASSES
+        }
 
     def forward(self, plan, input_ids, positions, forward_batch, input_embeds=None):
         from sglang.srt.layers.layer_boundary import get_attn_tp_context
