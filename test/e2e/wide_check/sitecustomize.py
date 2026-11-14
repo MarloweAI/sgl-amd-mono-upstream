@@ -337,11 +337,17 @@ def _install(mod, backbone):
             counter += torch.stack([one, n * one, 0 * one, n * one, n * one])
             return
         diff = again_diff = wide_only = 0 * one
-        for x, y, z in zip(ref, again, got):
+        for k, (x, y, z) in enumerate(zip(ref, again, got)):
             wd, ad = _bits(x) != _bits(z), _bits(x) != _bits(y)
             diff = diff + wd.sum()
             again_diff = again_diff + ad.sum()
             wide_only = wide_only + (wd & ~ad).sum()
+            # and each output on its own (``<field>_<k>``: the k-th of the stage's outputs)
+            each = counters.get((c, f"{field}_{k}"))
+            if each is None:
+                assert not torch.cuda.is_current_stream_capturing(), "no eager step first"
+                each = counters[c, f"{field}_{k}"] = torch.zeros(5, dtype=torch.int64, device=one.device)
+            each += torch.stack([one, wd.sum(), ad.sum(), (wd & ~ad).sum(), x.numel() * one])
         counter += torch.stack([one, diff, again_diff, wide_only, n * one])
 
     def stage_reruns(wide, stages, c, model, i, state, kw, one):
