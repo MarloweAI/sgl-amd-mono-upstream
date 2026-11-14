@@ -12,6 +12,10 @@ layer's (its residual or pending post, and pre). SGLang's rerun says where SGLan
 itself: an output whose kernels sum in a run-dependent order differs between SGLang's own
 runs, so the wide layer is held to SGLang only where SGLang's two runs agree.
 
+On an index source it also compares the selection the layer's front writes (its sparse page
+indices), each row as a set (``field=index_sets``, counted in rows): SGLang's top-k leaves a
+row's order to its atomics, so the order is not compared.
+
 Every 30 s each process prints a line per width class (``wide.CLASSES``) and output:
 
     WIDE_CHECK rank=<r> class=<c> field=<attn|moe_in|layer> steps=<n> differing=<d>
@@ -192,11 +196,24 @@ def _install(mod, backbone):
     mod.Exchange.reduce_scatter = checked_reduce_scatter
     sglang_layer = dv4.forward_layer_fused_boundary
 
-    def run(fn):
+    def selection(i):
+        """Layer i's sparse page indices, each row ascending (-1 last), on an index source."""
+        from sglang.srt.model_executor.forward_context import get_attn_backend
+
+        attn = active[0][0].model.layers[i].self_attn
+        r = attn.compress_ratio
+        if not r or getattr(attn, "indexer", None) is None:
+            return None
+        idx = get_attn_backend().forward_metadata.core_attn_metadata.sparse_page_indices(r)
+        big = torch.iinfo(torch.int32).max
+        return torch.where(idx >= 0, idx, big).sort(dim=1).values
+
+    def run(fn, i):
         seen.clear()
         out = fn()
         got = dict(seen)
         got["layer"] = [t.clone() for t in _flat(out)]
+        got["index_sets"] = selection(i)
         return out, got
 
     def fresh(state):
@@ -224,16 +241,28 @@ def _install(mod, backbone):
         copies = [fresh(state) for _ in range(2)]
         rows = kw["positions"].shape[0]
         mine = copies[1].take_rows(lambda t: t[stages.own(rows)].contiguous())
-        out, ref = run(lambda: sglang_layer(model, i, state, **kw))
-        _, again = run(lambda: sglang_layer(model, i, copies[0], **kw))
+        out, ref = run(lambda: sglang_layer(model, i, state, **kw), i)
+        _, again = run(lambda: sglang_layer(model, i, copies[0], **kw), i)
         _, got = run(
             lambda: stages.layer(
                 wide, i, mine, kw["positions"], kw["input_ids"], kw["forward_batch"],
                 kw["input_ids_global"], defer,
-            )
+            ),
+            i,
         )  # fmt: skip
-        one = torch.ones((), dtype=torch.int64, device=kw["positions"].device)
+        dev = kw["positions"].device
+        one = torch.ones((), dtype=torch.int64, device=dev)
         own = stages.own(rows)
+        if ref["index_sets"] is not None:
+            counter = counters.get((c, "index_sets"))
+            if counter is None:
+                assert not torch.cuda.is_current_stream_capturing(), "no eager step first"
+                counter = counters[c, "index_sets"] = torch.zeros(5, dtype=torch.int64, device=dev)
+            r, a, g = ref["index_sets"], again["index_sets"], got["index_sets"]
+            wd, ad = (r != g).any(1), (r != a).any(1)
+            counter += torch.stack(
+                [one, wd.sum(), ad.sum(), (wd & ~ad).sum(), r.shape[0] * one]
+            )
         for field in FIELDS:
             # a token-parallel layer holds this rank's rows
             r, a = ([t[own] if t.shape[0] == rows else t for t in got_ref.get(field, [])]

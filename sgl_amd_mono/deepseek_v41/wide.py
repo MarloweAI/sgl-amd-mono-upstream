@@ -144,6 +144,45 @@ SGLANG_READS = {
         "indexer",
         "_low_ratio_sources_break",
         "bcg_deepseek_v4_low_ratio_sources",
+        # ``Stages.prepare_low_ratio``: the low-ratio prepare, opened
+        "_compute_q_a",
+        "_compute_q_b",
+        "_compute_kv_to_cache",
+    ),
+    # the low-ratio sources and the REINDEX selection (``WideReindex``)
+    "srt/layers/attention/deepseek_v4_backend.py": (
+        "forward_low_ratio_sources",
+        "forward_low_ratio_sources(run_indexer)",
+        "forward_low_ratio_sources(run_compressor)",
+        "_first_rows",
+        "low_ratio_pos_i64",
+    ),
+    "srt/layers/attention/dsv4/dsv41_sparse.py": (
+        "uses_candidates",
+        "is_candidate_source",
+        "candidate_topk_blocks",
+        "candidate_block_size",
+    ),
+    "kernels/ops/attention/dsv4/fp4_indexer_hip.py": (
+        "LOW_RATIO_PAGE_TABLE_BUCKET",
+        "aiter_fp4_paged_mqa_logits",
+        "rowgroup_table_columns",
+    ),
+    "srt/layers/attention/dsv4/metadata.py": (
+        "page_table",
+        "compressed_seq_lens",
+        "compressed_page_size",
+    ),
+    "kernels/ops/attention/dsv4/candidate_blocks_hip.py": (
+        "CandidateBlocks",
+        "ids",
+        "block_size",
+        "topk_compact_candidate_rows",
+        "topk_compact_candidate_rows(sort_output)",
+        "topk_transform_paged_hip",
+        "compact_lens",
+        "compact_page_table",
+        "compact_page_size",
     ),
     "srt/models/deepseek_common/amd/deepseek_v4_hip.py": (
         "skip_head_pad",
@@ -277,6 +316,8 @@ SGLANG_READS = {
         "build_low_ratio_decode_workspaces(num_requests)",
         "build_low_ratio_decode_workspaces(page8_ratios)",
         "low_ratio_decode_rows_are_identity",
+        "low_ratio_decode_rows_fit_candidate_span",
+        "_indexer_inputs",
     ),
     "srt/layers/attention/deepseek_v4_backend_hip_radix.py": (
         "DSV4Metadata",
@@ -295,6 +336,12 @@ SGLANG_READS = {
         "sparse_topk_lengths",
         "get_swa_out_cache_loc",
         "forward_low_ratio_sources",
+        # the REINDEX selection (``WideReindex``)
+        "drop_folded_sparse_indices",
+        "_drop_opus_topk_csr",
+        "candidate_masks",
+        "low_ratio_indexer_metadata",
+        "sparse_raw_indices",
     ),
     "srt/mem_cache/deepseek_v4_memory_pool.py": (
         "low_ratio_index_k_page8_ratios",
@@ -302,6 +349,10 @@ SGLANG_READS = {
         "get_swa_key_buffer_radix",
         "get_extra_key_buffer",
         "get_extra_key_page_size",
+        # the REINDEX selection's index keys (``WideReindex``)
+        "low_ratio_index_k_page8",
+        "get_index_k_fp4_payload_buffer",
+        "get_index_k_fp4_scale_buffer",
         # the span A launch's KV store (``SpanA``)
         "get_swa_raw_buffer",
         "uniform_fp8",
@@ -466,8 +517,8 @@ class Stages:
             )
             kv = None
         elif low_ratio_multi_stream:
-            q = attn._forward_prepare_low_ratio_multi_stream(
-                x, positions, forward_batch, backend, q_out, x_quant=x_quant
+            q = self.prepare_low_ratio(
+                attn, x, positions, forward_batch, backend, q_out, x_quant
             )
             kv = None
         else:
@@ -493,6 +544,53 @@ class Stages:
             inv_rope=inv_rope,
             dtype=x.dtype,
         )
+
+    def prepare_low_ratio(self, attn, x, positions, forward_batch, backend, q_out, x_quant):
+        """``MQALayer._forward_prepare_low_ratio_multi_stream``: the compressor and the indexer
+        on a side stream beside the Q chain and the KV write; the indexer through
+        ``index_sources``."""
+        # both side streams are joined before returning, and nothing they read is released
+        # before the join
+        current_stream = torch.cuda.current_stream()
+        stream_kv = attn.alt_streams[0]
+        stream_sources = attn.alt_streams[-1]
+        x_linear = x_quant if x_quant is not None else x
+        if attn.compressor is not None:
+            stream_sources.wait_stream(current_stream)
+        qkv_a = None
+        if attn.fuse_wqa_wkv:
+            qkv_a, _ = attn.wqkv_a(x_linear)
+        if attn.compressor is not None:
+            with torch.cuda.stream(stream_sources):
+                backend.forward_low_ratio_sources(
+                    layer=attn, x=x, q_lora=None, positions=positions,
+                    forward_batch=forward_batch, run_indexer=False,
+                )  # fmt: skip
+        stream_kv.wait_stream(current_stream)
+        q_lora, q_for_wqb = attn._compute_q_a(x_linear, qkv_a=qkv_a)
+        if attn.indexer is not None:
+            stream_sources.wait_stream(current_stream)
+        q = attn._compute_q_b(q_for_wqb, positions, q_out)
+        if attn.indexer is not None:
+            # forked right after q_lora, recorded after the Q chain
+            with torch.cuda.stream(stream_sources):
+                self.index_sources(attn, backend, x, q_lora, positions, forward_batch)
+        with torch.cuda.stream(stream_kv):
+            attn._compute_kv_to_cache(
+                x_linear, positions, forward_batch, backend, qkv_a=qkv_a
+            )
+        current_stream.wait_stream(stream_kv)
+        if attn.compressor is not None or attn.indexer is not None:
+            current_stream.wait_stream(stream_sources)
+        return q
+
+    def index_sources(self, attn, backend, x, q_lora, positions, forward_batch):
+        """A ratio-1 / 2 layer's indexer: its top-512 of each row into the backend's sparse
+        indices (an index source scores; the others reuse their source's)."""
+        backend.forward_low_ratio_sources(
+            layer=attn, x=x, q_lora=q_lora, positions=positions,
+            forward_batch=forward_batch, run_compressor=False,
+        )  # fmt: skip
 
     def attn_core(self, attn, front: Front, forward_batch) -> torch.Tensor:
         """The sparse attention over the window and the top-k keys: this rank's heads."""
@@ -1343,10 +1441,14 @@ class SpanAStages(Stages):
             if dv4._low_ratio_sources_break(backend, forward_batch):
                 dv4.bcg_deepseek_v4_low_ratio_sources(attn, x, out.q_quant, positions)
             else:
-                backend.forward_low_ratio_sources(
-                    layer=attn, x=x, q_lora=out.q_quant, positions=positions,
-                    forward_batch=forward_batch,
-                )  # fmt: skip
+                # the compressor, then the indexer through ``index_sources``
+                if attn.compressor is not None:
+                    backend.forward_low_ratio_sources(
+                        layer=attn, x=x, q_lora=None, positions=positions,
+                        forward_batch=forward_batch, run_indexer=False,
+                    )  # fmt: skip
+                if attn.indexer is not None:
+                    self.index_sources(attn, backend, x, out.q_quant, positions, forward_batch)
         inv_rope = hip.attention_inv_rope(
             attn,
             positions,
@@ -1856,6 +1958,226 @@ def _fp8_projections(model) -> dict:
     return gemm
 
 
+class ReindexBuffers:
+    """The two-level selection's buffers at the widest class's rows. The producer's: its rows'
+    block maxima (``scores``, sized at its first, eager step), their blocks and compact widths
+    and its candidate blocks, which the step's REINDEX layers read. A REINDEX layer's: the
+    candidate blocks with the newest last, their virtual 8-row pages and each row's compact
+    columns (``candidate_table.reindex_table``), and the compact logits. The step's index layers
+    run in stream order (one side stream), so they share them."""
+
+    def __init__(self, device):
+        from sgl_amd_mono.deepseek_v41.gfx950.indexer import index_plan as ip
+
+        rows = CLASSES[-1]
+        i32 = dict(dtype=torch.int32, device=device)
+        self.ids = torch.empty(rows, ip.TOPK_BLOCKS, **i32)
+        self.table = torch.empty(rows, ip.TOPK_BLOCKS, **i32)
+        self.context = torch.empty(rows, **i32)
+        self.owners = torch.arange(rows, **i32)  # a row's page-table row: its own
+        self.compact = torch.empty(
+            rows, ip.TOPK_BLOCKS * ip.BLOCK_ROWS, dtype=torch.float32, device=device
+        )
+        self.blocks = torch.empty(rows, ip.TOPK_BLOCKS, **i32)
+        self.block_lens = torch.empty(rows, **i32)
+        self.compact_lens = torch.empty(rows, **i32)
+        self.block_pages = torch.zeros(rows, 1, **i32)
+        self.scores: Optional[torch.Tensor] = None
+
+    def block_scores(self, width: int) -> torch.Tensor:
+        """[rows, ceil(width / 8)] f32 rows 16-byte aligned (as SGLang's top-k reads them),
+        allocated at the first step, which runs eagerly before any graph captures."""
+        blocks = -(-width // 8)
+        if self.scores is None:
+            assert not torch.cuda.is_current_stream_capturing(), "no eager wide step first"
+            self.scores = torch.empty(
+                CLASSES[-1], -(-blocks // 4) * 4, dtype=torch.float32, device=self.ids.device
+            )
+        assert self.scores.shape[1] >= blocks, (self.scores.shape, width)
+        return self.scores[:, :blocks]
+
+
+class WideReindex(Stages):
+    """``Stages`` with the two-level selection's own pieces where the step's rows pass the
+    candidate span. The producer keeps SGLang's logits and top-k's, its block maxima on
+    ``candidate_table.block_maxima`` (bit for bit SGLang's level one). A REINDEX layer: SGLang
+    scores every compressed key of the request on the row-group kernel and keeps the top 512
+    of the candidate blocks' columns; here only those columns are scored
+    (``indexer.reindex_wide``, each logit SGLang's bit for bit), then SGLang's compact top-k
+    and its map back to slots, each row's 512 ascending by position. The other index layers,
+    and a REINDEX layer whose rows fit the candidate span (every block a candidate: SGLang's
+    plain top-k), keep SGLang's indexer. The step's REINDEX layers read the same candidate
+    blocks, so the first lays out their table (``reindex_table``) for all of them."""
+
+    def __init__(self, shared: Shared, c: int):
+        super().__init__(shared, c)
+        self._buf = shared.once("reindex", lambda: ReindexBuffers(shared.device))
+        consumers = [
+            i
+            for i, layer in enumerate(shared.model.layers)
+            if getattr(getattr(layer.self_attn, "indexer", None), "uses_candidates", False)
+        ]
+        # the step's first REINDEX layer lays out the candidate table for all of them
+        self._first = min(consumers) if consumers else None
+
+    def index_sources(self, attn, backend, x, q_lora, positions, forward_batch):
+        from sglang.srt.layers.attention.dsv4.low_ratio_backend_hip import (
+            low_ratio_decode_rows_are_identity,
+            low_ratio_decode_rows_fit_candidate_span,
+        )
+
+        mode = forward_batch.forward_mode
+        ratio = attn.compress_ratio
+        if not (
+            (attn.indexer.uses_candidates or attn.indexer.is_candidate_source)
+            and (mode.is_decode() or mode.is_target_verify())
+            and not low_ratio_decode_rows_are_identity(backend, forward_batch, ratio)
+            and not low_ratio_decode_rows_fit_candidate_span(backend, forward_batch)
+            and not backend.token_to_kv_pool.low_ratio_index_k_page8(attn.layer_id)
+        ):
+            return super().index_sources(
+                attn, backend, x, q_lora, positions, forward_batch
+            )
+        from sglang.srt.layers.attention.deepseek_v4_backend import _first_rows
+
+        # ``forward_low_ratio_sources``: the hoisted rows (the live ones first)
+        meta = backend.forward_metadata
+        pos = meta.low_ratio_pos_i64
+        if pos is None:
+            pos = positions
+        else:
+            n = min(pos.shape[0], positions.shape[0])
+            if n < positions.shape[0]:
+                x, q_lora = _first_rows(x, n), _first_rows(q_lora, n)
+            pos = pos[:n]
+        # ``_low_ratio_index_topk``: the ratio's page indices are rewritten in place
+        meta.core_metadata.drop_folded_sparse_indices(ratio)
+        backend._drop_opus_topk_csr(ratio)
+        if attn.indexer.is_candidate_source:
+            self.produce(attn, backend, x, q_lora, pos)
+        else:
+            self.reindex(attn, backend, x, q_lora, pos)
+
+    def produce(self, attn, backend, x, q_lora, pos):
+        """``low_ratio_index_topk_hip_decode``'s source branch: SGLang's logits, the level-one
+        block maxima here, SGLang's top 2048 of them and its top 512 of the columns."""
+        from sglang.kernels.ops.attention.dsv4.candidate_blocks_hip import (
+            CandidateBlocks,
+            topk_transform_paged_hip,
+        )
+        from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+            LOW_RATIO_PAGE_TABLE_BUCKET,
+            aiter_fp4_paged_mqa_logits,
+            rowgroup_table_columns,
+        )
+        from sglang.srt.layers.attention.dsv4.low_ratio_backend_hip import (
+            _indexer_inputs,
+        )
+
+        from sgl_amd_mono.deepseek_v41.gfx950.indexer import index_plan as ip
+        from sgl_amd_mono.deepseek_v41.gfx950.indexer.candidate_table import (
+            block_maxima,
+        )
+
+        pool = backend.token_to_kv_pool
+        meta = backend.forward_metadata
+        core = meta.core_metadata
+        ratio = attn.compress_ratio
+        im = meta.low_ratio_indexer_metadata(ratio)
+        indexer = attn.indexer
+        assert (
+            indexer.candidate_topk_blocks == ip.TOPK_BLOCKS
+            and indexer.candidate_block_size == ip.BLOCK_ROWS
+        ), "the wide producer's candidate blocks"
+        q_fp4, q_scale, weights = _indexer_inputs(attn, x, q_lora, pos)
+        logits = aiter_fp4_paged_mqa_logits(
+            q_fp4=q_fp4, q_scale=q_scale,
+            k_payload=pool.get_index_k_fp4_payload_buffer(attn.layer_id),
+            k_scale=pool.get_index_k_fp4_scale_buffer(attn.layer_id), weights=weights,
+            page_table=im.page_table, c4_seq_lens=im.compressed_seq_lens, weight_scale=1.0,
+            page_table_bucket=LOW_RATIO_PAGE_TABLE_BUCKET, is_decode=True,
+            decode_workspace=meta.fp4_low_ratio_decode_workspaces.get(ratio), page8=False,
+            rowgroup_table_columns=rowgroup_table_columns(
+                backend.max_context_len, ratio, LOW_RATIO_PAGE_TABLE_BUCKET
+            ),
+        )  # fmt: skip
+        rows = logits.shape[0]
+        b = self._buf
+        scores = b.block_scores(logits.shape[1])[:rows]
+        bounds = im.compressed_seq_lens.to(torch.int32).contiguous()
+        block_maxima(
+            logits=logits, bounds=bounds, scores=scores, block_lens=b.block_lens[:rows],
+            compact_lens=b.compact_lens[:rows], topk_blocks=ip.TOPK_BLOCKS,
+        )  # fmt: skip
+        ids = b.blocks[:rows]
+        topk_transform_paged_hip(scores, b.block_lens[:rows], None, ids, 1, None)
+        backend.candidate_masks = CandidateBlocks(
+            ids=ids,
+            compact_lens=b.compact_lens[:rows],
+            compact_page_table=b.block_pages[:rows],
+            compact_page_size=ip.TOPK_BLOCKS * ip.BLOCK_ROWS,
+            block_size=ip.BLOCK_ROWS,
+        )
+        topk_transform_paged_hip(
+            logits, im.compressed_seq_lens, im.page_table, core.sparse_page_indices(ratio),
+            im.compressed_page_size, core.sparse_raw_indices(ratio),
+        )  # fmt: skip
+
+    def reindex(self, attn, backend, x, q_lora, pos):
+        """``low_ratio_index_topk_hip_decode``'s consumer branch, scoring the candidate
+        blocks' columns alone."""
+        from sglang.kernels.ops.attention.dsv4.candidate_blocks_hip import (
+            CandidateBlocks,
+            topk_compact_candidate_rows,
+        )
+        from sglang.srt.layers.attention.dsv4.low_ratio_backend_hip import (
+            _indexer_inputs,
+        )
+
+        from sgl_amd_mono.deepseek_v41.gfx950.indexer import reindex_wide
+        from sgl_amd_mono.deepseek_v41.gfx950.indexer.candidate_table import (
+            reindex_table,
+        )
+
+        pool = backend.token_to_kv_pool
+        meta = backend.forward_metadata
+        core = meta.core_metadata
+        ratio = attn.compress_ratio
+        im = meta.low_ratio_indexer_metadata(ratio)
+        cands = backend.candidate_masks
+        q_fp4, q_scale, weights = _indexer_inputs(attn, x, q_lora, pos)
+        rows = q_fp4.shape[0]
+        assert (
+            isinstance(cands, CandidateBlocks)
+            and cands.ids.shape[0] == rows
+            and cands.block_size == 8
+            and weights.dtype == torch.bfloat16
+            and weights.is_contiguous()
+            and q_fp4.is_contiguous()
+            and q_scale.is_contiguous()
+        ), "the wide REINDEX selection's candidate blocks or index query"
+        b = self._buf
+        if attn.layer_id == self._first:
+            reindex_table(
+                ids=cands.ids, page_table=im.page_table, owners=b.owners[:rows],
+                bounds=im.compressed_seq_lens, ids_out=b.ids[:rows], table=b.table[:rows],
+                context=b.context[:rows],
+            )  # fmt: skip
+        reindex_wide.build(width_class(rows))(
+            q_fp4.data_ptr(), q_scale.data_ptr(), weights.data_ptr(),
+            pool.get_index_k_fp4_payload_buffer(attn.layer_id).data_ptr(),
+            pool.get_index_k_fp4_scale_buffer(attn.layer_id).data_ptr(),
+            b.table.data_ptr(), b.context.data_ptr(), b.compact.data_ptr(), rows,
+            stream=torch.cuda.current_stream(),
+        )  # fmt: skip
+        topk_compact_candidate_rows(
+            b.compact[:rows], b.context[:rows], b.ids[:rows], cands, im.compressed_seq_lens,
+            page_table=im.page_table, page_size=im.compressed_page_size,
+            page_indices=core.sparse_page_indices(ratio),
+            raw_indices=core.sparse_raw_indices(ratio), sort_output=True,
+        )  # fmt: skip
+
+
 def mixins(tp: int, heads: int, c: int) -> tuple:
     """The stages of width class c at TP size ``tp`` (``heads`` attention heads a rank), in
     method resolution order: each kernel's stages ahead of SGLang's (``Stages``)."""
@@ -1870,6 +2192,7 @@ def mixins(tp: int, heads: int, c: int) -> tuple:
     out.append(WideWoa)
     if c in UNION_CLASSES.get(heads, ()):
         out.append(UnionStages)
+    out.append(WideReindex)
     return (*out, Stages)
 
 

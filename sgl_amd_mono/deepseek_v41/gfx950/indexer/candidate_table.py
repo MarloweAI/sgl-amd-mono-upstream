@@ -157,3 +157,75 @@ def map_compact_selection(
         BLOCK_ROWS=ip.BLOCK_ROWS,
         PAGE_ROWS=PLANE_ROWS,
     )
+
+
+@triton.jit
+def ds41_idx_wide_bmax(
+    logits,
+    bounds,
+    scores,
+    block_lens,
+    compact_lens,
+    logits_stride,
+    scores_stride,
+    topk_blocks,
+    BLOCK_ROWS: tl.constexpr,
+    BLOCKS: tl.constexpr,
+):
+    """Program (row, p) of P a row: the row's 8-column block maxima over its columns in runs of
+    BLOCKS blocks, runs p, p + P, ..., the block of its newest column +inf; a run wholly inside
+    the row loads its columns unmasked. Program (row, 0) also writes the row's blocks and compact
+    width."""
+    row = tl.program_id(0)
+    p = tl.program_id(1)
+    P = tl.num_programs(1)
+    length = tl.load(bounds + row)
+    nb = (length + BLOCK_ROWS - 1) // BLOCK_ROWS
+    if p == 0:
+        tl.store(block_lens + row, nb)
+        tl.store(compact_lens + row, tl.minimum(nb, topk_blocks) * BLOCK_ROWS)
+    base = logits + row.to(tl.int64) * logits_stride
+    newest = (length - 1) // BLOCK_ROWS
+    for b0 in range(p * BLOCKS, nb, P * BLOCKS):
+        cols = b0 * BLOCK_ROWS + tl.arange(0, BLOCKS * BLOCK_ROWS)
+        if (b0 + BLOCKS) * BLOCK_ROWS <= length:
+            vals = tl.load(base + cols)
+        else:
+            vals = tl.load(base + cols, mask=cols < length, other=float("-inf"))
+        best = tl.max(tl.reshape(vals, (BLOCKS, BLOCK_ROWS)), axis=1)
+        blocks = b0 + tl.arange(0, BLOCKS)
+        best = tl.where(blocks == newest, float("inf"), best)
+        tl.store(scores + row * scores_stride + blocks, best, mask=blocks < nb)
+
+
+BMAX_BLOCKS = 256  # a run's blocks (2048 columns)
+BMAX_PROGRAMS = 4096  # programs a launch aims at
+
+
+def block_maxima(
+    *,
+    logits: torch.Tensor,
+    bounds: torch.Tensor,
+    scores: torch.Tensor,
+    block_lens: torch.Tensor,
+    compact_lens: torch.Tensor,
+    topk_blocks: int,
+) -> None:
+    """A producer's level one before its top-k: ``candidate_block_scores`` (``fill_tail``
+    off) and ``_candidate_lengths_kernel`` of SGLang's ``select_candidate_blocks_hip``, bit for
+    bit. ``scores`` [rows, >= blocks] f32 gets each row's first ceil(bound / 8) maxima."""
+    rows = logits.shape[0]
+    assert logits.stride(1) == 1 and scores.stride(1) == 1 and bounds.dtype == torch.int32
+    ds41_idx_wide_bmax[(rows, max(1, BMAX_PROGRAMS // rows))](
+        logits,
+        bounds,
+        scores,
+        block_lens,
+        compact_lens,
+        logits.stride(0),
+        scores.stride(0),
+        topk_blocks,
+        BLOCK_ROWS=ip.BLOCK_ROWS,
+        BLOCKS=BMAX_BLOCKS,
+        num_warps=4,
+    )
