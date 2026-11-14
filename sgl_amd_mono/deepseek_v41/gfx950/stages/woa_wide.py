@@ -729,7 +729,7 @@ def standalone(m, g, tile=None, ldx=None):
     ``workspace``, flags zeroed once; unused when ks = 1)."""
     tl = tile if tile is not None else TILES[(g, width_class(m))]
     ldx = g * D if ldx is None else ldx
-    keyed = key_tuple({"m": m, "g": g, "tile": tl, "ldx": ldx}, SOURCES)
+    keyed = key_tuple({"m": m, "g": g, "tile": tile, "tl": tl, "ldx": ldx}, SOURCES)
     key = (m, g, tl, ldx)
     if key in _BUILDS:
         return _BUILDS[key]
