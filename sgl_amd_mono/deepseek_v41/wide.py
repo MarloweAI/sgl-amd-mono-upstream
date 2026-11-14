@@ -1223,7 +1223,9 @@ class SpanA:
         """The flag-region keys of width m: (m, with a sum, the seam's post, its combine)."""
         if not self.gathers[m]:
             return [(m, True, True, True)] if self.sums[m] else []
-        return [(m, self.sums[m], True, True), (m, False, False, True), (m, False, False, False)]
+        # a settled sublayer output's post (no sum) as well: a stage check feeds SGLang's state
+        posts = [(m, True, True, True), (m, False, True, True)] if self.sums[m] else [(m, False, True, True)]
+        return [*posts, (m, False, False, True), (m, False, False, False)]
 
     def _stand_in_front(self, m):
         """A front of the width's shape (the peer layout reads only its presence)."""
