@@ -21,7 +21,8 @@ import time
 
 TARGET = "sgl_amd_mono.deepseek_v41.wide"
 PERIOD_S = 30
-NAMES = ("res", "normed", "xq", "xs", "pre", "post", "comb", "q", "qq", "qs", "cache")
+NAMES = ("res", "normed", "xq", "xs", "pre", "post", "comb", "q", "qq", "qs", "cache",
+         "q_real", "qq_real", "qs_real", "cache_real")
 
 
 def _install(mod):
@@ -78,6 +79,13 @@ def _install(mod):
         cnt[k, 0] += 1
         cnt[k, 1] += (g != r).sum()
         cnt[k, 2] += g.numel()
+
+    def count_real(m, name, got, ref, real, device):
+        """``count`` over the rows of ``real`` only (a row's bytes: its slice of dim 0)."""
+        n = real.shape[0]
+        g = got.contiguous().view(torch.uint8).view(n, -1)
+        r = ref.contiguous().view(torch.uint8).view(n, -1)
+        count(m, name, g * real[:, None], r * real[:, None], device)
 
     span_call = mod.SpanA.__call__
     stages = mod.Stages
@@ -154,7 +162,15 @@ def _install(mod):
             count(m, "q", out.q, r_q, dev)
             count(m, "qq", out.q_quant.q, r_qq.q, dev)
             count(m, "qs", out.q_quant.scale, r_qq.scale, dev)
-            count(m, "cache", _rows(pool.get_swa_raw_buffer(attn.layer_id), loc), r_cache, dev)
+            got_cache = _rows(pool.get_swa_raw_buffer(attn.layer_id), loc)
+            count(m, "cache", got_cache, r_cache, dev)
+            # the graph's padding rows write the pool's dummy slot 0 (and read it back)
+            real = loc > 0
+            if real.shape[0] == out.q.shape[0]:
+                count_real(m, "q_real", out.q, r_q, real, dev)
+                count_real(m, "qq_real", out.q_quant.q, r_qq.q, real, dev)
+                count_real(m, "qs_real", out.q_quant.scale, r_qq.scale, real, dev)
+            count_real(m, "cache_real", got_cache, r_cache, real, dev)
         return got
 
     def _rows(cache, loc):
