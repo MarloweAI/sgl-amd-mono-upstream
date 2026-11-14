@@ -636,6 +636,8 @@ class _Layer(msgspec.Struct):
     # (EngramWeights), and that layer
     eg: Any = None
     eg_for: int = 0
+    # wo_a's e4m3 in the wide steps' fragment order (``stages.woa_wide.pack_weight``)
+    woa_wide: Any = None
 
 
 def _keep(copies: dict, t: torch.Tensor, *key) -> torch.Tensor:
@@ -756,6 +758,9 @@ def _weights(copies: dict, tables: list, layer, i: int) -> _Layer:
         _keep(copies, woa, "wo_a mxfp8", i, "weight")
         _keep(copies, woa_s, "wo_a mxfp8", i, "scale")
     sink = a.attn_sink.detach()[p.tp_rank * d.heads : (p.tp_rank + 1) * d.heads]
+    from sgl_amd_mono.deepseek_v41.gfx950.stages.woa_wide import pack_weight
+
+    L.woa_wide = _keep(copies, pack_weight(woa), "wo_a wide order", i, "weight")
     L.k2 = K2Weights(
         woa=woa,
         woa_s=woa_s,
@@ -1118,7 +1123,7 @@ class _Built:
 
     def __init__(self, lm, runner, layers: dict):
         self.lm, self.model, self.runner, self._layers = lm, lm.model, runner, layers
-        self.wide = wide.WideForward(lm)
+        self.wide = wide.WideForward(lm, layers)
         self._normal_moe = lm.model.layers[min(layers)].mlp
         # DSpark's captures, [MAX_ROWS, layers * hidden]: K1 writes each layer's block
         self._packed: torch.Tensor | None = None

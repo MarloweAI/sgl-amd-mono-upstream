@@ -1576,6 +1576,66 @@ class _SeamResources:
         return got
 
 
+class WideWoa(Stages):
+    """``Stages`` with wo_a on ``stages.woa_wide`` for the covered layers: SGLang's inverse
+    RoPE, then one launch from the attention output to wo_b's MXFP8 input (the codes and
+    scales SGLang's gfx950 route emits, bit for bit from 65 rows on; ``woa_wide``). Layers
+    without the plugin's wo_a copy (the spec layer's ``woa_wide``: fragment-order e4m3, with
+    its E8M0 codes) keep SGLang's."""
+
+    def __init__(self, shared: Shared, c: int):
+        super().__init__(shared, c)
+        self._woa = shared.once("woa", lambda: _woa_weights(shared))
+        # a launch's K-split workspace: none at the static tiles
+        self._none = None
+
+    def wo_a(self, attn, o, positions, forward_batch, front: Front):
+        import sglang.srt.models.deepseek_v4 as dv4
+        from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import Mxfp8Activation
+
+        from sgl_amd_mono.deepseek_v41.gfx950.stages import woa_wide
+
+        w = self._woa.get(attn.layer_id)
+        if w is None:
+            return super().wo_a(attn, o, positions, forward_batch, front)
+        if front.inv_rope is None:
+            dv4.fused_rope_inplace(
+                o[..., -attn.qk_rope_head_dim :],
+                None,
+                attn.freqs_cis,
+                positions=positions,
+                inverse=True,
+            )
+        T, G = o.shape[0], attn.n_local_groups
+        o = o.view(T, G, -1)
+        assert o.stride(2) == 1 and o.stride(1) == o.shape[2], o.stride()
+        if self._none is None:
+            self._none = torch.zeros(1, dtype=torch.int32, device=o.device)
+        q = torch.empty(T, G * 1024, dtype=torch.float8_e4m3fn, device=o.device)
+        s = torch.empty(T, G * 32, dtype=torch.uint8, device=o.device)
+        woa_wide.standalone(T, G, ldx=o.stride(0))(
+            o.data_ptr(), w[0].data_ptr(), w[1].data_ptr(), q.data_ptr(), s.data_ptr(),
+            self._none.data_ptr(), self._none.data_ptr(),
+            stream=torch.cuda.current_stream(),
+        )  # fmt: skip
+        return Mxfp8Activation(q, s)
+
+
+def _woa_weights(shared: Shared) -> dict:
+    """layer -> (wo_a's fragment-order e4m3, its E8M0 codes) where the spec keeps the copy;
+    each such layer on SGLang's bf16 wo_a route with wo_b on an MXFP8 input."""
+    import sglang.srt.models.deepseek_v4 as dv4
+
+    woa = {i: (L.woa_wide, L.k2.woa_s) for i, L in shared.layers.items() if L.woa_wide is not None}
+    for i in woa:
+        a = shared.model.layers[i].self_attn
+        if a.wo_a_fp8 or a.use_fused_wo_a or a.use_flashinfer_mxfp8_wo_b:
+            raise RuntimeError(f"layer {i}: the wide wo_a needs SGLang's bf16 wo_a route")
+        if not dv4._hip.wo_b_emits_mxfp8(a, CLASSES[0]):
+            raise RuntimeError(f"layer {i}: the wide wo_a needs wo_b on an MXFP8 input")
+    return woa
+
+
 def mixins(tp: int, heads: int, c: int) -> tuple:
     """The stages of width class c at TP size ``tp`` (``heads`` attention heads a rank), in
     method resolution order: each kernel's stages ahead of SGLang's (``Stages``)."""
@@ -1586,6 +1646,7 @@ def mixins(tp: int, heads: int, c: int) -> tuple:
     elif token_parallel:
         out.append(TokenParallelStages)
     out.append(SeamStages)
+    out.append(WideWoa)
     return (*out, Stages)
 
 
