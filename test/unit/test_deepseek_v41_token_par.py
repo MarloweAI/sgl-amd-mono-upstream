@@ -14,7 +14,10 @@ from sgl_amd_mono.deepseek_v41.gfx950.token_par import (
 )
 from sgl_amd_mono.deepseek_v41.spec import SPEC
 
-WIDTHS = SPEC.devices["gfx950"].widths
+
+
+def widths(tp: int) -> tuple:
+    return SPEC.widths_at("gfx950", tp)
 
 
 @pytest.mark.parametrize("n", [HIDDEN // 2, Q_RANK // 2])
@@ -33,27 +36,27 @@ def test_the_gather_inverts_the_push(n):
 
 @pytest.mark.parametrize("tp", [2, 4])
 def test_peer_regions_start_on_a_line(tp):
-    for s in WIDTHS:
+    for s in widths(tp):
         assert all(off % LINE == 0 for off, _ in peer_layout(s, tp).values())
     # the other parity's regions start a half (the widest layout) later
-    widest = peer_layout(max(WIDTHS), tp)
+    widest = peer_layout(max(widths(tp)), tp)
     assert max(off + size for off, size in widest.values()) % LINE == 0
 
 
 @pytest.mark.parametrize("tp", [2, 4, 8])
 def test_cells_overlap_no_region(tp):
     # K2's cells read any word in their region as a mark: no width's regions reach it
-    off, size = acell_region(tp, WIDTHS)
+    off, size = acell_region(tp, widths(tp))
     assert off % LINE == 0 and size > 0
-    for s in WIDTHS:
+    for s in widths(tp):
         assert all(o + n <= off for o, n in peer_layout(s, tp).values())
 
 
 @pytest.mark.parametrize("tp", [2, 4, 8])
 def test_ffn_cells_follow_the_attention_cells(tp):
     # the per-row MoE's cells read any word in their region as a mark too: past ACELL
-    a_off, a_size = acell_region(tp, WIDTHS)
-    off, size = fcell_region(tp, WIDTHS, range(1, 7))
+    a_off, a_size = acell_region(tp, widths(tp))
+    off, size = fcell_region(tp, widths(tp), range(1, 7))
     assert (
         off % LINE == 0 and off >= a_off + a_size and size == tp * 6 * HIDDEN // 4 * 8
     )

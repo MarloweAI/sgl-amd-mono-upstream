@@ -5,8 +5,9 @@ A routed decode or DSpark verify step runs ``_Built.forward``, which takes and r
 what ``DeepseekV4ForCausalLM.forward`` does: SGLang's input preparation, the embedding,
 every layer in two launches, the head's combine and norm, and SGLang's logits
 processor, with SGLang's own modules where SGLang owns the state. That is the
-monokernel's forward, up to ``MAX_ROWS`` rows; a wider step (``wide.WIDTHS``) runs
-``wide.WideForward``, the same forward in stages on SGLang's kernels.
+monokernel's forward, up to ``MAX_ROWS`` rows; a wider step (``wide.WIDTHS``, at the TP
+sizes of ``wide.TP_WIDTHS``) runs ``wide.WideForward``, the same forward in stages on
+SGLang's kernels.
 
 - Every layer is K1, then K2. K1 runs the attention seam and front and writes the
   step's SWA KV records and K2's key table; K2 runs the attention core, wo_a, wo_b,
@@ -758,9 +759,10 @@ def _weights(copies: dict, tables: list, layer, i: int) -> _Layer:
         _keep(copies, woa, "wo_a mxfp8", i, "weight")
         _keep(copies, woa_s, "wo_a mxfp8", i, "scale")
     sink = a.attn_sink.detach()[p.tp_rank * d.heads : (p.tp_rank + 1) * d.heads]
-    from sgl_amd_mono.deepseek_v41.gfx950.stages.woa_wide import pack_weight
+    if p.tp_size in wide.TP_WIDTHS:
+        from sgl_amd_mono.deepseek_v41.gfx950.stages.woa_wide import pack_weight
 
-    L.woa_wide = _keep(copies, pack_weight(woa), "wo_a wide order", i, "weight")
+        L.woa_wide = _keep(copies, pack_weight(woa), "wo_a wide order", i, "weight")
     L.k2 = K2Weights(
         woa=woa,
         woa_s=woa_s,
@@ -1123,7 +1125,8 @@ class _Built:
 
     def __init__(self, lm, runner, layers: dict):
         self.lm, self.model, self.runner, self._layers = lm, lm.model, runner, layers
-        self.wide = wide.WideForward(lm, layers)
+        # the wide steps' stages at the TP sizes they run at
+        self.wide = wide.WideForward(lm, layers) if runner.tp in wide.TP_WIDTHS else None
         self._normal_moe = lm.model.layers[min(layers)].mlp
         # DSpark's captures, [MAX_ROWS, layers * hidden]: K1 writes each layer's block
         self._packed: torch.Tensor | None = None
@@ -1785,8 +1788,9 @@ SPEC = MonoSpec(
     name="deepseek_v41_hip",
     devices={
         "gfx950": DeviceLimits(
-            widths=MONO_WIDTHS + wide.WIDTHS,
+            widths=MONO_WIDTHS,
             tp_sizes=(2, 4, 8),
+            tp_widths=wide.TP_WIDTHS,
             resident_blocks=BLOCKS,
         )
     },

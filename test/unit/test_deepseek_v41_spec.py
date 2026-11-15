@@ -60,16 +60,24 @@ def test_the_plugin_registers_both_specs():
 def test_wide_steps_take_stock_graphs():
     from sglang.srt.kernel_plugins.amd.binding import covered_capture_sizes
 
-    widths = dsv41.SPEC.widths("gfx950")
-    assert widths[: dsv41.MAX_ROWS] == dsv41.MONO_WIDTHS == draft.SPEC.widths("gfx950")
-    assert widths[dsv41.MAX_ROWS :] == wide.WIDTHS and max(wide.WIDTHS) == 384
-    # SGLang's speculative decode graphs to 64 requests: a DSpark server keeps them all
-    stock = [*range(1, 9), *range(10, 33, 2), *range(40, 65, 4)]
-    for top in (16, 32, 64):
-        sizes = [b for b in stock if b <= top]
-        assert covered_capture_sizes(widths=widths, tokens_per_request=6, sizes=sizes) == sizes
+    assert dsv41.SPEC.widths("gfx950") == dsv41.MONO_WIDTHS == draft.SPEC.widths("gfx950")
+    assert sorted(wide.TP_WIDTHS) == [2, 4] and max(wide.WIDTHS) == 384
+    for tp in (2, 4):
+        widths = dsv41.SPEC.widths_at("gfx950", tp)
+        assert widths == dsv41.MONO_WIDTHS + wide.WIDTHS
+        # SGLang's speculative decode graphs to 64 requests: a DSpark server keeps them all
+        stock = [*range(1, 9), *range(10, 33, 2), *range(40, 65, 4)]
+        for top in (16, 32, 64):
+            sizes = [b for b in stock if b <= top]
+            assert covered_capture_sizes(widths=widths, tokens_per_request=6, sizes=sizes) == sizes
     rows = (60, 96, 108, 192, 240, 384)
     assert [wide.width_class(r) for r in rows] == [96, 96, 192, 192, 384, 384]
+
+
+def test_tp8_steps_stay_within_the_monokernels_rows():
+    # no wide width at TP8: the wide forward, its workspaces and peer buffers are never built
+    assert dsv41.SPEC.widths_at("gfx950", 8) == dsv41.MONO_WIDTHS
+    assert max(dsv41.SPEC.widths_at("gfx950", 8)) == dsv41.MAX_ROWS
 
 
 def test_token_parallel_rows_split_evenly():

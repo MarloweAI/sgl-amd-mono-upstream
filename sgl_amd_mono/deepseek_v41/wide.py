@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """DeepSeek-V4.1-Flash's wide verify steps: ``DeepseekV4ForCausalLM.forward`` at 60 to 384
-rows (``WIDTHS``), each layer in stages, every stage SGLang's own code in SGLang's order.
+rows (``WIDTHS``), each layer in stages, every stage SGLang's own code in SGLang's order. They
+run at the TP sizes of ``TP_WIDTHS`` only.
 
 The forward is SGLang's ROCm path for a decode or verify step (``_forward_impl``,
 ``_forward_layers_hc_pre_from_prev``, ``forward_layer_fused_boundary``), with the attention
@@ -393,6 +394,9 @@ SGLANG_READS = {
 WIDTHS = tuple(6 * b for b in (*range(10, 33, 2), *range(40, 65, 4)))
 # the width classes a kernel's stages are built for: each serves the rows up to it
 CLASSES = (96, 192, 384)
+# the TP sizes the wide steps run at, and their rows there. TP8 has none: its steps stay within
+# the monokernel's rows (``spec.MAX_ROWS``), so no wide stage, workspace or peer buffer is built
+TP_WIDTHS = {2: WIDTHS, 4: WIDTHS}
 
 
 def width_class(rows: int) -> int:
@@ -2370,7 +2374,8 @@ class WideForward:
 
 
 def reasons(model, layers) -> list[str]:
-    """What the wide forward needs of ``layers`` past the spec's other reasons: the
+    """What the wide forward needs of ``layers`` past the spec's other reasons, at a TP size
+    it runs at (``TP_WIDTHS``): the
     attention this module opens (not the mega one; an FP8 wo_a only on aiter's mxscale
     GEMM). A late-layer tail is a prefill's: decode and verify steps run every row.
     Token parallel (``TOKEN_PARALLEL``) needs plain TP (the attention's TP group is the
@@ -2381,6 +2386,8 @@ def reasons(model, layers) -> list[str]:
     m = model.model
     out = []
     parallel = get_parallel()
+    if parallel.tp_size not in TP_WIDTHS:
+        return out
     if TOKEN_PARALLEL.get(parallel.tp_size):
         ca = parallel.tp_group.ca_comm
         if parallel.attn_tp_size != parallel.tp_size:
