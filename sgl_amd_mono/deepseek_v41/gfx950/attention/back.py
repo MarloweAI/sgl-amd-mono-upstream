@@ -1445,6 +1445,11 @@ def run_back(c, key, bid, idle=None, before_wob=None):
                 regs = words_loads(c, c["xo"], q_rows // 2, off[1], half_w, t0, n)
             acc = bf16_gemv_mfmas(c, group_k, c["xl"], ops, acc, h, n)
             gpu.barrier()  # the next half's rows overwrite the LDS
+        if const_expr(tx8):
+            # wo_b's hint as the GEMV ends, with no wait: its polls of the X8B words
+            # (which carry the tag) arrive about as the words land
+            if c["tid"] == 0:
+                c["mb"].put(c["ardy"], woa_t * FLAG_STRIDE, fx.Int32(1))
         stage_woa(c, woa_t, acc, t0, n)
 
     if has_woa:
@@ -1474,6 +1479,10 @@ def run_back(c, key, bid, idle=None, before_wob=None):
         # drained here, as below
         rocdl.s_waitcnt(vmcnt=0)
         if has_wob:
+            # every wo_a task's hint first: polled from the wait's start, the X8B words
+            # would load the memory under the split, combine and wo_a from every wo_b CTA
+            woa_hints = c["ardy"]
+            await_flags(c, woa_hints, woa_tasks, lambda u: u * FLAG_STRIDE)
             x8b_rows(c, s, also)
     elif const_expr(woa_spread):
         # this tile's wo_a units

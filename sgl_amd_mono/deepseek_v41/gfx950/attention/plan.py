@@ -173,8 +173,9 @@ WORD = 16  # a tagged word's bytes: three data words, then the launch tag
 
 
 def tagged_x8b(d: Dims, s: int) -> bool:
-    """Whether wo_a hands X8B to wo_b as tagged words (no store-completion wait, no
-    flag): on TP4 and TP8 at one token tile."""
+    """Whether wo_a hands X8B to wo_b as tagged words (no store-completion wait), with
+    a hint flag a wo_a task that wo_b polls before the words: on TP4 and TP8 at one
+    token tile."""
     return d.tp in (4, 8) and s <= TILE
 
 
@@ -200,7 +201,11 @@ def back_scratch(s: int, d: Dims, start: int = 0) -> dict:
     """Return K2's scratch regions past ``start`` -> (byte offset, bytes)."""
     nchunk = cdiv(KEYS, split_keys(d, s))
     if tagged_x8b(d, s):
-        x8b = [("x8t", x8b_words(d, s) * WORD)]
+        x8b = [
+            ("x8t", x8b_words(d, s) * WORD),
+            # a hint flag a wo_a task, a line each: when wo_b starts polling the words
+            ("ardy", d.woa_tasks * PAIR * FLAG_STRIDE),
+        ]
     else:
         x8b = [
             ("x8b", s * d.o_rows),
