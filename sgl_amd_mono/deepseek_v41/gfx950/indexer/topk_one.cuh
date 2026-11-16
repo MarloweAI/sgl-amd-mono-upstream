@@ -343,6 +343,275 @@ TOPK_KERNEL void topk_pair(
   run<TopKMode::INDICES>(blocks, ws, row, kMaxRows + row, rank - kSplit);
 }
 
+
+// ---------------------------------------------------------------------------------------------
+// Context-parallel rows. From `band` columns every rank of the TP group scores and selects one
+// run of a row's 128-column chunks (`index_plan.cp_chunks`); each rank's top k of its run goes to
+// every rank as 8-byte cells, and each rank takes the row's top k of all of them. A cell's high
+// word orders the value as SGLang's exact radix key does, its low word the column, lower first,
+// so the keys are distinct and their top k is the row's top k by (value, then lower column).
+// ---------------------------------------------------------------------------------------------
+
+/// A launch's exchange: this rank's cells [parity][problem][source rank][row][kMaxTopK] (left
+/// zeroed: a rank zeroes each cell it reads), every rank's cells by rank, the rows' own picks,
+/// and each row's parity, flipped at each of its exchanges. A rank's next exchange of a row
+/// writes the other parity's cells, so it cannot reach a peer still reading this one's.
+struct Cp {
+  uint64_t* __restrict__ cells;
+  const uint64_t* __restrict__ peers;  // [tp] addresses of every rank's cells
+  int32_t* __restrict__ picks;         // [kMaxProblems][kMaxRows][kMaxTopK]
+  uint32_t* __restrict__ parity;       // [kMaxProblems][kMaxRows]
+  uint32_t rank, tp, band;
+};
+
+constexpr uint32_t kCpChunk = 128;   // index_plan.CHUNK
+constexpr uint32_t kCpScored = 512;  // index_plan.TOPK: rows at or below it are not scored
+constexpr uint32_t kCpMaxRanks = 8;
+constexpr uint32_t kCpMaxItems = kCpMaxRanks * kMaxTopK / kBlockSize;
+constexpr uint32_t kCpSpinLimit = 1u << 24;
+
+/// This rank's columns [lo, hi) of a row seeing `bound` columns; `on` when the row is
+/// context-parallel (index_plan.cp_chunks), else the whole row.
+struct CpWindow {
+  uint32_t lo, hi;
+  bool on;
+};
+SGL_DEVICE CpWindow cp_window(uint32_t bound, const Cp& cp) {
+  if (bound < cp.band) return {0, bound, false};
+  const uint32_t n = bound > kCpScored ? (bound + kCpChunk - 1) / kCpChunk : 0;
+  const uint32_t per = (n + cp.tp - 1) / cp.tp;
+  const uint32_t lo = min(cp.rank * per, n);
+  return {min(lo * kCpChunk, bound), min(min(lo + per, n) * kCpChunk, bound), true};
+}
+
+/// A pick's cell: SGLang's exact key of its value, then its column, lower first. Never zero.
+SGL_DEVICE uint64_t cp_cell(float v, uint32_t col) {
+  return (static_cast<uint64_t>(impl::extract_exact_bin(v)) << 32) | (0x80000000u | (0x7FFFFFFFu - col));
+}
+/// A cell for no pick (`i` keeps it distinct): below every pick's.
+SGL_DEVICE uint64_t cp_none(uint32_t i) {
+  return 0x80000000u | i;
+}
+SGL_DEVICE int32_t cp_column(uint64_t cell) {
+  return (cell >> 32) == 0 ? -1 : static_cast<int32_t>(0x7FFFFFFFu - (static_cast<uint32_t>(cell) & 0x7FFFFFFFu));
+}
+SGL_DEVICE size_t cp_slot(const Cp& cp, uint32_t q, uint32_t p, uint32_t src, uint32_t row) {
+  return (((static_cast<size_t>(q) * kMaxProblems + p) * cp.tp + src) * kMaxRows + row) * kMaxTopK;
+}
+
+/// SGLang's top k of columns [w.lo, w.hi) of `params`' row into `picks` (as the row's columns, -1
+/// past the window's). True on the CTA that ends the row, once every pick is in.
+SGL_DEVICE bool cp_select(
+    const TopKPagedParams& params, const Workspace& ws, int32_t* picks, CpWindow w, uint32_t row, uint32_t slot,
+    uint32_t rank) {
+  auto problem = params.problem(row, w.hi - w.lo);
+  problem.in += w.lo;
+  problem.bias = static_cast<int32_t>(w.lo);
+  problem.out = picks;
+  __shared__ impl::MaxSmem<Register4::Smem, Streaming::Smem, TopKSplit::Smem> smem;
+  if (problem.seq_len <= ws.floor) {
+    if (rank != 0) return false;
+    if (problem.seq_len <= problem.topk) {
+      for (uint32_t t = threadIdx.x; t < problem.topk; t += kBlockSize)
+        picks[t] = t < problem.seq_len ? static_cast<int32_t>(w.lo + t) : -1;
+    } else if (problem.seq_len <= kReg4MaxSeqLen) {
+      Register4::forward<false>(problem, &smem);
+    } else {
+      Streaming::forward<false>(problem, &smem);
+    }
+    drain();
+    __syncthreads();
+    return true;
+  }
+  auto* const sm = reinterpret_cast<Split::Smem*>(&smem);
+  auto* const ctr = &ws.ctr[slot];
+  auto* const ties = ws.ties + static_cast<size_t>(slot) * TopKSplit::kMaxNumTie;
+  auto* const row_hist = ws.hist + static_cast<size_t>(slot) * TopKSplit::kHistSize;
+  const auto chunk = TopKSplit::chunk_of(problem.seq_len, rank, kSplit);
+  if (threadIdx.x == 0) l2_or(&ctr->ranks, 1u << rank);
+  Split::histogram(problem, chunk, row_hist, sm);
+  Split::barrier(&ctr->arrive_hist);
+  Split::select(problem, chunk, row_hist, ctr, ties, sm);
+  if (!Split::arrive_last(ctr, sm)) return false;
+  Split::clear_row(row_hist);
+  Split::finish_ties(problem, ties, sm);
+  drain();
+  __syncthreads();
+  return true;
+}
+
+SGL_DEVICE int32_t cp_pick(const int32_t* picks, uint32_t t) {
+  return static_cast<int32_t>(l2_read(reinterpret_cast<uint32_t*>(const_cast<int32_t*>(picks + t))));
+}
+
+struct CpSmem {
+  uint32_t hist[256];
+  uint32_t wave_sum[4];
+  uint32_t bin, above, inbin, count;
+};
+
+/// Selection `p` of a context-parallel row: this rank's `k` picks (columns of `scores_row`) go
+/// to every rank, then the row's top k of every rank's cells is `emit(pos, cell)`, pos 0 .. k - 1.
+template <typename Emit>
+SGL_DEVICE void cp_merge(
+    const Cp& cp, const int32_t* picks, const float* scores_row, uint32_t p, uint32_t row, uint32_t k,
+    const Emit& emit) {
+  __shared__ CpSmem m;
+  const auto tx = threadIdx.x;
+  uint64_t* peer[kCpMaxRanks];
+#pragma unroll
+  for (uint32_t d = 0; d < kCpMaxRanks; ++d) peer[d] = d < cp.tp ? reinterpret_cast<uint64_t*>(cp.peers[d]) : nullptr;
+  uint32_t* const parity = cp.parity + p * kMaxRows + row;
+  const uint32_t q = *parity & 1u;
+  const size_t mine = cp_slot(cp, q, p, cp.rank, row);
+  for (uint32_t t = tx; t < k; t += kBlockSize) {
+    const int32_t pick = cp_pick(picks, t);
+    const uint64_t cell = pick >= 0 ? cp_cell(scores_row[pick], static_cast<uint32_t>(pick)) : cp_none(cp.rank * k + t);
+#pragma unroll
+    for (uint32_t d = 0; d < kCpMaxRanks; ++d)
+      if (d < cp.tp) __hip_atomic_store(peer[d] + mine + t, cell, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+  }
+  // every rank's cells, each zeroed for the next launch once read
+  const uint32_t n = cp.tp * k;
+  uint64_t key[kCpMaxItems];
+  bool live[kCpMaxItems];
+#pragma unroll
+  for (uint32_t i = 0; i < kCpMaxItems; ++i) {
+    const uint32_t j = i * kBlockSize + tx;
+    live[i] = j < n;
+    key[i] = 0;
+    if (live[i]) {
+      auto* const at = cp.cells + cp_slot(cp, q, p, j / k, row) + j % k;
+      uint32_t spins = 0;
+      while ((key[i] = __hip_atomic_load(at, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM)) == 0) {
+        __builtin_amdgcn_s_sleep(1);
+        if (++spins == kCpSpinLimit) __builtin_trap();
+      }
+      __hip_atomic_store(at, uint64_t{0}, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    }
+  }
+  // the top k of the n distinct keys, a byte at a time from the top
+  if (tx == 0) m.count = 0;
+  uint32_t remain = k;
+  for (uint32_t round = 0; round < 8; ++round) {
+    const uint32_t shift = 56 - 8 * round;
+    if (tx < 256) m.hist[tx] = 0;
+    __syncthreads();
+#pragma unroll
+    for (uint32_t i = 0; i < kCpMaxItems; ++i)
+      if (live[i]) atomicAdd(&m.hist[(key[i] >> shift) & 0xFFu], 1u);
+    __syncthreads();
+    // thread b' scans bin 255 - b', so its inclusive sum counts the keys at or above that bin
+    uint32_t h = 0, upto = 0;
+    if (tx < 256) {
+      h = m.hist[255 - tx];
+      upto = h;
+#pragma unroll
+      for (uint32_t o = 1; o < 64; o <<= 1) {
+        const uint32_t v = __shfl_up(upto, o, 64);
+        if (tx % 64 >= o) upto += v;
+      }
+      if (tx % 64 == 63) m.wave_sum[tx / 64] = upto;
+    }
+    __syncthreads();
+    if (tx < 256) {
+      for (uint32_t w = 0; w < tx / 64; ++w) upto += m.wave_sum[w];
+      if (upto - h < remain && upto >= remain) {
+        m.bin = 255 - tx;
+        m.above = upto - h;
+        m.inbin = h;
+      }
+    }
+    __syncthreads();
+    const uint32_t bin = m.bin;
+    remain -= m.above;
+    const bool all = m.inbin == remain;  // the bin's keys all make it
+#pragma unroll
+    for (uint32_t i = 0; i < kCpMaxItems; ++i) {
+      if (!live[i]) continue;
+      const uint32_t d = (key[i] >> shift) & 0xFFu;
+      if (d > bin || (d == bin && all)) {
+        emit(atomicAdd(&m.count, 1u), key[i]);
+        live[i] = false;
+      } else if (d < bin) {
+        live[i] = false;
+      }
+    }
+    if (all) break;
+    __syncthreads();
+  }
+  __syncthreads();
+  if (tx == 0) *parity = q ^ 1u;
+}
+
+/// A row's columns: SGLang's paged top-k with both outputs, context-parallel past the band.
+SGL_DEVICE void cp_cols(const TopKPagedParams& params, const Workspace& ws, const Cp& cp, uint32_t row, uint32_t rank) {
+  const auto w = cp_window(static_cast<uint32_t>(params.seq_lens[row]), cp);
+  int32_t* const picks = cp.picks + static_cast<size_t>(row) * kMaxTopK;
+  if (!cp_select(params, ws, picks, w, row, row, rank)) return;
+  const auto tr = params.template get_transform<TopKMode::DUAL_OUTPUT>(row);
+  int32_t* const out = params.get_output_ptr(row);
+  if (!w.on) {
+    for (uint32_t t = threadIdx.x; t < params.topk; t += kBlockSize) {
+      const int32_t pick = cp_pick(picks, t);
+      out[t] = pick >= 0 ? tr.page_to_indices(pick) : -1;
+      tr.raw_out[t] = pick;
+    }
+    return;
+  }
+  cp_merge(cp, picks, params.scores + row * params.score_stride, 0, row, params.topk, [&](uint32_t pos, uint64_t cell) {
+    const int32_t col = cp_column(cell);
+    out[pos] = col >= 0 ? tr.page_to_indices(col) : -1;
+    tr.raw_out[pos] = col;
+  });
+}
+
+/// A producer row's blocks (unpaged indices), their windows the 8-column blocks of its columns'.
+SGL_DEVICE void cp_blocks(
+    const TopKPagedParams& cols, const TopKPagedParams& blocks, const Workspace& ws, const Cp& cp, uint32_t row,
+    uint32_t rank) {
+  const auto c = cp_window(static_cast<uint32_t>(cols.seq_lens[row]), cp);
+  // a non-empty run starts on a chunk, so the ranks' blocks do not overlap
+  const auto w = !c.on        ? CpWindow{0, static_cast<uint32_t>(blocks.seq_lens[row]), false}
+                 : c.hi > c.lo ? CpWindow{c.lo / 8, (c.hi + 7) / 8, true}
+                               : CpWindow{0, 0, true};
+  int32_t* const picks = cp.picks + static_cast<size_t>(kMaxRows + row) * kMaxTopK;
+  if (!cp_select(blocks, ws, picks, w, row, kMaxRows + row, rank)) return;
+  int32_t* const out = blocks.get_output_ptr(row);
+  if (!w.on) {
+    for (uint32_t t = threadIdx.x; t < blocks.topk; t += kBlockSize) out[t] = cp_pick(picks, t);
+    return;
+  }
+  cp_merge(cp, picks, blocks.scores + row * blocks.score_stride, 1, row, blocks.topk, [&](uint32_t pos, uint64_t cell) {
+    out[pos] = cp_column(cell);
+  });
+}
+
+/// `topk_one` with context-parallel rows.
+TOPK_KERNEL void topk_one_cp(const __grid_constant__ TopKPagedParams params, const Workspace ws, const Cp cp) {
+  device::enable_smem_spilling();
+  if (blockIdx.x == kXcc * kSplit) return check_presence(ws.presence, kRanks);
+  const uint32_t rank = blockIdx.x / kXcc;
+  const uint32_t row = xcc_row(ws, rank);
+  if (row >= params.batch_size) return;
+  cp_cols(params, ws, cp, row, rank);
+}
+
+/// `topk_pair` with context-parallel rows.
+TOPK_KERNEL void topk_pair_cp(
+    const __grid_constant__ TopKPagedParams cols,
+    const __grid_constant__ TopKPagedParams blocks,
+    const Workspace ws,
+    const Cp cp) {
+  device::enable_smem_spilling();
+  if (blockIdx.x == kXcc * kSplit * 2) return check_presence(ws.presence, (1u << (2 * kSplit)) - 1u);
+  const uint32_t rank = blockIdx.x / kXcc;
+  const uint32_t row = xcc_row(ws, rank);
+  if (row >= cols.batch_size) return;
+  if (rank < kSplit) return cp_cols(cols, ws, cp, row, rank);
+  cp_blocks(cols, blocks, ws, cp, row, rank - kSplit);
+}
+
 }  // namespace topk_one
 
 struct TopKOne {
@@ -422,6 +691,99 @@ struct TopKOne {
     LaunchKernel(topk_one::kXcc * topk_one::kSplit + 1, kBlockSize, scores.device())
         .config({.use_pdl = false})
         .launch(topk_one::topk_one, params, ws);
+  }
+
+  /// The exchange of a context-parallel launch (`topk_one::Cp`): `picks` and `parity` the module's
+  /// scratch, `cells` this rank's cells (an address), `peers` [tp] int64 every rank's on the device.
+  static topk_one::Cp cp_of(
+      const tvm::ffi::TensorView picks,
+      const tvm::ffi::TensorView parity,
+      const int64_t cells,
+      const tvm::ffi::TensorView peers,
+      const int64_t rank,
+      const int64_t tp,
+      const int64_t band) {
+    using namespace host;
+    RuntimeCheck(parity.size(0) == topk_one::kMaxProblems * topk_one::kMaxRows, "parity shape");
+    RuntimeCheck(tp >= 2 && tp <= topk_one::kCpMaxRanks && rank >= 0 && rank < tp, "context-parallel rank of 2 to 8");
+    RuntimeCheck(peers.size(0) == tp, "an address a rank");
+    RuntimeCheck(picks.size(0) == topk_one::kMaxProblems * topk_one::kMaxRows * kMaxTopK, "picks shape");
+    RuntimeCheck(band > 0 && band <= 0x7FFFFFFF, "band");
+    return topk_one::Cp{
+        .cells = reinterpret_cast<uint64_t*>(cells),
+        .peers = static_cast<const uint64_t*>(peers.data_ptr()),
+        .picks = static_cast<int32_t*>(picks.data_ptr()),
+        .parity = static_cast<uint32_t*>(parity.data_ptr()),
+        .rank = static_cast<uint32_t>(rank),
+        .tp = static_cast<uint32_t>(tp),
+        .band = static_cast<uint32_t>(band),
+    };
+  }
+
+  /// `transform_paged`, each row seeing `band` columns or more selected context-parallel over
+  /// the `tp` ranks (`cp_of`).
+  static void transform_paged_cp(
+      const tvm::ffi::TensorView scores,
+      const tvm::ffi::TensorView seq_lens,
+      const tvm::ffi::TensorView page_table,
+      const tvm::ffi::TensorView page_out,
+      const tvm::ffi::TensorView raw_out,
+      const int64_t page_size,
+      const tvm::ffi::TensorView hist,
+      const tvm::ffi::TensorView ctr,
+      const tvm::ffi::TensorView ties,
+      const tvm::ffi::TensorView picks,
+      const tvm::ffi::TensorView parity,
+      const int64_t cells,
+      const tvm::ffi::TensorView peers,
+      const int64_t rank,
+      const int64_t tp,
+      const int64_t band) {
+    using namespace host;
+    const auto params = params_of(
+        scores, seq_lens, static_cast<const int32_t*>(page_table.data_ptr()), page_table.stride(0), page_out,
+        static_cast<int32_t*>(raw_out.data_ptr()), page_size);
+    const auto ws = workspace_of(hist, ctr, ties, params.batch_size);
+    const auto cp = cp_of(picks, parity, cells, peers, rank, tp, band);
+    LaunchKernel(topk_one::kXcc * topk_one::kSplit + 1, kBlockSize, scores.device())
+        .config({.use_pdl = false})
+        .launch(topk_one::topk_one_cp, params, ws, cp);
+  }
+
+  /// `transform_paged_pair`, context-parallel as `transform_paged_cp`: a row's blocks are the
+  /// 8-column blocks of its columns'.
+  static void transform_paged_pair_cp(
+      const tvm::ffi::TensorView scores,
+      const tvm::ffi::TensorView seq_lens,
+      const tvm::ffi::TensorView page_table,
+      const tvm::ffi::TensorView page_out,
+      const tvm::ffi::TensorView raw_out,
+      const int64_t page_size,
+      const tvm::ffi::TensorView block_scores,
+      const tvm::ffi::TensorView block_lens,
+      const tvm::ffi::TensorView block_out,
+      const tvm::ffi::TensorView hist,
+      const tvm::ffi::TensorView ctr,
+      const tvm::ffi::TensorView ties,
+      const tvm::ffi::TensorView picks,
+      const tvm::ffi::TensorView parity,
+      const int64_t cells,
+      const tvm::ffi::TensorView peers,
+      const int64_t rank,
+      const int64_t tp,
+      const int64_t band) {
+    using namespace host;
+    const auto cols = params_of(
+        scores, seq_lens, static_cast<const int32_t*>(page_table.data_ptr()), page_table.stride(0), page_out,
+        static_cast<int32_t*>(raw_out.data_ptr()), page_size);
+    const auto blocks = params_of(block_scores, block_lens, nullptr, 0, block_out, nullptr, 1);
+    RuntimeCheck(blocks.batch_size == cols.batch_size, "the pair's selections take the same rows");
+    RuntimeCheck(page_size == 64, "a row's runs start on 128 columns, whole pages of 64");
+    const auto ws = workspace_of(hist, ctr, ties, cols.batch_size);
+    const auto cp = cp_of(picks, parity, cells, peers, rank, tp, band);
+    LaunchKernel(topk_one::kXcc * topk_one::kSplit * 2 + 1, kBlockSize, scores.device())
+        .config({.use_pdl = false})
+        .launch(topk_one::topk_pair_cp, cols, blocks, ws, cp);
   }
 
   /// `transform_paged` of the columns, and in the same launch the top-k indices of `block_scores`

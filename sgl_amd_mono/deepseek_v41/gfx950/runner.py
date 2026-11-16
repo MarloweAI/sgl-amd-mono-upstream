@@ -351,7 +351,7 @@ class DSV41MonoRunner:
         _ensure_writable_flydsl_cache()
         from sgl_amd_mono.common.peer import PeerBuffer
 
-        self.tp, self.rank = tp, rank
+        self.tp, self.rank, self.group = tp, rank, group
         self.route = dict(experts=experts, topk=topk, swa_width=swa_width)
         if ug_groups not in (None, 1, 2):
             raise ValueError(
@@ -437,11 +437,18 @@ class DSV41MonoRunner:
 
     def enable_k2i(self, bound_max: int):
         """K2i's buffers and builds, for column bounds up to ``bound_max`` (the
-        server's longest context: a ratio-1 source's compressed length)."""
-        from .indexer.runner import K2iRunner
+        server's longest context: a ratio-1 source's compressed length). At a TP with a
+        context-parallel band its top-k exchange too: collective, every rank calls this."""
+        from .indexer.runner import CP_BAND, K2iRunner
+        from .indexer.topk_one import Exchange
 
         no_capture("the K2i buffers")
-        self.k2i = K2iRunner(device=self.device, bound_max=bound_max)
+        exchange = None
+        if ("full", self.tp) in CP_BAND:
+            exchange = Exchange(
+                rank=self.rank, tp=self.tp, group=self.group, device=self.device
+            )
+        self.k2i = K2iRunner(device=self.device, bound_max=bound_max, exchange=exchange)
         return self.k2i
 
     def set_deadline(self, seconds: float) -> None:

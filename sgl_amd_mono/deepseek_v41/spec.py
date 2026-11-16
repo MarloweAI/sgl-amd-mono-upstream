@@ -1005,6 +1005,7 @@ def _select(*, runner, L, plan, backend, positions, pos, forward_batch, M):
         # the candidate source's blocks of this step, for the layers after it
         candidates=plan.state["k2i candidates"] if kind == "reindex" else None,
         fill_plan=fill_plan,
+        two_level=two_level,
     )
     if kind == "producer":
         plan.state["k2i candidates"] = sel.blocks
