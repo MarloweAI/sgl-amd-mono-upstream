@@ -61,7 +61,8 @@ def _walk_case(*, rng, n):
 
 @pytest.mark.parametrize("seed", range(4))
 def test_walk_plan_device_equals_host(seed):
-    """The plan K2i lays out (``fill_plan``) equals the host plan, on ragged requests."""
+    """The plan K2i lays out (``fill_plan``) equals the host plan, on ragged requests, of a rank's
+    runs of context-parallel rows too."""
     rng = np.random.default_rng(seed)
     dev = torch.device("cuda")
     k2i = _k2i()
@@ -72,8 +73,14 @@ def test_walk_plan_device_equals_host(seed):
         n = int(rng.integers(1, 49))
         bounds, owners = _walk_case(rng=rng, n=n)
         bounds = np.minimum(bounds, 1 << 16)  # bounded scoring time
+        tp = int(rng.choice([1, 4, 8]))
+        cp = (
+            (int(rng.integers(tp)), tp, int(rng.choice([513, 4096, 1 << 15])))
+            if tp > 1
+            else (0, 1, ip.NO_CP)
+        )
         want = np.zeros((plan.shape[0], 4), dtype=np.int32)
-        ip.fill_walk_plan(bounds=bounds, owners=owners, plan=want)
+        ip.fill_walk_plan(bounds=bounds, owners=owners, plan=want, cp=cp)
         plan.fill_(-7)
         q = case["q"][:1].expand(n, -1, -1).contiguous()
         qs = case["qscale"][:1].expand(n, -1, -1, -1, -1).contiguous()
@@ -83,11 +90,12 @@ def test_walk_plan_device_equals_host(seed):
             rows=n, query=(q, qs, w), plane=(case["payload"], case["kscale"]), plan=plan,
             itab=table, itab_stride=table.stride(0), itab_len=table.shape[1],
             ibatch=torch.from_numpy(owners).to(dev), ishift=3,
-            ibound=torch.from_numpy(bounds).to(dev), lstride=64, reindex=0, fill_plan=1,
+            ibound=torch.from_numpy(bounds).to(dev), lstride=64, reindex=0, fill_plan=1, cp=cp,
         )  # fmt: skip
         got = plan.cpu().numpy()
         assert np.array_equal(got, want), (
             n,
+            cp,
             bounds.tolist(),
             owners.tolist(),
             np.argwhere(got != want)[:4].tolist(),

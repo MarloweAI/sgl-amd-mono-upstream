@@ -5,7 +5,8 @@
 """K2i: ATOM K2a's FP4 scorer (``score_fp4``) as its own launch between K1 and K2.
 
 Each CTA scores the task the step's walk plan (FULL; ``fill_plan``: worked out here, the step's
-first launch of the ratio) or its index (REINDEX) gives it, none waiting on another, into ``ilog``
+first launch of the ratio, over this rank's chunks of each row, ``index_plan.cp_chunks``) or its
+index (REINDEX) gives it, none waiting on another, into ``ilog``
 [S, lstride] f32 for SGLang's top-k; a producer's build also each row's 8-column block maxima
 into ``bmax`` [S, bstride] and its block and compact lengths into ``blens``. ``itab`` is
 a FULL layer's page table (an entry 2 ** ``ishift`` virtual 8-row pages, read at row
@@ -48,7 +49,7 @@ def build_k2i(tokens: int, blocks: bool = False):
         iq: Int64, iqs: Int64, iw: Int64, plane: Int64, pscale: Int64, iplan: Int64, itab: Int64,
         itab_stride: Int32, itab_len: Int32, ibatch: Int64, ishift: Int32, ibound: Int64, ilog: Int64,
         lstride: Int32, reindex: Int32, fill_plan: Int32, bmax: Int64, bstride: Int32,
-        blens: Int64,
+        blens: Int64, cp_rank: Int32, cp_tp: Int32, cp_band: Int32,
     ):  # fmt: skip
         _ = keyed
         tid = fx.thread_idx.x
@@ -58,6 +59,7 @@ def build_k2i(tokens: int, blocks: bool = False):
             "itab": itab, "itab_stride": itab_stride, "itab_len": itab_len, "ibatch": ibatch,
             "ishift": ishift, "ibound": ibound, "ilog": ilog, "lstride": lstride, "reindex": reindex,
             "fill_plan": fill_plan, "bmax": bmax, "bstride": bstride, "blens": blens,
+            "cp_rank": cp_rank, "cp_tp": cp_tp, "cp_band": cp_band,
         }  # fmt: skip
         c = {
             "tid": tid, "lane": tid % 64, "wave": tid // 64, "args": args,
@@ -70,12 +72,12 @@ def build_k2i(tokens: int, blocks: bool = False):
         iq: Int64, iqs: Int64, iw: Int64, plane: Int64, pscale: Int64, iplan: Int64, itab: Int64,
         itab_stride: Int32, itab_len: Int32, ibatch: Int64, ishift: Int32, ibound: Int64, ilog: Int64,
         lstride: Int32, reindex: Int32, fill_plan: Int32, bmax: Int64, bstride: Int32,
-        blens: Int64, stream: fx.Stream = _STREAM,
+        blens: Int64, cp_rank: Int32, cp_tp: Int32, cp_band: Int32, stream: fx.Stream = _STREAM,
     ):  # fmt: skip
         _ = keyed
         k2i(
             iq, iqs, iw, plane, pscale, iplan, itab, itab_stride, itab_len, ibatch, ishift, ibound, ilog,
-            lstride, reindex, fill_plan, bmax, bstride, blens,
+            lstride, reindex, fill_plan, bmax, bstride, blens, cp_rank, cp_tp, cp_band,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)  # fmt: skip
 
     return launch

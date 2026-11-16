@@ -20,6 +20,7 @@ from sgl_amd_mono.common.plan import BLOCKS
 from . import index_plan as ip
 
 MAX_ROWS = 64  # a row a lane; a mono step has at most 48 rows
+_FAR = 1 << 30  # past any chunk
 
 
 def _cdiv(a, b):
@@ -37,7 +38,9 @@ def _sum(v):
 @flyc.jit
 def walk_task(a, rows: int, bid):
     """CTA ``bid``'s task of the step's walk plan, (lead, span, ch0, ch1) wave-uniform, from
-    the bounds ``a["ibound"]`` and request owners ``a["ibatch"]`` of ``rows`` rows."""
+    the bounds ``a["ibound"]`` and request owners ``a["ibatch"]`` of ``rows`` rows, and this
+    rank's chunks of each (``index_plan.cp_chunks``, ``a["cp_rank"]`` of ``a["cp_tp"]`` from
+    ``a["cp_band"]``)."""
     assert 0 < rows <= MAX_ROWS, rows
     t = fx.thread_idx.x % 64
     row = t < rows
@@ -49,15 +52,22 @@ def walk_task(a, rows: int, bid):
     run_first = _scan(run_start.select(t, fx.Int32(0)), fx.ReductionOp.MAX)
     lead = row & (run_start | (((t - run_first) % ip.WALK_ROWS) == 0))
     piece = _scan(lead.select(fx.Int32(1), fx.Int32(0)), fx.ReductionOp.ADD) - 1
-    chunks = (row & (bound > ip.TOPK)).select(_cdiv(bound, ip.CHUNK), fx.Int32(0))
-    # a piece on its lead's lane: its rows are the lead and the next ones of its piece
-    need, span = chunks, fx.Int32(1)
+    # this rank's chunks of the row; none past the rows
+    c_lo, c_hi = ip.cp_chunks(bound, a["cp_rank"], a["cp_tp"], a["cp_band"])
+    live = row & (c_hi > c_lo)
+    c_lo = live.select(c_lo, fx.Int32(_FAR))
+    c_hi = live.select(c_hi, fx.Int32(0))
+    # a piece on its lead's lane: its rows are the lead and the next ones of its piece, its
+    # chunks from their first to their last
+    base, top, span = c_lo, c_hi, fx.Int32(1)
     for j in range_constexpr(1, ip.WALK_ROWS):
         u = fx.min(t + j, 63)
         same = (t + j < rows) & (lane_gather(piece, u) == piece)
-        need = fx.max(need, same.select(lane_gather(chunks, u), fx.Int32(0)))
+        base = fx.min(base, same.select(lane_gather(c_lo, u), fx.Int32(_FAR)))
+        top = fx.max(top, same.select(lane_gather(c_hi, u), fx.Int32(0)))
         span = span + same.select(fx.Int32(1), fx.Int32(0))
-    need = lead.select(need, fx.Int32(0))
+    need = lead.select(fx.max(top - base, 0), fx.Int32(0))
+    base = (need > 0).select(base, fx.Int32(0))
     pieces = popcount(ballot(need > 0))
     total = _sum(need)
     # the smallest width whose tasks fit in BLOCKS (feasibility is monotone)
@@ -77,13 +87,14 @@ def walk_task(a, rows: int, bid):
     at = has.select(at, fx.Int32(0))
     p_k = fx.max(read_lane_i32(k, at), 1)
     p_need = read_lane_i32(need, at)
+    p_base = read_lane_i32(base, at)
     i = bid - (read_lane_i32(end, at) - read_lane_i32(k, at))
     zero = fx.Int32(0)
     return [
         has.select(at, zero),
         has.select(read_lane_i32(span, at), zero),
-        has.select(i * p_need // p_k, zero),
-        has.select((i + 1) * p_need // p_k, zero),
+        has.select(p_base + i * p_need // p_k, zero),
+        has.select(p_base + (i + 1) * p_need // p_k, zero),
     ]
 
 
