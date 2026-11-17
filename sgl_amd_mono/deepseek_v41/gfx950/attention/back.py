@@ -104,6 +104,9 @@ class BackBuild(msgspec.Struct, frozen=True):
     ratio: int  # 0: window only; 1 / 2: top-k over a compressed cache
     timeline: bool = False
     shuffled: bool = False  # wo_b in aiter's (16, 16) preshuffle (wo_a stays row-major)
+    # the grid's last CTAs, which run no wo_b task (a seamed Engram producer's gate CTAs,
+    # ``layer.seam_gates``)
+    no_wob: int = 0
 
 
 def plus(t0, v):
@@ -1243,15 +1246,33 @@ def wob_by_task(key) -> bool:
 
 
 def wob_cta_count(key) -> int:
-    """wo_b's CTAs from WOB0: the CTAs without a wo_a unit on one token tile where two
-    tasks each cover it (a wo_a CTA sees the last wo_a flag a poll later than one already
-    waiting) and where wo_b runs by task (``wob_by_task``), else all."""
+    """wo_b's CTAs from WOB0: on one token tile the CTAs without a wo_a unit, but the grid's
+    last ``no_wob`` (``wob_unit``), where two tasks each cover it (a wo_a CTA sees the last
+    wo_a flag a poll later than one already waiting) and where wo_b runs by task
+    (``wob_by_task``), else all."""
     s, d = key.tokens, Dims(key.tp)
-    units = woa_units(s, d)
+    n = BLOCKS - woa_units(s, d) - key.no_wob
     one = len(token_tiles(s)) == 1
     if wob_by_task(key):
-        return BLOCKS - units
-    return BLOCKS - units if one and 2 * (BLOCKS - units) >= d.wob_tasks else BLOCKS
+        return n
+    if one and 2 * n >= d.wob_tasks:
+        return n
+    assert key.no_wob == 0, key
+    return BLOCKS
+
+
+def wob_unit(key, bid):
+    """CTA ``bid``'s wo_b unit (``wob_cta_count`` units from WOB0; past them: none): its
+    place from WOB0, the grid's last ``no_wob`` CTAs skipped (each given unit
+    ``wob_cta_count``, none)."""
+    u = first_task(bid, back_plan(key)[5])
+    if key.no_wob == 0:
+        return u
+    n = wob_cta_count(key)
+    u0 = BLOCKS - key.no_wob - back_plan(key)[5]
+    assert 0 < u0 <= n, key
+    skip = (u >= u0) & (u < u0 + key.no_wob)
+    return skip.select(fx.Int32(n), (u >= u0).select(u - key.no_wob, u))
 
 
 def ardy_waiters(key) -> int:
@@ -1379,24 +1400,24 @@ def run_back(c, key, bid, idle=None, before_wob=None):
     ops = bf16_gemv_loads(
         c, a["woa"], a["woa_s"], group_k, woa_t * WOA_ROWS, WOA_SPLIT_K, pred=has_woa
     )
-    wob_unit = first_task(bid, WOB0)
     wob_ctas = wob_cta_count(key)
-    has_wob = True if wob_ctas == BLOCKS else wob_unit < wob_ctas
+    wob_u = wob_unit(key, bid)
+    has_wob = True if wob_ctas == BLOCKS else wob_u < wob_ctas
     by_task = wob_by_task(key)
     if const_expr(nt == 1):
         # one or two wo_b tasks a CTA, every one on the step's rows
         wob_tile = 0
-        wob_ts = [wob_unit, wob_unit + wob_ctas]
+        wob_ts = [wob_u, wob_u + wob_ctas]
     elif const_expr(by_task):
-        # every tile of tasks wob_unit, + wob_ctas, ..
+        # every tile of tasks wob_u, + wob_ctas, ..
         wob_tile = 0
-        wob_ts = [wob_unit + k * wob_ctas for k in range(cdiv(wob_tasks, wob_ctas))]
+        wob_ts = [wob_u + k * wob_ctas for k in range(cdiv(wob_tasks, wob_ctas))]
     else:
         # a tile a CTA (ROCm/ATOM's tile tasks): rows read once, every task's weights in flight
-        wob_tile = wob_unit % nt
+        wob_tile = wob_u % nt
         per_tile = (BLOCKS - wob_tile + nt - 1) // nt
         most = -(-wob_tasks // (BLOCKS // nt))
-        wob_ts = [wob_unit // nt + k * per_tile for k in range(most)]
+        wob_ts = [wob_u // nt + k * per_tile for k in range(most)]
 
     def wob_weights():
         if const_expr(by_task):
