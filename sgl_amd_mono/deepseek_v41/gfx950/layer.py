@@ -2387,6 +2387,8 @@ def run_k2(
                 gpu.barrier()
             return seam.slice_prefetch(cs, bid % SLICES)
 
+    # TP8's seamed launches: wo_b polls the X8B words alone (their idle CTAs run the gates' inputs)
+    c["x8_hints"] = not (tp == 8 and key.seamed)
     spre = mb_back.run_back(c, bkey, bid, idle, before_wob)
     if const_expr(not one):
         # the epoch moves on once every CTA marked it, off the launch's end: the last CTA

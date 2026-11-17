@@ -1360,6 +1360,8 @@ def run_back(c, key, bid, idle=None, before_wob=None):
             stage_split(c, unit)
     stamp(c, 1)
     tx8 = tagged_x8b(dd, s)
+    # wo_b polls wo_a's hint flags before the words (``x8_hints``, the layer's rule)
+    hints = tx8 and c.get("x8_hints", True)
     for unit in range(first_task(bid, COMB0), n_comb, BLOCKS):
         stage_combine(c, unit)
     gpu.barrier()
@@ -1445,7 +1447,7 @@ def run_back(c, key, bid, idle=None, before_wob=None):
                 regs = words_loads(c, c["xo"], q_rows // 2, off[1], half_w, t0, n)
             acc = bf16_gemv_mfmas(c, group_k, c["xl"], ops, acc, h, n)
             gpu.barrier()  # the next half's rows overwrite the LDS
-        if const_expr(tx8):
+        if const_expr(hints):
             # wo_b's hint as the GEMV ends, with no wait: its polls of the X8B words
             # (which carry the tag) arrive about as the words land
             if c["tid"] == 0:
@@ -1481,8 +1483,9 @@ def run_back(c, key, bid, idle=None, before_wob=None):
         if has_wob:
             # every wo_a task's hint first: polled from the wait's start, the X8B words
             # would load the memory under the split, combine and wo_a from every wo_b CTA
-            woa_hints = c["ardy"]
-            await_flags(c, woa_hints, woa_tasks, lambda u: u * FLAG_STRIDE)
+            if const_expr(hints):
+                woa_hints = c["ardy"]
+                await_flags(c, woa_hints, woa_tasks, lambda u: u * FLAG_STRIDE)
             x8b_rows(c, s, also)
     elif const_expr(woa_spread):
         # this tile's wo_a units
