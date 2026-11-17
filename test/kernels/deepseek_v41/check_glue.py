@@ -1,6 +1,7 @@
 """Check the DSV4.1 glue's launches against SGLang's on one GPU: every field of a verify step's
 and a draft block's metadata, their SWA slots and request rows on random tables, lengths and
-slots, the inject's cache bytes (V4, V4.1), the draft head's FP8 row quant, the fused mHC posts
+slots, the verify window launch that also runs both builds (against SGLang's window and the two
+standalone builds), the inject's cache bytes (V4, V4.1), the draft head's FP8 row quant, the fused mHC posts
 (the head's combine and the Engram gate) and the prefill MQA logits with the block-table stride
 an argument, each bitwise."""
 
@@ -344,6 +345,124 @@ def _check_prefill_logits(device) -> int:
     return bad
 
 
+def _check_fold(rng, device) -> int:
+    """The window launch with both builds folded in: its own outputs equal SGLang's window
+    kernel's, and the builds' tensors equal the standalone builds' on the captured bucket's
+    rows, where the window's batch is the bucket's or smaller (a padded replay)."""
+    from sglang.kernels.ops.speculative.cache_locs import (
+        assign_extend_cache_locs_uniform_func,
+    )
+    from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
+        DSV4RawVerifyMetadata,
+    )
+
+    from sgl_amd_mono.deepseek_v41.glue import metadata
+
+    metadata.take_window()
+    if metadata._sgl_window is None:
+        print("fold: the window kernel was not taken over")
+        return 1
+    bad = 0
+    # (window batch, captured bucket): the graph runners pad a batch to the next captured
+    # bucket, so the window runs at the batch's size and the bucket's pad rows take
+    # SGLang's pad inputs (request 0, location 0, the fill length)
+    shapes = [(1 + t % 4, 1 + t % 4) for t in range(8)]
+    shapes += [(3, 4), (1, 4), (1, 2), (13, 16), (15, 16), (9, 10)]
+    for trial, (bs, bucket) in enumerate(shapes):
+        long_ctx = trial % 2 == 1
+        ctx = (1 << 20) + 256 * (trial % 3) if long_ctx else 1 << 16
+        reqs = 8 if bucket <= 8 else 16
+        b = _backend(rng, reqs=reqs, ctx=ctx, qo=6, draft=False, device=device)
+        d = _backend(rng, reqs=reqs, ctx=ctx, qo=5, draft=True, device=device)
+        d.req_to_token = b.req_to_token
+        top = ctx - 12 if long_ctx else 4096
+        relay = torch.randint(1, top, (reqs,), generator=rng, device=device)
+        req = torch.randperm(reqs, generator=rng, device=device)[:bs]
+
+        def window():
+            o = dict(
+                out=torch.full((bs * 6,), -5, dtype=torch.int64, device=device),
+                seq_lens_out=torch.full((bs,), -5, dtype=torch.int64, device=device),
+                draft_positions_out=torch.full(
+                    (bs * 5,), -5, dtype=torch.int64, device=device
+                ),
+                draft_loc_out=torch.full(
+                    (bs * 5,), -5, dtype=torch.int64, device=device
+                ),
+                loc32_out=torch.full((bs * 6,), -5, dtype=torch.int32, device=device),
+                draft_loc32_out=torch.full(
+                    (bs * 5,), -5, dtype=torch.int32, device=device
+                ),
+            )
+            assign_extend_cache_locs_uniform_func(
+                req_pool_indices=req,
+                req_to_token=b.req_to_token,
+                start_offset=relay,
+                batch_size=bs,
+                draft_token_num=6,
+                device=device,
+                start_by_row=True,
+                **o,
+            )
+            return o
+
+        metadata._FOLDED.clear()
+        metadata._KEPT.clear()
+        want_w = window()
+        pad = bucket - bs
+
+        def padded(t, per_row, value):
+            return torch.cat([t, t.new_full((pad * per_row,), value)])
+
+        # the bucket's graph buffers: the step's rows, then the pad rows
+        fill = b.get_cuda_graph_seq_len_fill_value()
+        req_p = padded(req, 1, 0)
+        seq_p = padded(want_w["seq_lens_out"], 1, fill)
+        raw = DSV4RawVerifyMetadata(
+            req_pool_indices=req_p,
+            seq_lens=seq_p,
+            out_cache_loc=padded(want_w["loc32_out"], 6, 0),
+        )
+        inputs = metadata._inputs(b, raw)
+        kw = dict(
+            max_seq_len=ctx,
+            req_pool_indices=req_p,
+            seq_lens=seq_p,
+            out_cache_loc=padded(want_w["draft_loc32_out"], 5, 0),
+            block_size=5,
+        )
+        if inputs is None or not metadata._draft_inputs_ok(d, **kw):
+            print(f"fold trial {trial}: inputs refused")
+            bad += 1
+            continue
+        want_v = metadata._fused(b, raw, inputs)
+        want_d = metadata._draft_fused(d, **kw)
+        # the builds as a forward graph's capture makes them: kept tensors, nothing launched
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            token = metadata._IN_GRAPH.set(b)
+            try:
+                got_v = metadata._fused(b, raw, inputs)
+                got_d = metadata._draft_fused(d, **kw)
+            finally:
+                metadata._IN_GRAPH.reset(token)
+        for t in metadata._KEPT.values():
+            for x in t.values():
+                x.fill_(-7)
+        got_w = window()
+        why = None
+        for k in want_w:
+            why = why or differs(want_w[k], got_w[k], f"window {k}")
+        why = why or differs(want_v, got_v, "verify")
+        why = why or differs(want_d, got_d, "draft")
+        print(f"fold trial {trial} bs {bs} bucket {bucket} ctx {ctx}: {why or 'ok'}")
+        bad += why is not None
+        del graph
+    metadata._FOLDED.clear()
+    metadata._KEPT.clear()
+    return bad
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--trials", type=int, default=20)
@@ -424,6 +543,7 @@ def main():
             why = why or differs(want_loc, held[1], "draft swa slots")
         print(f"trial {trial} bs {bs} ctx {ctx}: {why or 'ok'}")
         bad += why is not None
+    bad += _check_fold(rng, device)
     bad += _check_inject(device)
     bad += _check_draft_head(device)
     bad += _check_posts(device)
