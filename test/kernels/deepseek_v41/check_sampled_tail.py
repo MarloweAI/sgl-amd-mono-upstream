@@ -18,7 +18,8 @@ import os
 import torch
 import torch.distributed as dist
 
-VOCAB, T = 129280, 6
+# T: a request's verify rows (DSpark block + 1), 6 unless DSV41_CHECK_ROWS says
+VOCAB, T = 129280, int(os.environ.get("DSV41_CHECK_ROWS", "6"))
 GAMMA = T - 1
 
 

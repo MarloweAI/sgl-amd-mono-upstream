@@ -17,7 +17,8 @@ import torch.distributed as dist
 import triton
 import triton.language as tl
 
-VOCAB, T = 129280, 6
+# T: a request's verify rows (DSpark block + 1), 6 unless DSV41_CHECK_ROWS says
+VOCAB, T = 129280, int(os.environ.get("DSV41_CHECK_ROWS", "6"))
 
 
 @triton.jit
@@ -275,7 +276,8 @@ def main():
     fails += bad != 0
     seed = 100
     for mode in ("greedy", "sim0", "simt"):
-        for bs in (1, 2, 4, 8):
+        # the last: as many requests as the launch takes (8 of 6 rows, 6 of 7)
+        for bs in (1, 2, 4, vtail.MAX_ROWS // T):
             for rep in range(3):
                 seed += 1
                 x = inputs(Case(bs, mode), rank, tp, part, dev, seed)
