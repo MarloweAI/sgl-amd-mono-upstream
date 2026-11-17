@@ -138,17 +138,17 @@ class TopKCp:
         self.one, self.exchange = one, exchange
         self.picks = torch.zeros(slots * _MAX_K, **i32)
         self.parity = torch.zeros(slots, **i32)
+        # every rank's cells of a row and selection, and their values, for the merge
+        cells = slots * CP_RANKS * _MAX_K
+        self.vals = torch.zeros(cells, dtype=torch.float32, device=one.hist.device)
+        self.keys = torch.zeros(cells, dtype=torch.int64, device=one.hist.device)
 
     def _ws(self, band):
         one = self.one
         return (
-            one.hist,
-            one.ctr,
-            one.ties,
-            self.picks,
-            self.parity,
+            one.hist, one.ctr, one.ties, self.picks, self.parity, self.vals, self.keys,
             *self.exchange.args(band),
-        )
+        )  # fmt: skip
 
     def transform_paged(
         self, *, scores, seq_lens, page_table, page_indices, page_size, raw_indices, band,
