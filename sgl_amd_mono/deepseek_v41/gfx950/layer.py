@@ -69,12 +69,11 @@ from .stages.dims import Dims as StageDims
 from .stages.gemv import plus, token_tiles
 from .stages.moe_shape import (
     EXPERTS,
-    ROW_CTAS,
-    ROW_SLICES,
     SORT_NETS,
     TOPK,
     MoeBuild,
     route_shape,
+    row_widths,
 )
 from .token_par import (
     XG_WORDS,
@@ -258,23 +257,19 @@ def acell_region_bytes(tp: int) -> int:
     return acell_region(tp, range(1, MAX_TOKENS + 1))[1]
 
 
-# the per-row MoE's widths (``RouteShape.row_moe``): FCELL's
-ROW_WIDTHS = range(1, ROW_CTAS // ROW_SLICES + 1)
-
-
 def fcell_offset(tp: int) -> int:
     """FCELL's byte offset in a parity's half (``token_par.fcell_region``)."""
-    return fcell_region(tp, range(1, MAX_TOKENS + 1), ROW_WIDTHS)[0]
+    return fcell_region(tp, range(1, MAX_TOKENS + 1), row_widths(tp))[0]
 
 
 def fcell_region_bytes(tp: int) -> int:
     """FCELL's bytes in a parity's half (``token_par.fcell_region``)."""
-    return fcell_region(tp, range(1, MAX_TOKENS + 1), ROW_WIDTHS)[1]
+    return fcell_region(tp, range(1, MAX_TOKENS + 1), row_widths(tp))[1]
 
 
 def peer_half_bytes(tp: int) -> int:
     """One parity's peer regions (``token_par.peer_layout``), then ACELL, then FCELL."""
-    return sum(fcell_region(tp, range(1, MAX_TOKENS + 1), ROW_WIDTHS))
+    return sum(fcell_region(tp, range(1, MAX_TOKENS + 1), row_widths(tp)))
 
 
 def _epoch(epoch):
