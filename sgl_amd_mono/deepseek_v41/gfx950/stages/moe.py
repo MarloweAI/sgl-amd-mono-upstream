@@ -2810,11 +2810,18 @@ def run_moe(c, key, bid, before_ug=None):
             while task < ug_total:
                 task = stage_ug_tile(c, task, ug_total, placed)
         else:
-            # one token tile: every task placed; shared-unit CTAs reach ug late, so take none (``ug0``)
+            # one token tile: every task placed; shared-unit CTAs reach ug late, so take none of the first
+            # rounds (``ug0``; past two, ``spill_task``)
             loaded = fx.Int32(0)
             free = BLOCKS - c["rs"].shared_units
             at = first_task(bid, c["rs"].ug0)
-            for task in range(at, (at < free).select(fx.Int32(ug_tasks), at), free):
+            if const_expr(c["rs"].spill_ug):
+                end, step = spill_end(c["rs"], at), BLOCKS
+            else:
+                end, step = (at < free).select(fx.Int32(ug_tasks), at), free
+            for task in range(at, end, step):
+                if const_expr(c["rs"].spill_ug):
+                    task = spill_task(c["rs"], at, task)
                 if loaded == 0:
                     # X8R first: it is ready long before the routing
                     load_x8_rows(
@@ -2852,6 +2859,38 @@ def run_moe(c, key, bid, before_ug=None):
                     for rtask in range(first_task(bid, RED0), RED_TASKS, BLOCKS):
                         stage_reduce(cr, rtask)
         stamp(c, 26)
+
+
+def spill_task(rs, at, v):
+    """The placed ug task of round (v - at) / ``BLOCKS`` of the CTA ``at`` CTAs past ``ug0``: rounds 0 and 1
+    on the CTAs without a shared unit (tasks at, at + free), then rounds over every CTA from the
+    shared-unit CTAs on, whose unit ends before the first round's tasks (``RouteShape.spill_ug``)."""
+    free = BLOCKS - rs.shared_units
+    n = (v - at) // BLOCKS
+    own = at < free
+    later = (
+        2 * free
+        + (at + rs.shared_units) % BLOCKS
+        + BLOCKS * (n - own.select(fx.Int32(2), fx.Int32(0)))
+    )
+    return (own & (n < 2)).select(at + n * free, later)
+
+
+def spill_end(rs, at):
+    """The end of ``spill_task``'s rounds of the CTA ``at`` CTAs past ``ug0``, as ``at`` + ``BLOCKS`` rounds."""
+    free = BLOCKS - rs.shared_units
+    tasks = rs.max_u * rs.ug_parts
+    own = at < free
+    first = 2 * free + (at + rs.shared_units) % BLOCKS
+    later = fx.max((tasks - first + BLOCKS - 1) // BLOCKS, fx.Int32(0))
+    placed = own.select(
+        (at < tasks).select(fx.Int32(1), fx.Int32(0))
+        + (at + free < tasks).select(fx.Int32(1), fx.Int32(0)),
+        fx.Int32(0),
+    )
+    return at + BLOCKS * (
+        placed + (own & (at + free >= tasks)).select(fx.Int32(0), later)
+    )
 
 
 def await_x(c, tokens):
