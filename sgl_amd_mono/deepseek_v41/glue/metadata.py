@@ -1,7 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """A DSpark verify step's attention metadata (``make_forward_metadata_from_raw_verify``,
 ~40 launches) and a draft block's (~12), with their SWA write slots, in one launch each,
-every tensor as SGLang writes it. ``SGLANG_AMD_MONO_DSV41_METADATA=0`` keeps SGLang's."""
+every tensor as SGLang writes it. ``SGLANG_AMD_MONO_DSV41_METADATA=0`` keeps SGLang's.
+
+Inside a captured forward graph the two builds write tensors kept per shape and launch
+nothing: the step's verify window launch (SGLang's ``assign_extend_cache_locs_uniform``,
+which every DSpark decode step runs before its draft and verify graphs) computes both from
+the same request rows, prefix lengths and ``req_to_token``, as extra programs of its own
+launch. A step then pays one launch for its window and both metadata builds."""
 
 from __future__ import annotations
 
@@ -51,6 +57,12 @@ SGLANG_READS = {
         "forward_metadata",
     ),
     "srt/arg_groups/fields/exec_.py": ("dsa_topk_backend",),
+    "kernels/ops/speculative/cache_locs.py": (
+        "assign_extend_cache_locs_uniform",
+        "assign_extend_cache_locs_uniform[(batch_size,)]",
+        "START_BY_ROW",
+        "RING_ROWS",
+    ),
     "srt/layers/attention/dsv4/metadata.py": ("PagedIndexerMetadata",),
     "srt/layers/attention/dsv4/unified_kv_gate.py": ("is_unified_kv_triton",),
     "srt/mem_cache/deepseek_v4_memory_pool.py": (
@@ -97,10 +109,12 @@ _NEG = (
 
 
 @triton.jit
-def _verify_meta_kernel(
-    SEQ,
-    REQ,
-    LOC,
+def _verify_meta_row(
+    row,
+    blk,
+    req,
+    seq,
+    LOCB,
     R2T,
     MAP,
     L32,
@@ -126,11 +140,10 @@ def _verify_meta_kernel(
     NEG_W: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    row = tl.program_id(0)
-    blk = tl.program_id(1)
-    b = row // QO
-    req = tl.load(REQ + b).to(tl.int64)
-    casual = (tl.load(SEQ + b) + QO + (row % QO - QO + 1)).to(tl.int32)
+    """One program of a verify step's metadata: token row ``row`` (of request ``req`` with
+    prefix length ``seq``; ``LOCB`` its request's write locations), page-table block ``blk``."""
+    req = req.to(tl.int64)
+    casual = (seq + QO + (row % QO - QO + 1)).to(tl.int32)
     # page_table_from_req_to_token, its expansions and the c128 page indices
     col = blk * BLOCK + tl.arange(0, BLOCK)
     cm = col < num_cols
@@ -157,7 +170,7 @@ def _verify_meta_kernel(
     if blk == 0:
         pad = num_cols * C128P + tl.arange(0, 64)
         tl.store(C128_PI + r64 * W128 + pad, -1, mask=pad < W128)
-        loc = tl.load(LOC + row).to(tl.int64)
+        loc = tl.load(LOCB + row % QO).to(tl.int64)
         c4_raw = casual // 4
         c4_c1 = tl.maximum(c4_raw, 1)
         c1_c1 = tl.maximum(casual, 1)
@@ -197,6 +210,72 @@ def _verify_meta_kernel(
         raw = tl.where(before, -1, raw)
         sw = tl.load(MAP + tl.where(raw < 0, raw + map_n, raw))
         tl.store(SWA + row * W + k, sw.to(tl.int32))
+
+
+@triton.jit
+def _verify_meta_kernel(
+    SEQ,
+    REQ,
+    LOC,
+    R2T,
+    MAP,
+    L32,
+    L64,
+    NEG,
+    SWA,
+    PT,
+    PT1,
+    PT2,
+    C128_PI,
+    rows,
+    r2t_stride,
+    map_n,
+    num_cols,
+    topk,
+    QO: tl.constexpr,
+    W: tl.constexpr,
+    PAGE: tl.constexpr,
+    C128P: tl.constexpr,
+    W128: tl.constexpr,
+    BPP1: tl.constexpr,
+    BPP2: tl.constexpr,
+    NEG_W: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    blk = tl.program_id(1)
+    b = row // QO
+    _verify_meta_row(
+        row,
+        blk,
+        tl.load(REQ + b),
+        tl.load(SEQ + b),
+        LOC + b * QO,
+        R2T,
+        MAP,
+        L32,
+        L64,
+        NEG,
+        SWA,
+        PT,
+        PT1,
+        PT2,
+        C128_PI,
+        rows,
+        r2t_stride,
+        map_n,
+        num_cols,
+        topk,
+        QO,
+        W,
+        PAGE,
+        C128P,
+        W128,
+        BPP1,
+        BPP2,
+        NEG_W,
+        BLOCK,
+    )
 
 
 def _inputs(backend, raw):
@@ -263,37 +342,38 @@ def _fused(backend, raw, inputs):
     w128 = -(-(num_cols * c128p) // align) * align
     neg_w = -(-backend.index_topk // align) * align
     i32, i64 = dict(dtype=torch.int32, device=dev), dict(dtype=torch.int64, device=dev)
-    l32 = torch.empty((len(_I32), rows), **i32)
-    l64 = torch.empty((len(_I64), rows), **i64)
-    neg = torch.empty((len(_NEG), rows, neg_w), **i32)
-    pt = torch.empty((rows, num_cols), **i32)
-    pt1 = torch.empty((rows, num_cols * bpp1), **i32) if bpp1 > 1 else pt
-    pt2 = torch.empty((rows, num_cols * bpp2), **i32) if bpp2 > 1 else pt
-    swa = torch.empty((rows, w), **i32)
-    c128_pi = torch.empty((rows, w128), **i32)
+
+    def make():
+        pt = torch.empty((rows, num_cols), **i32)
+        return dict(
+            L32=torch.empty((len(_I32), rows), **i32),
+            L64=torch.empty((len(_I64), rows), **i64),
+            NEG=torch.empty((len(_NEG), rows, neg_w), **i32),
+            SWA=torch.empty((rows, w), **i32),
+            PT=pt,
+            PT1=torch.empty((rows, num_cols * bpp1), **i32) if bpp1 > 1 else pt,
+            PT2=torch.empty((rows, num_cols * bpp2), **i32) if bpp2 > 1 else pt,
+            C128_PI=torch.empty((rows, w128), **i32),
+        )
+
+    key = ("verify", rows, num_cols, w, w128, neg_w, bpp1, bpp2, dev)
+    out = _kept(key, make) if _IN_GRAPH.get() is not None else make()
+    l32, l64, neg, pt, pt1, pt2 = (
+        out[k] for k in ("L32", "L64", "NEG", "PT", "PT1", "PT2")
+    )
+    swa, c128_pi = out["SWA"], out["C128_PI"]
     t = dict(zip(_I32, l32)) | dict(zip(_I64, l64)) | dict(zip(_NEG, neg))
     if rows:
         block = min(1024, triton.next_power_of_2(max(num_cols, 1)))
-        grid = (rows, max(1, triton.cdiv(num_cols, block)))
-        _verify_meta_kernel[grid](
-            raw.seq_lens,
-            raw.req_pool_indices,
-            raw.out_cache_loc,
-            r2t,
-            mapping,
-            l32,
-            l64,
-            neg,
-            swa,
-            pt,
-            pt1,
-            pt2,
-            c128_pi,
-            rows,
-            r2t.stride(0),
-            mapping.shape[0],
-            num_cols,
-            backend.index_topk,
+        spec = dict(
+            out,
+            R2T=r2t,
+            MAP=mapping,
+            rows=rows,
+            r2t_stride=r2t.stride(0),
+            map_n=mapping.shape[0],
+            num_cols=num_cols,
+            topk=backend.index_topk,
             QO=qo,
             W=w,
             PAGE=page,
@@ -303,8 +383,16 @@ def _fused(backend, raw, inputs):
             BPP2=bpp2,
             NEG_W=neg_w,
             BLOCK=block,
-            num_warps=4,
         )
+        if not _fold(key, spec):
+            grid = (rows, max(1, triton.cdiv(num_cols, block)))
+            _verify_meta_kernel[grid](
+                raw.seq_lens,
+                raw.req_pool_indices,
+                raw.out_cache_loc,
+                **spec,
+                num_warps=4,
+            )
     core = hip.DSV4AttnMetadata(
         page_size=page,
         raw_out_loc=raw.out_cache_loc,
@@ -420,12 +508,14 @@ def _token_req_indices(orig, forward_batch, *args, **kwargs):
 
 
 @triton.jit
-def _block_meta_kernel(
-    SEQ,
-    REQ,
+def _block_meta_row(
+    q,
+    blk,
+    req,
+    seq,
+    LOCB,
     R2T,
     MAP,
-    LOC,
     VALID,
     L32,
     SWA,
@@ -443,10 +533,8 @@ def _block_meta_kernel(
     HAS_SLOTS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    q = tl.program_id(0)
-    blk = tl.program_id(1)
-    i = q // QO
-    req = tl.load(REQ + i)
+    """One program of a draft block's metadata: token row ``q`` (of request ``req`` with
+    prefix length ``seq``; ``LOCB`` its block's write locations), page-table block ``blk``."""
     rp = req.to(tl.int64)
     col = blk * BLOCK + tl.arange(0, BLOCK)
     cm = col < num_cols
@@ -455,7 +543,6 @@ def _block_meta_kernel(
     pq = tl.where((v < 0) & (v % PAGE != 0), pq - 1, pq)
     tl.store(PT + q.to(tl.int64) * num_cols + col, pq.to(tl.int32), mask=cm)
     if blk == 0:
-        seq = tl.load(SEQ + i)
         casual = (seq + QO + (q % QO - QO + 1)).to(tl.int32)
         tl.store(L32 + q, casual)
         tl.store(L32 + n + q, casual - 1)
@@ -478,15 +565,418 @@ def _block_meta_kernel(
         in_block = (k >= cl) & (k < cl + QO)
         bmask = kmask & in_block
         bcol = tl.maximum(k - cl, 0)
-        blk_full = tl.load(LOC + i * QO + bcol, mask=bmask, other=0).to(tl.int64)
+        blk_full = tl.load(LOCB + bcol, mask=bmask, other=0).to(tl.int64)
         blk_swa = tl.load(MAP + blk_full, mask=bmask, other=-1).to(tl.int32)
         val = tl.where(in_window, win_swa, tl.where(in_block, blk_swa, -1))
         tl.store(SWA + q * TW + k, val.to(tl.int32), mask=kmask)
         tl.store(L32 + 2 * n + q, (cl + QO).to(tl.int32))
         if HAS_SLOTS:
-            loc = tl.load(LOC + q).to(tl.int64)
+            loc = tl.load(LOCB + q % QO).to(tl.int64)
             sl = tl.load(MAP + tl.where(loc < 0, loc + map_n, loc))
             tl.store(L32 + 3 * n + q, sl.to(tl.int32))
+
+
+@triton.jit
+def _block_meta_kernel(
+    SEQ,
+    REQ,
+    LOC,
+    R2T,
+    MAP,
+    VALID,
+    L32,
+    SWA,
+    PT,
+    n,
+    r2t_stride,
+    num_cols,
+    map_n,
+    QO: tl.constexpr,
+    W: tl.constexpr,
+    TW: tl.constexpr,
+    TW_BLOCK: tl.constexpr,
+    PAGE: tl.constexpr,
+    HAS_VALID: tl.constexpr,
+    HAS_SLOTS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    q = tl.program_id(0)
+    blk = tl.program_id(1)
+    i = q // QO
+    _block_meta_row(
+        q,
+        blk,
+        tl.load(REQ + i),
+        tl.load(SEQ + i),
+        LOC + i * QO,
+        R2T,
+        MAP,
+        VALID,
+        L32,
+        SWA,
+        PT,
+        n,
+        r2t_stride,
+        num_cols,
+        map_n,
+        QO,
+        W,
+        TW,
+        TW_BLOCK,
+        PAGE,
+        HAS_VALID,
+        HAS_SLOTS,
+        BLOCK,
+    )
+
+
+# Tensors of the builds made inside a forward graph, kept per shape; and the builds the
+# window launch runs, by kind and batch size: ("verify" | "draft", bs) -> launch spec.
+_KEPT: dict = {}
+_FOLDED: dict = {}
+_VERIFY_ARGS = (
+    "R2T MAP L32 L64 NEG SWA PT PT1 PT2 C128_PI rows r2t_stride map_n num_cols topk "
+    "QO W PAGE C128P W128 BPP1 BPP2 NEG_W BLOCK"
+).split()
+_DRAFT_ARGS = (
+    "R2T MAP VALID L32 SWA PT n r2t_stride num_cols map_n "
+    "QO W TW TW_BLOCK PAGE HAS_VALID HAS_SLOTS BLOCK"
+).split()
+
+
+def _kept(key, make) -> dict:
+    """The tensors a build inside a forward graph writes: one set per shape, so every
+    graph captured for it reads what the step's window launch wrote."""
+    out = _KEPT.get(key)
+    if out is None:
+        out = _KEPT[key] = make()
+    return out
+
+
+def _fold(key, spec) -> bool:
+    """True when the build is being captured into a forward graph: it launches nothing,
+    and every later window launch of its rows runs it (``_window_launch``)."""
+    if (
+        _sgl_window is None
+        or _IN_GRAPH.get() is None
+        or not torch.cuda.is_current_stream_capturing()
+    ):
+        return False
+    kind, rows = key[0], key[1]
+    bs = rows // spec["QO"]
+    held = _FOLDED.get((kind, bs))
+    if held is None:
+        _FOLDED[(kind, bs)] = spec
+    elif any(
+        held[k] is not spec[k]
+        if isinstance(spec[k], torch.Tensor)
+        else held[k] != spec[k]
+        for k in spec
+    ):
+        raise RuntimeError(
+            f"DSV4.1 metadata fold: two {kind} builds of batch {bs} differ"
+        )
+    chose(f"{kind}_meta_in_window", True)
+    return True
+
+
+@triton.jit
+def _window_meta_kernel(
+    req_pool_indices,
+    req_to_token,
+    start_offset,
+    out_cache_loc,
+    pool_len: tl.constexpr,
+    draft_token_num: tl.constexpr,
+    full_v2p=None,
+    swa_v2p=None,
+    full_out=None,
+    swa_out=None,
+    PAGE_SIZE: tl.constexpr = 1,
+    num_v_pages=0,
+    num_swa_pages=0,
+    positions_out=None,
+    anchor_src=None,
+    anchor_out=None,
+    anchor_stride=0,
+    START_BY_ROW: tl.constexpr = False,
+    seq_lens_out=None,
+    draft_positions_out=None,
+    draft_loc_out=None,
+    DRAFT_WIDTH: tl.constexpr = 0,
+    loc32_out=None,
+    draft_loc32_out=None,
+    sim_correct_out=None,
+    sim_seed_out=None,
+    sim_counter=None,
+    sim_seed=0,
+    sim_acc_len=0.0,
+    SIM_METHOD: tl.constexpr = 0,
+    SIM_MAX: tl.constexpr = 1,
+    pub_tokens=None,
+    pub_accept=None,
+    ring=None,
+    ring_counter=None,
+    PUB_BS: tl.constexpr = 0,
+    PUB_N: tl.constexpr = 0,
+    PUB_BS_P2: tl.constexpr = 1,
+    PUB_N_P2: tl.constexpr = 1,
+    RING_ROWS: tl.constexpr = 1,
+    # the draft block's build (D_) and the verify's (V_), as _block_meta_kernel's and
+    # _verify_meta_kernel's arguments
+    D_MAP=None,
+    D_VALID=None,
+    D_L32=None,
+    D_SWA=None,
+    D_PT=None,
+    d_n=0,
+    d_num_cols=0,
+    d_map_n=0,
+    D_W: tl.constexpr = 1,
+    D_TW: tl.constexpr = 1,
+    D_TW_BLOCK: tl.constexpr = 1,
+    D_PAGE: tl.constexpr = 1,
+    D_HAS_VALID: tl.constexpr = False,
+    D_HAS_SLOTS: tl.constexpr = False,
+    D_BLOCK: tl.constexpr = 1,
+    D_QO: tl.constexpr = 1,
+    D_NB: tl.constexpr = 0,
+    V_MAP=None,
+    V_L32=None,
+    V_L64=None,
+    V_NEG=None,
+    V_SWA=None,
+    V_PT=None,
+    V_PT1=None,
+    V_PT2=None,
+    V_C128_PI=None,
+    v_rows=0,
+    v_map_n=0,
+    v_num_cols=0,
+    v_topk=0,
+    V_W: tl.constexpr = 1,
+    V_PAGE: tl.constexpr = 1,
+    V_C128P: tl.constexpr = 1,
+    V_W128: tl.constexpr = 1,
+    V_BPP1: tl.constexpr = 1,
+    V_BPP2: tl.constexpr = 1,
+    V_NEG_W: tl.constexpr = 1,
+    V_BLOCK: tl.constexpr = 1,
+    V_NB: tl.constexpr = 0,
+    BS: tl.constexpr = 1,
+):
+    """SGLang's verify window launch (programs 0 .. BS - 1, its own body) and the step's
+    draft block metadata (BS * D_QO rows) and verify metadata (BS * draft_token_num rows),
+    D_NB / V_NB page-table blocks a row, from the window's inputs: a request's prefix length
+    is its window start, its write locations ``req_to_token[row, start:]``, the block's the
+    first D_QO of them."""
+    pid = tl.program_id(0)
+    if pid < BS:
+        _sgl_window(
+            req_pool_indices,
+            req_to_token,
+            start_offset,
+            out_cache_loc,
+            pool_len,
+            draft_token_num,
+            full_v2p,
+            swa_v2p,
+            full_out,
+            swa_out,
+            PAGE_SIZE,
+            num_v_pages,
+            num_swa_pages,
+            positions_out,
+            anchor_src,
+            anchor_out,
+            anchor_stride,
+            START_BY_ROW,
+            seq_lens_out,
+            draft_positions_out,
+            draft_loc_out,
+            DRAFT_WIDTH,
+            loc32_out,
+            draft_loc32_out,
+            sim_correct_out,
+            sim_seed_out,
+            sim_counter,
+            sim_seed,
+            sim_acc_len,
+            SIM_METHOD,
+            SIM_MAX,
+            pub_tokens,
+            pub_accept,
+            ring,
+            ring_counter,
+            PUB_BS,
+            PUB_N,
+            PUB_BS_P2,
+            PUB_N_P2,
+            RING_ROWS,
+        )
+    else:
+        p = pid - BS
+        nd = BS * D_QO * D_NB
+        if p < nd:
+            if D_NB > 0:
+                q = p // D_NB
+                b = q // D_QO
+                req = tl.load(req_pool_indices + b)
+                if START_BY_ROW:
+                    seq = tl.load(start_offset + req)
+                else:
+                    seq = tl.load(start_offset + b)
+                locb = req_to_token + req.to(tl.int64) * pool_len + seq
+                _block_meta_row(
+                    q,
+                    p % D_NB,
+                    req,
+                    seq,
+                    locb,
+                    req_to_token,
+                    D_MAP,
+                    D_VALID,
+                    D_L32,
+                    D_SWA,
+                    D_PT,
+                    d_n,
+                    pool_len,
+                    d_num_cols,
+                    d_map_n,
+                    D_QO,
+                    D_W,
+                    D_TW,
+                    D_TW_BLOCK,
+                    D_PAGE,
+                    D_HAS_VALID,
+                    D_HAS_SLOTS,
+                    D_BLOCK,
+                )
+        else:
+            if V_NB > 0:
+                p = p - nd
+                row = p // V_NB
+                b = row // draft_token_num
+                req = tl.load(req_pool_indices + b)
+                if START_BY_ROW:
+                    seq = tl.load(start_offset + req)
+                else:
+                    seq = tl.load(start_offset + b)
+                locb = req_to_token + req.to(tl.int64) * pool_len + seq
+                _verify_meta_row(
+                    row,
+                    p % V_NB,
+                    req,
+                    seq,
+                    locb,
+                    req_to_token,
+                    V_MAP,
+                    V_L32,
+                    V_L64,
+                    V_NEG,
+                    V_SWA,
+                    V_PT,
+                    V_PT1,
+                    V_PT2,
+                    V_C128_PI,
+                    v_rows,
+                    pool_len,
+                    v_map_n,
+                    v_num_cols,
+                    v_topk,
+                    draft_token_num,
+                    V_W,
+                    V_PAGE,
+                    V_C128P,
+                    V_W128,
+                    V_BPP1,
+                    V_BPP2,
+                    V_NEG_W,
+                    V_BLOCK,
+                )
+
+
+_sgl_window = (
+    None  # SGLang's window kernel, which _window_meta_kernel runs as its first programs
+)
+_WINDOW_ARGS = (
+    "req_pool_indices req_to_token start_offset out_cache_loc pool_len draft_token_num "
+    "full_v2p swa_v2p full_out swa_out PAGE_SIZE num_v_pages num_swa_pages positions_out "
+    "anchor_src anchor_out anchor_stride START_BY_ROW seq_lens_out draft_positions_out "
+    "draft_loc_out DRAFT_WIDTH loc32_out draft_loc32_out sim_correct_out sim_seed_out "
+    "sim_counter sim_seed sim_acc_len SIM_METHOD SIM_MAX pub_tokens pub_accept ring "
+    "ring_counter PUB_BS PUB_N PUB_BS_P2 PUB_N_P2 RING_ROWS"
+).split()
+
+
+class _WindowLaunch:
+    """Stands in for SGLang's window kernel (``kernel[grid](...)``): a launch whose rows
+    have folded metadata builds runs them as more programs of the same launch."""
+
+    def __init__(self, kernel) -> None:
+        self.kernel = kernel
+
+    def __getitem__(self, grid):
+        return lambda *args, **kwargs: _window_launch(self.kernel, grid, args, kwargs)
+
+
+def _window_launch(kernel, grid, args, kwargs):
+    bs = grid[0]
+    width = args[5] if len(args) > 5 else kwargs["draft_token_num"]
+    d, v = _FOLDED.get(("draft", bs)), _FOLDED.get(("verify", bs))
+    if d is None and v is None:
+        return kernel[grid](*args, **kwargs)
+    r2t = args[1] if len(args) > 1 else kwargs["req_to_token"]
+    for kind, spec in (("draft", d), ("verify", v)):
+        if spec is None:
+            continue
+        if (
+            spec["R2T"] is not r2t
+            or spec["QO"] > width
+            or (kind == "verify" and spec["QO"] != width)
+            or spec["r2t_stride"] != r2t.shape[1]
+            or r2t.stride(1) != 1
+        ):
+            raise RuntimeError(
+                f"DSV4.1 metadata fold: the {kind} build of batch {bs} does not match "
+                "this window launch (req_to_token, width)"
+            )
+    meta = dict(BS=bs)
+    n_prog = bs
+    if d is not None:
+        meta.update(
+            {
+                ("D_" if k.isupper() else "d_") + k: d[k]
+                for k in _DRAFT_ARGS
+                if k not in ("R2T", "r2t_stride", "QO", "n", "num_cols", "map_n")
+            }
+        )
+        meta.update(
+            d_n=d["n"],
+            d_num_cols=d["num_cols"],
+            d_map_n=d["map_n"],
+            D_QO=d["QO"],
+            D_NB=max(1, triton.cdiv(d["num_cols"], d["BLOCK"])),
+        )
+        n_prog += d["n"] * meta["D_NB"]
+    if v is not None:
+        meta.update(
+            {
+                ("V_" if k.isupper() else "v_") + k: v[k]
+                for k in _VERIFY_ARGS
+                if k
+                not in ("R2T", "r2t_stride", "QO", "rows", "map_n", "num_cols", "topk")
+            }
+        )
+        meta.update(
+            v_rows=v["rows"],
+            v_map_n=v["map_n"],
+            v_num_cols=v["num_cols"],
+            v_topk=v["topk"],
+            V_NB=max(1, triton.cdiv(v["num_cols"], v["BLOCK"])),
+        )
+        n_prog += v["rows"] * meta["V_NB"]
+    return _window_meta_kernel[(n_prog,)](*args, **kwargs, **meta, num_warps=4)
 
 
 def _draft_inputs_ok(
@@ -527,27 +1017,30 @@ def _draft_fused(
     tw = -(-(w + block_size) // align) * align
     num_cols = max(0, (min(max_seq_len + block_size, r2t.shape[1]) + page - 1) // page)
     i32 = dict(dtype=torch.int32, device=dev)
-    lens = torch.empty((4, n), **i32)
+
+    def make():
+        return dict(
+            L32=torch.empty((4, n), **i32),
+            SWA=torch.empty((n, tw), **i32),
+            PT=torch.empty((n, num_cols), **i32),
+        )
+
+    key = ("draft", n, num_cols, tw, dev)
+    out = _kept(key, make) if _IN_GRAPH.get() is not None else make()
+    lens, swa, pt = out["L32"], out["SWA"], out["PT"]
     casual, pos, swa_len, swa_loc = lens
-    swa = torch.empty((n, tw), **i32)
-    pt = torch.empty((n, num_cols), **i32)
     slots = out_cache_loc.shape[0] == n
     if n:
         block = min(1024, triton.next_power_of_2(max(num_cols, 1)))
-        _block_meta_kernel[(n, max(1, triton.cdiv(num_cols, block)))](
-            seq_lens,
-            req_pool_indices,
-            r2t,
-            mapping,
-            out_cache_loc,
-            valid if valid is not None else seq_lens,
-            lens,
-            swa,
-            pt,
-            n,
-            r2t.stride(0),
-            num_cols,
-            mapping.shape[0],
+        spec = dict(
+            out,
+            R2T=r2t,
+            MAP=mapping,
+            VALID=valid if valid is not None else seq_lens,
+            n=n,
+            r2t_stride=r2t.stride(0),
+            num_cols=num_cols,
+            map_n=mapping.shape[0],
             QO=block_size,
             W=w,
             TW=tw,
@@ -557,6 +1050,10 @@ def _draft_fused(
             HAS_SLOTS=slots,
             BLOCK=block,
         )
+        if not _fold(key, spec):
+            _block_meta_kernel[(n, max(1, triton.cdiv(num_cols, block)))](
+                seq_lens, req_pool_indices, out_cache_loc, **spec
+            )
     core = hip.DSV4AttnMetadata(
         page_size=page,
         raw_out_loc=out_cache_loc,
@@ -610,3 +1107,20 @@ def install() -> None:
     if hasattr(cls, "_swa_loc_i32"):  # SGLang with the one-launch SWA lookup
         route(cls, "_swa_loc_i32", _swa_loc_i32)
     route(hip, "token_req_indices", _token_req_indices)
+    take_window()
+
+
+def take_window() -> None:
+    """SGLang's window kernel becomes ``_WindowLaunch`` (once), where its arguments are the
+    ones ``_window_meta_kernel`` passes on; else the builds stay in their graphs."""
+    global _sgl_window
+    from sglang.kernels.ops.speculative import cache_locs
+
+    kernel = cache_locs.assign_extend_cache_locs_uniform
+    if _sgl_window is not None or isinstance(kernel, _WindowLaunch):
+        return
+    if list(getattr(kernel, "arg_names", ())) == _WINDOW_ARGS:
+        _sgl_window = kernel
+        cache_locs.assign_extend_cache_locs_uniform = _WindowLaunch(kernel)
+    else:
+        chose("verify_window_meta", False, "the window kernel's arguments differ")
