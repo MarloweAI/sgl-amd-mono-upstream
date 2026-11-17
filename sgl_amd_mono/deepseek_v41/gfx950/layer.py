@@ -192,9 +192,14 @@ def _front_key(key: MonoBuild):
 
 
 def _back_key(key: MonoBuild):
-    # 0: the window only (compress ratio 0); 1: also top-k compressed rows
+    # 0: the window only (compress ratio 0); 1: also top-k compressed rows. A seamed
+    # Engram producer's gate CTAs, the grid's last, run no wo_b task (``seam_gates``)
     return mb_back.BackBuild(
-        key.tokens, key.tp, 1 if key.compressed else 0, shuffled=key.shuffled
+        key.tokens,
+        key.tp,
+        1 if key.compressed else 0,
+        shuffled=key.shuffled,
+        no_wob=key.tokens if key.seamed and key.eg else 0,
     )
 
 
@@ -1614,26 +1619,47 @@ def run_ffn(
                 run(task, loads(task))
 
 
+def eg_ctas(key: MonoBuild) -> tuple[int, int]:
+    """A later Engram layer's projection's CTAs (``key.eg``): ``engram.eg_plan``'s first and
+    count. In a seamed launch its tasks run on the first ``eg_own`` of them."""
+    _, n_split, n_comb, _, woa0, _, _ = mb_back.back_plan(_back_key(key))
+    return engram.eg_plan(
+        woa0, mb_back.woa_units(key.tokens, Dims(key.tp)), n_split, n_comb
+    )
+
+
+def eg_own(key: MonoBuild) -> int:
+    """The CTAs that run a seamed launch's projection share (``key.eg``): one a task, up to
+    all but a quarter of the slices' count of ``eg_ctas``. The mixes' partials run on the
+    CTAs past them, so neither holds the other's CTAs' wo_b weights."""
+    return min(key.eg, eg_ctas(key)[1] - seam.SLICES // 4) if key.eg else 0
+
+
 def mix_first(key: MonoBuild) -> int:
     """A seamed launch's first CTA of the mixes' partials (``seam_gates``): the first past the
-    attention back's split, combine and wo_a units. The split and combine run before the idle
-    hook; a wo_a CTA would issue its weights only past the partials, and wo_a's flags hold
-    the attention back's chain."""
+    attention back's split, combine and wo_a units and the Engram projection's tasks
+    (``eg_own``). The split and combine run before the idle hook; a wo_a CTA would issue
+    its weights only past the partials, and wo_a's flags hold the attention back's chain."""
     bkey = _back_key(key)
     woa0 = mb_back.back_plan(bkey)[4]
     first = woa0 + mb_back.woa_units(key.tokens, Dims(key.tp))
-    assert first + key.tokens < BLOCKS, key
+    if key.eg:
+        assert eg_ctas(key)[0] == first, key
+        first += eg_own(key)
+    assert BLOCKS - first >= seam.SLICES // 4, key
     return first
 
 
 def seam_gates(key: MonoBuild, lds, a, gin, layout, ep, amb):
     """A seamed launch's attention gates (``key.seamed``), as the idle work of the attention
-    back's CTAs past its split, combine and wo_a units: slice task k's mixes' partials
-    (``seam.stage_mix``, from the R_new rows the previous launch stored) on CTA
-    ``mix_first`` + k, a CTA after another past the grid's last; then token t's gate on CTA
-    BLOCKS - s + t, which polls the partials and flags its mixes for the FFN seam's slices
-    (``grdy``, K2's tag ``amb``). The partials go out as tagged pairs with K1's tag, device
-    scope, in a region the FFN seam rewrites with K2's only past those flags."""
+    back's CTAs: slice task k's mixes' partials (``seam.stage_mix``, from the R_new rows the
+    previous launch stored) on CTA ``mix_first`` + k, a CTA after another past the grid's
+    last; token t's gate on CTA BLOCKS - s + t, which polls the partials and flags its mixes
+    for the FFN seam's slices (``grdy``, K2's tag ``amb``); in an Engram producer, whose
+    mixes run on fewer CTAs (``mix_first``), the gate CTAs run no wo_b task (``_back_key``),
+    so the gate's longer wait on the partials holds no wo_b weights. The partials go out as
+    tagged pairs with K1's tag, device scope, in a region the FFN seam rewrites with K2's
+    only past those flags."""
     s = key.tokens
     M0 = mix_first(key)
     ctas = BLOCKS - M0
@@ -2389,8 +2415,11 @@ def run_k2(
             "tl": c.get("tl"),
         }  # fmt: skip
 
+        # a seamed launch: the projection on its tasks' CTAs alone (``eg_own``)
+        rc = {**ec, "ctas": eg_own(key)} if key.seamed else ec
+
         def idle():
-            engram.run_eg(gc, ec, s)
+            engram.run_eg(gc, rc, s)
 
     if const_expr(key.seamed):
         # the attention gates' inputs and the gates, ahead of any other idle work
