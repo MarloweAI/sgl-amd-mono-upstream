@@ -654,7 +654,7 @@ def run_k1(key: MonoBuild, sl, front, a: dict, ep, k2=None, early=None, chained=
                     cp, bases, pl["iwg"], row, h, [w0, w1]
                 )
             index_query.run_iw(c, c["args"], own_n, IW0, c["xl"], t0, push)
-        if const_expr(key.cp):
+        if const_expr(key.cp and not cp_side):
             # the compressor projection fills it too, on the CTAs past them (one token
             # tile: its operands issued past the wqkv GEMV)
             index_query.run_cp(
@@ -665,11 +665,18 @@ def run_k1(key: MonoBuild, sl, front, a: dict, ep, k2=None, early=None, chained=
             early.touch()
 
     # one token tile: the compressor projection's operands go out past the wqkv GEMV, ahead
-    # of the wq_b weights (they return in issue order), not behind them in q's wait
+    # of the wq_b weights (they return in issue order), not behind them in q's wait; where
+    # the wqkv is not split, a column tile a CTA on the CTAs past the wqkv tiles instead
     cp_ops = {}
+    cp_side = bool(key.cp) and index_query.cp_side(own_n)
 
     def cp_issue(seen):
-        cp_ops.update(index_query.cp_issue(c, c["args"], own_n, CP0, key.cp, seen))
+        if const_expr(cp_side):
+            # the CTAs past the wqkv tiles run the whole projection as soon as the norms
+            # publish; the wqkv CTAs reach q's wait without it
+            index_query.run_cp_side(c, c["args"], own_n, key.cp, c["xl"])
+        else:
+            cp_ops.update(index_query.cp_issue(c, c["args"], own_n, CP0, key.cp, seen))
 
     def early_keys():
         early.entries()
