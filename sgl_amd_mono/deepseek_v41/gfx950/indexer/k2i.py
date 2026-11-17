@@ -5,7 +5,7 @@
 """K2i: ATOM K2a's FP4 scorer (``score_fp4``) as its own launch between K1 and K2.
 
 Each CTA scores the task the step's walk plan (FULL; ``fill_plan``: worked out here, the step's
-first launch of the ratio, over this rank's chunks of each row, ``index_plan.cp_chunks``) or its
+first launch of the ratio; a context-parallel build's over this rank's chunks of each row) or its
 index (REINDEX) gives it, none waiting on another, into ``ilog``
 [S, lstride] f32 for SGLang's top-k; a producer's build also each row's 8-column block maxima
 into ``bmax`` [S, bstride] and its block and compact lengths into ``blens``. ``itab`` is
@@ -29,12 +29,14 @@ _STREAM = fx.Stream(None)
 MAX_ROWS = 48  # a step's rows at most (8 DSpark requests of 6)
 
 
-def build_k2i(tokens: int, blocks: bool = False):
-    """K2i for a step of ``tokens`` rows; ``blocks``: a producer's, keeping block maxima."""
+def build_k2i(tokens: int, blocks: bool = False, cp: bool = False):
+    """K2i for a step of ``tokens`` rows; ``blocks``: a producer's, keeping block maxima; ``cp``:
+    a context-parallel step's, whose walk plan covers this rank's chunks of each row
+    (``index_plan.cp_chunks``, three more arguments: the rank, the TP size and the band)."""
     assert 0 < tokens <= MAX_ROWS, tokens
-    extra = {"b": 1} if blocks else {}
+    extra = ({"b": 1} if blocks else {}) | ({"cp": 1} if cp else {})
     name = kernel_symbol("dsv41_mono_k2i", s=tokens, **extra)
-    keyed = (("tokens", tokens), ("blocks", blocks), ("sources", SOURCES))
+    keyed = (("tokens", tokens), ("blocks", blocks), ("cp", cp), ("sources", SOURCES))
 
     @fx.struct
     class RowsLds:
@@ -44,40 +46,79 @@ def build_k2i(tokens: int, blocks: bool = False):
     class K2iLds:
         scorer: RowsLds
 
-    @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
-    def k2i(
-        iq: Int64, iqs: Int64, iw: Int64, plane: Int64, pscale: Int64, iplan: Int64, itab: Int64,
-        itab_stride: Int32, itab_len: Int32, ibatch: Int64, ishift: Int32, ibound: Int64, ilog: Int64,
-        lstride: Int32, reindex: Int32, fill_plan: Int32, bmax: Int64, bstride: Int32,
-        blens: Int64, cp_rank: Int32, cp_tp: Int32, cp_band: Int32,
-    ):  # fmt: skip
-        _ = keyed
+    def body(args):
         tid = fx.thread_idx.x
         lds = fx.SharedAllocator().allocate(K2iLds).scorer.peek()
-        args = {
-            "iq": iq, "iqs": iqs, "iw": iw, "plane": plane, "pscale": pscale, "iplan": iplan,
-            "itab": itab, "itab_stride": itab_stride, "itab_len": itab_len, "ibatch": ibatch,
-            "ishift": ishift, "ibound": ibound, "ilog": ilog, "lstride": lstride, "reindex": reindex,
-            "fill_plan": fill_plan, "bmax": bmax, "bstride": bstride, "blens": blens,
-            "cp_rank": cp_rank, "cp_tp": cp_tp, "cp_band": cp_band,
-        }  # fmt: skip
         c = {
             "tid": tid, "lane": tid % 64, "wave": tid // 64, "args": args,
             "rows_lds": lds.rows.ptr, "blocks": blocks,
         }  # fmt: skip
         run_scores4(c, tokens, fx.block_idx.x)
 
+    def named(iq, iqs, iw, plane, pscale, iplan, itab, itab_stride, itab_len, ibatch, ishift,
+              ibound, ilog, lstride, reindex, fill_plan, bmax, bstride, blens):  # fmt: skip
+        return {
+            "iq": iq, "iqs": iqs, "iw": iw, "plane": plane, "pscale": pscale, "iplan": iplan,
+            "itab": itab, "itab_stride": itab_stride, "itab_len": itab_len, "ibatch": ibatch,
+            "ishift": ishift, "ibound": ibound, "ilog": ilog, "lstride": lstride, "reindex": reindex,
+            "fill_plan": fill_plan, "bmax": bmax, "bstride": bstride, "blens": blens,
+        }  # fmt: skip
+
+    if not cp:
+
+        @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
+        def k2i(
+            iq: Int64, iqs: Int64, iw: Int64, plane: Int64, pscale: Int64, iplan: Int64, itab: Int64,
+            itab_stride: Int32, itab_len: Int32, ibatch: Int64, ishift: Int32, ibound: Int64, ilog: Int64,
+            lstride: Int32, reindex: Int32, fill_plan: Int32, bmax: Int64, bstride: Int32,
+            blens: Int64,
+        ):  # fmt: skip
+            _ = keyed
+            body(named(
+                iq, iqs, iw, plane, pscale, iplan, itab, itab_stride, itab_len, ibatch, ishift,
+                ibound, ilog, lstride, reindex, fill_plan, bmax, bstride, blens,
+            ))  # fmt: skip
+
+        @flyc.jit
+        def launch(
+            iq: Int64, iqs: Int64, iw: Int64, plane: Int64, pscale: Int64, iplan: Int64, itab: Int64,
+            itab_stride: Int32, itab_len: Int32, ibatch: Int64, ishift: Int32, ibound: Int64, ilog: Int64,
+            lstride: Int32, reindex: Int32, fill_plan: Int32, bmax: Int64, bstride: Int32,
+            blens: Int64, stream: fx.Stream = _STREAM,
+        ):  # fmt: skip
+            _ = keyed
+            k2i(
+                iq, iqs, iw, plane, pscale, iplan, itab, itab_stride, itab_len, ibatch, ishift, ibound, ilog,
+                lstride, reindex, fill_plan, bmax, bstride, blens,
+            ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)  # fmt: skip
+
+        return launch
+
+    @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
+    def k2i_cp(
+        iq: Int64, iqs: Int64, iw: Int64, plane: Int64, pscale: Int64, iplan: Int64, itab: Int64,
+        itab_stride: Int32, itab_len: Int32, ibatch: Int64, ishift: Int32, ibound: Int64, ilog: Int64,
+        lstride: Int32, reindex: Int32, fill_plan: Int32, bmax: Int64, bstride: Int32,
+        blens: Int64, cp_rank: Int32, cp_tp: Int32, cp_band: Int32,
+    ):  # fmt: skip
+        _ = keyed
+        args = named(
+            iq, iqs, iw, plane, pscale, iplan, itab, itab_stride, itab_len, ibatch, ishift,
+            ibound, ilog, lstride, reindex, fill_plan, bmax, bstride, blens,
+        )  # fmt: skip
+        body(args | {"cp_rank": cp_rank, "cp_tp": cp_tp, "cp_band": cp_band})
+
     @flyc.jit
-    def launch(
+    def launch_cp(
         iq: Int64, iqs: Int64, iw: Int64, plane: Int64, pscale: Int64, iplan: Int64, itab: Int64,
         itab_stride: Int32, itab_len: Int32, ibatch: Int64, ishift: Int32, ibound: Int64, ilog: Int64,
         lstride: Int32, reindex: Int32, fill_plan: Int32, bmax: Int64, bstride: Int32,
         blens: Int64, cp_rank: Int32, cp_tp: Int32, cp_band: Int32, stream: fx.Stream = _STREAM,
     ):  # fmt: skip
         _ = keyed
-        k2i(
+        k2i_cp(
             iq, iqs, iw, plane, pscale, iplan, itab, itab_stride, itab_len, ibatch, ishift, ibound, ilog,
             lstride, reindex, fill_plan, bmax, bstride, blens, cp_rank, cp_tp, cp_band,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)  # fmt: skip
 
-    return launch
+    return launch_cp

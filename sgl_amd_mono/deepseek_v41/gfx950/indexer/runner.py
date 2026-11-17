@@ -119,15 +119,16 @@ class K2iRunner:
         )
         self.one = topk_one.TopKOne(device)
         self.exchange = exchange
+        self.cp = topk_one.TopKCp(self.one, exchange) if exchange is not None else None
         self._kernels: dict = {}
 
-    def kernel(self, rows: int, blocks: bool = False):
+    def kernel(self, rows: int, blocks: bool = False, cp: bool = False):
         from ..runner import no_capture
 
-        if (rows, blocks) not in self._kernels:
+        if (rows, blocks, cp) not in self._kernels:
             no_capture(f"K2i width {rows}")
-            self._kernels[rows, blocks] = build_k2i(rows, blocks)
-        return self._kernels[rows, blocks]
+            self._kernels[rows, blocks, cp] = build_k2i(rows, blocks, cp)
+        return self._kernels[rows, blocks, cp]
 
     def run_glue(self, rows: int, sel: Selection) -> None:
         """A selection's glue (``Selection.glue``) as its own launch, for the tests: what the
@@ -260,18 +261,18 @@ class K2iRunner:
             glue = {"gl_cols": pos, "gl_ids_out": ids, "gl_raw": raw_out}
             return Selection(None, (index_glue.RAWS, glue))
         producer = kind == "producer"
-        cp = self._cp(kind, rows) if two_level else None
+        band = self._band(kind, rows) if two_level else None
         logits = self.score(
-            ratio=ratio, fill_plan=fill_plan, blocks=producer, cp=cp, **inputs
+            ratio=ratio, fill_plan=fill_plan, blocks=producer, band=band, **inputs
         )  # fmt: skip
         cols = dict(
             scores=logits, seq_lens=bounds, page_table=page_table, page_indices=page_out,
             page_size=PLANE_ROWS, raw_indices=raw_out,
         )  # fmt: skip
         if not producer:
-            if cp is not None:
-                self._one_launch()
-                self.one.transform_paged_cp(**cols, cp=cp)
+            if band is not None:
+                self._cp_launch()
+                self.cp.transform_paged(**cols, band=band)
             else:
                 self._paged_topk(**cols)
             return Selection(None, None)
@@ -283,11 +284,11 @@ class K2iRunner:
             scores=self.bmax[: rows * self.bstride].view(rows, self.bstride)[:, :nb],
             seq_lens=self.blens[:rows],
         )
-        if cp is not None:
-            self._one_launch()
-            self.one.transform_paged_pair_cp(
+        if band is not None:
+            self._cp_launch()
+            self.cp.transform_paged_pair(
                 **cols, block_scores=blocks["scores"], block_lens=blocks["seq_lens"], block_ids=ids,
-                cp=cp,
+                band=band,
             )  # fmt: skip
         elif topk_one.TopKOne.fits(rows):
             self._one_launch()
@@ -321,13 +322,19 @@ class K2iRunner:
         }  # fmt: skip
         return Selection(published, (index_glue.TABLE, glue))
 
-    def _cp(self, kind: str, rows: int):
-        """A FULL or producer launch's exchange arguments (``topk_one.Exchange.args``), None
-        where its rows stay whole: no exchange, or more rows than the one-launch top-k takes."""
-        ex = self.exchange
-        if ex is None or not topk_one.TopKOne.fits(rows):
+    def _band(self, kind: str, rows: int):
+        """A FULL or producer launch's context-parallel band in columns, None where its rows
+        stay whole: no exchange, or more rows than the one-launch top-k takes."""
+        if self.exchange is None or not topk_one.TopKOne.fits(rows):
             return None
-        return ex.args(CP_BAND[kind, ex.tp])
+        return CP_BAND[kind, self.exchange.tp]
+
+    def _cp_launch(self) -> None:
+        """The context-parallel top-k's module, built outside graph capture."""
+        if not topk_one.cp_module.cache_info().currsize:
+            from ..runner import no_capture
+
+            no_capture("the context-parallel top-k")
 
     def _one_launch(self) -> None:
         """The one-launch top-k's module, built outside graph capture."""
@@ -347,11 +354,11 @@ class K2iRunner:
 
     def score(
         self, *, rows, per_req, ratio, query, plane, page_table, bounds, fill_plan=True,
-        blocks=False, cp=None,
+        blocks=False, band=None,
     ) -> torch.Tensor:  # fmt: skip
         """A FULL or producer layer's logits [rows, width] f32, valid below each row's bound
         (``fill_plan``: laying out the step's walk plan of ``ratio`` first; ``blocks``: a
-        producer's, also its block maxima and lengths; ``cp``: ``Exchange.args``, a plan of
+        producer's, also its block maxima and lengths; ``band``: context-parallel past it, a plan of
         this rank's chunks of each row, ``index_plan.cp_chunks``, valid only there).
 
         ``width`` spans the page table's columns, as wide as SGLang's logits for its top-k."""
@@ -362,7 +369,7 @@ class K2iRunner:
             itab_stride=page_table.stride(0), itab_len=page_table.shape[1],
             ibatch=self.owners[per_req - 1], ishift=3, ibound=bounds, lstride=width,
             reindex=0, fill_plan=int(fill_plan), blocks=blocks,
-            cp=(0, 1, ip.NO_CP) if cp is None else (cp[2], cp[3], cp[4]),
+            cp=None if band is None else (self.exchange.rank, self.exchange.tp, band),
         )  # fmt: skip
         return self.ilog[: rows * width].view(rows, width)
 
@@ -390,16 +397,16 @@ class K2iRunner:
 
     def _score(
         self, *, rows, query, plane, plan, itab, itab_stride, itab_len, ibatch, ishift,
-        ibound, lstride, reindex, fill_plan, blocks=False, cp=(0, 1, ip.NO_CP),
+        ibound, lstride, reindex, fill_plan, blocks=False, cp=None,
     ) -> None:  # fmt: skip
         q_fp4, q_scale, weights = query
         payload, scale = plane
         _run_compiled(
-            self.kernel(rows, blocks),
+            self.kernel(rows, blocks, cp is not None),
             q_fp4.data_ptr(), q_scale.data_ptr(), weights.data_ptr(), payload.data_ptr(), scale.data_ptr(),
             plan.data_ptr(), itab.data_ptr(), itab_stride, itab_len, ibatch.data_ptr(), ishift,
             ibound.data_ptr(), self.ilog.data_ptr(), lstride, reindex, fill_plan,
-            self.bmax.data_ptr(), self.bstride, self.blens.data_ptr(), *cp,
+            self.bmax.data_ptr(), self.bstride, self.blens.data_ptr(), *(cp or ()),
             torch.cuda.current_stream(),
         )  # fmt: skip
 
