@@ -90,7 +90,8 @@ def test_walk_plan_device_equals_host(seed):
             rows=n, query=(q, qs, w), plane=(case["payload"], case["kscale"]), plan=plan,
             itab=table, itab_stride=table.stride(0), itab_len=table.shape[1],
             ibatch=torch.from_numpy(owners).to(dev), ishift=3,
-            ibound=torch.from_numpy(bounds).to(dev), lstride=64, reindex=0, fill_plan=1, cp=cp,
+            ibound=torch.from_numpy(bounds).to(dev), lstride=64, reindex=0, fill_plan=1,
+            cp=cp if tp > 1 else None,
         )  # fmt: skip
         got = plan.cpu().numpy()
         assert np.array_equal(got, want), (

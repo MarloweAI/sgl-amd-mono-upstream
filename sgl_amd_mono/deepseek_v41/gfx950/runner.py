@@ -692,6 +692,15 @@ class DSV41MonoRunner:
         if k2i:
             # a producer's build keeps its block maxima too
             kernels += [self.k2i.kernel(tokens), self.k2i.kernel(tokens, blocks=True)]
+            from .indexer.topk_one import TopKOne, cp_module
+
+            if self.k2i.cp is not None and TopKOne.fits(tokens):
+                # a two-level step's context-parallel builds, and its top-k module
+                kernels += [
+                    self.k2i.kernel(tokens, cp=True),
+                    self.k2i.kernel(tokens, True, True),
+                ]
+                cp_module()
         for launch in kernels:
             compile_only(launch)
 
