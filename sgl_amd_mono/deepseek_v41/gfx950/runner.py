@@ -68,6 +68,9 @@ FINE_UG_ROWS = 7
 # TP8 holds 9 FP4 groups of an expert: two a task leave 5 parts, ~240 tasks at 8 rows
 # for 238 CTAs, and the CTAs with two run a second 328 KB round
 FINE_UG_ROWS_TP8 = 9
+# TP4's 7 rows (a DSpark block-6 verify step at one request) take one group a task too:
+# 3.55 -> 3.46 ms a step serving the Tetris prompt
+FINE_UG_ROWS_TP4 = 8
 RECORD = DATA + 8  # a token's KV record: 576 B of data, then 8 B of scales
 _LOG2E = 1.4426950408889634
 # a wait's deadline until the framework sets one from its watchdog timeout
@@ -510,7 +513,11 @@ class DSV41MonoRunner:
         end closer together (ROCm/ATOM's fine ug); the draft fixes its own."""
         ug = self.ug_groups
         if ug is None:
-            fine = FINE_UG_ROWS_TP8 if self.tp >= 8 else FINE_UG_ROWS
+            fine = (
+                FINE_UG_ROWS_TP8 if self.tp >= 8
+                else FINE_UG_ROWS_TP4 if self.tp == 4
+                else FINE_UG_ROWS
+            )
             ug = 1 if tokens < fine else 2
         return {**self.route, "ug_groups": ug}
 
