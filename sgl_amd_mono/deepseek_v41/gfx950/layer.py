@@ -582,20 +582,30 @@ def run_k1(key: MonoBuild, sl, front, a: dict, ep, k2=None, early=None, chained=
         stamp(c, 32)
         # seamed: the previous launch ran the slice
         if not key.seamed:
+            # TP4: the partial projections later (``slice_mixes``)
+            cs = {**ca, "mixes": seam.MIX_LATE} if tp == 4 else ca
             if const_expr(chained is None):
                 for task in range(first_task(bid, 0), SLICES, BLOCKS):
-                    seam.stage_slice(ca, task)
+                    seam.stage_slice(cs, task)
             else:
                 if chained:
                     for ctask in range(first_task(bid, 0), SLICES, BLOCKS):
                         chained_slice(cr, ctask)
                 else:
                     for task in range(first_task(bid, 0), SLICES, BLOCKS):
-                        seam.stage_slice(ca, task)
+                        seam.stage_slice(cs, task)
             gpu.barrier()
             stamp(c, 33)
 
     xr = sl.xr.ptr if tagged_rows(tp) else None
+
+    def slice_mixes():
+        # TP4: the slice's partial projections past its CTA's wqkv weights (row halves: a
+        # whole-K tile a CTA): R_new and LIN, which the norms wait on, go out before the
+        # weights; the mixes only the gates read. TP8 (K halves) keeps them in the slice:
+        # there the later mixes cost the attention back more than the weights gain
+        for task in range(first_task(bid, 0), SLICES, BLOCKS):
+            seam.slice_partials(ca, task)
 
     def store(t, col, ys, live):
         store_x8(c, t, col, ys, live)
@@ -680,6 +690,7 @@ def run_k1(key: MonoBuild, sl, front, a: dict, ep, k2=None, early=None, chained=
             x8_given=True,
             before_wqkv=seam_slice,
             after_wqkv=seam_norm,
+            after_weights=slice_mixes if tp == 4 else None,
             before_wqb=seam_gate,
             before_wqb_weights=cp_issue
             if key.cp and len(token_tiles(own_n)) == 1
@@ -737,7 +748,12 @@ def chained_reduce(key: MonoBuild, ca, sl, scratch, sym, ep) -> dict:
     else:
         ffn = preg(own, peer_offsets(s, tp)["ffn"], "ffn")
     return {
-        "ca": {**ca, "pend_lds": sl.pl.ptr},
+        # TP4's slice leaves its partial projections to ``slice_mixes``, as an unchained one
+        "ca": {
+            **ca,
+            "pend_lds": sl.pl.ptr,
+            "mixes": seam.MIX_LATE if tp == 4 else seam.MIX_HERE,
+        },
         "cp": {**ca, "pend_lds": sl.pl.ptr, "poll": Mailbox((pep << 1) + 2).poll},
         "ffn": ffn,
         "frdy": sreg(scratch, layout["frdy"][0], "frdy"),

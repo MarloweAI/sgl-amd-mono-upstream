@@ -65,7 +65,7 @@ KT = HC * COLS  # projection columns a slice task
 PART = MIX + 1  # a slice's partials a token: the mixes, then the sum of squares
 GATE_BLOCK = 8  # slices a gate thread sums
 # where a slice's partial projections run (``stage_slice``'s ``c["mixes"]``)
-MIX_HERE, MIX_NONE = "here", "none"
+MIX_HERE, MIX_LATE, MIX_NONE = "here", "late", "none"
 
 
 def scratch_layout(tokens: int) -> dict[str, tuple[int, int]]:
@@ -345,8 +345,9 @@ def slice_prefetch(c, task):
 def stage_slice(c, task, pre=None):
     """Compute R_new, the layer input and the partial projections of columns 32 task ..
     +32 (``pre``: ``slice_prefetch``'s loads). ``c["mixes"]``: ``MIX_HERE`` (default), the
-    partial projections here; ``MIX_NONE``, none (another launch's ``stage_mix`` computes
-    them)."""
+    partial projections here; ``MIX_LATE``, the mix weights staged in LDS and the
+    projections left to the caller (``slice_partials``, past loads it issues first);
+    ``MIX_NONE``, none (another launch's ``stage_mix`` computes them)."""
     s, tid = c["S"], c["tid"]
     rl, fl = c["rl"], c["fl"]
     c0 = task * COLS
