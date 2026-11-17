@@ -371,6 +371,7 @@ class DSV41MonoRunner:
         self._scratch: dict = {}  # width -> its scratch's PeerBuffer
         self._seam: dict = {}  # width -> its seam state (``seam_state``)
         self._xl_tables: dict = {}  # a multi-layer launch's rows -> its device table
+        self._xl_seams: dict = {}  # (width, layer of a TP8 run) -> ``_xl_seam``
         # [epoch, the guard block (deadline, error words), a mark per CTA, the MoE's counters]
         self.epoch = torch.zeros(EPOCH_WORDS, dtype=torch.int32, device=dev)
         self.fault_site, self.fault_after = guard.fault_injection(rank) or (0, 0)
@@ -509,10 +510,28 @@ class DSV41MonoRunner:
         return self.tp == 8 and not tok_par and tokens <= seam.SEAM_MAX_TOKENS
 
     def chains(self, tokens: int, tok_par: bool = False) -> bool:
-        """Whether a run of reuse layers at this width runs in one launch (``layers``): TP4,
-        where no seam moves, up to ``SEAM_MAX_TOKENS`` rows (the previous layer's sums run
-        on the slice's threads, as the seam tail's), not token parallel."""
-        return self.tp == 4 and not tok_par and tokens <= seam.SEAM_MAX_TOKENS
+        """Whether a run of reuse layers at this width runs in one launch (``layers``): TP4
+        and TP8, up to ``SEAM_MAX_TOKENS`` rows (the previous layer's sums run on the slice's
+        threads, as the seam tail's), not token parallel. At TP8 each boundary of the run is
+        the seam move, in the launch."""
+        return self.tp in (4, 8) and not tok_par and tokens <= seam.SEAM_MAX_TOKENS
+
+    def _xl_seam(self, tokens: int, i: int) -> tuple:
+        """Layer i's (from 1) seam state and attention-gate outputs (post, comb, pre) in a
+        TP8 multi-layer launch: a set a layer of the run, so no buffer is written twice in
+        a launch, allocated before graph capture."""
+        key = (tokens, i)
+        got = self._xl_seams.get(key)
+        if got is None:
+            no_capture(f"multi-layer seam state width {tokens}")
+            f32, dev = torch.float32, self.device
+            got = self._xl_seams[key] = (
+                self.new_seam_state(tokens),
+                torch.zeros(tokens, HC, dtype=f32, device=dev),
+                torch.zeros(tokens, HC, HC, dtype=f32, device=dev),
+                torch.zeros(tokens, HC, dtype=f32, device=dev),
+            )
+        return got
 
     def seam_res(self, state: torch.Tensor, tokens: int) -> torch.Tensor:
         """The R_new rows [tokens, 4, 5120] bf16 of a seam state."""
@@ -1219,7 +1238,8 @@ class DSV41MonoRunner:
         the launch's argument table is built once a distinct set, outside capture. Returns
         ``outs``."""
         n = len(steps)
-        if not 1 <= n <= XL_LAYERS or len(outs) != n:
+        moves = self.tp == 8
+        if not 1 + moves <= n <= XL_LAYERS or len(outs) != n:
             raise RuntimeError(
                 f"a multi-layer launch of {n} layers, {len(outs)} outputs"
             )
@@ -1238,11 +1258,30 @@ class DSV41MonoRunner:
                     raise RuntimeError(
                         f"layer {i}'s inputs are not layer {i - 1}'s outputs"
                     )
+            x, res, post, comb, pre = (
+                st[k] for k in ("x", "residual", "post", "comb", "pre")
+            )
+            aux = st.get("aux")
+            if moves and i > 0:
+                # seamed: the layer before's tail ran this layer's seam into its state
+                m0 = res.shape[0]
+                state, post, comb, pre = self._xl_seam(m0, i)
+                res = self.seam_res(state, m0)
+                off, nb = seam.seam_state_layout(m0)["lin"]
+                x = state[off : off + nb].view(torch.bfloat16).view(m0, HIDDEN)
+                aux = None
             a1, m, fold, _, _ = self._k1_args(
-                st["w"], st["x"], st["residual"], st["post"], st["comb"], st["pre"],
-                st["pos"], st["slot"], st["swa"], st["swa_block"], st["keys"], False,
-                False, st.get("aux"),
+                st["w"], x, res, post, comb, pre, st["pos"], st["slot"], st["swa"],
+                st["swa_block"], st["keys"], False, False, aux,
             )  # fmt: skip
+            if moves and i > 0:
+                # its gates' outputs, which its FFN seam reads (``layer.seam_gates``)
+                a1 |= {
+                    "res_out": res.data_ptr(),
+                    "post_out": post.data_ptr(),
+                    "comb_out": comb.data_ptr(),
+                    "pre_out": pre.data_ptr(),
+                }
             a2, _, comp = self._k2_args(
                 st["aw"], st["fw"], m, st["pos"], st["swa"], st["swa_block"],
                 st["comp"], st["comp_block"], out,
@@ -1258,6 +1297,18 @@ class DSV41MonoRunner:
             M, compressed = m, comp
             a2 |= dict.fromkeys(EG_ARGS + SEAM_ARGS + L2_ARGS, 0)
             a2 |= {"nx_aux_stride": HIDDEN, "seam_in": 0}
+            if moves and i > 0:
+                a2["seam_in"] = state.data_ptr()
+            if moves and i < n - 1:
+                # the next layer's seam into its state, its capture into its aux
+                naux = steps[i + 1].get("aux")
+                if naux is not None:
+                    self._check_aux(naux, m)
+                a2 |= {
+                    "nx_aux": 0 if naux is None else naux.data_ptr(),
+                    "nx_aux_stride": HIDDEN if naux is None else naux.stride(0),
+                    "seam_out": self._xl_seam(m, i + 1)[0].data_ptr(),
+                }
             eg = st.get("eg")
             if eg is not None:
                 ex, ew = eg
