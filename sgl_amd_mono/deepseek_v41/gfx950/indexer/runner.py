@@ -50,12 +50,14 @@ SGLANG_READS = {
 
 COMPACT = ip.TOPK_BLOCKS * ip.BLOCK_ROWS  # a REINDEX row's candidate columns
 KINDS = ("full", "producer", "reindex")
-# the columns from which a two-level step's FULL or producer row is context-parallel, by TP
+# the columns from which a two-level step's FULL or producer row is context-parallel, by TP: where the
+# ranks' exchange and merge cost less than the 1/TP scoring and selection save (FULL ratio-2 columns are
+# half the positions, a producer's all of them)
 CP_BAND = {
-    ("full", 4): 96 * 1024,
-    ("full", 8): 32 * 1024,
-    ("producer", 4): 192 * 1024,
-    ("producer", 8): 64 * 1024,
+    ("full", 4): 340 * 1024,
+    ("full", 8): 384 * 1024,
+    ("producer", 4): 660 * 1024,
+    ("producer", 8): 700 * 1024,
 }
 
 
