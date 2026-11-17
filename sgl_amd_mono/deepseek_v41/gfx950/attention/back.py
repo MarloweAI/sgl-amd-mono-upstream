@@ -104,6 +104,9 @@ class BackBuild(msgspec.Struct, frozen=True):
     ratio: int  # 0: window only; 1 / 2: top-k over a compressed cache
     timeline: bool = False
     shuffled: bool = False  # wo_b in aiter's (16, 16) preshuffle (wo_a stays row-major)
+    # the grid's last CTAs, which run no wo_b task (a seamed Engram producer's gate CTAs,
+    # ``layer.seam_gates``)
+    no_wob: int = 0
 
 
 def plus(t0, v):
@@ -1243,15 +1246,33 @@ def wob_by_task(key) -> bool:
 
 
 def wob_cta_count(key) -> int:
-    """wo_b's CTAs from WOB0: the CTAs without a wo_a unit on one token tile where two
-    tasks each cover it (a wo_a CTA sees the last wo_a flag a poll later than one already
-    waiting) and where wo_b runs by task (``wob_by_task``), else all."""
+    """wo_b's CTAs from WOB0: on one token tile the CTAs without a wo_a unit, but the grid's
+    last ``no_wob`` (``wob_unit``), where two tasks each cover it (a wo_a CTA sees the last
+    wo_a flag a poll later than one already waiting) and where wo_b runs by task
+    (``wob_by_task``), else all."""
     s, d = key.tokens, Dims(key.tp)
-    units = woa_units(s, d)
+    n = BLOCKS - woa_units(s, d) - key.no_wob
     one = len(token_tiles(s)) == 1
     if wob_by_task(key):
-        return BLOCKS - units
-    return BLOCKS - units if one and 2 * (BLOCKS - units) >= d.wob_tasks else BLOCKS
+        return n
+    if one and 2 * n >= d.wob_tasks:
+        return n
+    assert key.no_wob == 0, key
+    return BLOCKS
+
+
+def wob_unit(key, bid):
+    """CTA ``bid``'s wo_b unit (``wob_cta_count`` units from WOB0; past them: none): its
+    place from WOB0, the grid's last ``no_wob`` CTAs skipped (each given unit
+    ``wob_cta_count``, none)."""
+    u = first_task(bid, back_plan(key)[5])
+    if key.no_wob == 0:
+        return u
+    n = wob_cta_count(key)
+    u0 = BLOCKS - key.no_wob - back_plan(key)[5]
+    assert 0 < u0 <= n, key
+    skip = (u >= u0) & (u < u0 + key.no_wob)
+    return skip.select(fx.Int32(n), (u >= u0).select(u - key.no_wob, u))
 
 
 def ardy_waiters(key) -> int:
@@ -1360,6 +1381,8 @@ def run_back(c, key, bid, idle=None, before_wob=None):
             stage_split(c, unit)
     stamp(c, 1)
     tx8 = tagged_x8b(dd, s)
+    # wo_b polls wo_a's hint flags before the words (``x8_hints``, the layer's rule)
+    hints = tx8 and c.get("x8_hints", True)
     for unit in range(first_task(bid, COMB0), n_comb, BLOCKS):
         stage_combine(c, unit)
     gpu.barrier()
@@ -1377,24 +1400,24 @@ def run_back(c, key, bid, idle=None, before_wob=None):
     ops = bf16_gemv_loads(
         c, a["woa"], a["woa_s"], group_k, woa_t * WOA_ROWS, WOA_SPLIT_K, pred=has_woa
     )
-    wob_unit = first_task(bid, WOB0)
     wob_ctas = wob_cta_count(key)
-    has_wob = True if wob_ctas == BLOCKS else wob_unit < wob_ctas
+    wob_u = wob_unit(key, bid)
+    has_wob = True if wob_ctas == BLOCKS else wob_u < wob_ctas
     by_task = wob_by_task(key)
     if const_expr(nt == 1):
         # one or two wo_b tasks a CTA, every one on the step's rows
         wob_tile = 0
-        wob_ts = [wob_unit, wob_unit + wob_ctas]
+        wob_ts = [wob_u, wob_u + wob_ctas]
     elif const_expr(by_task):
-        # every tile of tasks wob_unit, + wob_ctas, ..
+        # every tile of tasks wob_u, + wob_ctas, ..
         wob_tile = 0
-        wob_ts = [wob_unit + k * wob_ctas for k in range(cdiv(wob_tasks, wob_ctas))]
+        wob_ts = [wob_u + k * wob_ctas for k in range(cdiv(wob_tasks, wob_ctas))]
     else:
         # a tile a CTA (ROCm/ATOM's tile tasks): rows read once, every task's weights in flight
-        wob_tile = wob_unit % nt
+        wob_tile = wob_u % nt
         per_tile = (BLOCKS - wob_tile + nt - 1) // nt
         most = -(-wob_tasks // (BLOCKS // nt))
-        wob_ts = [wob_unit // nt + k * per_tile for k in range(most)]
+        wob_ts = [wob_u // nt + k * per_tile for k in range(most)]
 
     def wob_weights():
         if const_expr(by_task):
@@ -1445,6 +1468,11 @@ def run_back(c, key, bid, idle=None, before_wob=None):
                 regs = words_loads(c, c["xo"], q_rows // 2, off[1], half_w, t0, n)
             acc = bf16_gemv_mfmas(c, group_k, c["xl"], ops, acc, h, n)
             gpu.barrier()  # the next half's rows overwrite the LDS
+        if const_expr(hints):
+            # wo_b's hint as the GEMV ends, with no wait: its polls of the X8B words
+            # (which carry the tag) arrive about as the words land
+            if c["tid"] == 0:
+                c["mb"].put(c["ardy"], woa_t * FLAG_STRIDE, fx.Int32(1))
         stage_woa(c, woa_t, acc, t0, n)
 
     if has_woa:
@@ -1474,6 +1502,11 @@ def run_back(c, key, bid, idle=None, before_wob=None):
         # drained here, as below
         rocdl.s_waitcnt(vmcnt=0)
         if has_wob:
+            # every wo_a task's hint first: polled from the wait's start, the X8B words
+            # would load the memory under the split, combine and wo_a from every wo_b CTA
+            if const_expr(hints):
+                woa_hints = c["ardy"]
+                await_flags(c, woa_hints, woa_tasks, lambda u: u * FLAG_STRIDE)
             x8b_rows(c, s, also)
     elif const_expr(woa_spread):
         # this tile's wo_a units

@@ -30,9 +30,13 @@ from .layer import (
     K2_ARGS,
     K2_GLUE_ARGS,
     K2_OF_LAYER,
+    L2_ARGS,
     LAYER_ARGS,
     MAX_TOKENS,
     SEAM_ARGS,
+    XL_FIRST,
+    XL_LAYERS,
+    XL_STEP,
     MonoBuild,
     acell_offset,
     acell_region_bytes,
@@ -40,11 +44,13 @@ from .layer import (
     build_mono_k1,
     build_mono_k2,
     build_mono_layer,
+    build_mono_layers,
     fcell_offset,
     fcell_region_bytes,
     peer_half_bytes,
     scratch_bytes,
     scratch_layout,
+    xl_row,
 )
 from .stages import engram, seam
 from .stages.dims import Dims as MoeDims
@@ -345,7 +351,7 @@ class DSV41MonoRunner:
         _ensure_writable_flydsl_cache()
         from sgl_amd_mono.common.peer import PeerBuffer
 
-        self.tp, self.rank = tp, rank
+        self.tp, self.rank, self.group = tp, rank, group
         self.route = dict(experts=experts, topk=topk, swa_width=swa_width)
         if ug_groups not in (None, 1, 2):
             raise ValueError(
@@ -364,6 +370,8 @@ class DSV41MonoRunner:
         self.device = dev
         self._scratch: dict = {}  # width -> its scratch's PeerBuffer
         self._seam: dict = {}  # width -> its seam state (``seam_state``)
+        self._xl_tables: dict = {}  # a multi-layer launch's rows -> its device table
+        self._xl_seams: dict = {}  # a run's layer buffers (``_xl_seam``, ``_xl_mids``)
         # [epoch, the guard block (deadline, error words), a mark per CTA, the MoE's counters]
         self.epoch = torch.zeros(EPOCH_WORDS, dtype=torch.int32, device=dev)
         self.fault_site, self.fault_after = guard.fault_injection(rank) or (0, 0)
@@ -429,11 +437,18 @@ class DSV41MonoRunner:
 
     def enable_k2i(self, bound_max: int):
         """K2i's buffers and builds, for column bounds up to ``bound_max`` (the
-        server's longest context: a ratio-1 source's compressed length)."""
-        from .indexer.runner import K2iRunner
+        server's longest context: a ratio-1 source's compressed length). At a TP with a
+        context-parallel band its top-k exchange too: collective, every rank calls this."""
+        from .indexer.runner import CP_BAND, K2iRunner
+        from .indexer.topk_one import Exchange
 
         no_capture("the K2i buffers")
-        self.k2i = K2iRunner(device=self.device, bound_max=bound_max)
+        exchange = None
+        if ("full", self.tp) in CP_BAND:
+            exchange = Exchange(
+                rank=self.rank, tp=self.tp, group=self.group, device=self.device
+            )
+        self.k2i = K2iRunner(device=self.device, bound_max=bound_max, exchange=exchange)
         return self.k2i
 
     def set_deadline(self, seconds: float) -> None:
@@ -500,6 +515,47 @@ class DSV41MonoRunner:
         attention seam (``layer(nxt=)``): TP8 (the per-row MoE's), up to
         ``SEAM_MAX_TOKENS`` rows, not token parallel."""
         return self.tp == 8 and not tok_par and tokens <= seam.SEAM_MAX_TOKENS
+
+    def chains(self, tokens: int, tok_par: bool = False) -> bool:
+        """Whether a run of reuse layers at this width runs in one launch (``layers``): TP4
+        and TP8, up to ``SEAM_MAX_TOKENS`` rows (the previous layer's sums run on the slice's
+        threads, as the seam tail's), not token parallel. At TP8 each boundary of the run is
+        the seam move, in the launch."""
+        return self.tp in (4, 8) and not tok_par and tokens <= seam.SEAM_MAX_TOKENS
+
+    def _xl_seam(self, tokens: int, i: int) -> tuple:
+        """Layer i's (from 1) seam state and attention-gate outputs (post, comb, pre) in a
+        TP8 multi-layer launch: a set a layer of the run, so no buffer is written twice in
+        a launch, allocated before graph capture."""
+        key = (tokens, i)
+        got = self._xl_seams.get(key)
+        if got is None:
+            no_capture(f"multi-layer seam state width {tokens}")
+            f32, dev = torch.float32, self.device
+            got = self._xl_seams[key] = (
+                self.new_seam_state(tokens),
+                torch.zeros(tokens, HC, dtype=f32, device=dev),
+                torch.zeros(tokens, HC, HC, dtype=f32, device=dev),
+                torch.zeros(tokens, HC, dtype=f32, device=dev),
+            )
+        return got
+
+    def _xl_mids(self, tokens: int, i: int) -> tuple:
+        """Layer i's K1 outputs (R_new, post, comb, pre) in a TP4 multi-layer launch, a set a
+        layer of the run but the last (which writes the runner's own): other CTAs read
+        them, so no buffer is written twice in a launch. Allocated before graph capture."""
+        key = ("mids", tokens, i)
+        got = self._xl_seams.get(key)
+        if got is None:
+            no_capture(f"multi-layer K1 outputs width {tokens}")
+            f32, dev = torch.float32, self.device
+            got = self._xl_seams[key] = (
+                torch.zeros(tokens, HC, HIDDEN, dtype=torch.bfloat16, device=dev),
+                torch.zeros(tokens, HC, dtype=f32, device=dev),
+                torch.zeros(tokens, HC, HC, dtype=f32, device=dev),
+                torch.zeros(tokens, HC, dtype=f32, device=dev),
+            )
+        return got
 
     def seam_res(self, state: torch.Tensor, tokens: int) -> torch.Tensor:
         """The R_new rows [tokens, 4, 5120] bf16 of a seam state."""
@@ -612,12 +668,14 @@ class DSV41MonoRunner:
         ffn: bool = False,
         k2i: bool = False,
         tok_par: bool = False,
+        layers=(),
     ) -> None:
         """Allocate this width's scratch and compile its launches without running them.
 
         K1 for each (fold, index, iq, cp) in ``k1``, K2 for each (compressed, index, glue) in
-        ``k2``, the layer launch for each (fold, compressed, embed, eg) in ``layer``, the FFN
-        launch, and K2i (``enable_k2i`` first)."""
+        ``k2``, the layer launch for each (fold, compressed, embed, eg) in ``layer``, the
+        multi-layer launch for each (compressed, eg) in ``layers`` where the width ``chains``, the
+        FFN launch, and K2i (``enable_k2i`` first)."""
         self.scratch(tokens)
         kernels = [self.k1_kernel(tokens, *v, tok_par=tok_par) for v in sorted(k1)]
         kernels += [
@@ -627,11 +685,22 @@ class DSV41MonoRunner:
         kernels += [
             self.layer_kernel(tokens, *v, tok_par=tok_par) for v in sorted(layer)
         ]
+        if self.chains(tokens, tok_par):
+            kernels += [self.layers_kernel(tokens, *v) for v in sorted(layers)]
         if ffn:
             kernels.append(self.ffn_kernel(tokens))
         if k2i:
             # a producer's build keeps its block maxima too
             kernels += [self.k2i.kernel(tokens), self.k2i.kernel(tokens, blocks=True)]
+            from .indexer.topk_one import TopKOne, cp_module
+
+            if self.k2i.cp is not None and TopKOne.fits(tokens):
+                # a two-level step's context-parallel builds, and its top-k module
+                kernels += [
+                    self.k2i.kernel(tokens, cp=True),
+                    self.k2i.kernel(tokens, True, True),
+                ]
+                cp_module()
         for launch in kernels:
             compile_only(launch)
 
@@ -1167,6 +1236,171 @@ class DSV41MonoRunner:
             )
         return self._kernels[key]
 
+    def layers_kernel(self, tokens: int, compressed: bool = True, eg: int = 0):
+        """Up to ``XL_LAYERS`` consecutive reuse layers' one launch at this width
+        (``build_mono_layers``); ``eg``: each layer's tasks of a later Engram layer's
+        projection (0: none)."""
+        key = (tokens, "layers", compressed, eg)
+        if key not in self._kernels:
+            no_capture(f"multi-layer launch width {tokens}")
+            self._kernels[key] = build_mono_layers(
+                MonoBuild(
+                    tokens,
+                    self.tp,
+                    kt=True,
+                    compressed=compressed,
+                    shuffled=self.shuffled,
+                    fault_site=self.fault_site,
+                    fault_after=self.fault_after,
+                    timeline=self.timeline_on,
+                    eg=eg,
+                    chain=True,
+                    **self.route_at(tokens),
+                )
+            )
+        return self._kernels[key]
+
+    def layers(self, steps: list, outs: list) -> list:
+        """Run ``len(steps)`` consecutive reuse layers in one launch (``build_mono_layers``):
+        ``steps[l]`` is ``layer``'s arguments of layer l as a dict (w, aw, fw, x, residual,
+        post, comb, pre, pos, slot, swa, swa_block, comp, comp_block, keys, ``aux``, and ``eg``:
+        (rows, EngramWeights), every layer's share of one later Engram layer's projection, of
+        equal tasks, or none); a later layer's x, residual, post, comb and pre are the layer
+        before's ``outs``. Every
+        layer's outputs (``outs[l]``) come from the caller, allocated before graph capture:
+        the launch's argument table is built once a distinct set, outside capture. Returns
+        ``outs``."""
+        n = len(steps)
+        moves = self.tp == 8
+        if not 1 + moves <= n <= XL_LAYERS or len(outs) != n:
+            raise RuntimeError(
+                f"a multi-layer launch of {n} layers, {len(outs)} outputs"
+            )
+        k2_name = {v: k for k, v in K2_OF_LAYER.items()}
+        rows, M, compressed, step, tasks = [], None, None, None, None
+        for i, (st, out) in enumerate(zip(steps, outs)):
+            if st["aw"].cos_sin.data_ptr() != st["w"].cos_sin.data_ptr():
+                raise RuntimeError(
+                    "the layer launch takes K1's rope table for K2's too"
+                )
+            if i > 0:
+                given = (st["x"], st["residual"], st["post"], st["comb"], st["pre"])
+                if any(
+                    g.data_ptr() != o.data_ptr() for g, o in zip(given, outs[i - 1])
+                ):
+                    raise RuntimeError(
+                        f"layer {i}'s inputs are not layer {i - 1}'s outputs"
+                    )
+            x, res, post, comb, pre = (
+                st[k] for k in ("x", "residual", "post", "comb", "pre")
+            )
+            aux = st.get("aux")
+            if moves and i > 0:
+                # seamed: the layer before's tail ran this layer's seam into its state
+                m0 = res.shape[0]
+                state, post, comb, pre = self._xl_seam(m0, i)
+                res = self.seam_res(state, m0)
+                off, nb = seam.seam_state_layout(m0)["lin"]
+                x = state[off : off + nb].view(torch.bfloat16).view(m0, HIDDEN)
+                aux = None
+            a1, m, fold, _, _ = self._k1_args(
+                st["w"], x, res, post, comb, pre, st["pos"], st["slot"], st["swa"],
+                st["swa_block"], st["keys"], False, False, aux,
+            )  # fmt: skip
+            mids = None
+            if moves and i > 0:
+                # its gates' outputs, which its FFN seam reads (``layer.seam_gates``)
+                mids = (res, post, comb, pre)
+            elif not moves and i < n - 1:
+                # R_new and the gates' outputs, which its FFN seam's CTAs read: a set of its own
+                mids = self._xl_mids(m, i)
+            if mids is not None:
+                a1 |= {
+                    k: t.data_ptr()
+                    for k, t in zip(
+                        ("res_out", "post_out", "comb_out", "pre_out"), mids
+                    )
+                }
+            a2, _, comp = self._k2_args(
+                st["aw"], st["fw"], m, st["pos"], st["swa"], st["swa_block"],
+                st["comp"], st["comp_block"], out,
+            )  # fmt: skip
+            if (
+                not (fold and self.chains(m))
+                or M not in (None, m)
+                or compressed not in (None, comp)
+            ):
+                raise RuntimeError(
+                    "a multi-layer launch: one width and kind, a post owed"
+                )
+            M, compressed = m, comp
+            a2 |= dict.fromkeys(EG_ARGS + SEAM_ARGS + L2_ARGS, 0)
+            a2 |= {"nx_aux_stride": HIDDEN, "seam_in": 0}
+            if moves and i > 0:
+                a2["seam_in"] = state.data_ptr()
+            if moves and i < n - 1:
+                # the next layer's seam into its state, its capture into its aux
+                naux = steps[i + 1].get("aux")
+                if naux is not None:
+                    self._check_aux(naux, m)
+                a2 |= {
+                    "nx_aux": 0 if naux is None else naux.data_ptr(),
+                    "nx_aux_stride": HIDDEN if naux is None else naux.stride(0),
+                    "seam_out": self._xl_seam(m, i + 1)[0].data_ptr(),
+                }
+            eg = st.get("eg")
+            if eg is not None:
+                ex, ew = eg
+                if not (
+                    ex.dtype == torch.bfloat16
+                    and tuple(ex.shape) == (m, engram.K)
+                    and ex.is_contiguous()
+                ):
+                    raise RuntimeError(f"Engram rows: {tuple(ex.shape)} {ex.dtype}")
+                a2 |= {
+                    "eg_x": ex.data_ptr(),
+                    "eg_w": ew.w.data_ptr(),
+                    "eg_ws": ew.ws.data_ptr(),
+                    "eg_kv": self.egkv.data_ptr(),
+                    "eg_row0": ew.row0,
+                }
+            if tasks not in (None, eg[1].tasks if eg is not None else 0):
+                raise RuntimeError(
+                    "a multi-layer launch's layers project equal Engram shares"
+                )
+            tasks = eg[1].tasks if eg is not None else 0
+            vals = {n_: a1[n_] for n_ in K1_ARGS}
+            vals |= {n_: a2[k2_name.get(n_, n_)] for n_ in LAYER_ARGS[len(K1_ARGS) :]}
+            if i == 0:
+                step = {n_: vals[n_] for n_ in XL_STEP + XL_FIRST}
+            elif any(vals[n_] != step[n_] for n_ in XL_STEP):
+                raise RuntimeError(
+                    "a multi-layer launch's layers share their step's keys"
+                )
+            # the launch passes these itself (a later layer's inputs are the persistent
+            # outputs before it): a table stays the same from step to step
+            vals |= dict.fromkeys(XL_STEP + (XL_FIRST if i == 0 else ()), 0)
+            rows.append(xl_row(vals))
+        blob = b"".join(rows)
+        table = self._xl_tables.get(blob)
+        if table is None:
+            no_capture("a multi-layer launch's argument table")
+            table = torch.frombuffer(bytearray(blob), dtype=torch.uint8).to(self.device)
+            self._xl_tables[blob] = table
+        _run_compiled(
+            self.layers_kernel(M, compressed, tasks),
+            table.data_ptr(),
+            n,
+            self.scratch(M).data_ptr(),
+            self.peer.local,
+            self.peer.addresses.data_ptr(),
+            self.rank,
+            self.epoch.data_ptr(),
+            *(step[n_] for n_ in XL_STEP + XL_FIRST),
+            torch.cuda.current_stream(),
+        )
+        return outs
+
     def layer(
         self,
         w: K1Weights,
@@ -1237,6 +1471,7 @@ class DSV41MonoRunner:
         )
         a2 |= dict.fromkeys(EG_ARGS, 0)
         a2 |= dict.fromkeys(SEAM_ARGS, 0)
+        a2 |= dict.fromkeys(L2_ARGS, 0)
         a2["nx_aux_stride"] = HIDDEN
         a2["seam_in"] = seam_in.data_ptr() if seamed else 0
         if nxt is not None:
@@ -1245,10 +1480,14 @@ class DSV41MonoRunner:
             if nxt_aux is not None:
                 self._check_aux(nxt_aux, M)
             a2 |= {
-                "nx_fn": nxt.hc_fn.data_ptr(),
                 "nx_aux": 0 if nxt_aux is None else nxt_aux.data_ptr(),
                 "nx_aux_stride": HIDDEN if nxt_aux is None else nxt_aux.stride(0),
                 "seam_out": seam_out.data_ptr(),
+                # its front weights, loaded into the L2 at this launch's end
+                "nx_wqkv": nxt.wqkv.data_ptr(),
+                "nx_wqkv_s": nxt.wqkv_s.data_ptr(),
+                "nx_wqb": nxt.wqb.data_ptr(),
+                "nx_wqb_s": nxt.wqb_s.data_ptr(),
             }
         if eg is not None:
             rows, ew = eg

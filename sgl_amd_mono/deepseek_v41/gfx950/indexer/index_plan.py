@@ -12,7 +12,7 @@ device's truncation agree. A token's ``bound`` is the columns its scorer may rea
 
 import numpy as np
 
-from sgl_amd_mono.common.plan import cdiv, sel
+from sgl_amd_mono.common.plan import cdiv, imin, sel
 
 CHUNK = 128  # columns a score task: 16 tiles of 8 rows
 TOPK = 512
@@ -36,13 +36,30 @@ def score_chunks(bound):
     return sel(scored(bound), cdiv(bound, CHUNK), 0)
 
 
-def fill_walk_plan(*, bounds, owners, plan):
+# a context-parallel band no row reaches: every rank scores and selects whole rows
+NO_CP = 1 << 30
+
+
+def cp_chunks(bound, rank, tp, band):
+    """The scored chunks [lo, hi) of a token that rank ``rank`` of ``tp`` scores and selects.
+
+    A token seeing ``band`` columns or more is context-parallel: each rank takes an equal run of
+    its chunks, the last rank the rest; below the band every rank takes all of them."""
+    n = score_chunks(bound)
+    on = bound >= band
+    per = sel(on, cdiv(n, tp), n)
+    lo = sel(on, imin(rank * per, n), 0)
+    return lo, imin(lo + per, n)
+
+
+def fill_walk_plan(*, bounds, owners, plan, cp=(0, 1, NO_CP)):
     """The FP4 plane's FULL-layer score tasks of a step, on the host.
 
     ``plan`` [ctas, 4] gets (lead, span, ch0, ch1) a CTA -- chunks [ch0, ch1) of a piece, the
     ``span`` tokens from ``lead``: at most WALK_ROWS adjacent tokens of one owner, scored off each
-    key load -- and zeros past the last task. A piece's chunks are split evenly at the smallest
-    width that fits ``ctas``, as one chunk wider leaves a wave per CTA a step behind the rest."""
+    key load -- and zeros past the last task. A piece's chunks run from the first of its rows'
+    ``cp_chunks`` (``cp``: rank, tp, band) to the last, split evenly at the smallest width that
+    fits ``ctas``, as one chunk wider leaves a wave per CTA a step behind the rest."""
     n, ctas = bounds.shape[0], plan.shape[0]
     plan.fill(0)
     t = np.arange(n)
@@ -51,9 +68,15 @@ def fill_walk_plan(*, bounds, owners, plan):
     run_first = np.maximum.accumulate(np.where(run_start, t, 0))
     lead = np.flatnonzero(run_start | ((t - run_first) % WALK_ROWS == 0))
     span = np.diff(lead, append=n)
-    need = np.maximum.reduceat(np.where(scored(bounds), cdiv(bounds, CHUNK), 0), lead)
+    rows = [cp_chunks(int(b), *cp) for b in bounds.tolist()]
+    base, need = [], []
+    for a, b in zip(lead.tolist(), (lead + span).tolist()):
+        live = [(lo, hi) for lo, hi in rows[a:b] if hi > lo]
+        base.append(min(lo for lo, _ in live) if live else 0)
+        need.append(max(hi for _, hi in live) - base[-1] if live else 0)
+    base, need = np.array(base, dtype=np.int64), np.array(need, dtype=np.int64)
     live = need > 0
-    lead, span, need = lead[live], span[live], need[live]
+    lead, span, base, need = lead[live], span[live], base[live], need[live]
     if not need.size:
         return
     assert need.size < ctas, (need.size, ctas)
@@ -68,8 +91,8 @@ def fill_walk_plan(*, bounds, owners, plan):
     tasks = plan[: piece.size]
     tasks[:, 0] = lead[piece]
     tasks[:, 1] = span[piece]
-    tasks[:, 2] = i * need[piece] // k[piece]
-    tasks[:, 3] = (i + 1) * need[piece] // k[piece]
+    tasks[:, 2] = base[piece] + i * need[piece] // k[piece]
+    tasks[:, 3] = base[piece] + (i + 1) * need[piece] // k[piece]
 
 
 # a REINDEX token's chunks at most: its candidate blocks' rows

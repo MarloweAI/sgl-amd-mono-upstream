@@ -3,7 +3,11 @@
 (``topk_one.cuh``): its split path's histogram and select meet at an in-launch barrier on one
 XCC instead of a kernel boundary. A candidate producer's two selections, its top-512 columns and
 its top-2048 blocks, share one launch (``transform_paged_pair``). The selected sets are SGLang's;
-built with SGLang's JIT against its own top-k header."""
+built with SGLang's JIT against its own top-k header.
+
+Across a TP group (``TopKCp``, its own module ``topk_cp.cuh``; ``Exchange``), a long row is
+context-parallel: each rank selects in its run of the row's chunks, and every rank takes the row's
+top k of all the ranks' picks."""
 
 from __future__ import annotations
 
@@ -29,11 +33,16 @@ MAX_ROWS = 8  # a row an XCC
 _XCC = 8
 _PROBLEMS = 2  # a workspace row a row and selection of the pair
 _HIST_BINS, _MAX_TIES, _CTR_WORDS = 4096, 2048, 32
+_MAX_K = 2048  # a selection's k at most
+CP_RANKS = 8  # a context-parallel launch's ranks at most
 
 
-@functools.cache
-def module():
-    """The JIT module, built at first use."""
+def cp_cells_bytes(tp: int) -> int:
+    """A rank's context-parallel cells: [parity][selection][source rank][row][k] of 8 bytes."""
+    return 2 * _PROBLEMS * tp * MAX_ROWS * _MAX_K * 8
+
+
+def _load(name: str, src: str, wrappers: list):
     import sglang
     from sglang.kernels.jit.utils import load_jit
     from sglang.srt.environ import envs
@@ -42,14 +51,37 @@ def module():
     # since sglang#47960 the top-k header needs the exactness mode SGLang's own top-k uses
     mode = getattr(envs, "SGLANG_TOPK_V2_MODE", None)
     return load_jit(
+        name,
+        cuda_files=[str(Path(__file__).with_name(src))],
+        cuda_wrappers=wrappers,
+        extra_cuda_cflags=[] if mode is None else [f"-DSGL_TOPK_MODE={mode.get()}"],
+        extra_include_paths=[str(csrc)],
+    )
+
+
+@functools.cache
+def cp_module():
+    """The context-parallel launches' JIT module, built at first use."""
+    return _load(
+        "sgl_amd_mono_dsv41_topk_cp",
+        "topk_cp.cuh",
+        [
+            ("transform_paged_cp", "TopKCp::transform_paged_cp"),
+            ("transform_paged_pair_cp", "TopKCp::transform_paged_pair_cp"),
+        ],
+    )
+
+
+@functools.cache
+def module():
+    """The JIT module, built at first use."""
+    return _load(
         "sgl_amd_mono_dsv41_topk_one",
-        cuda_files=[str(Path(__file__).with_name("topk_one.cuh"))],
-        cuda_wrappers=[
+        "topk_one.cuh",
+        [
             ("transform_paged", "TopKOne::transform_paged"),
             ("transform_paged_pair", "TopKOne::transform_paged_pair"),
         ],
-        extra_cuda_cflags=[] if mode is None else [f"-DSGL_TOPK_MODE={mode.get()}"],
-        extra_include_paths=[str(csrc)],
     )
 
 
@@ -94,3 +126,70 @@ class TopKOne:
             scores, seq_lens, page_table, page_indices, raw_indices, page_size,
             block_scores, block_lens, block_ids, self.hist, self.ctr, self.ties,
         )  # fmt: skip
+
+
+class TopKCp:
+    """The context-parallel launches on one rank: each row's own picks and exchange parity, beside
+    a ``TopKOne``'s workspace (``one``), and the group's ``Exchange``."""
+
+    def __init__(self, one: TopKOne, exchange: "Exchange"):
+        i32 = dict(dtype=torch.int32, device=one.hist.device)
+        slots = _PROBLEMS * MAX_ROWS
+        self.one, self.exchange = one, exchange
+        self.picks = torch.zeros(slots * _MAX_K, **i32)
+        self.parity = torch.zeros(slots, **i32)
+        # every rank's cells of a row and selection, and their values, for the merge
+        cells = slots * CP_RANKS * _MAX_K
+        self.vals = torch.zeros(cells, dtype=torch.float32, device=one.hist.device)
+        self.keys = torch.zeros(cells, dtype=torch.int64, device=one.hist.device)
+
+    def _ws(self, band):
+        one = self.one
+        return (
+            one.hist, one.ctr, one.ties, self.picks, self.parity, self.vals, self.keys,
+            *self.exchange.args(band),
+        )  # fmt: skip
+
+    def transform_paged(
+        self, *, scores, seq_lens, page_table, page_indices, page_size, raw_indices, band,
+    ) -> None:  # fmt: skip
+        """``TopKOne.transform_paged``, rows seeing ``band`` columns or more context-parallel."""
+        cp_module().transform_paged_cp(
+            scores,
+            seq_lens,
+            page_table,
+            page_indices,
+            raw_indices,
+            page_size,
+            *self._ws(band),
+        )
+
+    def transform_paged_pair(
+        self, *, scores, seq_lens, page_table, page_indices, page_size, raw_indices,
+        block_scores, block_lens, block_ids, band,
+    ) -> None:  # fmt: skip
+        """``TopKOne.transform_paged_pair``, context-parallel as ``transform_paged``."""
+        cp_module().transform_paged_pair_cp(
+            scores, seq_lens, page_table, page_indices, raw_indices, page_size,
+            block_scores, block_lens, block_ids, *self._ws(band),
+        )  # fmt: skip
+
+
+class Exchange:
+    """A TP group's context-parallel top-k exchange on one rank: its cells, an uncached
+    ``PeerBuffer`` with every peer's mapped, built collectively over ``group``."""
+
+    def __init__(self, *, rank: int, tp: int, group, device: torch.device):
+        from sgl_amd_mono.common.peer import PeerBuffer
+
+        if not 2 <= tp <= CP_RANKS:
+            raise RuntimeError(
+                f"context-parallel top-k: {tp} ranks, built for 2 to {CP_RANKS}"
+            )
+        self.rank, self.tp = rank, tp
+        self.buf = PeerBuffer(cp_cells_bytes(tp), group, rank, tp, device)
+        self.buf.bytes.zero_()
+
+    def args(self, band: int) -> tuple:
+        """A launch's exchange arguments, rows seeing ``band`` columns or more context-parallel."""
+        return (self.buf.local, self.buf.addresses, self.rank, self.tp, band)

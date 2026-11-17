@@ -20,12 +20,16 @@ from sgl_amd_mono.deepseek_v41.gfx950.stages.gemv import (
     token_tiles,
 )
 from sgl_amd_mono.deepseek_v41.gfx950.stages.router import PARTS as ROUTER_PARTS
+from sgl_amd_mono.deepseek_v41.gfx950.stages.seam import HIDDEN
 
 EXPERTS, TOPK = 384, 6  # DeepSeek-V4.1-Flash routing
 ROUTER0 = 8  # the router's first task: past the xq tasks (a token each)
 MASK_WORDS = 2  # an expert's token bitmap in the route table: tokens <= 64
-ROW_SLICES = 40  # a token row's CTAs in the per-row MoE: 128 hidden rows each (``RouteShape.row_moe``)
-ROW_CTAS = 240  # the per-row MoE's CTAs at most: 6 rows
+# a token row's CTAs in the per-row MoE (``row_slice_counts``): the most of these that fit ``ROW_CTAS``, 40 of
+# 128 hidden rows each up to 6 rows, 32 of 160 at 7; whole MFMA tiles, and a multiple of 8, so a CTA's XCD class
+# is its slice's
+ROW_SLICES = (40, 32)
+ROW_CTAS = 240  # the per-row MoE's CTAs at most
 ROW_SHARED = 18  # the per-row MoE's shared expert units: on the last CTAs, past every row's ug units
 # the per-row MoE's fewest rows a TP: a row's ug bytes a CTA are fixed (its topk experts' share over
 # its 40 CTAs), the deduplicated split's grow with the experts a step routes; at TP4 (twice TP8's
@@ -126,7 +130,7 @@ class RouteShape(msgspec.Struct, frozen=True):
             self.tp in ROW_MIN_TOKENS
             and self.tokens >= ROW_MIN_TOKENS[self.tp]
             and not self.multi
-            and self.tokens * ROW_SLICES <= ROW_CTAS
+            and self.row_slices > 0
             and (self.experts, self.topk) == (EXPERTS, TOPK)
         )
 
@@ -139,9 +143,33 @@ class RouteShape(msgspec.Struct, frozen=True):
         return self.tp == 4 and self.multi and not self.row_moe
 
     @property
+    def spill_ug(self) -> bool:
+        """The placed ug tasks past two rounds from the shared-unit CTAs on (``moe.spill_task``), not on the
+        CTAs with two already: TP4, one token tile, the target's route. A TP4 ug task carries twice TP8's
+        bytes, and a third task on a CTA ends past every other CTA's down."""
+        return (
+            self.tp == 4
+            and not self.multi
+            and not self.row_moe
+            and (self.experts, self.topk) == (EXPERTS, TOPK)
+        )
+
+    @property
+    def row_slices(self) -> int:
+        """A token row's CTAs in the per-row MoE (``row_slice_counts``); 0 where none fits."""
+        return next(
+            (n for n in row_slice_counts(self.tp) if self.tokens * n <= ROW_CTAS), 0
+        )
+
+    @property
+    def row_tiles(self) -> int:
+        """A per-row MoE CTA's hidden rows, 16-row tiles: its row's slice."""
+        return HIDDEN // ROWS // self.row_slices
+
+    @property
     def row_ug_ctas(self) -> int:
         """The per-row MoE's ug CTAs: those below the shared units."""
-        return min(self.tokens * ROW_SLICES, self.shared0)
+        return min(self.tokens * self.row_slices, self.shared0)
 
     @property
     def shared_by_task(self) -> bool:
@@ -275,6 +303,18 @@ class RouteShape(msgspec.Struct, frozen=True):
 
     def tile_slot(self, tab, i):
         return fx.ptr_load(tab + (self.tile_slot0 + i))
+
+
+def row_slice_counts(tp: int) -> tuple[int, ...]:
+    """A TP's per-row MoE row CTAs (``ROW_SLICES``): 32 at TP8 only. A TP4 row carries twice TP8's
+    bytes, and at 7 rows its 32 CTAs (7 ug units, 10 down tiles each) end later than the deduplicated
+    split."""
+    return ROW_SLICES if tp == 8 else ROW_SLICES[:1]
+
+
+def row_widths(tp: int) -> range:
+    """The widths a TP's per-row MoE can take (``RouteShape.row_slices``): FCELL's."""
+    return range(1, ROW_CTAS // min(row_slice_counts(tp)) + 1)
 
 
 def route_shape(key: MoeBuild) -> RouteShape:

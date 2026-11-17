@@ -50,6 +50,15 @@ SGLANG_READS = {
 
 COMPACT = ip.TOPK_BLOCKS * ip.BLOCK_ROWS  # a REINDEX row's candidate columns
 KINDS = ("full", "producer", "reindex")
+# the columns from which a two-level step's FULL or producer row is context-parallel, by TP: where the
+# ranks' exchange and merge cost less than the 1/TP scoring and selection save (FULL ratio-2 columns are
+# half the positions, a producer's all of them)
+CP_BAND = {
+    ("full", 4): 340 * 1024,
+    ("full", 8): 384 * 1024,
+    ("producer", 4): 660 * 1024,
+    ("producer", 8): 700 * 1024,
+}
 
 
 def _roundup(x: int, m: int) -> int:
@@ -84,9 +93,10 @@ class Selection(NamedTuple):
 
 class K2iRunner:
     """K2i on one device, for rows up to MAX_ROWS and column bounds up to
-    ``bound_max``."""
+    ``bound_max``; with ``exchange`` (``topk_one.Exchange``), a two-level step's FULL and
+    producer rows past ``CP_BAND`` are context-parallel over its TP group."""
 
-    def __init__(self, device: torch.device, bound_max: int):
+    def __init__(self, device: torch.device, bound_max: int, exchange=None):
         f32 = dict(dtype=torch.float32, device=device)
         i32 = dict(dtype=torch.int32, device=device)
         self.bound_max = _roundup(max(bound_max, COMPACT), ip.CHUNK)
@@ -110,15 +120,17 @@ class K2iRunner:
             **i32
         )
         self.one = topk_one.TopKOne(device)
+        self.exchange = exchange
+        self.cp = topk_one.TopKCp(self.one, exchange) if exchange is not None else None
         self._kernels: dict = {}
 
-    def kernel(self, rows: int, blocks: bool = False):
+    def kernel(self, rows: int, blocks: bool = False, cp: bool = False):
         from ..runner import no_capture
 
-        if (rows, blocks) not in self._kernels:
+        if (rows, blocks, cp) not in self._kernels:
             no_capture(f"K2i width {rows}")
-            self._kernels[rows, blocks] = build_k2i(rows, blocks)
-        return self._kernels[rows, blocks]
+            self._kernels[rows, blocks, cp] = build_k2i(rows, blocks, cp)
+        return self._kernels[rows, blocks, cp]
 
     def run_glue(self, rows: int, sel: Selection) -> None:
         """A selection's glue (``Selection.glue``) as its own launch, for the tests: what the
@@ -212,6 +224,7 @@ class K2iRunner:
         page_out: torch.Tensor,  # int32 [rows, 512]: sparse_page_indices
         candidates=None,  # a REINDEX layer's: the producer's CandidateBlocks
         fill_plan=True,  # FULL / producer: the step's first of ``ratio`` lays out its walk plan
+        two_level=False,  # the step filters candidates: its long rows may be context-parallel
     ) -> Selection:
         """An index source's top-512 of each row (``kind`` in KINDS).
 
@@ -219,7 +232,11 @@ class K2iRunner:
         them lays out (``fill_plan``). A producer returns its candidate blocks for the step's
         REINDEX layers and, as its K2's glue, their candidate table (``index_glue.TABLE``); a
         REINDEX layer's top-k writes its page indices through that table, and its K2's glue
-        its raw indices (``index_glue.RAWS``)."""
+        its raw indices (``index_glue.RAWS``).
+
+        On a ``two_level`` step with an exchange, a FULL or producer row seeing CP_BAND columns
+        or more is scored and selected context-parallel: each rank its run of the row's chunks,
+        then the ranks' top-k merge exactly (``topk_one``)."""
         from ..stages import index_glue
 
         assert kind in KINDS, kind
@@ -246,13 +263,20 @@ class K2iRunner:
             glue = {"gl_cols": pos, "gl_ids_out": ids, "gl_raw": raw_out}
             return Selection(None, (index_glue.RAWS, glue))
         producer = kind == "producer"
-        logits = self.score(ratio=ratio, fill_plan=fill_plan, blocks=producer, **inputs)
+        band = self._band(kind, rows) if two_level else None
+        logits = self.score(
+            ratio=ratio, fill_plan=fill_plan, blocks=producer, band=band, **inputs
+        )  # fmt: skip
         cols = dict(
             scores=logits, seq_lens=bounds, page_table=page_table, page_indices=page_out,
             page_size=PLANE_ROWS, raw_indices=raw_out,
         )  # fmt: skip
         if not producer:
-            self._paged_topk(**cols)
+            if band is not None:
+                self._cp_launch()
+                self.cp.transform_paged(**cols, band=band)
+            else:
+                self._paged_topk(**cols)
             return Selection(None, None)
         # SGLang's level one on K2i's block maxima: the top TOPK_BLOCKS of each row's first
         # ceil(bound / 8), as ``select_candidate_blocks_hip`` takes them
@@ -262,7 +286,13 @@ class K2iRunner:
             scores=self.bmax[: rows * self.bstride].view(rows, self.bstride)[:, :nb],
             seq_lens=self.blens[:rows],
         )
-        if topk_one.TopKOne.fits(rows):
+        if band is not None:
+            self._cp_launch()
+            self.cp.transform_paged_pair(
+                **cols, block_scores=blocks["scores"], block_lens=blocks["seq_lens"], block_ids=ids,
+                band=band,
+            )  # fmt: skip
+        elif topk_one.TopKOne.fits(rows):
             self._one_launch()
             self.one.transform_paged_pair(
                 **cols,
@@ -294,6 +324,20 @@ class K2iRunner:
         }  # fmt: skip
         return Selection(published, (index_glue.TABLE, glue))
 
+    def _band(self, kind: str, rows: int):
+        """A FULL or producer launch's context-parallel band in columns, None where its rows
+        stay whole: no exchange, or more rows than the one-launch top-k takes."""
+        if self.exchange is None or not topk_one.TopKOne.fits(rows):
+            return None
+        return CP_BAND[kind, self.exchange.tp]
+
+    def _cp_launch(self) -> None:
+        """The context-parallel top-k's module, built outside graph capture."""
+        if not topk_one.cp_module.cache_info().currsize:
+            from ..runner import no_capture
+
+            no_capture("the context-parallel top-k")
+
     def _one_launch(self) -> None:
         """The one-launch top-k's module, built outside graph capture."""
         if not topk_one.module.cache_info().currsize:
@@ -312,11 +356,12 @@ class K2iRunner:
 
     def score(
         self, *, rows, per_req, ratio, query, plane, page_table, bounds, fill_plan=True,
-        blocks=False,
+        blocks=False, band=None,
     ) -> torch.Tensor:  # fmt: skip
         """A FULL or producer layer's logits [rows, width] f32, valid below each row's bound
         (``fill_plan``: laying out the step's walk plan of ``ratio`` first; ``blocks``: a
-        producer's, also its block maxima and lengths).
+        producer's, also its block maxima and lengths; ``band``: context-parallel past it, a plan of
+        this rank's chunks of each row, ``index_plan.cp_chunks``, valid only there).
 
         ``width`` spans the page table's columns, as wide as SGLang's logits for its top-k."""
         width = min(page_table.shape[1] * PLANE_ROWS, self.bound_max)
@@ -326,6 +371,7 @@ class K2iRunner:
             itab_stride=page_table.stride(0), itab_len=page_table.shape[1],
             ibatch=self.owners[per_req - 1], ishift=3, ibound=bounds, lstride=width,
             reindex=0, fill_plan=int(fill_plan), blocks=blocks,
+            cp=None if band is None else (self.exchange.rank, self.exchange.tp, band),
         )  # fmt: skip
         return self.ilog[: rows * width].view(rows, width)
 
@@ -353,16 +399,16 @@ class K2iRunner:
 
     def _score(
         self, *, rows, query, plane, plan, itab, itab_stride, itab_len, ibatch, ishift,
-        ibound, lstride, reindex, fill_plan, blocks=False,
+        ibound, lstride, reindex, fill_plan, blocks=False, cp=None,
     ) -> None:  # fmt: skip
         q_fp4, q_scale, weights = query
         payload, scale = plane
         _run_compiled(
-            self.kernel(rows, blocks),
+            self.kernel(rows, blocks, cp is not None),
             q_fp4.data_ptr(), q_scale.data_ptr(), weights.data_ptr(), payload.data_ptr(), scale.data_ptr(),
             plan.data_ptr(), itab.data_ptr(), itab_stride, itab_len, ibatch.data_ptr(), ishift,
             ibound.data_ptr(), self.ilog.data_ptr(), lstride, reindex, fill_plan,
-            self.bmax.data_ptr(), self.bstride, self.blens.data_ptr(),
+            self.bmax.data_ptr(), self.bstride, self.blens.data_ptr(), *(cp or ()),
             torch.cuda.current_stream(),
         )  # fmt: skip
 

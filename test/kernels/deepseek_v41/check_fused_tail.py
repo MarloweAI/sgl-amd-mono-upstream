@@ -27,7 +27,14 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-VOCAB, T, K, HC, EPS = 129280, 6, 5120, 4, 1e-6
+# T: a request's verify rows (DSpark block + 1), 6 unless DSV41_CHECK_ROWS says
+VOCAB, T, K, HC, EPS = (
+    129280,
+    int(os.environ.get("DSV41_CHECK_ROWS", "6")),
+    5120,
+    4,
+    1e-6,
+)
 
 
 def head_weights(model, rank, part):
@@ -144,10 +151,11 @@ def run_reference(x, w, a, o, tail, target_out=None):
     from sgl_amd_mono.deepseek_v41.gfx950.headgemm import ops as hg_ops
 
     logits = torch.empty(x.shape[0], w.shape[0], dtype=torch.bfloat16, device=x.device)
-    for r in range(
-        0, x.shape[0], T
-    ):  # headgemm stages x in at most 64 KB of LDS; rows are independent
-        hg_ops().head_gemm(x[r : r + T], w, logits[r : r + T], 13)
+    step = (
+        64 * 1024 // (x.shape[1] * 2)
+    )  # headgemm stages x in at most 64 KB of LDS; rows are independent
+    for r in range(0, x.shape[0], step):
+        hg_ops().head_gemm(x[r : r + step], w, logits[r : r + step], 13)
     tail(
         logits,
         a["cand"],
@@ -518,17 +526,16 @@ def main():
 
         sync = lambda: dist.barrier()  # noqa: E731
         norm()
-        t = {
-            name: graph_us(fn, args.reps, sync)
-            for name, fn in (
-                ("norm + one launch", ours),
-                ("norm + hipBLASLt + vtail", separate),
-                ("one launch", lambda: run_fused(ft, normed, w, a, o)),
-                ("norm", norm),
-                ("hipBLASLt", lambda: F.linear(normed, w)),
-                ("headgemm v13", lambda: hg_ops().head_gemm(normed, w, out, 13)),
-            )
-        }
+        fns = [
+            ("norm + one launch", ours),
+            ("norm + hipBLASLt + vtail", separate),
+            ("one launch", lambda: run_fused(ft, normed, w, a, o)),
+            ("norm", norm),
+            ("hipBLASLt", lambda: F.linear(normed, w)),
+        ]
+        if normed.numel() * 2 <= 64 * 1024:  # headgemm's x in LDS
+            fns.append(("headgemm v13", lambda: hg_ops().head_gemm(normed, w, out, 13)))
+        t = {name: graph_us(fn, args.reps, sync) for name, fn in fns}
         say(
             f"time {mode} bs {bs}: "
             + ", ".join(f"{k} {v:.2f} us" for k, v in t.items())
