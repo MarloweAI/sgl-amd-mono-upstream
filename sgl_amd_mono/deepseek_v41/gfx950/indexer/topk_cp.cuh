@@ -24,6 +24,8 @@ struct Cp {
   const uint64_t* __restrict__ peers;  // [tp] addresses of every rank's cells
   int32_t* __restrict__ picks;         // [kMaxProblems][kMaxRows][kMaxTopK]
   uint32_t* __restrict__ parity;       // [kMaxProblems][kMaxRows]
+  float* __restrict__ vals;            // [kMaxProblems][kMaxRows][kCpMaxRanks * kMaxTopK]: the cells' values
+  uint64_t* __restrict__ keys;         // the same, the cells
   uint32_t rank, tp, band;
 };
 
@@ -57,25 +59,20 @@ SGL_DEVICE uint64_t cp_none(uint32_t i) {
 SGL_DEVICE int32_t cp_column(uint64_t cell) {
   return (cell >> 32) == 0 ? -1 : static_cast<int32_t>(0x7FFFFFFFu - (static_cast<uint32_t>(cell) & 0x7FFFFFFFu));
 }
-constexpr uint32_t kCpDigitBits = 11;
-constexpr uint32_t kCpBins = 1u << kCpDigitBits;
-constexpr uint32_t kCpWaves = kBlockSize / 64;
+constexpr uint32_t kCpMaxTies = 2048;  // ties at the k-th value ranked in LDS; more take a slower pass
 
 struct CpSmem {
-  uint32_t hist[kCpBins];
-  uint32_t wave_sum[kCpWaves];
-  uint32_t bin, above, inbin, count;
-  unsigned long long lo, hi;
+  int32_t sel[kMaxTopK];
+  uint32_t tie_col[kCpMaxTies];
+  uint32_t vk;  // the k-th value's exact key (SGLang's order-preserving map)
+  uint32_t above, ties, count;
 };
 
-/// A context-parallel row's LDS: the selection's, then (once it is dead) the merge's keys and picks.
-union CpLds {
+/// A context-parallel row's LDS: the local selection's, then the merge's (the selection's buffer is
+/// reused by the merge's own SGLang selection over the cells).
+struct CpLds {
   impl::MaxSmem<Register4::Smem, Streaming::Smem, TopKSplit::Smem> select;
-  struct {
-    CpSmem m;
-    uint64_t keys[kCpMaxRanks * kMaxTopK];
-    uint64_t taken[kMaxTopK];
-  } merge;
+  CpSmem m;
 };
 SGL_DEVICE CpLds& cp_lds() {
   __shared__ CpLds lds;
@@ -132,17 +129,129 @@ SGL_DEVICE int32_t cp_pick(const int32_t* picks, uint32_t t) {
   return __hip_atomic_load(const_cast<int32_t*>(picks + t), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 }
 
+SGL_DEVICE float cp_value(uint64_t cell) {
+  const uint32_t hi = static_cast<uint32_t>(cell >> 32);
+  if (hi == 0) return -INFINITY;  // no pick
+  return __uint_as_float((hi & 0x80000000u) ? (hi & 0x7FFFFFFFu) : ~hi);
+}
+
+/// The row's top k of the `n` cells of selection `p` (every rank's), each cell zeroed for the launch
+/// after next once read: `emit(pos, cell)`, pos 0 .. k - 1. SGLang's one-block top-k of the cells'
+/// values finds the k-th value; the cells above it are in, and of those equal to it the lowest columns.
+template <typename Emit>
+SGL_DEVICE void cp_top(const Cp& cp, uint32_t q, uint32_t p, uint32_t row, uint32_t k, uint32_t n, const Emit& emit) {
+  auto& lds = cp_lds();
+  auto& m = lds.m;
+  const auto tx = threadIdx.x;
+  const size_t at0 = (static_cast<size_t>(p) * kMaxRows + row) * (kCpMaxRanks * kMaxTopK);
+  float* const vals = cp.vals + at0;
+  uint64_t* const keys = cp.keys + at0;
+  // every cell's load in flight together (up to 4 a thread at once), then a poll of those not in yet
+  constexpr uint32_t kBatch = 4;
+#pragma unroll 1
+  for (uint32_t j0 = tx; j0 < n; j0 += kBatch * kBlockSize) {
+    uint64_t v[kBatch];
+#pragma unroll
+    for (uint32_t u = 0; u < kBatch; ++u) {
+      const uint32_t j = j0 + u * kBlockSize;
+      v[u] = j < n ? __hip_atomic_load(cp.cells + cp_slot(cp, q, p, j / k, row) + j % k, __ATOMIC_RELAXED,
+                                       __HIP_MEMORY_SCOPE_SYSTEM)
+                   : 1;
+    }
+#pragma unroll
+    for (uint32_t u = 0; u < kBatch; ++u) {
+      const uint32_t j = j0 + u * kBlockSize;
+      if (j >= n) continue;
+      auto* const at = cp.cells + cp_slot(cp, q, p, j / k, row) + j % k;
+      uint32_t spins = 0;
+      while (v[u] == 0) {
+        __builtin_amdgcn_s_sleep(1);
+        if (++spins == kCpSpinLimit) __builtin_trap();
+        v[u] = __hip_atomic_load(at, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+      }
+      __hip_atomic_store(at, uint64_t{0}, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+      keys[j] = v[u];
+      vals[j] = cp_value(v[u]);
+    }
+  }
+  if (tx == 0) {
+    m.vk = ~0u;
+    m.above = m.ties = m.count = 0;
+  }
+  drain();
+  __syncthreads();
+  // SGLang's one-block top-k of the n values (n <= kReg4MaxSeqLen): its k-th value
+  static_assert(kCpMaxRanks * kMaxTopK <= kReg4MaxSeqLen);
+  TopKProblem problem{.in = vals, .out = m.sel, .topk = k, .seq_len = n};
+  Register4::forward<false>(problem, &lds.select);
+  __syncthreads();
+  {
+    uint32_t vk = ~0u;
+    for (uint32_t t = tx; t < k; t += kBlockSize) vk = min(vk, impl::extract_exact_bin(vals[m.sel[t]]));
+#pragma unroll
+    for (uint32_t o = 32; o > 0; o >>= 1) vk = min(vk, static_cast<uint32_t>(__shfl_xor(vk, o, 64)));
+    if (tx % 64 == 0) atomicMin(&m.vk, vk);
+  }
+  __syncthreads();
+  // the cells above the k-th value are in; of those equal to it (as floats, SGLang's ties), the
+  // lowest columns fill the rest
+  const uint32_t vkb = m.vk;
+  const float vk = __uint_as_float((vkb & 0x80000000u) ? (vkb & 0x7FFFFFFFu) : ~vkb);
+#pragma unroll 1
+  for (uint32_t j = tx; j < n; j += kBlockSize) {
+    const float v = vals[j];
+    if (v > vk) {
+      atomicAdd(&m.above, 1u);
+    } else if (v == vk) {
+      const uint32_t t = atomicAdd(&m.ties, 1u);
+      if (t < kCpMaxTies) m.tie_col[t] = static_cast<uint32_t>(cp_column(keys[j]));
+    }
+  }
+  __syncthreads();
+  const uint32_t need = k - m.above, ties = m.ties;
+  const uint64_t below = (uint64_t{1} << (tx % 64)) - 1;
+#pragma unroll 1
+  for (uint32_t j0 = 0; j0 < n; j0 += kBlockSize) {
+    const uint32_t j = j0 + tx;
+    bool take = false;
+    uint64_t key = 0;
+    if (j < n) {
+      const float v = vals[j];
+      key = keys[j];
+      if (v > vk) {
+        take = true;
+      } else if (v == vk) {
+        if (ties == need) {
+          take = true;
+        } else {
+          // rank among the ties by column
+          const uint32_t col = static_cast<uint32_t>(cp_column(key));
+          uint32_t rank = 0;
+          if (ties <= kCpMaxTies) {
+            for (uint32_t t = 0; t < ties; ++t) rank += m.tie_col[t] < col;
+          } else {
+            for (uint32_t i = 0; i < n; ++i)
+              rank += vals[i] == vk && static_cast<uint32_t>(cp_column(keys[i])) < col;
+          }
+          take = rank < need;
+        }
+      }
+    }
+    // a wave's takes get consecutive places, one LDS atomic a wave
+    const uint64_t mask = __ballot(take);
+    uint32_t base = 0;
+    if (tx % 64 == 0 && mask != 0) base = atomicAdd(&m.count, static_cast<uint32_t>(__popcll(mask)));
+    base = __shfl(base, 0, 64);
+    if (take) emit(base + __popcll(mask & below), key);
+  }
+}
+
 /// Selection `p` of a context-parallel row: this rank's `k` picks (columns of `scores_row`) go
 /// to every rank, then the row's top k of every rank's cells is `emit(pos, cell)`, pos 0 .. k - 1.
-/// The cells sit in LDS; a key leaves the set (taken or dropped) as 0.
 template <typename Emit>
 SGL_DEVICE void cp_merge(
     const Cp& cp, const int32_t* picks, const float* scores_row, uint32_t p, uint32_t row, uint32_t k,
     const Emit& emit) {
-  auto& lds = cp_lds().merge;
-  auto& m = lds.m;
-  uint64_t* const keys = lds.keys;
-  uint64_t* const taken = lds.taken;
   const auto tx = threadIdx.x;
   uint32_t* const parity = cp.parity + p * kMaxRows + row;
   const uint32_t q = *parity & 1u;
@@ -169,138 +278,7 @@ SGL_DEVICE void cp_merge(
       __hip_atomic_store(base + t, cell, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
     }
   }
-  // every rank's cells: one load of each in flight together, then a poll of the ones not in yet
-  const uint32_t n = cp.tp * k;
-  constexpr uint32_t kBatch = 4;
-#pragma unroll 1
-  for (uint32_t j0 = tx; j0 < n; j0 += kBatch * kBlockSize) {
-    uint64_t v[kBatch];
-#pragma unroll
-    for (uint32_t u = 0; u < kBatch; ++u) {
-      const uint32_t j = j0 + u * kBlockSize;
-      v[u] = j < n ? __hip_atomic_load(cp.cells + cp_slot(cp, q, p, j / k, row) + j % k, __ATOMIC_RELAXED,
-                                       __HIP_MEMORY_SCOPE_SYSTEM)
-                   : 0;
-    }
-#pragma unroll
-    for (uint32_t u = 0; u < kBatch; ++u)
-      if (j0 + u * kBlockSize < n) keys[j0 + u * kBlockSize] = v[u];
-  }
-#pragma unroll 1
-  for (uint32_t j = tx; j < n; j += kBlockSize) {
-    auto* const at = cp.cells + cp_slot(cp, q, p, j / k, row) + j % k;
-    uint64_t key = keys[j];
-    uint32_t spins = 0;
-    while (key == 0) {
-      __builtin_amdgcn_s_sleep(1);
-      if (++spins == kCpSpinLimit) __builtin_trap();
-      key = __hip_atomic_load(at, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-    }
-    keys[j] = key;
-    __hip_atomic_store(at, uint64_t{0}, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);  // for the launch after next
-  }
-  // the top k of the n distinct keys: each round takes kCpDigitBits from the live keys' highest differing bit
-  uint32_t remain = k;
-  const uint32_t lane = tx % 64, wave = tx / 64;
-  const uint64_t below = (uint64_t{1} << lane) - 1;
-  if (tx == 0) {
-    m.count = 0;
-    m.lo = ~0ull;
-    m.hi = 0;
-  }
-  __syncthreads();
-  // the live range: here from every key, then from the keys a round keeps
-  auto range = [&](unsigned long long lo, unsigned long long hi) {
-#pragma unroll
-    for (uint32_t o = 32; o > 0; o >>= 1) {
-      lo = min(lo, static_cast<unsigned long long>(__shfl_xor(lo, o, 64)));
-      hi = max(hi, static_cast<unsigned long long>(__shfl_xor(hi, o, 64)));
-    }
-    if (lane == 0) {
-      atomicMin(&m.lo, lo);
-      atomicMax(&m.hi, hi);
-    }
-  };
-  {
-    unsigned long long lo = ~0ull, hi = 0;
-#pragma unroll 1
-    for (uint32_t j = tx; j < n; j += kBlockSize) {
-      lo = min(lo, static_cast<unsigned long long>(keys[j]));
-      hi = max(hi, static_cast<unsigned long long>(keys[j]));
-    }
-    range(lo, hi);
-  }
-#pragma unroll 1
-  while (true) {
-    for (uint32_t b = tx; b < kCpBins; b += kBlockSize) m.hist[b] = 0;
-    __syncthreads();
-    const unsigned long long diff = m.hi ^ m.lo;
-    const uint32_t top = diff == 0 ? 0 : 63 - __clzll(diff);  // the highest differing bit
-    const uint32_t shift = top >= kCpDigitBits - 1 ? top - (kCpDigitBits - 1) : 0;
-#pragma unroll 1
-    for (uint32_t j = tx; j < n; j += kBlockSize) {
-      const uint64_t key = keys[j];
-      if (key != 0) atomicAdd(&m.hist[(key >> shift) & (kCpBins - 1)], 1u);
-    }
-    __syncthreads();
-    // bins from the top, two a thread: thread t holds bins kCpBins - 1 - 2t and the one below it
-    const uint32_t h0 = m.hist[kCpBins - 1 - 2 * tx], h1 = m.hist[kCpBins - 2 - 2 * tx];
-    uint32_t upto = h0 + h1;
-#pragma unroll
-    for (uint32_t o = 1; o < 64; o <<= 1) {
-      const uint32_t v = __shfl_up(upto, o, 64);
-      if (lane >= o) upto += v;
-    }
-    if (lane == 63) m.wave_sum[wave] = upto;
-    if (tx == 0) {
-      m.lo = ~0ull;
-      m.hi = 0;
-    }
-    __syncthreads();
-    for (uint32_t w = 0; w < wave; ++w) upto += m.wave_sum[w];
-    // upto counts the keys at or above bin kCpBins - 2 - 2t
-    const uint32_t at1 = upto, at0 = upto - h1;
-    if (at0 - h0 < remain && at0 >= remain) {
-      m.bin = kCpBins - 1 - 2 * tx;
-      m.above = at0 - h0;
-      m.inbin = h0;
-    } else if (at1 - h1 < remain && at1 >= remain) {
-      m.bin = kCpBins - 2 - 2 * tx;
-      m.above = at1 - h1;
-      m.inbin = h1;
-    }
-    __syncthreads();
-    const uint32_t bin = m.bin;
-    remain -= m.above;
-    const bool all = m.inbin == remain;  // the bin's keys all make it
-    unsigned long long lo = ~0ull, hi = 0;
-#pragma unroll 1
-    for (uint32_t j0 = 0; j0 < n; j0 += kBlockSize) {
-      const uint32_t j = j0 + tx;
-      const uint64_t key = j < n ? keys[j] : 0;
-      const uint32_t d = (key >> shift) & (kCpBins - 1);
-      const bool live = key != 0;
-      const bool take = live && (d > bin || (d == bin && all));
-      // a wave's takes get consecutive places, one LDS atomic a wave
-      const uint64_t mask = __ballot(take);
-      uint32_t base = 0;
-      if (mask != 0 && lane == static_cast<uint32_t>(__ffsll(static_cast<long long>(mask)) - 1))
-        base = atomicAdd(&m.count, static_cast<uint32_t>(__popcll(mask)));
-      base = __shfl(base, __ffsll(static_cast<long long>(mask)) - 1, 64);
-      if (take) taken[base + __popcll(mask & below)] = key;
-      if (live && (take || d < bin)) {
-        keys[j] = 0;
-      } else if (live) {
-        lo = min(lo, static_cast<unsigned long long>(key));
-        hi = max(hi, static_cast<unsigned long long>(key));
-      }
-    }
-    if (all) break;
-    range(lo, hi);
-    __syncthreads();
-  }
-  __syncthreads();
-  for (uint32_t pos = tx; pos < k; pos += kBlockSize) emit(pos, taken[pos]);
+  cp_top(cp, q, p, row, k, cp.tp * k, emit);
   if (tx == 0) *parity = q ^ 1u;
 }
 
@@ -380,6 +358,8 @@ struct TopKCp {
   static topk_one::Cp cp_of(
       const tvm::ffi::TensorView picks,
       const tvm::ffi::TensorView parity,
+      const tvm::ffi::TensorView vals,
+      const tvm::ffi::TensorView keys,
       const int64_t cells,
       const tvm::ffi::TensorView peers,
       const int64_t rank,
@@ -391,11 +371,15 @@ struct TopKCp {
     RuntimeCheck(peers.size(0) == tp, "an address a rank");
     RuntimeCheck(picks.size(0) == topk_one::kMaxProblems * topk_one::kMaxRows * kMaxTopK, "picks shape");
     RuntimeCheck(band > 0 && band <= 0x7FFFFFFF, "band");
+    constexpr int64_t kCells = topk_one::kMaxProblems * topk_one::kMaxRows * topk_one::kCpMaxRanks * kMaxTopK;
+    RuntimeCheck(vals.size(0) == kCells && keys.size(0) == kCells, "cell scratch shape");
     return topk_one::Cp{
         .cells = reinterpret_cast<uint64_t*>(cells),
         .peers = static_cast<const uint64_t*>(peers.data_ptr()),
         .picks = static_cast<int32_t*>(picks.data_ptr()),
         .parity = static_cast<uint32_t*>(parity.data_ptr()),
+        .vals = static_cast<float*>(vals.data_ptr()),
+        .keys = static_cast<uint64_t*>(keys.data_ptr()),
         .rank = static_cast<uint32_t>(rank),
         .tp = static_cast<uint32_t>(tp),
         .band = static_cast<uint32_t>(band),
@@ -416,6 +400,8 @@ struct TopKCp {
       const tvm::ffi::TensorView ties,
       const tvm::ffi::TensorView picks,
       const tvm::ffi::TensorView parity,
+      const tvm::ffi::TensorView vals,
+      const tvm::ffi::TensorView keys,
       const int64_t cells,
       const tvm::ffi::TensorView peers,
       const int64_t rank,
@@ -426,7 +412,7 @@ struct TopKCp {
         scores, seq_lens, static_cast<const int32_t*>(page_table.data_ptr()), page_table.stride(0), page_out,
         static_cast<int32_t*>(raw_out.data_ptr()), page_size);
     const auto ws = TopKOne::workspace_of(hist, ctr, ties, params.batch_size);
-    const auto cp = cp_of(picks, parity, cells, peers, rank, tp, band);
+    const auto cp = cp_of(picks, parity, vals, keys, cells, peers, rank, tp, band);
     LaunchKernel(topk_one::kXcc * topk_one::kSplit + 1, kBlockSize, scores.device())
         .config({.use_pdl = false})
         .launch(topk_one::topk_one_cp, params, ws, cp);
@@ -449,6 +435,8 @@ struct TopKCp {
       const tvm::ffi::TensorView ties,
       const tvm::ffi::TensorView picks,
       const tvm::ffi::TensorView parity,
+      const tvm::ffi::TensorView vals,
+      const tvm::ffi::TensorView keys,
       const int64_t cells,
       const tvm::ffi::TensorView peers,
       const int64_t rank,
@@ -462,7 +450,7 @@ struct TopKCp {
     RuntimeCheck(blocks.batch_size == cols.batch_size, "the pair's selections take the same rows");
     RuntimeCheck(page_size == 64, "a row's runs start on 128 columns, whole pages of 64");
     const auto ws = TopKOne::workspace_of(hist, ctr, ties, cols.batch_size);
-    const auto cp = cp_of(picks, parity, cells, peers, rank, tp, band);
+    const auto cp = cp_of(picks, parity, vals, keys, cells, peers, rank, tp, band);
     LaunchKernel(topk_one::kXcc * topk_one::kSplit * 2 + 1, kBlockSize, scores.device())
         .config({.use_pdl = false})
         .launch(topk_one::topk_pair_cp, cols, blocks, ws, cp);
