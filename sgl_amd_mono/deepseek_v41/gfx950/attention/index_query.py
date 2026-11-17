@@ -30,9 +30,9 @@ from sgl_amd_mono.common.plan import first_task
 from sgl_amd_mono.deepseek_v41.gfx950.stages.gemv import ld_f32, plus
 
 from ..indexer import compress
-from .device import BLOCKS, WAVES, ld_i32
+from .device import BLOCKS, THREADS, WAVES, ld_i32
 from .gemv import _step_load, _step_mfma
-from .plan import HIDDEN, Q_RANK, ROPE, ROWS
+from .plan import HIDDEN, Q_RANK, ROPE, ROWS, WQKV_TASKS, wqkv_split
 
 HEADS = 32
 DIM = 128
@@ -378,6 +378,149 @@ def run_cp(c, a, rows, cp0, lds, ratio, issued=None):
                 c, a, t0, n, tile, (task // CP_PARTS) % ctiles, ctiles, task % CP_PARTS,
                 lds, ratio,
             )  # fmt: skip
+
+
+CP_XROW = HIDDEN // CP_PARTS // 2 + 4  # a part's x row in LDS, i32 words (+16 B pad)
+
+
+def cp_side(rows: int) -> bool:
+    """Whether an index K1 runs its compressor projection on the CTAs past the wqkv tiles
+    (``run_cp_side``): one token tile whose wqkv is not split, so the 144 CTAs past the 112
+    wqkv tiles (the slices', norms', gates', qkv's, head weights', the rest) hold a column
+    tile each (32 at ratio 1, 64 at ratio 2). Where the wqkv is split, 32 CTAs are left: their
+    tiles run past q's arrival, so the wqkv CTAs run the split projection (``run_cp``)."""
+    return rows <= 16 and not wqkv_split(rows, rows)
+
+
+def cp_side_first(rows):
+    """The first CTA of the compressor projection's own CTAs: past the wqkv tiles."""
+    assert cp_side(rows)
+    return WQKV_TASKS
+
+
+def _cp_x_part(c, a, rows, p, lds):
+    """x [rows, HIDDEN] bf16's K part p (``normed_out``, device scope) into LDS rows of
+    ``CP_XROW`` words."""
+    tid = c["tid"]
+    per_row = HIDDEN // CP_PARTS // 8  # 16-B chunks a row's part
+    for i in range_constexpr(-(-(rows * per_row) // THREADS)):
+        u = tid + THREADS * i
+        row = fx.min(u // per_row, rows - 1)
+        ch = (u < rows * per_row).select(u % per_row, (rows * per_row - 1) % per_row)
+        v = fx.Vector(
+            bo.buffer_load(
+                rsrc(a["normed_out"]), (row * HIDDEN + p * (HIDDEN // CP_PARTS) + 8 * ch) // 2,
+                vec_width=4, dtype=T.i32, cache_modifier=CM_DEV,
+            )
+        )  # fmt: skip
+        # a thread past the rows rewrites row rows - 1's chunk with its own bytes: no branch
+        fx.ptr_store(v, lds + (row * CP_XROW + 4 * ch))
+
+
+def _cp_x_lds(c, lds, n, kl):
+    """A 32-K MFMA step's x operand from the part in LDS: rows 0 .. n, part-local K kl +
+    its lane's 8 (``_cp_x_load``'s layout)."""
+    lane = c["lane"]
+    row = fx.min(lane % 16, n - 1)
+    return fx.ptr_load(
+        lds + (row * CP_XROW + (kl + 8 * (lane // 16)) // 2),
+        result_type=fx.Vector.make_type(4, fx.Int32),
+    )
+
+
+@flyc.jit
+def run_cp_side(c, a, rows, ratio, lds):
+    """The compressor projection (``run_cp``'s output, bit for bit) on the CTAs from
+    ``cp_side_first``, ahead of their other stages: a CTA the whole of 16-column tiles j,
+    j + n, .. (all four K parts, so no partial crosses CTAs), each part's x once in LDS
+    for the CTA's tiles, then each tile's sum in ``stage_cp``'s order: a part's waves in
+    wave order, then the parts in part order."""
+    tid, lane, wave = c["tid"], c["lane"], c["wave"]
+    first = cp_side_first(rows)
+    n_cp = BLOCKS - first
+    ctiles = cp_cols(ratio) // 16
+    per = -(-ctiles // n_cp)
+    # ``lds``: the front's X tile, rows x lds_row(X_WORDS) words: a part's x, then the partials
+    assert rows <= 16 and max(rows * CP_XROW, WAVES * 16 * 16) <= rows * (
+        HIDDEN // 4 + 4
+    )
+    j = c["bid"] - first
+    # only the CTAs with a tile (the qkv CTAs, past them, never wait on the norms here)
+    if (j >= 0) & (j < ctiles):
+        if tid < 2 * rows:
+            c["mb"].poll([(c["xrdy"], fx.min(tid, 2 * rows - 1), 1)])
+        gpu.barrier()
+        cts = [fx.min(j + n_cp * i, fx.Int32(ctiles - 1)) for i in range(per)]
+        lives = [j + n_cp * i < ctiles for i in range(per)]
+        nbs = [lv.select(fx.Int64(0xFFFFFFFF), fx.Int64(0)) for lv in lives]
+
+        def weights(p):
+            k0 = p * (HIDDEN // CP_PARTS) + wave * CP_WAVE_K
+            return [
+                [_cp_w_load(c, a["cp_w"], k0 + st * 32, cts[i], nbs[i])
+                 for st in range(CP_WAVE_K // 32)]
+                for i in range(per)
+            ]  # fmt: skip
+
+        accs = [[None] * CP_PARTS for _ in range(per)]
+        ws = weights(0)
+        for p in range_constexpr(CP_PARTS):
+            _cp_x_part(c, a, rows, p, lds)
+            nxt = weights(p + 1) if p + 1 < CP_PARTS else None
+            gpu.barrier()
+            xs = [_cp_x_lds(c, lds, rows, wave * CP_WAVE_K + st * 32)
+                  for st in range(CP_WAVE_K // 32)]  # fmt: skip
+            for i in range_constexpr(per):
+                accs[i][p] = _cp_mfmas(c, xs, ws[i], rows)
+            gpu.barrier()
+            ws = nxt
+        cols = cp_cols(ratio)
+        for i in range_constexpr(per):
+            vs = None
+            for p in range_constexpr(CP_PARTS):
+                for q in range_constexpr(4):
+                    r = 4 * (lane // 16) + q
+                    fx.ptr_store(
+                        accs[i][p][q].bitcast(fx.Int32),
+                        lds + (wave * 16 + r) * 16 + lane % 16,
+                    )
+                gpu.barrier()
+                # every thread sums (rows past ``rows`` are not stored), so no value leaves a branch
+                r, h = fx.min(tid // 8, 15), 2 * (tid % 8)
+                v = []
+                for d in range_constexpr(2):
+                    x = fx.ptr_load(lds + (r * 16 + h + d)).bitcast(fx.Float32)
+                    for w_ in range_constexpr(1, WAVES):
+                        x = x + fx.ptr_load(lds + (w_ * 16 + r) * 16 + h + d).bitcast(
+                            fx.Float32
+                        )
+                    v.append(x)
+                vs = v if p == 0 else [vs[d] + v[d] for d in range(2)]
+                gpu.barrier()
+            if (tid < rows * 8) & lives[i]:
+                r, h = tid // 8, 2 * (tid % 8)
+                at = r * cols + 16 * cts[i] + h
+                if const_expr(ratio == 2):
+                    bo.buffer_store(
+                        fx.Vector.from_elements(vs, fx.Float32).bitcast(fx.Int32),
+                        rsrc(a["cp_out"]), at, cache_modifier=CM_DEV,
+                    )  # fmt: skip
+                else:
+                    word = (
+                        fx.Vector.from_elements(vs, fx.Float32)
+                        .to(fx.BFloat16)
+                        .bitcast(fx.Int32)[0]
+                    )
+                    bo.buffer_store(
+                        word, rsrc(a["cp_out"]), at // 2, cache_modifier=CM_DEV
+                    )
+        # the columns visible device-wide, then their flags (``run_kc`` waits on them)
+        rocdl.s_waitcnt(vmcnt=0)
+        gpu.barrier()
+        if tid == 0:
+            for i in range_constexpr(per):
+                if lives[i]:
+                    c["mb"].put(c["cprdy"], cts[i], fx.Int32(1))
 
 
 def kc_context(c, ratio):
