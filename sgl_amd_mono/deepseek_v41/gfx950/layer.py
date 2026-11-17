@@ -150,7 +150,8 @@ class MonoBuild(msgspec.Struct, frozen=True):
     seam_next: bool = False
     # a layer of a multi-layer launch's loop (``build_mono_layers``): its seam slices may run
     # the layer before's MoE all-reduce, its FFN gates flag their mixes, its MoE may skip
-    # its all-reduce
+    # its all-reduce. TP8 (with ``seamed`` / ``seam_next``): the next layer's seam runs in
+    # this layer's tail where a layer follows, its outputs polled in the launch
     chain: bool = False
 
 
@@ -239,6 +240,10 @@ def scratch_layout(s: int, tp: int, timeline: bool = False, **route) -> dict:
     place({"qt": (0, s * q_words(d) * WORD if tagged_q_split(d, s) else 0)})
     # the router CTAs' x boxes (``moe.signal_xbox``): uncached scratch, scalar-polled
     place({"xbox": (0, moe.xbox_bytes(s))})
+    # a TP8 multi-layer launch: the seam tail's R_new for the next layer's gate inputs
+    # (``seam.stage_mix``), as tagged pairs a value
+    if tp == 8 and s <= seam.SEAM_MAX_TOKENS:
+        place({"rnew": (0, SLICES * s * seam.KT * 8)})
     if timeline:
         place({"timeline": (0, BLOCKS * TL_POINTS * 8)})
     return out
@@ -556,8 +561,9 @@ def run_k1(key: MonoBuild, sl, front, a: dict, ep, k2=None, early=None, chained=
     }
     for region in ("lin", "pmix"):
         ca[region] = sreg(scratch, layout[region][0], region)
-    if const_expr(key.seamed):
-        # the layer input the previous launch's tail stored: plain rows
+    if const_expr(key.seamed and not key.chain):
+        # the layer input the previous launch's tail stored: plain rows (a multi-layer
+        # launch's tail puts it into ``lin`` with this layer's tag, as a slice would)
         st = seam.seam_state_layout(s)
         ca["lin"] = a["seam_in"] + fx.Int64(st["lin"][0])
         ca["poll"] = seam.plain_loads
@@ -1483,7 +1489,7 @@ def run_ffn(
         cb[region] = sreg(a["epoch"], 4 * (EPOCH_COUNTERS + i * moe.TAGS), region)
     # the next layer's seam slice sums the down partials itself (``seam_next``); in a
     # multi-layer launch, where a layer follows (traced)
-    cb["seam_next"] = key.seam_next
+    cb["seam_next"] = key.seam_next and not key.chain
     if const_expr(key.chain):
         cb["reduce"] = chain[1]
     frdy = sreg(scratch, layout["frdy"][0], "frdy")
@@ -1588,10 +1594,17 @@ def run_ffn(
     if const_expr(key.seam_next):
         # the next layer's seam slice past the MoE: its loads issued after the down's, which
         # they would delay, and in flight through the wait on the ranks' partials
-        loads, run = seam_tail(key, ca, cb, a, sn, frdy)
-        gpu.barrier()
-        for task in range(first_task(bid, 0), SLICES, BLOCKS):
-            run(task, loads(task))
+        loads, run = seam_tail(key, ca, cb, a, sn, frdy, ep)
+        if const_expr(key.chain):
+            # a multi-layer launch: where a layer follows (traced)
+            if chain[0]:
+                gpu.barrier()
+                for task in range(first_task(bid, 0), SLICES, BLOCKS):
+                    run(task, loads(task))
+        else:
+            gpu.barrier()
+            for task in range(first_task(bid, 0), SLICES, BLOCKS):
+                run(task, loads(task))
 
 
 def mix_first(key: MonoBuild) -> int:
@@ -1643,6 +1656,9 @@ def seam_gates(key: MonoBuild, lds, a, gin, layout, ep, amb):
             "comb_out": a["comb_in"],
         },
     }
+    if const_expr(key.chain):
+        # a multi-layer launch: R_new from the layer before's seam tail, as tagged pairs
+        cg["rnew"] = sreg(a["scratch"], layout["rnew"][0], "rnew")
     if const_expr(key.timeline):
         cg["tl"] = timeline_row(a["scratch"], layout["timeline"][0], bid)
     grdy = sreg(a["scratch"], layout["grdy"][0], "grdy")
@@ -1682,13 +1698,16 @@ def split_first(key: MonoBuild) -> int:
     return 0
 
 
-def seam_tail(key: MonoBuild, ca, cb, a, sn, frdy):
+def seam_tail(key: MonoBuild, ca, cb, a, sn, frdy, ep):
     """The next layer's attention seam slice, task k on CTA k past its MoE work, as
     (``loads``, ``run``): ``loads(task)`` waits on the FFN gates' mixes and issues the
     slice's own loads; ``run(task, pre)`` sums the ranks' down partials of columns 32 k ..
     in rank order (the MoE reduce's sum, bf16) into the pend LDS, then folds them into the
     next layer's R_new and computes its layer input, both stored plain into the seam state
-    ``seam_out``."""
+    ``seam_out``. In a multi-layer launch (``key.chain``) the next layer reads them in this
+    launch: the layer input goes to the ``lin`` mailbox and R_new also to ``rnew``, both
+    tagged with the next layer's K1 tag (epoch ``ep`` + 1), as the next layer's seamed front
+    and gate inputs poll them."""
     s, tp = key.tokens, key.tp
     assert TAIL_SUM0 + s * seam.COLS // 2 <= THREADS, s
     st = seam.seam_state_layout(s)
@@ -1711,6 +1730,12 @@ def seam_tail(key: MonoBuild, ca, cb, a, sn, frdy):
         "fold": True,
         "aux_on": sn["nx_aux"] != 0,
     }
+    if const_expr(key.chain):
+        nmb = Mailbox(((ep + 1) << 1) + 1)
+        layout = scratch_layout(s, tp, key.timeline, **route_of(key))
+        cn["put_bf"] = nmb.put_bf
+        cn["lin"] = ca["lin"]
+        cn["rnew"] = (sreg(a["scratch"], layout["rnew"][0], "rnew"), nmb.put)
     if const_expr(cb["rs"].row_moe):
         ffn = preg(cb["sym"], cb["fcell_off"], "fcell")
     else:
@@ -2438,7 +2463,8 @@ def run_k2(
     if const_expr(key.eg):
         # every rank's share of the projection in, long since: into ``eg_kv``
         engram.unpack(gc, ec, s)
-    if const_expr(key.seam_next and l2_prefetch(key)):
+    # (a multi-layer launch's next layer issues its front weights as its CTAs reach it)
+    if const_expr(key.seam_next and not key.chain and l2_prefetch(key)):
         # the layer launch's arguments (``L2_ARGS``)
         assert one, key
         idle_tail({n: c[n] for n in ("tid", "tl") if n in c}, tp, bid)
@@ -3056,6 +3082,7 @@ def layer_body(key: MonoBuild, lds, a: dict, ep, pbases, load, chain=None):
     early = mb_back.EarlyKeys(
         _back_key(key), key.swa_width, a, fx.min(sunit, n_split - 1), sunit < n_split
     )
+    # TP8 (seam move): the layer before's tail ran this layer's slices
     run_k1(
         key,
         lds.seam.peek(),
@@ -3064,7 +3091,7 @@ def layer_body(key: MonoBuild, lds, a: dict, ep, pbases, load, chain=None):
         ep,
         k2,
         early,
-        None if chain is None else chain[0],
+        None if chain is None or key.seamed or key.seam_next else chain[0],
     )
     # the K1 half's LDS is free
     gpu.barrier()
@@ -3580,11 +3607,27 @@ def build_mono_layers(key: MonoBuild):
     Every write of layer l + 1 follows, on its CTA, that CTA's own layer-l work, which
     waited on layer l's down (the slices, on the down partials of their columns; every other
     CTA, through its down task's wait on the ug), so no single-slot region or runner buffer
-    is written while layer l reads it."""
+    is written while layer l reads it.
+
+    TP8 (at least two layers): every boundary is the seam move inside the launch. Layer 0
+    runs the plain front, the later layers the seamed one (a second copy of the body, in the
+    loop); a layer that a layer follows runs that layer's seam slices in its tail
+    (``seam_tail``), which puts the layer input into ``lin`` and R_new into ``rnew`` as
+    tagged pairs with the next layer's K1 tag, where its norms and gate inputs poll them,
+    and stores R_new plain into that layer's own seam state for the slice CTA's FFN seam.
+    The runner gives each layer of the run its own seam state and attention-gate outputs."""
     s, tp = key.tokens, key.tp
     assert key.chain and key.kt and key.fold, key
     assert not (key.index or key.tok_par or key.embed or key.glue), key
     assert not (key.seamed or key.seam_next), key
+    # TP8 (at least two layers): each boundary is the seam move, in this launch. Layer 0
+    # runs the plain front and the next layer's seam slices in its tail; the later layers
+    # run the seamed front, then the tail where a layer follows, else the MoE reduce
+    moves = tp == 8
+    first_key = msgspec.structs.replace(key, seam_next=True) if moves else key
+    body_key = (
+        msgspec.structs.replace(key, seamed=True, seam_next=True) if moves else key
+    )
     rs = route_shape(_moe_key(key))
     assert rs.experts // 64 in SORT_NETS
     half = peer_half_bytes(tp)
@@ -3643,8 +3686,9 @@ def build_mono_layers(key: MonoBuild):
             ep0 = uniform(_epoch(epoch))
             pbases = [ptr64(w) for w in peer_words]
 
-            def one_layer(li):
-                # a function: the loop carries none of the stages' Python state
+            def one_layer(li, lkey, first=None):
+                # a function: the loop carries none of the stages' Python state.
+                # ``first``: whether this is layer 0, static (TP8) or traced
                 row = table + fx.Int64(li) * fx.Int64(XL_ROW)
                 # the row's lines in the scalar cache before its arguments' loads
                 warm_kernargs(XL_ROW, row)
@@ -3658,9 +3702,12 @@ def build_mono_layers(key: MonoBuild):
 
                 with layer_ids():
                     a = load(BODY_ARGS)
-                    a |= {n: (li == 0).select(k[n], a[n]) for n in XL_FIRST}
+                    if const_expr(first is None):
+                        a |= {n: (li == 0).select(k[n], a[n]) for n in XL_FIRST}
+                    elif const_expr(first):
+                        a |= {n: k[n] for n in XL_FIRST}
                     layer_body(
-                        key,
+                        lkey,
                         lds,
                         a,
                         uniform(ep0 + li),
@@ -3669,10 +3716,17 @@ def build_mono_layers(key: MonoBuild):
                         (li > 0, li < count - 1, li >= count - 1),
                     )
 
-            for li in range(count):
-                # the layer before's LDS is free
-                gpu.barrier()
-                one_layer(fx.Int32(li))
+            if const_expr(moves):
+                one_layer(fx.Int32(0), first_key, True)
+                for li in range(1, count):
+                    # the layer before's LDS is free
+                    gpu.barrier()
+                    one_layer(fx.Int32(li), body_key, False)
+            else:
+                for li in range(count):
+                    # the layer before's LDS is free
+                    gpu.barrier()
+                    one_layer(fx.Int32(li), key)
 
     @flyc.jit
     def launch(

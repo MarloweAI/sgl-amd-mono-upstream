@@ -308,6 +308,10 @@ def slice_row(c, c0, e, got):
             v = bf16_round(fma(cm[HC - 1], r[HC - 1], v))
     bo.buffer_store(v.to(fx.BFloat16), rsrc(a["res_out"]), (t * HC + o) * HIDDEN + col)
     fx.ptr_store(v, c["rl"] + (t * KT + o * COLS + e % COLS))
+    rn = c.get("rnew")
+    if const_expr(rn is not None):
+        # a multi-layer launch's seam tail: R_new for the next layer's ``stage_mix`` too
+        rn[1](rn[0], c0 // COLS * (c["S"] * KT) + e, v)
 
 
 def slice_fn_loads(c, task):
@@ -423,12 +427,28 @@ def stage_mix(c, task):
     s, tid = c["S"], c["tid"]
     a, rl, fl, c0 = c["args"], c["rl"], c["fl"], task * COLS
     fn = slice_fn_loads(c, task)
+    rnew = c.get("rnew")
+    if const_expr(rnew is not None):
+        # a multi-layer launch: the layer before's seam tail put R_new as tagged pairs
+        n = s * KT
+        rounds = -(-n // THREADS)
+        vals = c["poll"](
+            [
+                (rnew, task * n + fx.min(tid + THREADS * i, n - 1), 1)
+                for i in range(rounds)
+            ]
+        )
+        for i in range_constexpr(rounds):
+            e = tid + THREADS * i
+            if e < n:
+                fx.ptr_store(vals[i][0].bitcast(fx.Float32), rl + e)
+    else:
 
-    def load(e):
-        t, o, col = slice_at(c0, e)
-        return ld_bf(a["res_in"], (t * HC + o) * HIDDEN + col)
+        def load(e):
+            t, o, col = slice_at(c0, e)
+            return ld_bf(a["res_in"], (t * HC + o) * HIDDEN + col)
 
-    batched_rounds(tid, s * KT, load, lambda e, v: fx.ptr_store(v, rl + e))
+        batched_rounds(tid, s * KT, load, lambda e, v: fx.ptr_store(v, rl + e))
     for i in range_constexpr(len(fn)):
         e = tid + THREADS * i
         if e < MIX * KT:

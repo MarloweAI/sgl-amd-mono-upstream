@@ -1252,7 +1252,8 @@ class _Built:
                 seamed = False
                 pending = post if defer else (None, hidden, None, None)
                 continue
-            moves = self._seam_moves(i, rows, tok_par)
+            # a run's first layer runs its own seam (its launch's plain front)
+            moves = self._seam_moves(i, rows, tok_par) and i + 1 not in runs
             hidden, pre, post = self._layer(
                 self._layers[i], plan, positions, forward_batch, pending, pre, defer,
                 first if i == m.start_layer else None,

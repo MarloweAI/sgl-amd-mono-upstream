@@ -396,7 +396,10 @@ def main():
     # against three layer launches each on the previous one's outputs, every output of each
     # (the first two's MoE outputs summed by the next layer's seam slices), the last one's
     # K1 outputs and the SWA cache; then the launch in one graph under replay
-    # each of the three layers projecting an equal share of the Engram layer's rows
+    # each of the three layers projecting an equal share of the Engram layer's rows. At TP8
+    # the three launches are the seam move's (each runs the next layer's seam, as the run
+    # does in its launch), and of the K1 outputs only A's R_new is compared: B's and C's gate
+    # outputs go to the run's own buffers
     third = n_eg // 96 * 32
     thirds = [
         EngramWeights(
@@ -437,16 +440,24 @@ def main():
                 eg=(eg_rows[M], thirds[i]) if eg else None,
             ))  # fmt: skip
             ins = outs[i]
+        moves = runner.seam_moves(M)
         if one:
-            for st, o in zip(sts, outs):
+            for i, (st, o) in enumerate(zip(sts, outs)):
+                kw = {}
+                if moves and i > 0:
+                    kw["seamed"] = True
+                if moves and i + 1 < len(sts):
+                    kw["nxt"] = sts[i + 1]["w"]
                 runner.layer(
                     st["w"], aw, mw, st["x"], st["residual"], st["post"], st["comb"],
                     st["pre"], pos, slot, swa, SWA_BLOCK, cc, COMP_BLOCK, keys, outs=o,
-                    eg=st["eg"],
+                    eg=st["eg"], **kw,
                 )  # fmt: skip
         else:
             runner.layers(sts, outs)
-        mids = (runner.res_mid, runner.post_a, runner.comb_a, runner.pre_a)
+        mids = (runner.res_mid,)
+        if not moves:
+            mids += (runner.post_a, runner.comb_a, runner.pre_a)
         kv = [runner.egkv[:M].clone()] if eg else []
         return (
             [t.clone() for o in outs for t in o]
