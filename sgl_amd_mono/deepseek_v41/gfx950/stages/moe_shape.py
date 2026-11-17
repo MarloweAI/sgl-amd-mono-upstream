@@ -143,6 +143,18 @@ class RouteShape(msgspec.Struct, frozen=True):
         return self.tp == 4 and self.multi and not self.row_moe
 
     @property
+    def spill_ug(self) -> bool:
+        """The placed ug tasks past two rounds from the shared-unit CTAs on (``moe.spill_task``), not on the
+        CTAs with two already: TP4, one token tile, the target's route. A TP4 ug task carries twice TP8's
+        bytes, and a third task on a CTA ends past every other CTA's down."""
+        return (
+            self.tp == 4
+            and not self.multi
+            and not self.row_moe
+            and (self.experts, self.topk) == (EXPERTS, TOPK)
+        )
+
+    @property
     def row_slices(self) -> int:
         """A token row's CTAs in the per-row MoE (``row_slice_counts``); 0 where none fits."""
         return next(
