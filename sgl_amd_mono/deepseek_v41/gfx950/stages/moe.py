@@ -2516,6 +2516,7 @@ def stage_row_down(c, bid):
     r, sl = row_of(bid)
     topk = rs.topk
     assert topk + 2 <= WAVES
+    red = c.get("reduce")
     if wave < topk:
         row_down_slot(c, bid, wave)
     if wave >= WAVES - 2:
@@ -2543,11 +2544,15 @@ def stage_row_down(c, bid):
         ]
         push_ffn_cell(c, r, s, col, vs)
     stamp(c, 25)
-    # ``seam_next``: the next layer's seam slices sum the partials (``layer.seam_tail``)
+    # ``seam_next``: the next layer's seam slices sum the partials (``layer.seam_tail``);
+    # ``reduce`` (traced): in a multi-layer launch, the launch's last layer's own sum
     if const_expr(not c.get("seam_next", False)):
         # on wave 1: wave 0 pushed, and a wave's first wait also waits on its own pushes' acks
         u = tid - 64
-        if (u >= 0) & (u < width // CELL_VALUES):
+        live = (u >= 0) & (u < width // CELL_VALUES)
+        if const_expr(red is not None):
+            live = live & red
+        if live:
             cc = width * sl + CELL_VALUES * u
             fcell = c["sym"] + fx.Int64(c["fcell_off"])
             cells = [seam.ffn_cell(src, r, s, cc) for src in range(d.tp)]
@@ -2706,6 +2711,7 @@ def run_moe(c, key, bid, before_ug=None):
     """The MoE stages, in order (``before_ug``: work for this CTA once its shared
     expert's unit is done, off the routing's path)."""
     s, tid = key.tokens, c["tid"]
+    red = c.get("reduce")
     router_tasks = c["rs"].router_tasks
     route0, shared0 = c["rs"].route0, c["rs"].shared0
     shared_tasks = c["d"].shared_tasks
@@ -2819,10 +2825,17 @@ def run_moe(c, key, bid, before_ug=None):
         stamp(c, 25)
         # token parallel: this rank's rows' sums alone, ``out`` from its first row
         cr = c if const_expr(c["own"] is None) else c["own_view"]
-        # ``seam_next``: the next layer's seam slices sum the partials (``layer.seam_tail``)
+        # ``seam_next``: the next layer's seam slices sum the partials (``layer.seam_tail``);
+        # ``reduce`` (traced): in a multi-layer launch, the launch's last layer reduces, the
+        # others' next layer's slices sum them (``layer.chained_slice``)
         if const_expr(not c.get("seam_next", False)):
-            for task in range(first_task(bid, RED0), RED_TASKS, BLOCKS):
-                stage_reduce(cr, task)
+            if const_expr(red is None):
+                for task in range(first_task(bid, RED0), RED_TASKS, BLOCKS):
+                    stage_reduce(cr, task)
+            else:
+                if red:
+                    for rtask in range(first_task(bid, RED0), RED_TASKS, BLOCKS):
+                        stage_reduce(cr, rtask)
         stamp(c, 26)
 
 

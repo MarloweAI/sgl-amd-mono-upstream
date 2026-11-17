@@ -3,6 +3,8 @@
 """Build K1 (attention seam and front), K2 (attention back, seam, MoE and TP
 all-reduces) and the FFN launch (seam, MoE and TP all-reduce)."""
 
+import struct
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import msgspec
@@ -144,6 +146,10 @@ class MonoBuild(msgspec.Struct, frozen=True):
     # one launch per layer: the MoE reduce runs the next layer's attention seam slice into
     # the seam state the next launch reads (``seamed``)
     seam_next: bool = False
+    # a layer of a multi-layer launch's loop (``build_mono_layers``): its seam slices may run
+    # the layer before's MoE all-reduce, its FFN gates flag their mixes, its MoE may skip
+    # its all-reduce
+    chain: bool = False
 
 
 ROUTE = ("experts", "topk", "ug_groups", "swa_width")
@@ -168,6 +174,7 @@ def _variant(key: MonoBuild) -> dict:
         | ({"gl": key.glue} if key.glue else {})
         | ({"sd": 1} if key.seamed else {})
         | ({"sn": 1} if key.seam_next else {})
+        | ({"ch": 1} if key.chain else {})
     )
 
 
@@ -371,11 +378,13 @@ K1_KC_ARGS = tuple(f"kc_{n}" for n in compress.KC_ARGS[1:])
 
 
 @flyc.jit
-def run_k1(key: MonoBuild, sl, front, a: dict, ep, k2=None, early=None):
+def run_k1(key: MonoBuild, sl, front, a: dict, ep, k2=None, early=None, chained=None):
     """K1 on this CTA: the pending post, the attention seam and the attention front
     (``sl``, ``front``: the seam's and the front's LDS views). ``k2``: one launch per
     layer, the attention back's hand-off (``layer_handoff``); ``early``: its split's keys
-    from the launch's inputs (``back.EarlyKeys``), loaded past the wqkv and wq_b weights."""
+    from the launch's inputs (``back.EarlyKeys``), loaded past the wqkv and wq_b weights.
+    ``chained`` (``key.chain``, traced): the layer before ran in this launch; each seam
+    slice then sums that layer's MoE partials of its columns itself (``chained_slice``)."""
     (
         res_in,
         pend,
@@ -572,12 +581,23 @@ def run_k1(key: MonoBuild, sl, front, a: dict, ep, k2=None, early=None):
         pl = peer_offsets(s, tp)
         mb_front.token_par_context(c, own_n, t0, rank, bases, sym + par, pl)
 
+    if const_expr(chained is not None):
+        cr = chained_reduce(key, ca, sl, scratch, sym, ep)
+
     def seam_slice():
         stamp(c, 32)
         # seamed: the previous launch ran the slice
         if not key.seamed:
-            for task in range(first_task(bid, 0), SLICES, BLOCKS):
-                seam.stage_slice(ca, task)
+            if const_expr(chained is None):
+                for task in range(first_task(bid, 0), SLICES, BLOCKS):
+                    seam.stage_slice(ca, task)
+            else:
+                if chained:
+                    for ctask in range(first_task(bid, 0), SLICES, BLOCKS):
+                        chained_slice(cr, ctask)
+                else:
+                    for task in range(first_task(bid, 0), SLICES, BLOCKS):
+                        seam.stage_slice(ca, task)
             gpu.barrier()
             stamp(c, 33)
 
@@ -712,6 +732,43 @@ def run_k1(key: MonoBuild, sl, front, a: dict, ep, k2=None, early=None):
         kc.update(kv=a["cp_out"], ratio=fx.Int32(key.cp), cm=CM_DEV)
         index_query.run_kc(c, kc, s, key.cp)
     stamp(c, 40)
+
+
+def chained_reduce(key: MonoBuild, ca, sl, scratch, sym, ep) -> dict:
+    """The context of a seam slice that runs the layer before's MoE all-reduce (that layer
+    on epoch ``ep - 1``, in this launch): its gates' flags (``frdy``) and partials (its
+    parity's FCELL cells, or its tagged pairs) under its K2 tag, this seam's pend LDS."""
+    s, tp = key.tokens, key.tp
+    assert key.chain and not (key.tok_par or key.seamed or key.seam_next), key
+    assert TAIL_SUM0 + s * seam.COLS // 2 <= THREADS, s
+    layout = scratch_layout(s, tp, key.timeline, **route_of(key))
+    pep = ep - 1
+    own = sym + fx.Int64(pep & 1) * fx.Int64(peer_half_bytes(tp))
+    if const_expr(route_shape(_moe_key(key)).row_moe):
+        ffn = preg(own, fcell_offset(tp), "fcell")
+    else:
+        ffn = preg(own, peer_offsets(s, tp)["ffn"], "ffn")
+    return {
+        "ca": {**ca, "pend_lds": sl.pl.ptr},
+        "cp": {**ca, "pend_lds": sl.pl.ptr, "poll": Mailbox((pep << 1) + 2).poll},
+        "ffn": ffn,
+        "frdy": sreg(scratch, layout["frdy"][0], "frdy"),
+        # the layer before's MoE output, this layer's ``pend``
+        "out": ca["args"]["pend"],
+    }
+
+
+@flyc.jit
+def chained_slice(cr, task):
+    """Seam slice ``task`` of a layer whose layer before ran in this launch, as that layer's
+    ``seam_tail`` would run it: once its gates flagged their mixes, the slice's own loads,
+    then its MoE partials of the slice's 32 columns summed in rank order into the pend LDS
+    and that layer's ``out`` (its all-reduce, which it skipped), then the slice. The
+    residual is that layer's FFN slice ``task``, stored by this CTA."""
+    ca, cp = cr["ca"], cr["cp"]
+    s, tp = ca["S"], ca["d"].tp
+    pre = tail_loads(cp, ca, cr["frdy"], s, task)
+    tail_run(cp, ca, cr["ffn"], s, tp, task, pre, cr["out"])
 
 
 def _k1_lds(s, tp):
@@ -1317,12 +1374,16 @@ def run_ffn(
     part=None,
     sn=None,
     pre=None,
+    chain=None,
 ):
     """Run the FFN seam, the MoE and its all-reduce into ``a["out"]``; ``sn``
     (``key.seam_next``, ``SEAM_ARGS``): the all-reduce into the next layer's attention seam
     slice instead, whose outputs go to the seam state ``sn["seam_out"]``. ``pre``: the
-    slice's first loads, issued before wo_b (``early_slice``)."""
+    slice's first loads, issued before wo_b (``early_slice``). ``chain`` (``key.chain``):
+    traced (more, last); where a layer follows in this launch, its seam slices run the
+    all-reduce (``chained_slice``) and this MoE stops at its down."""
     assert (sn is not None) == key.seam_next, key
+    assert (chain is not None) == key.chain, key
     assert not key.seam_next or not key.tok_par, key
     s, tp = key.tokens, key.tp
     layout = scratch_layout(s, tp, key.timeline, **route_of(key))
@@ -1413,8 +1474,11 @@ def run_ffn(
         cb["tl"] = ca["tl"]
     for i, region in enumerate(COUNTERS):
         cb[region] = sreg(a["epoch"], 4 * (EPOCH_COUNTERS + i * moe.TAGS), region)
-    # the next layer's seam slice sums the down partials itself (``seam_next``)
+    # the next layer's seam slice sums the down partials itself (``seam_next``); in a
+    # multi-layer launch, where a layer follows (traced)
     cb["seam_next"] = key.seam_next
+    if const_expr(key.chain):
+        cb["reduce"] = chain[1]
     frdy = sreg(scratch, layout["frdy"][0], "frdy")
     if const_expr(key.tok_par):
         # the down sums reduce-scattered: each rank sums its own rows into ``out``
@@ -1499,7 +1563,8 @@ def run_ffn(
     stamp(ca, 18)
 
     # the next layer's seam slice reads the mixes in this launch: device scope, flagged
-    cg = {**ca, "dev": True} if const_expr(key.seam_next) else ca
+    flagged = key.seam_next or key.chain
+    cg = {**ca, "dev": True} if const_expr(flagged) else ca
 
     def gates():
         # only the next layer's seam reads the mixes; later MoE stages reload the LDS the
@@ -1507,7 +1572,7 @@ def run_ffn(
         gpu.barrier()
         for t in range(first_task(bid, GATE0), own_n, BLOCKS):
             seam.stage_gate(cg, t)
-            if const_expr(key.seam_next):
+            if const_expr(flagged):
                 publish(amb.put, frdy, t * FLAG_STRIDE, 1, tid == 0)
         stamp(ca, 23)
 
@@ -1604,9 +1669,10 @@ def tail_cells(s, tp, task, u):
 
 
 @flyc.jit
-def tail_run(ca, cn, ffn, s, tp, task, pre):
+def tail_run(ca, cn, ffn, s, tp, task, pre, out=None):
     """``seam_tail``'s sums and slice. ``ffn``: FCELL (the per-row MoE: the summed cells
-    emptied) or the tagged pairs' region."""
+    emptied) or the tagged pairs' region; ``out``: the sums also stored there, bf16, as
+    the MoE's own all-reduce stores them."""
     gpu.barrier()
     # the sums on waves 2 .. : wave 0 pushed the down partials, wave 1 polled the gates' flags
     u = ca["tid"] - TAIL_SUM0
@@ -1620,6 +1686,9 @@ def tail_run(ca, cn, ffn, s, tp, task, pre):
             for i in range_constexpr(seam.CELL_VALUES):
                 at = ca["pend_lds"] + ((u // per) * seam.COLS + cc + i)
                 fx.ptr_store(bf16_round(accs[i]), at)
+                if const_expr(out is not None):
+                    at = (u // per) * HIDDEN + task * seam.COLS + cc + i
+                    bo.buffer_store(accs[i].to(fx.BFloat16), rsrc(out), at)
             # emptied here, not past the slice: the launch's end would wait on the stores
             seam.empty_cells(ffn.value, cells)
     else:
@@ -1632,6 +1701,9 @@ def tail_run(ca, cn, ffn, s, tp, task, pre):
             )
             fx.ptr_store(bf16_round(acc0), ca["pend_lds"] + (t * seam.COLS + cc))
             fx.ptr_store(bf16_round(acc1), ca["pend_lds"] + (t * seam.COLS + cc + 1))
+            if const_expr(out is not None):
+                bo.buffer_store(acc0.to(fx.BFloat16), rsrc(out), t * HIDDEN + col)
+                bo.buffer_store(acc1.to(fx.BFloat16), rsrc(out), t * HIDDEN + col + 1)
     gpu.barrier()
     stamp(ca, 31)
     seam.stage_slice(cn, task, pre)
@@ -1889,6 +1961,7 @@ def run_k2(
     pre=None,
     pbases=None,
     sn=None,
+    chain=None,
 ):
     """K2 on this CTA: the attention back on K1's q, its wo_b partial pushed to every
     rank, then ``run_ffn`` (``lds``: a union with K2's members). ``one``: one launch per
@@ -1896,7 +1969,7 @@ def run_k2(
     first loads of a split CTA's K1 flags, issued as K1's half ended; ``pre``: its keys,
     ``back.EarlyKeys.loads``; ``pbases``: the peer bases, loaded at the launch's start). ``eg``: a later
     Engram layer's projection's arguments (``EG_ARGS``, ``key.eg``); ``sn``: the next
-    layer's attention seam's (``SEAM_ARGS``, ``key.seam_next``)."""
+    layer's attention seam's (``SEAM_ARGS``, ``key.seam_next``); ``chain``: ``run_ffn``'s."""
     (
         q,
         swa,
@@ -2174,7 +2247,7 @@ def run_k2(
         a["grdy"] = sreg(scratch, layout["grdy"][0], "grdy")
         wob0 = mb_back.back_plan(bkey)[5]
         a["grdy_late"] = first_task(bid, wob0) >= mb_back.ardy_waiters(bkey)
-    run_ffn(key, lds, a, amb, bases, own, rank, ep, sn=sn, pre=spre)
+    run_ffn(key, lds, a, amb, bases, own, rank, ep, sn=sn, pre=spre, chain=chain)
     if const_expr(key.eg):
         # every rank's share of the projection in, long since: into ``eg_kv``
         engram.unpack(gc, ec, s)
@@ -2578,15 +2651,19 @@ def kernarg_offsets(names, i32) -> dict:
     return out
 
 
-def warm_kernargs(nbytes: int):
+def warm_kernargs(nbytes: int, row=None):
     """Load a word of every 64-byte line of the kernarg segment at the launch's start, in
     the entry's wait: the arguments LLVM loads again later (it rematerializes them under
-    SGPR pressure) then hit the scalar cache instead of waiting on L2 where they are used."""
+    SGPR pressure) then hit the scalar cache instead of waiting on L2 where they are used.
+    ``row``: a table row laid out as the segment, at that address, instead."""
     seg_ptr = ir.Type.parse("!llvm.ptr<4>")
-    seg = llvm.PtrToIntOp(
-        T.i64,
-        llvm.call_intrinsic(seg_ptr, "llvm.amdgcn.kernarg.segment.ptr", [], [], []),
-    ).result
+    if row is None:
+        seg = llvm.PtrToIntOp(
+            T.i64,
+            llvm.call_intrinsic(seg_ptr, "llvm.amdgcn.kernarg.segment.ptr", [], [], []),
+        ).result
+    else:
+        seg = as_ir_value(fx.Int64(row))
     words = []
     for off in range(0, nbytes, 64):
         ptr = llvm.IntToPtrOp(
@@ -2624,16 +2701,19 @@ K1_KERNARG_BYTES = kernarg_bytes(
 K2_KERNARG_BYTES = kernarg_bytes(K2_ARGS + K2_GLUE_ARGS, LAYER_I32 | {"gl_ptab_stride"})
 
 
-def reload_args(names, offsets: dict, i32) -> dict:
-    """Arguments ``names`` loaded again from the kernarg segment, its address through an
-    empty asm first so LLVM keeps these loads apart from the entry's: an argument a
-    later half of the launch reads then does not stay live (spilled) through the
-    earlier half."""
+def reload_args(names, offsets: dict, i32, row=None) -> dict:
+    """Arguments ``names`` loaded again from the kernarg segment (``row``: from a table row
+    laid out as the segment, at that address), its address through an empty asm first so
+    LLVM keeps these loads apart from the entry's: an argument a later half of the launch
+    reads then does not stay live (spilled) through the earlier half."""
     seg_ptr = ir.Type.parse("!llvm.ptr<4>")
-    seg = llvm.PtrToIntOp(
-        T.i64,
-        llvm.call_intrinsic(seg_ptr, "llvm.amdgcn.kernarg.segment.ptr", [], [], []),
-    ).result
+    if row is None:
+        seg = llvm.PtrToIntOp(
+            T.i64,
+            llvm.call_intrinsic(seg_ptr, "llvm.amdgcn.kernarg.segment.ptr", [], [], []),
+        ).result
+    else:
+        seg = as_ir_value(fx.Int64(row))
     base = fx.Int64(llvm.inline_asm(T.i64, [seg], "", "=s,0", has_side_effects=True))
     out = {}
     for n in names:
@@ -2665,6 +2745,177 @@ def layer_handoff(scratch, layout: dict, ep) -> dict:
     return h
 
 
+class _Ids:
+    def __init__(self, x):
+        self.x = x
+
+
+class layer_ids:
+    """Trace the stages inside on opaque copies of the thread and block ids, masked to their
+    ranges: a layer of a multi-layer launch's loop then shares no lane math with the code
+    outside it, so LLVM hoists none of it out of the loop into long-lived registers."""
+
+    def __enter__(self):
+        t = fx.Int32(
+            llvm.inline_asm(
+                T.i32,
+                [fx.Int32(fx.thread_idx.x).ir_value()],
+                "v_mov_b32 $0, $1",
+                "=v,v",
+                has_side_effects=True,
+            )
+        ) & (THREADS - 1)
+        b = fx.Int32(
+            llvm.inline_asm(
+                T.i32,
+                [fx.Int32(fx.block_idx.x).ir_value()],
+                "s_mov_b32 $0, $1",
+                "=s,s",
+                has_side_effects=True,
+            )
+        ) & (BLOCKS - 1)
+        self.hw = fx.thread_idx, fx.block_idx
+        fx.thread_idx, fx.block_idx = _Ids(t), _Ids(b)
+
+    def __exit__(self, *exc):
+        fx.thread_idx, fx.block_idx = self.hw
+
+
+# a multi-layer launch (``build_mono_layers``): up to XL_LAYERS layers; a layer's row of its
+# table is the layer launch's kernarg segment (``LAYER_ARGS``); the launch's own arguments
+# are its step's (every layer's) and its first layer's inputs (the others' are the layer
+# before's outputs), so a table stays the same from step to step
+XL_LAYERS = 8
+# (and the later Engram layer's rows its layers project: one layer's, 0 for none)
+XL_STEP = (
+    "pos",
+    "slot",
+    "slot_words",
+    "swa_idx",
+    "swa_lens",
+    "topk",
+    "topk_lens",
+    "eg_x",
+)
+XL_FIRST = ("res_in", "pend", "post_in", "comb_in", "pre_in")
+XL_ARGS = (
+    ("table", "count", "scratch", "sym", "peers", "rank", "epoch") + XL_STEP + XL_FIRST
+)
+XL_I32 = frozenset(("count", "rank", "slot_words"))
+# a layer body's K1 arguments (``layer_body``'s ``a``)
+BODY_ARGS = tuple(n for n in LAYER_ARGS if n not in SEAM_ARGS)
+XL_ROW = -(-kernarg_bytes(LAYER_ARGS, LAYER_I32) // 64) * 64
+
+
+def xl_row(values: dict) -> bytes:
+    """One layer's row of a multi-layer launch's table, from its ``LAYER_ARGS`` values."""
+    row = bytearray(XL_ROW)
+    for n, off in kernarg_offsets(LAYER_ARGS, LAYER_I32).items():
+        v = int(values[n])
+        if n in LAYER_I32:
+            struct.pack_into("<I", row, off, v & 0xFFFFFFFF)
+        else:
+            struct.pack_into("<Q", row, off, v & 0xFFFFFFFFFFFFFFFF)
+    return bytes(row)
+
+
+def _layer_lds(key: MonoBuild, rs):
+    """A layer launch's LDS: K1's and K2's stages one at a time."""
+    s, tp = key.tokens, key.tp
+    SplitLds, GemvLds, SeamLds, MoeLds = _k2_members(s, tp, rs)
+    FrontLds = mb_front.front_lds(s, Dims(tp))
+
+    # the Engram projection's (``key.eg``), else one no larger than the others
+    EgLds = engram.eg_lds(mb_front.tile_rows(s) if key.eg else 1)
+
+    # K1's seam takes K2's (a prefix of its members)
+    @fx.union
+    class LayerLds:
+        seam: SeamLds  # type: ignore[valid-type]
+        front: FrontLds  # type: ignore[valid-type]
+        split: SplitLds  # type: ignore[valid-type]
+        gemv: GemvLds  # type: ignore[valid-type]
+        moe: MoeLds  # type: ignore[valid-type]
+        eg: EgLds  # type: ignore[valid-type]
+
+    return LayerLds
+
+
+def layer_body(key: MonoBuild, lds, a: dict, ep, pbases, load, chain=None):
+    """A layer launch's K1, then its K2, on this CTA: ``a`` K1's arguments, ``load(names)``
+    loads K2's (past K1's half, so they do not stay live through it), ``pbases`` the peer
+    bases. ``chain``, a multi-layer launch's loop (``build_mono_layers``): traced
+    (chained, more, last): the layer before ran in this launch, a layer follows, this is
+    the launch's last."""
+    s, tp = key.tokens, key.tp
+    nchunk, n_split = mb_back.back_plan(_back_key(key))[:2]
+    SPLIT0 = split_first(key)
+    layout = scratch_layout(s, tp, key.timeline, **route_of(key))
+    k2 = layer_handoff(a["scratch"], layout, ep)
+    bid = fx.block_idx.x
+    # this CTA's split unit (``split_first``)
+    sunit = bid if SPLIT0 == 0 else first_task(bid, SPLIT0)
+    early = mb_back.EarlyKeys(
+        _back_key(key), key.swa_width, a, fx.min(sunit, n_split - 1), sunit < n_split
+    )
+    run_k1(
+        key,
+        lds.seam.peek(),
+        lds.front.peek(),
+        a,
+        ep,
+        k2,
+        early,
+        None if chain is None else chain[0],
+    )
+    # the K1 half's LDS is free
+    gpu.barrier()
+    # a split CTA's K2 inputs in issue order, past the barrier (it would drain them):
+    # its K1 flags' first loads, then its old keys' records, in flight through the
+    # wait on q
+    if const_expr(tagged_q_split(Dims(tp), s, key.tok_par)):
+        first = mb_back.q_flag_load(
+            a["scratch"] + fx.Int64(layout["qt"][0]),
+            k2["krdy"],
+            k1_words(layout, True),
+            fx.thread_idx.x,
+            fx.min(sunit, n_split - 1) // nchunk,
+            s,
+            Dims(tp),
+            # the waves past the poll's (the keys') issue none
+            pred=(sunit < n_split) & (fx.thread_idx.x < 256),
+        )()
+    else:
+        first = mb_back.k1_flag_load(
+            k2["krdy"],
+            k1_words(layout, key.tok_par),
+            fx.thread_idx.x,
+            fx.min(sunit, n_split - 1) // nchunk,
+            s,
+            pred=sunit < n_split,
+        )()
+    pre = early.loads()
+    names = [K2_OF_LAYER.get(n, n) for n in K2_ARGS]
+    names += list(EG_ARGS) if key.eg else []
+    names += list(SEAM_ARGS) if key.seam_next else []
+    a2 = load(names)
+    eg = {n: a2[n] for n in EG_ARGS} if key.eg else None
+    sn = {n: a2[n] for n in SEAM_ARGS} if key.seam_next else None
+    run_k2(
+        key,
+        lds,
+        {n: a2[K2_OF_LAYER.get(n, n)] for n in K2_ARGS},
+        ep,
+        True,
+        eg,
+        first,
+        pre,
+        pbases,
+        sn,
+        None if chain is None else chain[1:],
+    )
+
+
 def build_mono_layer(key: MonoBuild):
     """Build one launch per layer (a reuse layer): K1, then K2 in the same launch.
 
@@ -2684,31 +2935,14 @@ def build_mono_layer(key: MonoBuild):
     assert rs.experts // 64 in SORT_NETS
     half = peer_half_bytes(tp)
     assert SLICES + 2 * s <= BLOCKS
-    SplitLds, GemvLds, SeamLds, MoeLds = _k2_members(s, tp, rs)
-    FrontLds = mb_front.front_lds(s, Dims(tp))
-
-    # the Engram projection's (``key.eg``), else one no larger than the others
-    EgLds = engram.eg_lds(mb_front.tile_rows(s) if key.eg else 1)
-
-    # K1's seam takes K2's (a prefix of its members)
-    @fx.union
-    class LayerLds:
-        seam: SeamLds  # type: ignore[valid-type]
-        front: FrontLds  # type: ignore[valid-type]
-        split: SplitLds  # type: ignore[valid-type]
-        gemv: GemvLds  # type: ignore[valid-type]
-        moe: MoeLds  # type: ignore[valid-type]
-        eg: EgLds  # type: ignore[valid-type]
-
+    LayerLds = _layer_lds(key, rs)
     name = kernel_symbol(
         "dsv41_mono_layer", s=s, tp=tp, c=key.compressed, f=key.fold, **_variant(key)
     )
     keyed = key_tuple(key, SOURCES)
     offsets = kernarg_offsets(LAYER_ARGS, LAYER_I32)
-    nchunk, n_split = mb_back.back_plan(_back_key(key))[:2]
     # a split unit a CTA (``back.run_back``), its keys loaded in K1's half
-    assert n_split <= BLOCKS
-    SPLIT0 = split_first(key)
+    assert mb_back.back_plan(_back_key(key))[1] <= BLOCKS
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def layer(
@@ -2820,95 +3054,6 @@ def build_mono_layer(key: MonoBuild):
             )
         ):
             lds = fx.SharedAllocator().allocate(LayerLds)
-            a = {
-                "res_in": res_in,
-                "pend": pend,
-                "post_in": post_in,
-                "comb_in": comb_in,
-                "pre_in": pre_in,
-                "hc_fn": hc_fn,
-                "hc_scale": hc_scale,
-                "hc_base": hc_base,
-                "attn_w": attn_w,
-                "res_out": res_out,
-                "aux_out": aux_out,
-                "aux_stride": aux_stride,
-                "post_out": post_out,
-                "comb_out": comb_out,
-                "pre_out": pre_out,
-                "wqkv": wqkv,
-                "wqkv_s": wqkv_s,
-                "qn_w": qn_w,
-                "kvn_w": kvn_w,
-                "wqb": wqb,
-                "wqb_s": wqb_s,
-                "cos_sin": cos_sin,
-                "pos": pos,
-                "slot": slot,
-                "slot_words": slot_words,
-                "swa": swa,
-                "swa_stride": swa_stride,
-                "swa_block": swa_block,
-                "swa_idx": swa_idx,
-                "swa_lens": swa_lens,
-                "topk": topk,
-                "topk_lens": topk_lens,
-                "kt": kt,
-                "klen": klen,
-                "q": q,
-                "normed_out": normed_out,
-                "qr_out": qr_out,
-                "iq_w": iq_w,
-                "iq_ws": iq_ws,
-                "iw_w": iw_w,
-                "iw_scale": iw_scale,
-                "num_pos": num_pos,
-                "iq_out": iq_out,
-                "iqs_out": iqs_out,
-                "iw_out": iw_out,
-                "scratch": scratch,
-                "sym": sym,
-                "peers": peers,
-                "rank": rank,
-                "epoch": epoch,
-                "ids": ids,
-                "ids_words": ids_words,
-                "comp": comp,
-                "comp_stride": comp_stride,
-                "comp_block": comp_block,
-                "sink": sink,
-                "qk_scale": qk_scale,
-                "woa": woa,
-                "woa_s": woa_s,
-                "wob": wob,
-                "wob_s": wob_s,
-                "zrec": zrec,
-                "ffn_fn": ffn_fn,
-                "ffn_scale": ffn_scale,
-                "ffn_base": ffn_base,
-                "ffn_w": ffn_w,
-                "out_res": out_res,
-                "out_post": out_post,
-                "out_comb": out_comb,
-                "out_pre": out_pre,
-                "gate_w": gate_w,
-                "bias": bias,
-                "w13": w13,
-                "w13_s": w13_s,
-                "w2": w2,
-                "w2_s": w2_s,
-                "sgu": sgu,
-                "sgu_s": sgu_s,
-                "sw2": sw2,
-                "sw2_s": sw2_s,
-                "out": out,
-                "eg_x": eg_x,
-                "eg_w": eg_w,
-                "eg_ws": eg_ws,
-                "eg_kv": eg_kv,
-                "eg_row0": eg_row0,
-                "seam_in": seam_in,
-            }
             # the peer table's words and the epoch together; the epoch in a scalar register,
             # it lives through K1 into K2, and the peer bases too (K2 reads them, a load of
             # them there would wait behind the split's early loads)
@@ -2918,63 +3063,102 @@ def build_mono_layer(key: MonoBuild):
             ]
             ep = uniform(_epoch(epoch))
             pbases = [ptr64(w) for w in peer_words]
-            layout = scratch_layout(s, tp, key.timeline, **route_of(key))
-            k2 = layer_handoff(scratch, layout, ep)
-            bid = fx.block_idx.x
-            # this CTA's split unit (``split_first``)
-            sunit = bid if SPLIT0 == 0 else first_task(bid, SPLIT0)
-            early = mb_back.EarlyKeys(
-                _back_key(key),
-                key.swa_width,
-                a,
-                fx.min(sunit, n_split - 1),
-                sunit < n_split,
-            )
-            run_k1(key, lds.seam.peek(), lds.front.peek(), a, ep, k2, early)
-            # the K1 half's LDS is free
-            gpu.barrier()
-            # a split CTA's K2 inputs in issue order, past the barrier (it would drain them):
-            # its K1 flags' first loads, then its old keys' records, in flight through the
-            # wait on q
-            if const_expr(tagged_q_split(Dims(tp), s, key.tok_par)):
-                first = mb_back.q_flag_load(
-                    scratch + fx.Int64(layout["qt"][0]),
-                    k2["krdy"],
-                    k1_words(layout, True),
-                    fx.thread_idx.x,
-                    fx.min(sunit, n_split - 1) // nchunk,
-                    s,
-                    Dims(tp),
-                    # the waves past the poll's (the keys') issue none
-                    pred=(sunit < n_split) & (fx.thread_idx.x < 256),
-                )()
-            else:
-                first = mb_back.k1_flag_load(
-                    k2["krdy"],
-                    k1_words(layout, key.tok_par),
-                    fx.thread_idx.x,
-                    fx.min(sunit, n_split - 1) // nchunk,
-                    s,
-                    pred=sunit < n_split,
-                )()
-            pre = early.loads()
-            names = [K2_OF_LAYER.get(n, n) for n in K2_ARGS]
-            names += list(EG_ARGS) if key.eg else []
-            names += list(SEAM_ARGS) if key.seam_next else []
-            a2 = reload_args(names, offsets, LAYER_I32)
-            eg = {n: a2[n] for n in EG_ARGS} if key.eg else None
-            sn = {n: a2[n] for n in SEAM_ARGS} if key.seam_next else None
-            run_k2(
+
+            layer_body(
                 key,
                 lds,
-                {n: a2[K2_OF_LAYER.get(n, n)] for n in K2_ARGS},
+                {
+                    "res_in": res_in,
+                    "pend": pend,
+                    "post_in": post_in,
+                    "comb_in": comb_in,
+                    "pre_in": pre_in,
+                    "hc_fn": hc_fn,
+                    "hc_scale": hc_scale,
+                    "hc_base": hc_base,
+                    "attn_w": attn_w,
+                    "res_out": res_out,
+                    "aux_out": aux_out,
+                    "aux_stride": aux_stride,
+                    "post_out": post_out,
+                    "comb_out": comb_out,
+                    "pre_out": pre_out,
+                    "wqkv": wqkv,
+                    "wqkv_s": wqkv_s,
+                    "qn_w": qn_w,
+                    "kvn_w": kvn_w,
+                    "wqb": wqb,
+                    "wqb_s": wqb_s,
+                    "cos_sin": cos_sin,
+                    "pos": pos,
+                    "slot": slot,
+                    "slot_words": slot_words,
+                    "swa": swa,
+                    "swa_stride": swa_stride,
+                    "swa_block": swa_block,
+                    "swa_idx": swa_idx,
+                    "swa_lens": swa_lens,
+                    "topk": topk,
+                    "topk_lens": topk_lens,
+                    "kt": kt,
+                    "klen": klen,
+                    "q": q,
+                    "normed_out": normed_out,
+                    "qr_out": qr_out,
+                    "iq_w": iq_w,
+                    "iq_ws": iq_ws,
+                    "iw_w": iw_w,
+                    "iw_scale": iw_scale,
+                    "num_pos": num_pos,
+                    "iq_out": iq_out,
+                    "iqs_out": iqs_out,
+                    "iw_out": iw_out,
+                    "scratch": scratch,
+                    "sym": sym,
+                    "peers": peers,
+                    "rank": rank,
+                    "epoch": epoch,
+                    "ids": ids,
+                    "ids_words": ids_words,
+                    "comp": comp,
+                    "comp_stride": comp_stride,
+                    "comp_block": comp_block,
+                    "sink": sink,
+                    "qk_scale": qk_scale,
+                    "woa": woa,
+                    "woa_s": woa_s,
+                    "wob": wob,
+                    "wob_s": wob_s,
+                    "zrec": zrec,
+                    "ffn_fn": ffn_fn,
+                    "ffn_scale": ffn_scale,
+                    "ffn_base": ffn_base,
+                    "ffn_w": ffn_w,
+                    "out_res": out_res,
+                    "out_post": out_post,
+                    "out_comb": out_comb,
+                    "out_pre": out_pre,
+                    "gate_w": gate_w,
+                    "bias": bias,
+                    "w13": w13,
+                    "w13_s": w13_s,
+                    "w2": w2,
+                    "w2_s": w2_s,
+                    "sgu": sgu,
+                    "sgu_s": sgu_s,
+                    "sw2": sw2,
+                    "sw2_s": sw2_s,
+                    "out": out,
+                    "eg_x": eg_x,
+                    "eg_w": eg_w,
+                    "eg_ws": eg_ws,
+                    "eg_kv": eg_kv,
+                    "eg_row0": eg_row0,
+                    "seam_in": seam_in,
+                },
                 ep,
-                True,
-                eg,
-                first,
-                pre,
                 pbases,
-                sn,
+                lambda names: reload_args(names, offsets, LAYER_I32),
             )
 
     @flyc.jit
@@ -3165,6 +3349,166 @@ def build_mono_layer(key: MonoBuild):
             nx_aux_stride,
             seam_in,
             seam_out,
+        ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
+
+    return launch
+
+
+def build_mono_layers(key: MonoBuild):
+    """Build up to ``XL_LAYERS`` consecutive reuse layers in one launch: ``layer_body`` in a
+    runtime loop over the launch's ``count`` layers.
+
+    Layer l's arguments are row l of a table laid out as the layer launch's kernarg segment
+    (``xl_row``), its step's from the launch's own (``XL_STEP``: with the Engram rows each
+    layer's share of a later Engram layer's projection reads, ``key.eg`` tasks a layer), and
+    the first layer's inputs too (``XL_FIRST``); it runs on epoch ``ep + l``, so every tag, parity and MoE
+    counter slot is the one separate launches would use, and on ids of its own
+    (``layer_ids``). A layer past the first has no launch boundary before it: its seam slice
+    k sums the layer before's MoE partials of its 32 columns on CTA k, where that layer's
+    FFN slice k stored the residual (``chained_slice``); that layer skipped its own sum.
+    Every write of layer l + 1 follows, on its CTA, that CTA's own layer-l work, which
+    waited on layer l's down (the slices, on the down partials of their columns; every other
+    CTA, through its down task's wait on the ug), so no single-slot region or runner buffer
+    is written while layer l reads it."""
+    s, tp = key.tokens, key.tp
+    assert key.chain and key.kt and key.fold, key
+    assert not (key.index or key.tok_par or key.embed or key.glue), key
+    assert not (key.seamed or key.seam_next), key
+    rs = route_shape(_moe_key(key))
+    assert rs.experts // 64 in SORT_NETS
+    half = peer_half_bytes(tp)
+    assert SLICES + 2 * s <= BLOCKS
+    assert mb_back.back_plan(_back_key(key))[1] <= BLOCKS
+    LayerLds = _layer_lds(key, rs)
+    name = kernel_symbol(
+        "dsv41_mono_layers", s=s, tp=tp, c=key.compressed, f=key.fold, **_variant(key)
+    )
+    keyed = key_tuple(key, SOURCES)
+    offsets = kernarg_offsets(LAYER_ARGS, LAYER_I32)
+    xoffsets = kernarg_offsets(XL_ARGS, XL_I32)
+
+    @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
+    def layers(
+        table: Int64,
+        count: Int32,
+        scratch: Int64,
+        sym: Int64,
+        peers: Int64,
+        rank: Int32,
+        epoch: Int64,
+        pos: Int64,
+        slot: Int64,
+        slot_words: Int32,
+        swa_idx: Int64,
+        swa_lens: Int64,
+        topk: Int64,
+        topk_lens: Int64,
+        eg_x: Int64,
+        res_in: Int64,
+        pend: Int64,
+        post_in: Int64,
+        comb_in: Int64,
+        pre_in: Int64,
+    ):
+        _ = keyed
+        warm_kernargs(max(xoffsets.values()) + 8)
+        with guard.scope(
+            guard.Guard(
+                epoch,
+                own=sym,
+                peers=peers,
+                rank=rank,
+                npes=tp,
+                flags_offset=2 * half,
+                fault_site=key.fault_site or None,
+                fault_after=key.fault_after,
+            )
+        ):
+            lds = fx.SharedAllocator().allocate(LayerLds)
+            peer_words = [
+                fx.Vector(bo.buffer_load(rsrc(peers), 2 * p, vec_width=2, dtype=T.i32))
+                for p in range(tp)
+            ]
+            ep0 = uniform(_epoch(epoch))
+            pbases = [ptr64(w) for w in peer_words]
+
+            def one_layer(li):
+                # a function: the loop carries none of the stages' Python state
+                row = table + fx.Int64(li) * fx.Int64(XL_ROW)
+                # the row's lines in the scalar cache before its arguments' loads
+                warm_kernargs(XL_ROW, row)
+                k = reload_args(XL_STEP + XL_FIRST, xoffsets, XL_I32)
+
+                def load(names):
+                    out = reload_args(
+                        [n for n in names if n not in XL_STEP], offsets, LAYER_I32, row
+                    )
+                    return out | {n: k[n] for n in names if n in XL_STEP}
+
+                with layer_ids():
+                    a = load(BODY_ARGS)
+                    a |= {n: (li == 0).select(k[n], a[n]) for n in XL_FIRST}
+                    layer_body(
+                        key,
+                        lds,
+                        a,
+                        uniform(ep0 + li),
+                        pbases,
+                        load,
+                        (li > 0, li < count - 1, li >= count - 1),
+                    )
+
+            for li in range(count):
+                # the layer before's LDS is free
+                gpu.barrier()
+                one_layer(fx.Int32(li))
+
+    @flyc.jit
+    def launch(
+        table: Int64,
+        count: Int32,
+        scratch: Int64,
+        sym: Int64,
+        peers: Int64,
+        rank: Int32,
+        epoch: Int64,
+        pos: Int64,
+        slot: Int64,
+        slot_words: Int32,
+        swa_idx: Int64,
+        swa_lens: Int64,
+        topk: Int64,
+        topk_lens: Int64,
+        eg_x: Int64,
+        res_in: Int64,
+        pend: Int64,
+        post_in: Int64,
+        comb_in: Int64,
+        pre_in: Int64,
+        stream: fx.Stream = _STREAM,
+    ):
+        _ = keyed
+        layers(
+            table,
+            count,
+            scratch,
+            sym,
+            peers,
+            rank,
+            epoch,
+            pos,
+            slot,
+            slot_words,
+            swa_idx,
+            swa_lens,
+            topk,
+            topk_lens,
+            eg_x,
+            res_in,
+            pend,
+            post_in,
+            comb_in,
+            pre_in,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 
     return launch

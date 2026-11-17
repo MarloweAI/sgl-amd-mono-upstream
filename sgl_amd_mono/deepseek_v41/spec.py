@@ -790,6 +790,40 @@ def _boundary_out(layer, defer_post, x, residual, post, comb, pre):
     return layer.hc_post(x, residual, post, comb), pre, None
 
 
+def _step_keys(runner, L, plan, positions, forward_batch, M):
+    """Layer ``L``'s (positions, SWA slots, keys) at this step, its caches looked up at its
+    first launch: the window's slots and lengths, and its index source's top-k (none: ratio
+    0)."""
+    from sglang.srt.model_executor.forward_context import (
+        get_attn_backend,
+        get_token_to_kv_pool,
+    )
+
+    from sgl_amd_mono.deepseek_v41.gfx950.runner import SLOT_DTYPES
+
+    if L.swa is None:  # the layer's caches, at its first launch
+        pool = get_token_to_kv_pool()
+        L.swa, L.swa_block = pool.get_swa_raw_buffer(L.i), pool.get_swa_key_page_size()
+        if L.ratio:
+            # SGLang types the compressed cache as e4m3; K2 addresses its records' bytes
+            L.comp = pool.get_extra_key_buffer(L.i).view(torch.uint8)
+            L.comp_block = pool.get_extra_key_page_size(L.i)
+    backend = get_attn_backend()
+    if "k1" not in plan.state:
+        # the forward's first K1 converts them where needed; a graph records the copies
+        slot = backend.get_swa_out_cache_loc(forward_batch)[:M]
+        if not (slot.dtype in SLOT_DTYPES and slot.is_contiguous()):
+            slot = slot.long().contiguous()
+        plan.state["k1"] = (positions[:M].long().contiguous(), slot)
+    pos, slot = plan.state["k1"]
+    md = backend.forward_metadata.core_attn_metadata
+    if L.ratio:  # the top-k of the layer's index source (its own, after K1)
+        topk = (md.sparse_page_indices(L.ratio), md.sparse_topk_lengths(L.ratio))
+    else:
+        topk = (runner.no_topk, runner.no_topk_lens)
+    return pos, slot, (md.swa_page_indices, md.swa_topk_lengths, *topk)
+
+
 def _launch(
     runner,
     L,
@@ -815,36 +849,12 @@ def _launch(
     (``runner.layer(eg=)``). ``nxt``: the next layer (a reuse layer), whose attention seam
     this launch runs (``runner.layer(nxt=)``); ``seamed``: the previous launch ran this
     layer's (the pending post is not read)."""
-    from sglang.srt.model_executor.forward_context import (
-        get_attn_backend,
-        get_token_to_kv_pool,
-    )
-
-    from sgl_amd_mono.deepseek_v41.gfx950.runner import SLOT_DTYPES
+    from sglang.srt.model_executor.forward_context import get_attn_backend
 
     x, residual, post, comb = pending_post
-    if L.swa is None:  # the layer's caches, at its first launch
-        pool = get_token_to_kv_pool()
-        L.swa, L.swa_block = pool.get_swa_raw_buffer(L.i), pool.get_swa_key_page_size()
-        if L.ratio:
-            # SGLang types the compressed cache as e4m3; K2 addresses its records' bytes
-            L.comp = pool.get_extra_key_buffer(L.i).view(torch.uint8)
-            L.comp_block = pool.get_extra_key_page_size(L.i)
     backend = get_attn_backend()
     M = residual.shape[0] if embed is None else embed[1].shape[0]
-    if "k1" not in plan.state:
-        # the forward's first K1 converts them where needed; a graph records the copies
-        slot = backend.get_swa_out_cache_loc(forward_batch)[:M]
-        if not (slot.dtype in SLOT_DTYPES and slot.is_contiguous()):
-            slot = slot.long().contiguous()
-        plan.state["k1"] = (positions[:M].long().contiguous(), slot)
-    pos, slot = plan.state["k1"]
-    md = backend.forward_metadata.core_attn_metadata
-    if L.ratio:  # the top-k of the layer's index source (its own, after K1)
-        topk = (md.sparse_page_indices(L.ratio), md.sparse_topk_lengths(L.ratio))
-    else:
-        topk = (runner.no_topk, runner.no_topk_lens)
-    keys = (md.swa_page_indices, md.swa_topk_lengths, *topk)
+    pos, slot, keys = _step_keys(runner, L, plan, positions, forward_batch, M)
     if x is None:
         if embed is None:
             residual = residual.contiguous()  # the broadcast embedding may be a view
@@ -1207,7 +1217,10 @@ class _Built:
         tok_par = plan.state["tok_par"]
         fuse = fused.enabled()
         seamed = False
+        runs, inside = self._runs(rows, tok_par), set()
         for i in range(m.start_layer, m.end_layer):
+            if i in inside:
+                continue
             engram = m.layers[i].engram
             if engram is not None:
                 # the previous layer's launch projected its rows, where it could
@@ -1223,6 +1236,22 @@ class _Built:
                 defer = fuse and not (tok_par and aux is None)
             else:
                 defer = nxt.engram is None or fuse
+            if i in runs:
+                # a run of reuse layers in one launch; ``defer`` is its last layer's
+                js = runs[i]
+                inside.update(js[1:])
+                nl = js[-1] + 1
+                defer = (
+                    (fuse and not (tok_par and aux is None))
+                    if nl >= m.end_layer
+                    else m.layers[nl].engram is None or fuse
+                )
+                hidden, pre, post = self._run(
+                    js, plan, positions, forward_batch, pending, pre, defer, engram_rows
+                )
+                seamed = False
+                pending = post if defer else (None, hidden, None, None)
+                continue
             moves = self._seam_moves(i, rows, tok_par)
             hidden, pre, post = self._layer(
                 self._layers[i], plan, positions, forward_batch, pending, pre, defer,
@@ -1260,6 +1289,83 @@ class _Built:
         # every captured layer wrote its block: the logits processor reads them packed
         assert len(aux) == len(m.dspark_layers_to_capture)
         return (hidden, pre_hc_head), packed
+
+    def _runs(self, rows, tok_par) -> dict:
+        """The runs of reuse layers a step at this width runs in one launch each
+        (``runner.layers``, where ``runner.chains``): its first layer -> its layers, up to
+        ``XL_LAYERS``, at least two. A run's layers are reuse layers (not an index source,
+        not the first layer) with no Engram write, each owing its post to the next, and each
+        projecting the same tasks of a later Engram layer's rows (or none)."""
+        from sgl_amd_mono.deepseek_v41.gfx950.layer import XL_LAYERS
+
+        m = self.model
+        if not (fused.enabled() and self.runner.chains(rows, tok_par)):
+            return {}
+        cache = self.__dict__.setdefault("_run_plans", {})
+        if (rows, tok_par) in cache:
+            return cache[rows, tok_par]
+
+        eg = self.runner.eg_fused(rows, tok_par)
+
+        def kind(i):
+            """Layer i's Engram tasks, or None where it cannot join a run."""
+            L = self._layers.get(i)
+            if not (
+                m.start_layer < i < m.end_layer
+                and L is not None
+                and not L.index
+                and m.layers[i].engram is None
+            ):
+                return None
+            return L.eg.tasks if eg and L.eg is not None else 0
+
+        runs, cur = {}, []
+        for i in range(m.start_layer, m.end_layer + 1):
+            k = kind(i)
+            if k is not None and cur and k == kind(cur[0]) and len(cur) < XL_LAYERS:
+                cur.append(i)
+                continue
+            if len(cur) >= 2:
+                runs[cur[0]] = list(cur)
+            cur = [i] if k is not None else []
+        cache[rows, tok_par] = runs
+        return runs
+
+    def _run(
+        self, js, plan, positions, forward_batch, pending, pre, defer_post, engram_rows
+    ):
+        """Layers ``js`` in one launch (``runner.layers``), each owing its post to the next:
+        the pending post (x, residual, post, comb) and pre of the layer before in; the fused
+        boundary's outputs of the last out; each layer's share of a later Engram layer's
+        projection (``_engram_projection``). Every layer's outputs are the runner's own for
+        it, so the launch's argument table is the same at every step."""
+        from sgl_amd_mono.deepseek_v41.gfx950.runner import no_capture
+
+        self._warm_normal_moe()
+        r = self.runner
+        x, residual, post, comb = pending
+        M = residual.shape[0]
+        steps, outs = [], []
+        for j in js:
+            L = self._layers[j]
+            pos, slot, keys = _step_keys(r, L, plan, positions, forward_batch, M)
+            steps.append(
+                dict(
+                    w=L.k1, aw=L.k2, fw=L.ffn, x=x, residual=residual, post=post,
+                    comb=comb, pre=pre, pos=pos, slot=slot, swa=L.swa, swa_block=L.swa_block,
+                    comp=L.comp, comp_block=L.comp_block, keys=keys,
+                    aux=self._capture(plan, L, M),
+                    eg=self._engram_projection(plan, j, engram_rows, M),
+                )
+            )  # fmt: skip
+            key = ("layer outs", M, j)
+            if key not in self.__dict__:
+                no_capture(f"layer {j}'s outputs at width {M}")
+                self.__dict__[key] = r._outs(M, r.res_mid[:M])
+            outs.append(self.__dict__[key])
+            x, residual, post, comb, pre = outs[-1]
+        r.layers(steps, outs)
+        return _boundary_out(self._layers[js[-1]].module, defer_post, *outs[-1])
 
     def _seam_moves(self, i, rows, tok_par) -> bool:
         """Whether layer i's launch runs layer i + 1's attention seam: both reuse layers in
@@ -1764,12 +1870,21 @@ def _build(model, hf_config, ctx) -> _Built:
             (False, first.ratio > 0, True, eg)
             for eg in {0, first.eg.tasks if first.eg is not None else 0}
         }
+    # the runs of reuse layers in one launch (``_Built._runs``): their kinds
+    xl = {
+        (L.ratio > 0, eg)
+        for i, L in layers.items()
+        if i > model.model.start_layer
+        and not L.index
+        and model.model.layers[i].engram is None
+        for eg in {0, L.eg.tasks if L.eg is not None else 0}
+    }
     # ranks share FlyDSL's disk cache (a lock per kernel), so each starts at its own slice
     widths = [m for m in ctx.widths if m <= MAX_ROWS]
     start = len(widths) * p.tp_rank // p.tp_size
     for m in widths[start:] + widths[:start]:
         runner.precompile(
-            m, k1=k1, k2=k2, layer=one, k2i=k2i, tok_par=runner.tok_par(m)
+            m, k1=k1, k2=k2, layer=one, k2i=k2i, tok_par=runner.tok_par(m), layers=xl
         )
     glue.prewarm(device)
     built = _Built(model, runner, layers)

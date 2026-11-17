@@ -392,6 +392,115 @@ def main():
         if bad:
             fails.append("seam move replay")
 
+    # a run of reuse layers in one launch (``runner.layers``): the three layers A, B, C
+    # against three layer launches each on the previous one's outputs, every output of each
+    # (the first two's MoE outputs summed by the next layer's seam slices), the last one's
+    # K1 outputs and the SWA cache; then the launch in one graph under replay
+    # each of the three layers projecting an equal share of the Engram layer's rows
+    third = n_eg // 96 * 32
+    thirds = [
+        EngramWeights(
+            w=ew.w[a : a + third],
+            ws=ew.ws[a // 32 : (a + third) // 32].contiguous(),
+            row0=a,
+        )
+        for a in (0, third, 2 * third)
+    ]
+    eg_rows = {}
+
+    def run_layers(M, step, compressed, one, eg=False):
+        x, res, post, comb, pre, pos, slot, keys = step
+        if eg:
+            if M not in eg_rows:
+                gi = torch.Generator().manual_seed(700 + M)
+                eg_rows[M] = (
+                    (torch.randn(M, engram.K, generator=gi) * 0.3).bfloat16().to(dev)
+                )
+            runner.egkv.fill_(SENTINEL)
+        cc = comp if compressed else None
+        if not compressed:
+            keys = (*keys[:2], runner.no_topk, runner.no_topk_lens)
+        swa.copy_(swa0)
+        # allocated once, outside the graph: the launch's argument table holds them
+        outs = xl_outs.setdefault(
+            (M, compressed, one, eg), [runner._outs(M, res) for _ in chain]
+        )
+        for o in outs:
+            for t in o:
+                t.fill_(SENTINEL)
+        sts, ins = [], (x, res, post, comb, pre)
+        for i, w in enumerate(chain):
+            sts.append(dict(
+                w=w, aw=aw, fw=mw, x=ins[0], residual=ins[1], post=ins[2], comb=ins[3],
+                pre=ins[4], pos=pos, slot=slot, swa=swa, swa_block=SWA_BLOCK, comp=cc,
+                comp_block=COMP_BLOCK, keys=keys,
+                eg=(eg_rows[M], thirds[i]) if eg else None,
+            ))  # fmt: skip
+            ins = outs[i]
+        if one:
+            for st, o in zip(sts, outs):
+                runner.layer(
+                    st["w"], aw, mw, st["x"], st["residual"], st["post"], st["comb"],
+                    st["pre"], pos, slot, swa, SWA_BLOCK, cc, COMP_BLOCK, keys, outs=o,
+                    eg=st["eg"],
+                )  # fmt: skip
+        else:
+            runner.layers(sts, outs)
+        mids = (runner.res_mid, runner.post_a, runner.comb_a, runner.pre_a)
+        kv = [runner.egkv[:M].clone()] if eg else []
+        return (
+            [t.clone() for o in outs for t in o]
+            + [t[:M].clone() for t in mids]
+            + [swa.clone()]
+            + kv
+        )
+
+    xl_cases, xl_outs = [], {}
+    for M in (int(v) for v in args.widths.split(",")):
+        if not runner.chains(M):
+            continue
+        step = step_inputs(M, tp, rank, dev)
+        for compressed, eg in ((True, False), (False, False), (True, True)):
+            want = run_layers(M, step, compressed, True, eg)
+            got = run_layers(M, step, compressed, False, eg)
+            bad = [
+                i for i, (u, v) in enumerate(zip(got, want))
+                if not u.view(torch.uint8).equal(v.view(torch.uint8))
+            ]  # fmt: skip
+            name = f"M={M} compressed={compressed} engram={eg} multi-layer launch"
+            if rank == 0:
+                print(
+                    f"{name}: {'bitwise' if not bad else f'DIFFERS {bad}'}", flush=True
+                )
+            if bad:
+                fails.append(name)
+            xl_cases.append((M, step, compressed, eg, got))
+    if xl_cases:
+
+        def xl_all():
+            return [run_layers(M, st, cmp, False, eg) for M, st, cmp, eg, _ in xl_cases]
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            outs_g = xl_all()
+        bad = 0
+        for i in range(args.replays):
+            graph.replay()
+            if i % 10 == 9 or i == args.replays - 1:
+                torch.cuda.synchronize()
+                for got, (_, _, _, _, want) in zip(outs_g, xl_cases):
+                    bad += sum(
+                        not x.view(torch.uint8).equal(y.view(torch.uint8))
+                        for x, y in zip(got, want)
+                    )
+        if rank == 0:
+            print(
+                f"multi-layer launch replays: {args.replays}, {bad} mismatching checks",
+                flush=True,
+            )
+        if bad:
+            fails.append("multi-layer launch replay")
+
     # every step's layer launch in one graph: bit for bit against eager under replay; the
     # steps share the cache their K1s write, so each pass starts from the same one
     def run_all():
