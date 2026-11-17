@@ -13,9 +13,9 @@ from pathlib import Path
 import torch
 
 _HERE = Path(__file__).resolve().parent
-# verify rows (requests x rows a request) the launch takes; larger verifies keep the
-# separate launches
-MAX_ROWS = 6
+# verify rows (requests x rows a request) the launch takes, DSpark block 6 at C = 1 (fused_tail.hip's
+# MAX_M); larger verifies keep the separate launches
+MAX_ROWS = 7
 MAX_TP = 8
 MAX_T = 8
 MAX_BLOCKS = 256  # a block 128 vocab rows of the shard

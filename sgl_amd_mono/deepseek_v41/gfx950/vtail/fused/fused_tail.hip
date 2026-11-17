@@ -45,7 +45,7 @@ constexpr int GAP    = 32;        // a row's 4 lanes contiguous in each load ins
 constexpr int STEP   = 4 * 8 * V; // K an iteration
 constexpr int MAX_K  = 6144;
 // the launch
-constexpr int MAX_M      = 6; // verify rows (x [M, K] in LDS beside the waves' weight tiles)
+constexpr int MAX_M      = 7; // verify rows (x [M, K] in LDS beside the waves' weight tiles): DSpark block 6 at C = 1
 constexpr int MAX_TP     = 8;
 constexpr int MAX_T      = 8;
 constexpr int MAX_BLOCKS = 256;
