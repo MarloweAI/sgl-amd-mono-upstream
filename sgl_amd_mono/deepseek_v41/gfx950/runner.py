@@ -371,7 +371,7 @@ class DSV41MonoRunner:
         self._scratch: dict = {}  # width -> its scratch's PeerBuffer
         self._seam: dict = {}  # width -> its seam state (``seam_state``)
         self._xl_tables: dict = {}  # a multi-layer launch's rows -> its device table
-        self._xl_seams: dict = {}  # (width, layer of a TP8 run) -> ``_xl_seam``
+        self._xl_seams: dict = {}  # a run's layer buffers (``_xl_seam``, ``_xl_mids``)
         # [epoch, the guard block (deadline, error words), a mark per CTA, the MoE's counters]
         self.epoch = torch.zeros(EPOCH_WORDS, dtype=torch.int32, device=dev)
         self.fault_site, self.fault_after = guard.fault_injection(rank) or (0, 0)
@@ -527,6 +527,23 @@ class DSV41MonoRunner:
             f32, dev = torch.float32, self.device
             got = self._xl_seams[key] = (
                 self.new_seam_state(tokens),
+                torch.zeros(tokens, HC, dtype=f32, device=dev),
+                torch.zeros(tokens, HC, HC, dtype=f32, device=dev),
+                torch.zeros(tokens, HC, dtype=f32, device=dev),
+            )
+        return got
+
+    def _xl_mids(self, tokens: int, i: int) -> tuple:
+        """Layer i's K1 outputs (R_new, post, comb, pre) in a TP4 multi-layer launch, a set a
+        layer of the run but the last (which writes the runner's own): other CTAs read
+        them, so no buffer is written twice in a launch. Allocated before graph capture."""
+        key = ("mids", tokens, i)
+        got = self._xl_seams.get(key)
+        if got is None:
+            no_capture(f"multi-layer K1 outputs width {tokens}")
+            f32, dev = torch.float32, self.device
+            got = self._xl_seams[key] = (
+                torch.zeros(tokens, HC, HIDDEN, dtype=torch.bfloat16, device=dev),
                 torch.zeros(tokens, HC, dtype=f32, device=dev),
                 torch.zeros(tokens, HC, HC, dtype=f32, device=dev),
                 torch.zeros(tokens, HC, dtype=f32, device=dev),
@@ -1274,13 +1291,19 @@ class DSV41MonoRunner:
                 st["w"], x, res, post, comb, pre, st["pos"], st["slot"], st["swa"],
                 st["swa_block"], st["keys"], False, False, aux,
             )  # fmt: skip
+            mids = None
             if moves and i > 0:
                 # its gates' outputs, which its FFN seam reads (``layer.seam_gates``)
+                mids = (res, post, comb, pre)
+            elif not moves and i < n - 1:
+                # R_new and the gates' outputs, which its FFN seam's CTAs read: a set of its own
+                mids = self._xl_mids(m, i)
+            if mids is not None:
                 a1 |= {
-                    "res_out": res.data_ptr(),
-                    "post_out": post.data_ptr(),
-                    "comb_out": comb.data_ptr(),
-                    "pre_out": pre.data_ptr(),
+                    k: t.data_ptr()
+                    for k, t in zip(
+                        ("res_out", "post_out", "comb_out", "pre_out"), mids
+                    )
                 }
             a2, _, comp = self._k2_args(
                 st["aw"], st["fw"], m, st["pos"], st["swa"], st["swa_block"],
