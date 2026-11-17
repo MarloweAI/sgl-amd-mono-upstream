@@ -30,6 +30,7 @@ from .layer import (
     K2_ARGS,
     K2_GLUE_ARGS,
     K2_OF_LAYER,
+    L2_ARGS,
     LAYER_ARGS,
     MAX_TOKENS,
     SEAM_ARGS,
@@ -1255,7 +1256,7 @@ class DSV41MonoRunner:
                     "a multi-layer launch: one width and kind, a post owed"
                 )
             M, compressed = m, comp
-            a2 |= dict.fromkeys(EG_ARGS + SEAM_ARGS, 0)
+            a2 |= dict.fromkeys(EG_ARGS + SEAM_ARGS + L2_ARGS, 0)
             a2 |= {"nx_aux_stride": HIDDEN, "seam_in": 0}
             eg = st.get("eg")
             if eg is not None:
@@ -1380,6 +1381,7 @@ class DSV41MonoRunner:
         )
         a2 |= dict.fromkeys(EG_ARGS, 0)
         a2 |= dict.fromkeys(SEAM_ARGS, 0)
+        a2 |= dict.fromkeys(L2_ARGS, 0)
         a2["nx_aux_stride"] = HIDDEN
         a2["seam_in"] = seam_in.data_ptr() if seamed else 0
         if nxt is not None:
@@ -1391,6 +1393,11 @@ class DSV41MonoRunner:
                 "nx_aux": 0 if nxt_aux is None else nxt_aux.data_ptr(),
                 "nx_aux_stride": HIDDEN if nxt_aux is None else nxt_aux.stride(0),
                 "seam_out": seam_out.data_ptr(),
+                # its front weights, loaded into the L2 at this launch's end
+                "nx_wqkv": nxt.wqkv.data_ptr(),
+                "nx_wqkv_s": nxt.wqkv_s.data_ptr(),
+                "nx_wqb": nxt.wqb.data_ptr(),
+                "nx_wqb_s": nxt.wqb_s.data_ptr(),
             }
         if eg is not None:
             rows, ew = eg

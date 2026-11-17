@@ -52,6 +52,9 @@ from .attention import device as mb_device
 from .attention import front as mb_front
 from .attention import index_query
 from .attention.plan import (
+    Q_RANK,
+    QKV_ROWS,
+    ROWS,
     WINDOW,
     WORD,
     WQKV_TASKS,
@@ -1788,6 +1791,97 @@ def reset_counters(epoch, ep):
         gstore(epoch + fx.Int64(at), fx.Int32(0), words=1)
 
 
+# A seam-move launch's CTAs past the seam tail's slices are idle once their MoE work is
+# done: they load the next layer's front weights into the L2, which keeps clean lines
+# across the launch boundary. A CTA runs on the same XCD in every launch of the grid, and
+# CTAs c and c + 8 on the same XCD, so the front's 16-row tile read on CTA c (wqkv's row
+# tile c % 112, wq_b's task c) goes to the L2 of a loading CTA = c (mod 8).
+L2_FIRST = SLICES
+L2_ROUND = (
+    4096  # bytes a round: 16 B a thread of a CTA's half, each half its own rounds
+)
+L2_HALVES = THREADS * 16 // L2_ROUND
+L2_DEPTH = 8  # loads in flight a CTA (64 KB)
+L2_ARGS = ("nx_wqkv_s", "nx_wqb_s", "nx_wqkv", "nx_wqb")
+
+
+def l2_weights(tp: int) -> list:
+    """The next layer's front weights in load order, each (argument, its tile's bytes, or 0:
+    the whole tensor into every XCD's L2 (the E8M0 blocks), its bytes)."""
+    d = Dims(tp)
+    return [
+        ("nx_wqkv_s", 0, QKV_ROWS // 32 * HIDDEN // 32),
+        ("nx_wqb_s", 0, d.q_rows // 32 * Q_RANK // 32),
+        ("nx_wqkv", ROWS * HIDDEN, QKV_ROWS * HIDDEN),
+        ("nx_wqb", ROWS * Q_RANK, d.q_rows * Q_RANK),
+    ]
+
+
+def l2_plan(tp: int) -> list:
+    """Each weight's loads a loading CTA, as (argument, its bytes, the tile's bytes or 0,
+    its rounds an XCD, a CTA's loads)."""
+    per = (BLOCKS - L2_FIRST) // 8
+    out = []
+    for arg, tile, nbytes in l2_weights(tp):
+        if tile:
+            assert tile % L2_ROUND == 0 and nbytes % (8 * tile) == 0, arg
+            rounds = nbytes // tile // 8 * (tile // L2_ROUND)
+        else:
+            rounds = -(-nbytes // L2_ROUND)
+        out.append((arg, nbytes, tile, rounds, -(-rounds // (per * L2_HALVES))))
+    return out
+
+
+def keep_vectors(values):
+    """``values`` (loads) waited for here, never used."""
+    llvm.InlineAsmOp(
+        None,
+        [as_ir_value(v) for v in values],
+        "",
+        ",".join("v" * len(values)),
+        has_side_effects=True,
+    )
+
+
+@flyc.jit
+def idle_tail(c, tp, bid):
+    """A seam-move launch's end on a CTA past the seam tail's slices: ``front_l2``."""
+    if bid >= L2_FIRST:
+        nx = reload_args(L2_ARGS, kernarg_offsets(LAYER_ARGS, LAYER_I32), LAYER_I32)
+        front_l2(c, nx, l2_plan(tp), bid)
+
+
+def front_l2(c, nx, plan, bid):
+    """Load the next layer's front weights (``nx``: ``L2_ARGS``) of this XCD's CTAs into
+    its L2, default cache policy: CTA ``bid`` (past ``L2_FIRST``) the rounds j, j + 12 ..
+    of each weight's rounds of the tiles = bid (mod 8), a half of the CTA every other one,
+    64 KB in flight."""
+    per = (BLOCKS - L2_FIRST) // 8
+    xcd = bid % 8
+    j = (bid - L2_FIRST) // 8
+    half = c["tid"] // (L2_ROUND // 16)
+    at16 = c["tid"] % (L2_ROUND // 16) * 16
+    pending = []
+    for arg, nbytes, tile, rounds, loads in plan:
+        res = rsrc(nx[arg], fx.Int64(nbytes))
+        for i in range_constexpr(loads):
+            u = j + per * (L2_HALVES * i + half)
+            if const_expr(tile):
+                spt = tile // L2_ROUND
+                off = (xcd + 8 * (u // spt)) * tile + (u % spt) * L2_ROUND
+            else:
+                off = u * L2_ROUND
+            # past the weight's rounds: out of bounds, no traffic
+            off = (u < rounds).select(off + at16, fx.Int32(nbytes))
+            pending.append(bo.buffer_load(res, off // 4, vec_width=4, dtype=T.i32))
+            if const_expr(len(pending) == L2_DEPTH):
+                keep_vectors(pending)
+                pending = []
+    if const_expr(pending):
+        keep_vectors(pending)
+    stamp(c, 173)
+
+
 def build_mono_ffn(key: MonoBuild):
     """Build the FFN launch: push this rank's wo_b partial, then ``run_ffn``."""
     s, tp = key.tokens, key.tp
@@ -2334,6 +2428,10 @@ def run_k2(
     if const_expr(key.eg):
         # every rank's share of the projection in, long since: into ``eg_kv``
         engram.unpack(gc, ec, s)
+    if const_expr(key.seam_next):
+        # the layer launch's arguments (``L2_ARGS``)
+        assert one, key
+        idle_tail({n: c[n] for n in ("tid", "tl") if n in c}, tp, bid)
 
 
 def _k2_members(s, tp, rs):
@@ -2696,6 +2794,12 @@ LAYER_ARGS = K1_ARGS + (
     "nx_aux_stride",
     "seam_in",
     "seam_out",
+    # the next layer's front weights, loaded into the L2 at a seam-move launch's end
+    # (``front_l2``)
+    "nx_wqkv",
+    "nx_wqkv_s",
+    "nx_wqb",
+    "nx_wqb_s",
 )
 EG_ARGS = ("eg_x", "eg_w", "eg_ws", "eg_kv", "eg_row0")
 SEAM_ARGS = ("nx_aux", "nx_aux_stride", "seam_out")
@@ -3124,6 +3228,10 @@ def build_mono_layer(key: MonoBuild):
         nx_aux_stride: Int32,
         seam_in: Int64,
         seam_out: Int64,
+        nx_wqkv: Int64,
+        nx_wqkv_s: Int64,
+        nx_wqb: Int64,
+        nx_wqb_s: Int64,
     ):
         _ = keyed
         warm_kernargs(max(offsets.values()) + 8)
@@ -3340,6 +3448,10 @@ def build_mono_layer(key: MonoBuild):
         nx_aux_stride: Int32,
         seam_in: Int64,
         seam_out: Int64,
+        nx_wqkv: Int64,
+        nx_wqkv_s: Int64,
+        nx_wqb: Int64,
+        nx_wqb_s: Int64,
         stream: fx.Stream = _STREAM,
     ):
         _ = keyed
@@ -3434,6 +3546,10 @@ def build_mono_layer(key: MonoBuild):
             nx_aux_stride,
             seam_in,
             seam_out,
+            nx_wqkv,
+            nx_wqkv_s,
+            nx_wqb,
+            nx_wqb_s,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 
     return launch
