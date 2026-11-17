@@ -1843,6 +1843,14 @@ def keep_vectors(values):
     )
 
 
+def l2_prefetch(key: MonoBuild) -> bool:
+    """Whether a seam-move launch's idle CTAs load the next layer's front weights: where its
+    MoE leaves them the time, up to 2 rows a token tile or past the per-row MoE's widths. At
+    4-7 rows the per-row MoE holds them until the seam tail's end, and the loads would hold
+    the launch's end."""
+    return key.tokens <= 2 or not route_shape(_moe_key(key)).row_moe
+
+
 @flyc.jit
 def idle_tail(c, tp, bid):
     """A seam-move launch's end on a CTA past the seam tail's slices: ``front_l2``."""
@@ -2430,7 +2438,7 @@ def run_k2(
     if const_expr(key.eg):
         # every rank's share of the projection in, long since: into ``eg_kv``
         engram.unpack(gc, ec, s)
-    if const_expr(key.seam_next):
+    if const_expr(key.seam_next and l2_prefetch(key)):
         # the layer launch's arguments (``L2_ARGS``)
         assert one, key
         idle_tail({n: c[n] for n in ("tid", "tl") if n in c}, tp, bid)
