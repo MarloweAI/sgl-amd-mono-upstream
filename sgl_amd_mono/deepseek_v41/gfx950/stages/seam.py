@@ -64,6 +64,8 @@ SLICES = HIDDEN // COLS
 KT = HC * COLS  # projection columns a slice task
 PART = MIX + 1  # a slice's partials a token: the mixes, then the sum of squares
 GATE_BLOCK = 8  # slices a gate thread sums
+# where a slice's partial projections run (``stage_slice``'s ``c["mixes"]``)
+MIX_HERE, MIX_NONE = "here", "none"
 
 
 def scratch_layout(tokens: int) -> dict[str, tuple[int, int]]:
@@ -77,8 +79,9 @@ def scratch_layout(tokens: int) -> dict[str, tuple[int, int]]:
 
 # ---------------------------------------------------------------- seam state
 # A launch can run the next layer's attention seam slice past its MoE reduce
-# (``MonoBuild.seam_next``): the next launch then reads that seam's R_new, its layer input
-# (LIN, bf16) and the mixes' partials (f32) as plain rows (``MonoBuild.seamed``).
+# (``MonoBuild.seam_next``): the next launch then reads that seam's R_new and its layer
+# input (LIN, bf16) as plain rows (``MonoBuild.seamed``), and computes the mixes' partials
+# from R_new on CTAs its attention leaves idle (``stage_mix``).
 SEAM_MAX_TOKENS = (
     8  # widths the slice's first loads fit in registers beside the MoE reduce's
 )
@@ -90,7 +93,6 @@ def seam_state_layout(tokens: int) -> dict[str, tuple[int, int]]:
     for name, n in (
         ("res", tokens * HC * HIDDEN * 2),
         ("lin", tokens * HIDDEN * 2),
-        ("pmix", SLICES * tokens * PART * 4),
     ):
         out[name] = (off, n)
         off = -(-(off + n) // 256) * 256
@@ -310,9 +312,12 @@ def slice_row(c, c0, e, got):
 
 def slice_fn_loads(c, task):
     """Slice ``task``'s f32 mix weights (they wait on nothing), fn in full fp32 as
-    SGLang's boundary kernel (an IEEE fp32 dot) applies it."""
+    SGLang's boundary kernel (an IEEE fp32 dot) applies it; none where another launch
+    computes the slice's mixes (``c["mixes"]`` ``MIX_NONE``)."""
     tid, a, c0 = c["tid"], c["args"], task * COLS
     out = []
+    if const_expr(c.get("mixes", MIX_HERE) == MIX_NONE):
+        return out
     for i in range_constexpr((MIX * KT + THREADS - 1) // THREADS):
         e = fx.min(tid + THREADS * i, MIX * KT - 1)
         j = e // KT
@@ -339,8 +344,10 @@ def slice_prefetch(c, task):
 @flyc.jit
 def stage_slice(c, task, pre=None):
     """Compute R_new, the layer input and the partial projections of columns 32 task ..
-    +32 (``pre``: ``slice_prefetch``'s loads)."""
-    s, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
+    +32 (``pre``: ``slice_prefetch``'s loads). ``c["mixes"]``: ``MIX_HERE`` (default), the
+    partial projections here; ``MIX_NONE``, none (another launch's ``stage_mix`` computes
+    them)."""
+    s, tid = c["S"], c["tid"]
     rl, fl = c["rl"], c["fl"]
     c0 = task * COLS
     if const_expr(pre is None):
@@ -364,7 +371,26 @@ def stage_slice(c, task, pre=None):
     # layer input: bf16 R_new times pre, products rounded, summed in order (as the Triton collapse)
     for pas in range_constexpr(0, s * COLS // 2, THREADS):
         slice_input(c, task, plus(pas, tid), pm[pas // THREADS])
-    # sum of squares: token t on wave t % WAVES, two columns a lane
+    if const_expr(c.get("mixes", MIX_HERE) == MIX_HERE):
+        slice_sq(c, task)
+        # mixes: fp32 MFMA 16x16x4, A = fn rows, B = R_new^T, a token tile at a time
+        for t0, n in token_tiles(s):
+            slice_mix(c, task, t0, n)
+
+
+@flyc.jit
+def slice_partials(c, task):
+    """The partial projections of slice ``task`` (its sums of squares, then ``slice_mix`` a
+    token tile at a time) from its R_new and mix weights in ``rl`` and ``fl``."""
+    slice_sq(c, task)
+    for t0, n in token_tiles(c["S"]):
+        slice_mix(c, task, t0, n)
+
+
+@flyc.jit
+def slice_sq(c, task):
+    """The sums of squares of R_new in ``rl``: token t on wave t % WAVES, two columns a lane."""
+    s, lane, wave, rl = c["S"], c["lane"], c["wave"], c["rl"]
     if const_expr(s <= WAVES or c["d"].tp == 8):
         for t in range_constexpr(s):
             if wave == t % WAVES:
@@ -385,9 +411,29 @@ def stage_slice(c, task, pre=None):
         for t, sq in zip(toks, sqs):
             if (lane == 0) & (t < s):
                 c["put"](c["pmix"], (task * s + t) * PART + MIX, sq)
-    # mixes: fp32 MFMA 16x16x4, A = fn rows, B = R_new^T, a token tile at a time
-    for t0, n in token_tiles(s):
-        slice_mix(c, task, t0, n)
+
+
+@flyc.jit
+def stage_mix(c, task):
+    """The mixes' partials of slice ``task`` (columns 32 task ..) from the stored R_new rows
+    (``res_in``, bf16, as ``slice_row`` rounded them): ``rl`` and ``fl`` filled as
+    ``stage_slice`` fills them, then its sums of squares and ``slice_mix``, the same tasks,
+    waves and order."""
+    s, tid = c["S"], c["tid"]
+    a, rl, fl, c0 = c["args"], c["rl"], c["fl"], task * COLS
+    fn = slice_fn_loads(c, task)
+
+    def load(e):
+        t, o, col = slice_at(c0, e)
+        return ld_bf(a["res_in"], (t * HC + o) * HIDDEN + col)
+
+    batched_rounds(tid, s * KT, load, lambda e, v: fx.ptr_store(v, rl + e))
+    for i in range_constexpr(len(fn)):
+        e = tid + THREADS * i
+        if e < MIX * KT:
+            fx.ptr_store(fn[i], fl + e)
+    gpu.barrier()
+    slice_partials(c, task)
 
 
 @flyc.jit

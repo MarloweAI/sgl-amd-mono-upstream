@@ -1388,7 +1388,6 @@ class DSV41MonoRunner:
             if nxt_aux is not None:
                 self._check_aux(nxt_aux, M)
             a2 |= {
-                "nx_fn": nxt.hc_fn.data_ptr(),
                 "nx_aux": 0 if nxt_aux is None else nxt_aux.data_ptr(),
                 "nx_aux_stride": HIDDEN if nxt_aux is None else nxt_aux.stride(0),
                 "seam_out": seam_out.data_ptr(),
