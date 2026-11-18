@@ -197,7 +197,7 @@ class TestMonokernelVerify(_Serving, CustomTestCase):
 
     def test_passkey_past_the_candidate_span(self):
         # the candidate source must keep the passkey's early block for later index sources to read
-        from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+        from sglang.srt.hf_transformers.tokenizer import get_tokenizer
 
         tok = get_tokenizer(MODEL, trust_remote_code=True)
         prompt = _long_prompts()[1]

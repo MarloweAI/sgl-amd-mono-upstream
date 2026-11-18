@@ -5,12 +5,13 @@ sgl-project/sglang#43949).
 Every covered layer is one launch for the whole decoder layer (``gfx950/kernel.py``):
 the input norm, q_a | kv_a, the q and kv norms, the cache writes, q_b, the indexer
 (on the layers that run it) and its exact top-2048, the sparse MLA, o_proj and its
-TP reduce, the post-attention norm, the router, the routed and shared FP8 experts
-and the MoE TP reduce, adding both outputs to the hidden stream.
+TP reduce, the post-attention norm, the router, the routed and shared experts and
+the MoE TP reduce, adding both outputs to the hidden stream.
 
-The dense layers 0 to 2 run the same launch with their FP8 SwiGLU MLP in place
-of the MoE, on the experts' W8A8 path (per-128 FP8 activations, as SGLang's dense
-FP8 linears). Layer 0 starts from the step's tokens: SGLang's embedding is not run.
+The dense layers 0 to 2 run the same launch with their SwiGLU MLP in place of the
+MoE, on the experts' path. The MLPs are the checkpoint's: FP8 (per-128 FP8
+activations, as SGLang's FP8 linears) or MXFP4 (MXFP4 activations, as SGLang's
+MXFP4 ops). Layer 0 starts from the step's tokens: SGLang's embedding is not run.
 After layer 77 the tail launch runs the final norm, the LM head and the logits'
 all-gather; SGLang's final norm is not run, and its logits processor returns the
 tail's logits (``_get_logits``) and stores the final norm's rows.
@@ -31,6 +32,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+from typing import Optional
 
 import msgspec
 import torch
@@ -176,9 +178,10 @@ NUMERICS = Numerics(
         # A dense layer's MLP (check.dense), every rank's shard summed: its mid against
         # an f32 gate | up on its own FP8 activations, its output against the f32 down
         # projection of its own per-128 FP8 mid, and its distance to an f32 MLP on its
-        # FFN input over SGLang's FP8 MLP's on the same input, less one. 3x the largest
+        # FFN input over SGLang's MLP's on the same input, less one. 3x the largest
         # the serving check measured (TP8, FP8 KV, 1-8 rows, positions to 8.2K: 5.5e-5,
-        # 9.2e-3, 0.036); a down or gate | up scale x2 on one rank fails them.
+        # 9.2e-3, 0.036); a down or gate | up scale x2 on one rank fails them. An MXFP4
+        # MLP reports the last only (serving max 4.4e-3).
         # Its input, the post-attention norm of its FFN input, against SGLang's MLP's
         # input (both bf16): the dense launch's attention, o_proj and residual. 3x
         # the largest the serving check measured (0.029, layer 0 at 108K keys).
@@ -198,12 +201,13 @@ NUMERICS = Numerics(
         "head.logits_vs_fp32.rel": 7.5e-3,
         # The MTP draft (draft.py, check.draft). Its NextN entry x against SGLang's
         # eh_proj on its own enorm | hnorm rows, and against an f32 entry: 3x the
-        # serving check's maxima (TP8, FP8 KV, 1-2 requests, 1K-64K: 4.7e-4, 2.9e-3,
-        # SGLang's own 2.9e-3); the enorm and hnorm weights swapped give 0.58. A draft
-        # decode row attends exactly the seed's valid entries, and the seed SGLang
-        # gets is the draft extend's top-k; a count from the row's position or every
-        # seed row row 0's gives 1-2 and 4-936.
-        "draft.eh.rel": 1.4e-3,
+        # serving check's maxima (TP8, FP8 KV, 1-2 requests, 1K-64K: 4.3e-3 on the
+        # MXFP4 checkpoint, where SGLang's own eh_proj is 4.4e-3 off f32, and 5.5e-4
+        # on the FP8 one; 2.9e-3, SGLang's own 2.9e-3); the enorm and hnorm weights
+        # swapped give 0.58. A draft decode row attends exactly the seed's valid
+        # entries, and the seed SGLang gets is the draft extend's top-k; a count from
+        # the row's position or every seed row row 0's gives 1-2 and 4-936.
+        "draft.eh.rel": 1.3e-2,
         "draft.eh_vs_fp32.rel": 8.8e-3,
         "draft.topk_extra.max_abs": 0.0,
         "draft.seed.max_abs": 0.0,
@@ -236,6 +240,38 @@ def _deadline(key, deadline_s: float, longest_s: int) -> float:
     return min(max(deadline_s, 0.5 * get_device().watchdog_timeout), longest_s)
 
 
+def _quant_reason(quant: dict) -> Optional[str]:
+    """Why the checkpoint's quantization is not one the kernels run, or None: the FP8
+    block-128 checkpoint, or the MXFP4 one (static FP4 weights, dynamic FP4
+    activations, an E8M0 a 32 values). Each layer's tensors are checked as loaded."""
+    method = quant.get("quant_method")
+    if method == "fp8" and list(quant.get("weight_block_size") or ()) == [128, 128]:
+        return None
+    if method == "quark":
+        g = quant.get("global_quant_config") or {}
+
+        def mx(spec: dict, dynamic: bool) -> bool:
+            return (
+                spec.get("dtype") == "fp4"
+                and spec.get("qscheme") == "per_group"
+                and spec.get("group_size") == 32
+                and spec.get("scale_format", "e8m0") == "e8m0"
+                and bool(spec.get("is_dynamic")) == dynamic
+            )
+
+        if mx(g.get("weight") or {}, False) and mx(g.get("input_tensors") or {}, True):
+            return None
+        return (
+            "needs the MXFP4 checkpoint (E2M1 a 32 with an E8M0, dynamic "
+            f"MXFP4 activations), got weight {g.get('weight')!r} input "
+            f"{g.get('input_tensors')!r}"
+        )
+    return (
+        "needs the FP8 block-128 or the MXFP4 checkpoint, got "
+        f"{method!r} {quant.get('weight_block_size')!r}"
+    )
+
+
 def _config_disable_reasons(cfg, hf_config) -> list[str]:
     reasons = [
         f"needs GLM-5.3's {key} = {want!r}, got {getattr(hf_config, key, None)!r}"
@@ -261,14 +297,9 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
         or cfg.speculative_num_draft_tokens != cfg.speculative_num_steps + 1
     ):
         reasons.append("MTP verifies one draft chain: topk 1, draft tokens = steps + 1")
-    quant = getattr(hf_config, "quantization_config", None) or {}
-    if quant.get("quant_method") != "fp8" or list(
-        quant.get("weight_block_size") or ()
-    ) != [128, 128]:
-        reasons.append(
-            "needs the FP8 block-128 checkpoint, got "
-            f"{quant.get('quant_method')!r} {quant.get('weight_block_size')!r}"
-        )
+    why = _quant_reason(getattr(hf_config, "quantization_config", None) or {})
+    if why is not None:
+        reasons.append(why)
     if importlib.util.find_spec("flydsl") is None:
         reasons.append("needs FlyDSL")
     return reasons
@@ -598,6 +629,11 @@ def _build(model, hf_config, ctx) -> _Built:
     if len(shuffled) != 1:
         raise ValueError("GLM-5.3 monokernel: the layers' FP8 layouts differ")
     fp8_shuffled = shuffled.pop()
+    # Each kind's runtime takes its own layers' form, so the dense layers and the
+    # MoE ones need not agree: GLM-5.2's MXFP4 checkpoint keeps its dense MLPs in
+    # bf16 (copied as block FP8) next to MXFP4 experts. A dense MLP that is itself
+    # MXFP4 is the MXFP4 checkpoint's, whose rows run MXFP4 too.
+    dense_mxfp4 = any(L.w.mxfp4 for L in layers.values() if L.w.dense)
     dense = {L.w.dense for L in layers.values() if L.w.dense}
     if len(dense) > 1 or not layers[0].w.dense or layers[0].w.index is None:
         raise ValueError(
@@ -663,6 +699,11 @@ def _build(model, hf_config, ctx) -> _Built:
                 dense=layers[ids[0]].w.dense,
                 tokens=kind == "embed",
                 vocab_rows=vocab_rows if kind == "embed" else 0,
+                mxfp4=layers[ids[0]].w.mxfp4,
+                # MXFP4 experts on MXFP8 rows (ATOM's layout, the FP4 MFMA): at 6
+                # rows and 64K keys 69 us a shared layer, the bf16 rows' dequant
+                # path 106 us. The MXFP4 checkpoint's own MLPs run MXFP4 rows.
+                native_fp4=layers[ids[0]].w.mxfp4 and not dense_mxfp4,
             )
             rt = runtime(key)
             runtimes[w, kind] = rt

@@ -15,7 +15,9 @@ zero and recency-heavy index caches, at about 8K and 300K keys (and for layer 0 
 a dense layer at 8K and 128K); and each NextN (MTP draft) launch equals the plain
 launch of its kind fed its own entry rows, bitwise, with its entry within its
 bounds, its step tables equal to the torch ops, and a draft step's graph replaying
-bitwise (``glm53/check_nextn.py``)."""
+bitwise (``glm53/check_nextn.py``). With MXFP4 MLPs: each
+launch kind's MLP against the AITER ops SGLang runs (``glm53/check_mxfp4.py``), the
+cache writes, the graph replays and the NextN launches as above."""
 
 import subprocess
 import sys
@@ -37,6 +39,7 @@ def _gfx950_gpus() -> int:
 CHECK = Path(__file__).with_name("glm53") / "check_layer.py"
 TOPK = Path(__file__).with_name("glm53") / "check_topk.py"
 NEXTN = Path(__file__).with_name("glm53") / "check_nextn.py"
+MXFP4 = Path(__file__).with_name("glm53") / "check_mxfp4.py"
 # the widths the spec builds at each TP size
 WIDTHS = {4: "2,4,8", 8: "2,4,8"}
 
@@ -110,6 +113,50 @@ class TestMonoGlm53Kernels(CustomTestCase):
         self._check("--pos", "8447,300000", script=TOPK)
         # layer 0 from the tokens and a dense layer: the same indexer stages
         self._check("--kind", "embed", "--pos", "8447,131071", script=TOPK)
+
+    def test_mxfp4_mlps_within_the_aiter_ops(self):
+        for kind in ("shared", "index", "dense"):
+            self._check("--kind", kind, script=MXFP4)
+
+    def test_mxfp4_launches_write_their_rows_and_replay(self):
+        for kind in ("shared", "index", "dense", "embed"):
+            self._check("--kind", kind, "--rowsets", "p1", "--writes", "--mxfp4")
+
+    def test_mxfp8_rows_launches_write_their_rows_and_replay(self):
+        # GLM-5.2's Quark checkpoint: MXFP4 experts on MXFP8 rows (the FP4 MFMA), as
+        # served; the dense layers and the NextN layer keep FP8 experts
+        mxfp4 = ("--mxfp4", "--native-fp4")
+        for kind in ("shared", "index"):
+            for kv in ("bf16", "fp8"):
+                self._check(
+                    "--kind", kind, "--kv", kv, "--rowsets", "p1", "--writes", *mxfp4
+                )
+        self._check(
+            "--kind",
+            "model",
+            "--launches",
+            "8",
+            "--replays",
+            "20",
+            "--rowsets",
+            "p0,v4",
+            *mxfp4,
+        )
+        self._check(
+            "--kind",
+            "full",
+            "--launches",
+            "7",
+            "--replays",
+            "20",
+            "--rowsets",
+            "p1,v4",
+            *mxfp4,
+        )
+        self._check("--kind", "index", "--check-tags", "--rowsets", "p0,v4", *mxfp4)
+
+    def test_mxfp4_nextn_launches_equal_the_plain_ones_on_their_entry(self):
+        self._check("--mxfp4", script=NEXTN)
 
 
 if __name__ == "__main__":

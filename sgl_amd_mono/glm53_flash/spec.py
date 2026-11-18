@@ -56,7 +56,10 @@ from sgl_amd_mono.glm53_flash import (
 )
 
 # kernel widths; a step of fewer rows runs at the next width, the rest pad rows
-WIDTHS = (2, 4, 8)
+# (12: two MTP5 or three MTP3 requests)
+WIDTHS = (2, 4, 8, 12, 16)
+# above this width the MoE runs expert-major (``FlashBuild.grouped``)
+GROUPED_FROM = 9
 ROWS = tuple(range(1, max(WIDTHS) + 1))
 TP_SIZES = (2, 4, 8)
 # the rows a step runs on the kernels at most at this TP size: at TP2 a sparse-
@@ -393,6 +396,17 @@ def normed_rows(lm, owed: _Owed, S: int) -> torch.Tensor:
     return lm.model.norm(check.contract(written))
 
 
+def check_verify_page_table(page_table: torch.Tensor, verify: int) -> None:
+    """Refuse a verify step whose rows of one request differ in ``page_table``: the
+    sparse-attention launch scores a request's keys once, from its first row."""
+    rows = page_table.reshape(-1, verify, page_table.shape[-1])
+    if not torch.equal(rows, rows[:, :1].expand_as(rows)):
+        raise RuntimeError(
+            "GLM-5.3-Flash monokernel: the DSA backend's page table no longer repeats "
+            "a verify request's row for each of its rows"
+        )
+
+
 def _written(module, x, residual, post, comb) -> torch.Tensor:
     """The streams with the owed FFN post applied, as SGLang's FFN exit writes them."""
     s = x.shape[0]
@@ -591,7 +605,10 @@ class _Built:
                 pos, rpi = buf[0, :S], buf[1, :S]
             idx = slots if slots.dtype == torch.int32 else slots.int()
             page_table = backend.full_attn_backend.forward_metadata.real_page_table
-            # the DSA backend repeats a verify request's page-table row for each row
+            # the DSA backend repeats a verify request's page-table row for each row;
+            # an eager step checks it (a graph replays without the host)
+            if V > 1 and not torch.cuda.is_current_stream_capturing():
+                check_verify_page_table(page_table[:S], V)
             plan.state["dsa_rows"] = (self.rows[W], page_table[:S])
             step = {
                 "ids": input_ids[:S],
@@ -898,6 +915,7 @@ def _build(model, hf_config, ctx) -> _Built:
                 dense_shuffled=dense_sh if kind in ("dense", "embed") else False,
                 tokens=kind == "embed",
                 verify=verify,
+                grouped=w >= GROUPED_FROM and kind not in ("dense", "embed"),
                 fault_site=fault_site,
                 fault_after=fault_after,
             )

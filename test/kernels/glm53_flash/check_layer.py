@@ -33,6 +33,7 @@ from sgl_amd_mono.glm53_flash.gfx950.config import (
     N_EXPERTS,
     VOCAB,
 )
+from sgl_amd_mono.glm53_flash.spec import GROUPED_FROM
 
 N_MIX = HC_MULT * (2 + HC_MULT)
 
@@ -858,6 +859,7 @@ def build(args, kind, rank, tp, group, device, layers=1, shuffled=False):
         dense_shuffled=shuffled and dense,
         tokens=kind == "embed",
         head=kind == "head",
+        grouped=args.rows >= GROUPED_FROM and not dense and kind != "head",
         stop=False,
     )
     rt = FlashRuntime(key, rank, group, device)
@@ -1184,6 +1186,7 @@ def check_verify(args, rank, tp, group, device) -> bool:
             dsa=not kda,
             max_pools=0 if kda else args.max_pools,
             verify=verify,
+            grouped=rows >= GROUPED_FROM,
             stop=False,
         )
         rt = FlashRuntime(key, rank, group, device)

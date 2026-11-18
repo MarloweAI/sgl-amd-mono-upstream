@@ -97,7 +97,8 @@ def _time(args, rows: int, rank: int, tp: int, group, device) -> None:
     if rank == 0:
         print(
             f"TIME kind={args.kind} rows={rows} tp={tp} launches={launches} "
-            f"pos={args.pos} kv={args.kv} us_per_launch median={median:.2f} "
+            f"pos={args.pos} kv={args.kv} experts={'mxfp4' if args.mxfp4 else 'fp8'} "
+            f"us_per_launch median={median:.2f} "
             f"min={min(per_launch):.2f} max={max(per_launch):.2f} "
             f"slowest_rank_median={max(m for m, _ in medians):.2f} "
             f"clean={all(c for _, c in medians)}",
@@ -131,6 +132,10 @@ def main() -> int:
     ap.add_argument("--trials", type=int, default=7)
     ap.add_argument("--deadline", type=float, default=60.0)
     ap.add_argument("--similar", type=float, default=0.0, help="rows routing alike")
+    ap.add_argument("--mxfp4", action="store_true", help="MXFP4 MLPs")
+    ap.add_argument(
+        "--native-fp4", action="store_true", help="MXFP8 x MXFP4 MFMA (with --mxfp4)"
+    )
     args = ap.parse_args()
     rank, tp = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))

@@ -59,9 +59,15 @@ class _Entries:
 
     widths: tuple = ()
     draft_loop = draft_extend = begin_draft_round = graph_variants = None
+    # current SGLang reads .built and .prepare of the entry, older SGLang the entry itself
+    prepare = None
 
     def __init__(self, draft_sampler):
         self.draft_sampler = draft_sampler
+
+    @property
+    def built(self):
+        return self
 
     def summary(self) -> str:
         return "the sampled DSpark draft's Markov block"

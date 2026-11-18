@@ -1,0 +1,162 @@
+name: Nightly (AMD)
+
+# main on the newest SGLang ROCm image, each nightly model (`nightly` in
+# scripts/ci/models.py): its tests, accuracy benchmarks and speed test.
+# Sunday to Friday, the nightly runs the monokernels on only, skips the `weekly`
+# benchmarks (AIME26 x4) and holds the scores to each model's fixed `baseline`.
+# Saturday's weekly run has every benchmark with the monokernels on and off; its
+# off results become the monokernel-off reference (monokernel_off_ref) the nightly
+# and the PR test read until the next one. See scripts/ci/README.md.
+
+on:
+  schedule:
+    - cron: "17 5 * * 0-5"
+    # weekly: every benchmark
+    - cron: "17 5 * * 6"
+  workflow_dispatch:
+    inputs:
+      weekly:
+        description: "Weekly run: every benchmark, on and off; also rewrites the shared monokernel-off reference, so tick it on main only"
+        type: boolean
+        default: false
+      models:
+        description: "Models to run instead of the nightly set, comma-separated (see scripts/ci/models.py)"
+        default: ""
+      image:
+        description: "SGLang ROCm image (default: the newest rocm/sgl-dev v*-rocm10-mi35x-YYYYMMDD)"
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-amd
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    if: github.repository == 'sgl-project/sgl-amd-mono' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    outputs:
+      mode: ${{ steps.matrix.outputs.mode }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      sha: ${{ steps.matrix.outputs.sha }}
+      image: ${{ steps.image.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Matrix
+        id: matrix
+        env:
+          MODELS: ${{ inputs.models }}
+          WEEKLY: ${{ github.event.schedule == '17 5 * * 6' || inputs.weekly }}
+        run: |
+          mode=nightly; [[ "$WEEKLY" == true ]] && mode=weekly
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          if [[ -n "$MODELS" ]]; then
+            matrix="$(jq -cn --arg m "$MODELS" '$m | split(",") | map(gsub(" "; "")) | map(select(length > 0)) | map({model: ., tier: "full"})')"
+          else
+            matrix="$(python3 scripts/ci/models.py nightly)"
+          fi
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "matrix: $matrix"
+
+      - name: Image
+        id: image
+        env:
+          IMAGE: ${{ inputs.image }}
+        run: |
+          if [[ -z "$IMAGE" ]]; then
+            tag="$(curl -sfL 'https://hub.docker.com/v2/repositories/rocm/sgl-dev/tags?page_size=100&ordering=last_updated&name=-rocm10-mi35x-' \
+              | jq -r '.results[].name' | grep -E '^v[0-9][0-9A-Za-z.]*-rocm10-mi35x-[0-9]{8}$' \
+              | sort -t- -k4 -r | head -1)"
+            [[ -n "$tag" ]] || { echo "no rocm10 mi35x image found"; exit 1; }
+            IMAGE="rocm/sgl-dev:$tag"
+          fi
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "image: $IMAGE"
+
+  test:
+    needs: plan
+    name: ${{ needs.plan.outputs.mode }} (${{ matrix.model }})
+    runs-on: [self-hosted, sgl-amd-mono-mi355x]
+    timeout-minutes: 1440
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      CI_MODE: ${{ needs.plan.outputs.mode }}
+      CI_IMAGE: ${{ needs.plan.outputs.image }}
+      CI_PR_SHA: ${{ needs.plan.outputs.sha }}
+      CI_BASE_SHA: ${{ needs.plan.outputs.sha }}
+      # the weekly run has both sides and every benchmark: allow a day
+      TIME_LIMIT: "23:30:00"
+      RESULTS: /tmp/sgl-amd-mono-ci/${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+          path: harness
+          sparse-checkout: scripts/ci
+          persist-credentials: false
+
+      - name: Run on the CI node
+        env:
+          CI_RESULTS: ${{ env.RESULTS }}/${{ matrix.model }}
+        run: bash harness/scripts/ci/slurm_launch.sh "${{ matrix.model }}" "${{ matrix.tier }}"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mono-ci-${{ matrix.model }}
+          path: ${{ env.RESULTS }}/${{ matrix.model }}
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Judge
+        run: |
+          python3 harness/scripts/ci/report.py --results "$RESULTS" --model "${{ matrix.model }}" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Cancel the cluster job
+        if: cancelled()
+        run: scancel --name "sgl-amd-mono-ci-${{ github.run_id }}-${{ matrix.model }}" || true
+
+      - name: Clean up
+        if: always()
+        run: rm -rf "$RESULTS/${{ matrix.model }}"
+
+  report:
+    needs: [plan, test]
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+          path: harness
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Report
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          # the models the run started: one without a result is reported, not dropped
+          MATRIX: ${{ needs.plan.outputs.matrix }}
+        run: |
+          mkdir -p results
+          for d in artifacts/mono-ci-*; do [[ -d "$d" ]] && mv "$d" "results/${d#artifacts/mono-ci-}"; done
+          rc=0
+          expect="$(jq -r 'map(.model) | join(",")' <<< "$MATRIX")"
+          python3 harness/scripts/ci/report.py --nightly --results results --expect "$expect" \
+            --title "AMD ${{ needs.plan.outputs.mode }} (main)" \
+            --run-url "$RUN_URL" --out report.md > /dev/null || rc=$?
+          cat report.md >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"

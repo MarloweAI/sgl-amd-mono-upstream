@@ -14,6 +14,7 @@ from sgl_amd_mono.deepseek_v41.glue import flag, route
 
 ENV = "SGLANG_AMD_MONO_DSV41_ACCEPT"
 VERIFY = "sglang.srt.speculative.dspark_components.dspark_verify"
+SPEC_UTILS = "sglang.srt.speculative.spec_utils"
 
 # by file under sglang/ (test_contract.py pins them)
 SGLANG_READS = {
@@ -89,4 +90,10 @@ def install() -> None:
 
     verify = importlib.import_module(VERIFY)
     route(verify.DsparkVerifyEpilogue, "__init__", _epilogue_init)
-    route(verify.TargetVerifyExecutor, "begin_simulated_step", _begin_simulated_step)
+    # SGLang with this generator draws the length and DSpark's bonus seed alike on every
+    # rank; replacing its step would leave the bonus seed unset
+    spec_utils = importlib.import_module(SPEC_UTILS)
+    if not hasattr(spec_utils, "simulated_acc_len_generator"):
+        route(
+            verify.TargetVerifyExecutor, "begin_simulated_step", _begin_simulated_step
+        )

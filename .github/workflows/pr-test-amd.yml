@@ -1,0 +1,262 @@
+name: PR Test (AMD)
+
+# The PR test of the review guideline: per model the PR touches, its unit, kernel and
+# serving tests, accuracy (sgl-eval) and InferenceX fixed-length speed against the
+# base branch, and the kernel-only timing scripts, on dedicated MI355X nodes. A run
+# takes hours, so a maintainer starts it: add the `run-ci` label (removed again when
+# the run starts, so a later push needs a maintainer again), or run this workflow
+# with a PR number. `run-ci-extra` runs the same and adds GPQA, which catches the
+# long-context losses GSM8K cannot (a PR that touches attention, the KV cache or
+# long sequences should get it). The result is the "AMD PR test" status on the PR's head commit
+# and a sticky PR comment; see scripts/ci/README.md.
+
+on:
+  pull_request_target:
+    types: [labeled]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: PR number
+        required: true
+      models:
+        description: "Models to run instead of the PR's scope, comma-separated (see scripts/ci/models.py; 'common' for the unit and common kernel tests)"
+        default: ""
+      image:
+        description: "SGLang ROCm image (default: the newest rocm/sgl-dev v*-rocm10-mi35x-YYYYMMDD)"
+        default: ""
+      extra:
+        description: "Add GPQA, as the run-ci-extra label does"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  # Only runs that test: other label events must not cancel one.
+  group: >-
+    ${{ (github.event_name == 'workflow_dispatch'
+         || github.event.label.name == 'run-ci' || github.event.label.name == 'run-ci-extra')
+        && format('pr-test-amd-{0}', github.event.pull_request.number || inputs.pr)
+        || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  STATUS_CONTEXT: AMD PR test
+
+jobs:
+  plan:
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      || github.event.label.name == 'run-ci' || github.event.label.name == 'run-ci-extra'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      statuses: write
+    outputs:
+      matrix: ${{ steps.scope.outputs.matrix }}
+      title_type: ${{ steps.scope.outputs.title_type }}
+      pr: ${{ steps.pr.outputs.pr }}
+      pr_sha: ${{ steps.pr.outputs.pr_sha }}
+      base_sha: ${{ steps.pr.outputs.base_sha }}
+      image: ${{ steps.image.outputs.image }}
+      extra: ${{ github.event.label.name == 'run-ci-extra' || inputs.extra || false }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+          persist-credentials: false
+
+      - name: Resolve the PR
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number || inputs.pr }}
+          # On a label event, the head the maintainer saw when labelling.
+          EVENT_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          gh api "repos/$REPO/pulls/$PR" > pr.json
+          [[ "$(jq -r .state pr.json)" == open ]] || { echo "PR #$PR is not open"; exit 1; }
+          pr_sha="${EVENT_SHA:-$(jq -r .head.sha pr.json)}"
+          base_ref="$(jq -r .base.ref pr.json)"
+          # The PR's merge-base, not the base branch's tip: the base side then holds
+          # exactly what the PR started from, and the comparison is the PR's own diff.
+          base_sha="$(gh api "repos/$REPO/compare/$base_ref...$pr_sha" --jq .merge_base_commit.sha 2>/dev/null || true)"
+          [[ "$base_sha" =~ ^[0-9a-f]{40}$ ]] || base_sha="$(gh api "repos/$REPO/commits/$base_ref" --jq .sha)"
+          jq -r .title pr.json > title.txt
+          gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[]' | jq -s . > files.json
+          {
+            echo "pr=$PR"
+            echo "pr_sha=$pr_sha"
+            echo "base_sha=$base_sha"
+          } >> "$GITHUB_OUTPUT"
+          echo "PR #$PR head $pr_sha, base $base_ref at $base_sha: $(cat title.txt)"
+
+      - name: Remove the label that started the run
+        if: github.event_name == 'pull_request_target'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LABEL: ${{ github.event.label.name }}
+        run: gh api -X DELETE "repos/${{ github.repository }}/issues/${{ steps.pr.outputs.pr }}/labels/$LABEL" || true
+
+      # Read only: scope.py looks for model READMEs; nothing from the PR runs here.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.pr.outputs.pr_sha }}
+          path: pr
+          persist-credentials: false
+          allow-unsafe-pr-checkout: true
+
+      - name: Scope
+        id: scope
+        env:
+          MODELS: ${{ inputs.models }}
+        run: |
+          python3 harness/scripts/ci/scope.py --files files.json --title "$(cat title.txt)" \
+            --pr-dir pr --models "$MODELS" --out scope.json
+
+      - name: Image
+        id: image
+        env:
+          IMAGE: ${{ inputs.image }}
+        run: |
+          if [[ -z "$IMAGE" ]]; then
+            tag="$(curl -sfL 'https://hub.docker.com/v2/repositories/rocm/sgl-dev/tags?page_size=100&ordering=last_updated&name=-rocm10-mi35x-' \
+              | jq -r '.results[].name' | grep -E '^v[0-9][0-9A-Za-z.]*-rocm10-mi35x-[0-9]{8}$' \
+              | sort -t- -k4 -r | head -1)"
+            [[ -n "$tag" ]] || { echo "no rocm10 mi35x image found"; exit 1; }
+            IMAGE="rocm/sgl-dev:$tag"
+          fi
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "image: $IMAGE"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: scope
+          path: |
+            scope.json
+            title.txt
+
+      - name: Pending status
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # GitHub caps a status description at 140 characters.
+          desc="$(jq -r '"Running: " + (.models | keys | join(", "))' scope.json | cut -c1-140)"
+          gh api "repos/${{ github.repository }}/statuses/${{ steps.pr.outputs.pr_sha }}" \
+            -f state=pending -f context="$STATUS_CONTEXT" \
+            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            -f description="$desc" > /dev/null
+
+  test:
+    needs: plan
+    name: test (${{ matrix.model }}, ${{ matrix.tier }})
+    # Two runners on a cluster host that submits Slurm jobs (scripts/ci/runner.sh);
+    # each job takes one of the two CI nodes.
+    runs-on: [self-hosted, sgl-amd-mono-mi355x]
+    timeout-minutes: 1200
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      CI_IMAGE: ${{ needs.plan.outputs.image }}
+      CI_PR: ${{ needs.plan.outputs.pr }}
+      CI_PR_SHA: ${{ needs.plan.outputs.pr_sha }}
+      CI_BASE_SHA: ${{ needs.plan.outputs.base_sha }}
+      CI_EXTRA: ${{ needs.plan.outputs.extra == 'true' && '1' || '' }}
+      # The runner host's local disk: a shared home may be slow to write.
+      RESULTS: /tmp/sgl-amd-mono-ci/${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      # The scripts that run outside the container come from the base branch. The
+      # cluster job fetches the PR and base commits onto the node itself.
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+          sparse-checkout: scripts/ci
+          persist-credentials: false
+
+      - name: Run on the CI node
+        env:
+          CI_RESULTS: ${{ env.RESULTS }}/${{ matrix.model }}
+        run: bash harness/scripts/ci/slurm_launch.sh "${{ matrix.model }}" "${{ matrix.tier }}"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mono-ci-${{ matrix.model }}
+          path: ${{ env.RESULTS }}/${{ matrix.model }}
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Judge
+        run: |
+          python3 harness/scripts/ci/report.py --results "$RESULTS" --model "${{ matrix.model }}" \
+            --title-type "${{ needs.plan.outputs.title_type }}" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Cancel the cluster job
+        if: cancelled()
+        run: scancel --name "sgl-amd-mono-ci-${{ github.run_id }}-${{ matrix.model }}" || true
+
+      - name: Clean up
+        if: always()
+        run: rm -rf "$RESULTS/${{ matrix.model }}"
+
+  report:
+    needs: [plan, test]
+    # Not on a cancelled run: a newer run (a new label) has taken over the status.
+    if: ${{ !cancelled() && needs.plan.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      statuses: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Report
+        id: report
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ needs.plan.outputs.pr }}
+          SHA: ${{ needs.plan.outputs.pr_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          mkdir -p results
+          for d in artifacts/mono-ci-*; do [[ -d "$d" ]] && mv "$d" "results/${d#artifacts/mono-ci-}"; done
+          rc=0
+          python3 harness/scripts/ci/report.py --scope artifacts/scope/scope.json --results results \
+            --run-url "$RUN_URL" --out report.md > report.log 2>&1 || rc=$?
+          # A crash of report.py itself must still end the pending status.
+          if [[ ! -s report.md ]]; then
+            rc=1
+            { echo "<!-- sgl-amd-mono-ci -->"; echo "## AMD PR test: ❌ the report failed"; echo
+              echo "See the [run]($RUN_URL)."; echo; echo '```'; tail -n 30 report.log; echo '```'; } > report.md
+          fi
+          cat report.md >> "$GITHUB_STEP_SUMMARY"
+          # GitHub caps a comment at 65536 characters; cut on a character boundary.
+          # (iconv -c drops a split character but still exits 1, which bash -e would stop on)
+          body="$(head -c 60000 report.md | iconv -f utf-8 -t utf-8 -c 2>/dev/null || true)"
+          (( $(wc -c < report.md) > 60000 )) && body+=$'\n\n… truncated; the full report is in the run summary.'
+          id="$(gh api --paginate "repos/$REPO/issues/$PR/comments" \
+                --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | startswith("<!-- sgl-amd-mono-ci -->"))) | .id' | tail -1)"
+          if [[ -n "$id" ]]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$id" -f body="$body" > /dev/null
+          else
+            gh api "repos/$REPO/issues/$PR/comments" -f body="$body" > /dev/null
+          fi
+          state=success; desc="All checks passed"
+          if (( rc )); then state=failure; desc="A check failed; see the PR comment"; fi
+          gh api "repos/$REPO/statuses/$SHA" -f state="$state" -f context="$STATUS_CONTEXT" \
+            -f target_url="$RUN_URL" -f description="$desc" > /dev/null
+          exit "$rc"

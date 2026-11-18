@@ -41,7 +41,7 @@ ARGS = [
     "cpu",
 ]
 # MTP with one draft chain of 3 tokens: 4 verify rows a request, so verify steps of 1
-# and 2 requests fit the 8-row width
+# to 4 requests fit the 16-row width
 MTP = [
     "--speculative-algorithm",
     "EAGLE",

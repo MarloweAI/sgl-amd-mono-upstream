@@ -24,6 +24,7 @@ what they see today. Rows are padded to a bucket (padded requests have no KDA
 state: slot -1).
 """
 
+import contextlib
 import os
 
 import torch
@@ -31,13 +32,40 @@ import torch
 # The SGLang names this module reads (test/unit/test_contract.py).
 SGLANG_READS = {
     "srt/runtime_context.py": ("get_spec",),
-    "srt/models/kimi_k3.py": ("KimiK3MoE", "AuxHiddenStateList", "_cdiv"),
+    "srt/models/kimi_k3.py": (
+        "KimiK3MoE",
+        "AuxHiddenStateList",
+        "_cdiv",
+        # the routed experts the launch's top-k / sort feed (_routed, _experts)
+        "_forward_routed",
+        "_route_quant_fuse_eligible",
+    ),
     # the new dev_amd moved KimiK3MoE's ROCm paths into kimi_k3_amd
     "srt/models/kimi_k3_amd/moe.py": (
         "_vector_aligned",
-        "_COLUMN_TAIL_MAX_TOKENS",
         "_forward_shared_casting_routed",
+        "_forward_routed_a8w4",
     ),
+    # the row cap of SGLang's column tail, which _column_exit must not exceed; and
+    # _launch_topk_ok: when SGLang's top-k post-processing is a no-op
+    "srt/environ.py": (
+        "envs",
+        "SGLANG_ROCM_K3_COLUMN_TAIL_MAX_TOKENS",
+        "SGLANG_SIMULATE_UNIFORM_EXPERTS",
+        "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS",
+    ),
+    "srt/layers/moe/__init__.py": ("get_moe_a2a_backend",),
+    "srt/layers/moe/topk.py": (
+        "TopKOutputFormat",
+        "is_expert_remapping_enabled",
+        "build_precomputed_topk_output",
+        "num_shared_topk_slots",
+        "waterfill_balancer",
+        "enable_waterfill",
+    ),
+    # _experts: the routed experts on the launch's top-k / sort
+    "srt/layers/zero_copy_context.py": ("set_moe_output",),
+    "srt/layers/moe/route_quant_handoff.py": ("stage", "clear"),
     "srt/layers/attn_residual_hip.py": ("gather_covers",),
     "srt/layers/attention/linear/utils.py": (
         "select_verify_intermediate_state_indices",
@@ -55,8 +83,10 @@ SGLANG_READS = {
         "tensor_model_parallel_all_reduce",
         "tensor_model_parallel_all_gather",
     ),
-    "srt/distributed/parallel_state.py": ("get_tp_group",),
     "srt/utils/common.py": ("BumpAllocator",),
+    # the layer's place in the state pool
+    "srt/layers/attention/hybrid_linear_attn_backend.py": ("state_layer",),
+    "srt/mem_cache/kv/router.py": ("view_layer_id",),
 }
 
 TP, H, SL, E, NF, LAT = 8, 7168, 896, 896, 2096, 3584
@@ -189,6 +219,154 @@ def _say(msg):
         print(f"[k31 wide] {msg}", flush=True)
 
 
+def _launch_sort(b):
+    """The sort kind bucket b's launches also make (with the output zeroing), or None
+    (``SGLANG_AMD_MONO_K31_WIDE_LAUNCH_SORT=1``, needs ``..._LAUNCH_TOPK=1``; m <= 64):
+    "aux16" (aiter's BM16 aux sort, handed over by ``aiter.presorted_moe.register_presorted_moe``) when aiter
+    has that API, else "sgl" (SGLang's BM32 small sort + mxfp8 quant, ``presort.injected``)."""
+    from sgl_amd_mono.kimi_k31 import presort
+    from sgl_amd_mono.kimi_k31.gfx950.stages import moe_front as mf
+
+    if not (
+        os.environ.get("SGLANG_AMD_MONO_K31_WIDE_LAUNCH_SORT", "1") == "1"
+        and os.environ.get("SGLANG_AMD_MONO_K31_WIDE_LAUNCH_TOPK", "1") == "1"
+        and b <= mf.SORT_MAX_ROWS
+    ):
+        return None
+    return presort.sort_kind()
+
+
+def _sort_views(buf, m, kind="sgl"):
+    """Tensor views of the launch's sort buffer (``moe_front.sort_layout``): as SGLang's small sort returns them
+    ("sgl"), or under ``register_presorted_moe``'s key names ("aux16")."""
+    from sgl_amd_mono.kimi_k31.gfx950.stages import moe_front as mf
+
+    ly = mf.sort_layout(m, kind)
+    o = ly["offs"]
+
+    def at(k, n):
+        return buf[o[k] : o[k] + n]
+
+    if kind == "aux16":
+        maxp, nblk = ly["maxp"], ly["nblk"]
+        return dict(
+            kind=kind,
+            sorted_token_ids=at("ids", 4 * maxp).view(torch.int32),
+            sorted_weights=at("w", 4 * maxp).view(torch.float32),
+            sorted_expert_ids=at("eids", 4 * nblk).view(torch.int32),
+            num_valid_ids=at("nv", 8).view(torch.int32),
+            m_indices=at("mi", 4 * maxp).view(torch.int32),
+            reverse_sorted=at("dest", 4 * m * mf.TOPK).view(torch.int32),
+        )
+    maxp, nblk, srows = ly["maxp"], ly["nblk"], ly["srows"]
+    return dict(
+        kind=kind,
+        ids=at("ids", 4 * maxp).view(torch.int32),
+        w=at("w", 4 * maxp).view(torch.float32),
+        eids=at("eids", 4 * nblk).view(torch.int32),
+        nv=at("nv", 8).view(torch.int32),
+        q=at("q", m * LAT).view(torch.float8_e4m3fn).view(m, LAT),
+        qs=at("qs", srows * mf.SCALE_COLS).view(srows, mf.SCALE_COLS),
+    )
+
+
+def _launch_topk_ok(moe) -> bool:
+    """Whether the routed experts may take the launch's own top-16 (ids, w) instead of SGLang's
+    ``self.topk``: the launch's route stage is sigmoid + bias, ungrouped top-16, renormalized (10.18), so only a
+    STANDARD output whose post-processing is a no-op (no padding mask / EPLB remap / waterfill) qualifies."""
+    if os.environ.get("SGLANG_AMD_MONO_K31_WIDE_LAUNCH_TOPK", "1") != "1":
+        return False
+    ok = getattr(moe, "_k31_launch_topk_ok", None)
+    if ok is None:
+        # SGLang's precomputed_topk_postprocess_is_noop is CUDA-only. On HIP, select_experts' post-processing
+        # (_post_process_topk_ids) is a no-op for K3's call (no num_token_non_padded, no shared slots) unless
+        # EPLB remapping, megamoe or a routing simulation is on, so check exactly those.
+        bad = []
+        try:
+            from sglang.srt.environ import envs
+            from sglang.srt.layers.moe import get_moe_a2a_backend
+            from sglang.srt.layers.moe.topk import (
+                TopKOutputFormat,
+                is_expert_remapping_enabled,
+            )
+
+            cfg = moe.topk.topk_config
+            checks = {
+                "output_format": cfg.output_format in (None, TopKOutputFormat.STANDARD),
+                "sigmoid": cfg.scoring_func == "sigmoid",
+                "bias": cfg.correction_bias is not None,
+                "ungrouped": (cfg.num_expert_group or 1) == 1
+                and (cfg.topk_group or 1) == 1,
+                "top16": cfg.top_k == 16,
+                "no_shared_slots": cfg.num_shared_topk_slots == 0,
+                "no_waterfill": moe.topk.waterfill_balancer is None
+                and not moe.topk.enable_waterfill,
+                "no_eplb_remap": not is_expert_remapping_enabled(),
+                "no_megamoe": not get_moe_a2a_backend().is_megamoe(),
+                "no_sim": not envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
+                and not envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get(),
+            }
+            bad = [k for k, v in checks.items() if not v]
+        except Exception as e:
+            bad = [f"{type(e).__name__}: {e}"]
+        ok = not bad
+        moe._k31_launch_topk_ok = ok
+        _say(
+            f"launch top-k {'on' if ok else 'off'} (layer {moe.layer_idx})"
+            + ("" if ok else f": {', '.join(bad)}")
+        )
+    return ok
+
+
+def _routed(moe, lat, logits, ids, w, out, sortv=None):
+    """SGLang's ``KimiK3MoE._forward_routed(lat, logits, lat, out)``, with the launch's (ids, w) in place of
+    ``self.topk`` when ``SGLANG_AMD_MONO_K31_WIDE_LAUNCH_TOPK=1`` (saves aiter's topk kernel a layer)."""
+    if not _launch_topk_ok(moe):
+        return moe._forward_routed(lat, logits, lat, out)
+    if hasattr(moe, "_forward_routed_a8w4") and moe._forward_routed_a8w4(
+        lat, logits, lat, out
+    ):
+        return
+    _experts(moe, lat, ids, w, out, sortv)
+
+
+def _experts(moe, lat, ids, w, out, sortv):
+    """SGLang's routed experts on the launch's (ids, w) -> out; with ``sortv``, on the launch's sort + quant."""
+    from sglang.srt.layers.moe.route_quant_handoff import clear, stage
+    from sglang.srt.layers.moe.topk import build_precomputed_topk_output
+    from sglang.srt.layers.zero_copy_context import set_moe_output
+
+    if moe._route_quant_fuse_eligible:
+        stage(lat, layer=moe.experts)
+    try:
+        topk_output = build_precomputed_topk_output(
+            w, ids, moe.topk.topk_config, moe.layer_idx
+        )
+        with contextlib.ExitStack() as es:
+            inj = None
+            if sortv is not None:
+                from sgl_amd_mono.kimi_k31 import presort
+
+                cm = (
+                    presort.registered(sortv, ids, w, out)
+                    if sortv["kind"] == "aux16"
+                    else presort.injected(sortv, ids.shape[0], ids, out)
+                )
+                inj = es.enter_context(cm)
+            with set_moe_output(out):
+                y = moe.experts(lat, topk_output)
+            if inj is not None and not getattr(moe, "_k31_sort_said", False):
+                moe._k31_sort_said = True
+                _say(
+                    f"launch sort {sortv['kind']} {'on' if inj['used'] else 'NOT used'} "
+                    f"(layer {moe.layer_idx})"
+                )
+    finally:
+        clear()
+    if y.data_ptr() != out.data_ptr():
+        out.copy_(y)
+
+
 class _Layer:
     """A covered layer's weights as the launch reads them (views where SGLang's
     layout already fits; the front rows and the folded up projection are copies)."""
@@ -225,10 +403,7 @@ class _Layer:
         if self.t1:
             prev = backbone.layers[i - 1].mlp
             up = prev.routed_expert_up_proj.weight[r * SL : (r + 1) * SL]
-            if (
-                os.environ.get("SGLANG_AMD_MONO_K31_WIDE_UP_COPY") != "1"
-                and up.is_contiguous()
-            ):
+            if up.is_contiguous():
                 # SGLang's rows as is; the launch scales the gathered latent by the norm weight
                 self.w["w_up"], self.up_norm = up, True
                 self.w["bias"] = torch.cat(
@@ -267,10 +442,8 @@ def _front_weight(moe, rank):
         moe.shared_experts.gate_up_proj.weight,
     )
     st = {p.untyped_storage().data_ptr() for p in parts}
-    if (
-        os.environ.get("SGLANG_AMD_MONO_K31_WIDE_FRONT_COPY") != "1"
-        and len(st) == 1
-        and all(p.dtype == torch.bfloat16 and p.stride() == (H, 1) for p in parts)
+    if len(st) == 1 and all(
+        p.dtype == torch.bfloat16 and p.stride() == (H, 1) for p in parts
     ):
         storage = parts[0].untyped_storage()
         base = torch.empty(0, dtype=torch.bfloat16, device=parts[0].device).set_(
@@ -301,10 +474,6 @@ def _tail_fusable(layer) -> bool:
     )
 
 
-def _check_steps() -> int:
-    return int(os.environ.get("SGLANG_AMD_MONO_K31_WIDE_ENTRY_CHECK", "0"))
-
-
 class Wide:
     def __init__(self, model, rank, group, device, L=8):
         from sgl_amd_mono.common import guard
@@ -320,22 +489,16 @@ class Wide:
         cov = set(idx)
         # standard layers whose MoE tail runs in the next run's first launch (t1 on):
         # SGLang runs them up to the routed / shared partials only
-        self.entry = set()
-        if os.environ.get("SGLANG_AMD_MONO_K31_WIDE_ENTRY_T1", "1") == "1":
-            self.entry = {
-                i - 1
-                for i in idx
-                if (i - 1) not in cov
-                and i - 1 >= bb.start_layer
-                and _tail_fusable(bb.layers[i - 1])
-            }
+        self.entry = {
+            i - 1
+            for i in idx
+            if (i - 1) not in cov
+            and i - 1 >= bb.start_layer
+            and _tail_fusable(bb.layers[i - 1])
+        }
         a0 = torch.cuda.memory_allocated()
         self.layers = {i: _Layer(bb, i, rank, cov | self.entry) for i in idx}
         a1 = torch.cuda.memory_allocated()
-        self.check_left = _check_steps()
-        self.column_exit = (
-            os.environ.get("SGLANG_AMD_MONO_K31_WIDE_COLUMN_EXIT", "1") == "1"
-        )
         self.slots = {i: n for n, i in enumerate(idx)}  # a launch's slot in the step
         caps = set(bb.dspark_layers_to_capture or ())
         self.peers, self.bufs, self.half = {}, {}, {}
@@ -436,13 +599,9 @@ class Wide:
         flat = [z(b * (LAT + H)), z(b * (LAT + H))]
         # the launch's hand-off mailboxes uncached (as the K3 launches): a consumer reads a line at its home memory,
         # not through the producer XCD's L2. A one-rank peer buffer, never freed while the process lives.
-        scr_pb = None
-        if os.environ.get("SGLANG_AMD_MONO_K31_WIDE_UNCACHED_SCRATCH", "1") == "1":
-            scr_pb = PeerBuffer(scratch, self.group, self.rank, 1, dev)
-            scr = scr_pb.bytes
-            scr.zero_()
-        else:
-            scr = torch.zeros(scratch, dtype=torch.uint8, device=dev)
+        scr_pb = PeerBuffer(scratch, self.group, self.rank, 1, dev)
+        scr = scr_pb.bytes
+        scr.zero_()
         bufs = dict(
             cfg=cfg,
             mid=z(b, SL),
@@ -467,6 +626,19 @@ class Wide:
             num_acc=torch.ones(b // L, dtype=torch.int32, device=dev),
             win_row=torch.full((b // L,), -1, dtype=torch.int32, device=dev),
         )
+        # the launch's sort + quant (sort builds); a placeholder pointer otherwise
+        from sgl_amd_mono.kimi_k31.gfx950.stages import moe_front as mf
+
+        kind = _launch_sort(b)
+        if kind:
+            bufs["sort"] = torch.zeros(
+                mf.sort_layout(b, kind)["nbytes"], dtype=torch.uint8, device=dev
+            )
+            mf.sort_init(bufs["sort"], b, kind)
+            bufs["sortv"] = _sort_views(bufs["sort"], b, kind)
+        else:
+            bufs["sort"] = torch.zeros(256, dtype=torch.uint8, device=dev)
+            bufs["sortv"] = None
         self.bufs[b] = bufs
         _say(f"bucket {b}: peer {need / 1e6:.1f} MB, scratch {scratch / 1e6:.1f} MB")
         return bufs
@@ -514,6 +686,7 @@ class Wide:
             self.epoch.data_ptr(),
             slot,
             pre.shape[0] * H * 2 - col0,
+            bufs["sort"].data_ptr(),
         )
 
     def _build_launch(self, pk, b, L, v, cfg):
@@ -537,6 +710,7 @@ class Wide:
             half_bytes=self.half[b],
             front_rows=pk.front_rows,
             up_norm=pk.up_norm,
+            sort=_launch_sort(b),
         )[0]
 
     def warmup(self, buckets=None):
@@ -615,7 +789,9 @@ class Wide:
         if not self.kda_ready:
             self.kda_ready = True
             for pk in self.layers.values():
-                pk.mamba_idx = pool.mamba2_layer_index(pk.layer.self_attn.attn.layer_id)
+                pk.mamba_idx = backend.state_layer(
+                    pk.layer.self_attn.attn.layer_id
+                ).view_layer_id
         slots = meta.mamba_cache_indices[:R]
         vrows = select_verify_intermediate_state_indices(
             backend.verify_intermediate_state_indices,
@@ -697,23 +873,23 @@ class Wide:
         else:
             moe._forward_shared(gate_up, sh)
         moe._forward_routed(x, logits, routed, bufs["lat_p"][ping][:rows])
-        return x, prefix
+        return prefix
 
     def _column_exit(self, moe, b, rows, bufs, ping):
-        """A run's exit as SGLang's column tail (<= 64 rows): one all-reduce of the
+        """A run's exit as SGLang's column tail (up to its row cap): one all-reduce of the
         [latent | shared] pair, this rank's stream columns (its prefix columns added
         there), and the stream's all-gather that also stages the next layer's attention
         read. None, before anything runs, when SGLang's kernels do not take the batch."""
         import sglang.kernels.ops.attention.k3_attn_res_read_hip as hip
-        import sglang.srt.models.kimi_k3_amd.moe as k3_amd_moe
         from sglang.srt.distributed import tensor_model_parallel_all_reduce
+        from sglang.srt.environ import envs
         from sglang.srt.layers.attn_residual_hip import gather_covers
 
         read = moe.next_attn_read
         if (
-            not self.column_exit
-            or read is None
-            or rows > k3_amd_moe._COLUMN_TAIL_MAX_TOKENS
+            read is None
+            # _column_tail_and_next_read's own cap: past it, it would decline after the all-reduce
+            or rows > envs.SGLANG_ROCM_K3_COLUMN_TAIL_MAX_TOKENS.get()
             or not moe._fused_latent_tail_eligible
         ):
             return None
@@ -729,17 +905,6 @@ class Wide:
         )
         assert stream is not None
         return stream
-
-    def _rel(self, got, ref):
-        """rel L2 over the TP group of tensors each rank holds a part of."""
-        import torch.distributed as dist
-        from sglang.srt.distributed import get_tp_group
-
-        t = torch.stack(
-            [(got.float() - ref.float()).square().sum(), ref.float().square().sum()]
-        )
-        dist.all_reduce(t, group=get_tp_group().device_group)
-        return (t[0] / t[1]).sqrt().item()
 
     def backbone(self, built, input_ids, fb, input_embeds):
         from sglang.srt.distributed import tensor_model_parallel_all_gather
@@ -776,16 +941,13 @@ class Wide:
         ks = self._kda_step(fb, R, L, bufs)
         self.epoch[0].add_(1)
         cols = self.cols
-        check = self.check_left > 0 and not torch.cuda.is_current_stream_capturing()
-        self.check_left -= int(check)
         i = m.start_layer
         ping = 0
-        ref_mid = None
         entry_prefix = None  # SGLang's prefix the next run's first launch reads (kept alive until it is enqueued)
         bank_synced = False
         while i < m.end_layer:
             if i in self.entry:
-                x, prefix = self._tail_front(
+                prefix = self._tail_front(
                     m.layers[i],
                     hidden,
                     built._positions,
@@ -799,8 +961,6 @@ class Wide:
                     entry_prefix = prefix
                 else:
                     bufs["pout"][ping][:rows, cols] = prefix[:, cols]
-                if check:  # SGLang's whole MoE on the same input, this rank's columns
-                    ref_mid = m.layers[i].mlp(x, prefix_sum=prefix)[:, cols].clone()
                 i += 1
                 continue
             if i not in self.layers:
@@ -828,13 +988,6 @@ class Wide:
             if not bank_synced:
                 bufs["bank"][:rows, :nvb] = res.block_residual[:rows, :nvb, cols]
                 bank_synced = True
-            elif check:
-                d = (
-                    (bufs["bank"][:rows, :nvb] != res.block_residual[:rows, :nvb, cols])
-                    .sum()
-                    .item()
-                )
-                assert d == 0, f"wide bank out of sync at layer {i}: {d} values"
             run = []
             while i in self.layers:
                 run.append(i)
@@ -857,12 +1010,6 @@ class Wide:
                 )
                 if n == 0:
                     entry_prefix = None
-                if n == 0 and ref_mid is not None:
-                    e = self._rel(bufs["mid"][:rows], ref_mid)
-                    _say(
-                        f"entry check layer {li - 1} -> {li} rows {rows}: mid rel {e:.2e}"
-                    )
-                    ref_mid = None
                 if v["capture"]:
                     aux.append(bufs["cap"][:rows].clone())
                 if pk.write:
@@ -872,23 +1019,20 @@ class Wide:
                         )
                     )
                 lat_p = bufs["lat_p"][cur]
-                pk.moe._forward_routed(
+                _routed(
+                    pk.moe,
                     bufs["lat"][:rows],
                     bufs["logits"][:rows],
-                    bufs["lat"][:rows],
+                    bufs["ids"][:rows],
+                    bufs["w"][:rows],
                     lat_p[:rows],
+                    # the launch sorted all b rows: usable only when the step fills its bucket (pad = M = rows)
+                    sortv=bufs["sortv"] if rows == b else None,
                 )
                 ping = cur
             # leave: the last layer's MoE tail on SGLang
             last = self.layers[run[-1]]
             sh = bufs["sh"][ping][:rows]
-            if check:  # the gathered-prefix tail
-                full = tensor_model_parallel_all_gather(
-                    bufs["pout"][ping][:rows, cols].contiguous(), dim=-1
-                )
-                ref = last.moe._column_split_tail(
-                    bufs["lat_p"][ping][:rows].clone(), sh.clone(), full, cols=cols
-                )
             stream = self._column_exit(last.moe, b, rows, bufs, ping)
             if stream is None:
                 # this rank's prefix columns ride in its columns of the shared partial, so
@@ -896,11 +1040,6 @@ class Wide:
                 sh[:, cols] += bufs["pout"][ping][:rows, cols]
                 stream = last.moe._column_split_tail(
                     bufs["lat_p"][ping][:rows], sh, None, cols=cols
-                )
-            if check:
-                _say(
-                    f"exit check layer {run[-1]} rows {rows}: stream rel "
-                    f"{((stream.float() - ref.float()).norm() / ref.float().norm()).item():.2e}"
                 )
             hidden = set_written(stream, fb)
             if run[-1] in captures:

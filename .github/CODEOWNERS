@@ -1,6 +1,10 @@
 # Overall owners: every path without a more specific line below.
 * @HaiShaw @kevin-mii @alexnails
 
+# CI: the workflows and the AMD PR test's scripts, with the overall owners.
+/.github/workflows/ @HaiShaw @kevin-mii @alexnails @michaelzhang-ai @bingxche
+/scripts/ci/ @HaiShaw @kevin-mii @alexnails @michaelzhang-ai @bingxche
+
 # Per model: one owner for its spec, forward, kernels and tests. Each new
 # model's PR adds its line.
 **/*deepseek_v4* @1am9trash @RolaoDenthu
@@ -13,5 +17,8 @@
 **/*minimax_m31* @kevin-mii
 sgl_amd_mono/minimax/ @zijiecode @kevin-mii
 **/*muse_spark* @zijiecode @RolaoDenthu
+sgl_amd_mono/qwen35_a17b/ @yichiche
+**/*qwen35_a17b* @yichiche
 **/*qwen38_a95b_mxfp4* @yichiche
 **/*qwen38_flash_next* @yichiche
+**/*qwen3_8_dense* @yichiche

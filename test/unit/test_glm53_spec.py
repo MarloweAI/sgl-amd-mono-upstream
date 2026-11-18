@@ -306,16 +306,115 @@ def test_config_reasons_name_each_mismatch():
     assert "index_topk_freq" in text
     assert "MoE" in text
     assert "--page-size 1" in text
-    assert "FP8 block-128" in text
+    assert "MXFP4 checkpoint" in text
     assert "RoPE 'yarn'" in text
+    fp4 = {"dtype": "fp4", "qscheme": "per_group", "group_size": 32}
+    quant = {
+        "quant_method": "quark",
+        "global_quant_config": {
+            "weight": {**fp4, "is_dynamic": False},
+            "input_tensors": {**fp4, "is_dynamic": True},
+        },
+    }
+    mxfp4 = SimpleNamespace(**{**vars(GLM53), "quantization_config": quant})
+    assert glm53._config_disable_reasons(CFG, mxfp4) == []
+    int8 = {**quant, "global_quant_config": {"weight": {"dtype": "int8"}}}
+    other = SimpleNamespace(**{**vars(GLM53), "quantization_config": int8})
+    assert "MXFP4 checkpoint" in " ".join(glm53._config_disable_reasons(CFG, other))
+    bf16 = SimpleNamespace(**{**vars(GLM53), "quantization_config": {}})
+    assert "FP8 block-128" in " ".join(glm53._config_disable_reasons(CFG, bf16))
+
+
+MXFP4 = {"dtype": "fp4", "group_size": 32, "scale_format": "e8m0"}
+
+
+def test_glm52s_quark_mxfp4_checkpoint_is_served():
+    quark = {
+        "quant_method": "quark",
+        "global_quant_config": {"weight": MXFP4, "input_tensors": MXFP4},
+        "layer_quant_config": {},
+    }
+    glm52 = SimpleNamespace(**{**vars(GLM53), "quantization_config": quark})
+    assert glm53._config_disable_reasons(CFG, glm52) == []
+    fp8_inputs = {**MXFP4, "dtype": "fp8_e4m3"}
+    other = {
+        **quark,
+        "global_quant_config": {"weight": MXFP4, "input_tensors": fp8_inputs},
+    }
+    glm52 = SimpleNamespace(**{**vars(GLM53), "quantization_config": other})
+    assert "Quark MXFP4" in " ".join(glm53._config_disable_reasons(CFG, glm52))
+
+
+def _mxfp4_moe(shuffled=True, scale_dims=3):
+    w13 = torch.empty(257, 4, 8, dtype=torch.uint8)
+    if shuffled:
+        w13.is_shuffled = True
+    scale = torch.empty((257, 4, 1)[3 - scale_dims :], dtype=torch.uint8)
+    return SimpleNamespace(
+        experts=SimpleNamespace(w13_weight=w13, w13_weight_scale=scale)
+    )
+
+
+def test_mxfp4_experts_are_read_only_in_aiters_a4w4_layout():
+    from sgl_amd_mono.glm53.gfx950.weights import experts_reason, is_mxfp4_experts
+
+    assert is_mxfp4_experts(_mxfp4_moe())
+    assert experts_reason(_mxfp4_moe()) is None
+    assert "shuffled" in experts_reason(_mxfp4_moe(shuffled=False))
+    assert "GU-interleaved" in experts_reason(_mxfp4_moe(scale_dims=2))
+
+
+def _aiter_shuffle():
+    """AITER's (16, 16) shuffle (CPU torch); skipped where AITER does not import."""
+    try:
+        from aiter.ops.shuffle import shuffle_weight
+    except Exception as e:  # noqa: BLE001 - no AITER, or no ROCm to import it on
+        pytest.skip(f"AITER does not import: {type(e).__name__}: {e}")
+    return shuffle_weight
+
+
+@pytest.mark.parametrize("shape", [(1, 64, 256), (3, 512, 6144)])
+def test_unshuffle_bf16_inverts_aiter_shuffle(shape):
+    # GLM-5.2's bf16 NextN experts: SGLang shuffles them in place for AITER's CK MoE
+    from sgl_amd_mono.glm53.gfx950.weights import _unshuffle_bf16
+
+    w = torch.randn(shape, generator=torch.Generator().manual_seed(0)).bfloat16()
+    shuffled = _aiter_shuffle()(w.clone(), (16, 16))
+    assert not torch.equal(shuffled, w)
+    assert torch.equal(_unshuffle_bf16(shuffled), w)
+
+
+@pytest.mark.parametrize("rows,cols,bc", [(2624, 6144, 128), (1024, 192, 64)])
+def test_block_quant_pads_and_keeps_each_block_within_half_an_fp8_step(rows, cols, bc):
+    # 2,624 fused_qkv_a rows pad to 21 blocks; W_UK takes 128 x 64 blocks
+    from sgl_amd_mono.glm53.gfx950.weights import _block_quant
+
+    g = torch.Generator().manual_seed(rows)
+    w = (torch.randn(rows, cols, generator=g) * 2e-2).bfloat16()
+    w[:128, :bc] = 0
+    q, scale = _block_quant(w, 128, bc)
+    assert q.dtype == torch.float8_e4m3fn and tuple(q.shape) == (rows, cols)
+    assert tuple(scale.shape) == (-(-rows // 128), cols // bc)
+    s = scale.repeat_interleave(128, 0)[:rows].repeat_interleave(bc, 1)
+    deq = q.float() * s
+    assert torch.equal(deq[:128, :bc], torch.zeros(128, bc))
+    # E4M3's step is 32 at its top binade [256, 448]; ties land on 16 up to f32 scales
+    assert ((deq - w.float()).abs() <= 16 * s * (1 + 1e-4)).all()
+
+
+def test_a_bf16_dense_mlp_is_copied_not_refused():
+    from sgl_amd_mono.glm53.gfx950.weights import dense_reason
+
+    assert dense_reason(_dense_layer(dtype=torch.bfloat16), 8) is None
 
 
 def _linear(shuffled=True):
     # SGLang marks only the block-FP8 linears it rewrote into AITER's layout
     if not shuffled:
-        return SimpleNamespace(weight=SimpleNamespace())
+        return SimpleNamespace(weight=SimpleNamespace(dtype=torch.float8_e4m3fn))
     return SimpleNamespace(
-        aiter_bpreshuffled=True, weight=SimpleNamespace(is_shuffled=True)
+        aiter_bpreshuffled=True,
+        weight=SimpleNamespace(is_shuffled=True, dtype=torch.float8_e4m3fn),
     )
 
 
@@ -360,7 +459,7 @@ def _dense_layer(indexer=True, inter=DENSE_TP8, dtype=torch.float8_e4m3fn):
     layer = _layer(indexer=indexer)
     layer.mlp = SimpleNamespace(
         gate_up_proj=_fp8_linear(2 * inter, HIDDEN, dtype),
-        down_proj=_fp8_linear(HIDDEN, inter),
+        down_proj=_fp8_linear(HIDDEN, inter, dtype),
     )
     return layer
 
@@ -417,11 +516,11 @@ def test_model_reasons(tp8):
     good = _layers()
     assert glm53._model_disable_reasons(_model(good), GLM53, {}) == []
     bad = list(good)
-    bad[5] = _layer(experts_dtype=torch.bfloat16)
+    bad[5] = _layer(experts_dtype=torch.float16)
     bad[9] = _layer(n_experts=256)
     bad[0] = _dense_layer(indexer=False)
     reasons = " | ".join(glm53._model_disable_reasons(_model(bad), GLM53, {}))
-    assert "layer 5: needs block-FP8 experts" in reasons
+    assert "layer 5: needs block-FP8, MXFP4 or bf16 experts" in reasons
     assert "layer 9: needs the shared expert fused" in reasons
     # layer 0 runs the indexer: the MoE layers before the first indexer one read its
     # top-k (and layers 1 and 2 recompute it)
@@ -439,8 +538,8 @@ def test_model_reasons_of_the_tail_the_embedding_and_the_dense_layers(tp8, monke
     monkeypatch.setattr(tp8, "head_weights", refuse("an fp8 LM head"))
     monkeypatch.setattr(tp8, "embedding", refuse("padded rows"))
     layers = _layers()
-    # a bf16 dense MLP; 1,600 intermediates a rank, not slices of the experts' 256
-    layers[1] = _dense_layer(dtype=torch.bfloat16)
+    # an fp16 dense MLP; 1,600 intermediates a rank, not slices of the experts' 256
+    layers[1] = _dense_layer(dtype=torch.float16)
     layers[2] = _dense_layer(inter=1600)
     lp = _lp(
         use_attn_tp_group=True,
@@ -558,6 +657,52 @@ def test_the_dense_mlp_is_copied_as_expert_slices(shuffled):
     mlp.down_proj.aiter_bpreshuffled = not shuffled
     with pytest.raises(ValueError, match="one FP8 layout"):
         _dense_mlp(mlp, 0, inter, {})
+
+
+def test_the_mxfp4_dense_mlp_is_copied_as_expert_slices():
+    # An MXFP4 dense MLP (row-major E2M1 bytes, an E8M0 a 32) as the experts'
+    # slices in AITER's MoE layouts: slice e's gate and up rows, then down's matching
+    # K columns, as (16, 16) bytes and e8m0_shuffle'd codes
+    fp4_utils = pytest.importorskip("aiter.utility.fp4_utils")
+    from sgl_amd_mono.glm53.gfx950.config import HIDDEN
+    from sgl_amd_mono.glm53.gfx950.weights import _dense_mxfp4
+
+    inter, n, di = 256, 6, DENSE_TP8
+    g = torch.Generator().manual_seed(0)
+
+    def u8(*shape):
+        return torch.randint(0, 256, shape, generator=g, dtype=torch.uint8)
+
+    gu, s_gu, dn, s_dn = (
+        u8(2 * di, HIDDEN // 2),
+        u8(2 * di, HIDDEN // 32),
+        u8(HIDDEN, di // 2),
+        u8(HIDDEN, di // 32),
+    )
+    mlp = SimpleNamespace(
+        gate_up_proj=SimpleNamespace(weight=gu, weight_scale=s_gu),
+        down_proj=SimpleNamespace(weight=dn, weight_scale=s_dn),
+    )
+    copies = {}
+    w_ug, c_ug, w_dn, c_dn, slices = _dense_mxfp4(mlp, 0, inter, copies)
+    assert slices == n and len(copies) == 4
+    assert w_ug.shape == (n, 2 * inter, HIDDEN // 2)
+    assert w_dn.shape == (n, HIDDEN, inter // 2)
+    for e in range(n):
+        rows = slice(e * inter, (e + 1) * inter)
+        ug = torch.cat([gu[rows], gu[di:][rows]])
+        assert torch.equal(check.unshuffle(w_ug[e]), ug)
+        assert torch.equal(
+            check.unshuffle(w_dn[e]), dn[:, e * inter // 2 :][:, : inter // 2]
+        )
+        s = torch.cat([s_gu[rows], s_gu[di:][rows]])
+        assert torch.equal(c_ug[e], fp4_utils.e8m0_shuffle(s))
+        s = s_dn[:, e * inter // 32 :][:, : inter // 32].contiguous()
+        assert torch.equal(c_dn[e], fp4_utils.e8m0_shuffle(s))
+    # SGLang's ASM GEMM layout refuses
+    mlp.gate_up_proj.use_aiter_asm_fp4_gemm = True
+    with pytest.raises(ValueError, match="row-major Triton"):
+        _dense_mxfp4(mlp, 0, inter, {})
 
 
 def _vocab_module(tp, rank=1, padding=0, added=0, method="UnquantizedEmbeddingMethod"):

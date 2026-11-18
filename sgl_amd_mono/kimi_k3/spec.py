@@ -103,12 +103,12 @@ SGLANG_READS = {
     ),
     # the MXFP4 expert layout the launch reads, as Mxfp4MoEMethod chose it
     "srt/layers/quantization/mxfp4.py": ("_aiter_situ_uses_gu_interleaved_weights",),
-    # mlp-sync padding, which the launch has no handling for
     "srt/utils/common.py": (
         "BumpAllocator",
         "get_bool_env_var",
-        "require_mlp_sync",
     ),
+    # mlp-sync padding, which the launch has no handling for
+    "srt/layers/dp_attention.py": ("require_mlp_sync",),
     # the model's own forward, which _Built reproduces for a routed step
     "srt/managers/mm_utils.py": ("general_mm_embed_routine",),
     "srt/managers/schedule_batch.py": ("Modality",),
@@ -217,7 +217,10 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
     """Every per-layer check the config cannot answer. The kernels read each
     weight as a raw address, so a wrong dtype, shape or layout is read as if it
     were the expected one."""
-    from sglang.srt.utils.common import require_mlp_sync
+    try:
+        from sglang.srt.layers.dp_attention import require_mlp_sync
+    except ImportError:  # SGLang before sgl-project/sglang#48781
+        from sglang.srt.utils.common import require_mlp_sync
 
     hidden = HF_CONFIG["hidden_size"]
     covered = _covered_layers(hf_config)
@@ -328,9 +331,16 @@ def _warmup(runner, packed_layers: dict, rows: int) -> None:
     banks: dict[int, torch.Tensor] = {}
 
     def bank(nb: int):
+        # One row past the nb blocks the launch reads: a block-write layer's
+        # launch (K1 or mla_pre, key.write_idx == nb) stores its updated prefix
+        # in block nb, as a served step does into the bank's spare capacity.
+        # An nb-row bank put the last token's write one HIDDEN row past the end
+        # and zeroed whatever the allocator had placed there (seen: a later
+        # layer's indexer k_norm at 8 draft tokens, which silently broke that
+        # layer's DSA top-k).
         if nb not in banks:
             banks[nb] = torch.zeros(
-                rows, nb, HIDDEN, dtype=torch.bfloat16, device=device
+                rows, nb + 1, HIDDEN, dtype=torch.bfloat16, device=device
             )
         return banks[nb]
 

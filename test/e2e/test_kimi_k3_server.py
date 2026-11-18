@@ -110,7 +110,7 @@ class TestMonokernelKimiK3(CustomTestCase):
                     "num_questions": 200,
                     "max_new_tokens": 512,
                     "parallel": 2,
-                    "host": "http://127.0.0.1",
+                    "host": "127.0.0.1",
                     "port": int(DEFAULT_URL_FOR_TEST.split(":")[-1]),
                 },
             )()
@@ -121,10 +121,11 @@ class TestMonokernelKimiK3(CustomTestCase):
         # The launch folds the residual add in, so a wrong seam is a silent
         # numerical error: only scoring the same tokens the other way finds it.
         assert_logprobs_match(
-            self,
             DEFAULT_URL_FOR_TEST,
+            {MODEL: {"kl_div": KL_BOUND}},
+            MODEL,
             max_new_tokens=32,
-            kl_div_threshold=KL_BOUND,
+            trust_remote_code=True,
         )
 
 

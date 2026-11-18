@@ -1,8 +1,9 @@
 """The GLM-5.3-Flash gfx950 monokernel spec on CPU (RFC #43949): the layers its
 forward covers on the GLM-5.3-Flash layer structure, its row routing and TP2 row
-cap, the tail's logits in place of the logits processor's, its registry entry, its
-config and model refusal reasons, and the dense, embedding and LM-head views. SGLang
-checks its declared requirements, the same way for every spec."""
+cap, its verify page-table check, the tail's logits in place of the logits
+processor's, its registry entry, its config and model refusal reasons, and the
+dense, embedding and LM-head views. SGLang checks its declared requirements, the
+same way for every spec."""
 
 import math
 from types import SimpleNamespace
@@ -96,7 +97,9 @@ def _plan(rows, tokens=1):
 
 def test_a_step_runs_at_the_next_width_and_tp2_takes_four_rows():
     # a step of fewer rows than a width runs at the next width, the rest pad rows
-    assert [flash._width(r) for r in flash.ROWS] == [2, 2, 4, 4, 8, 8, 8, 8]
+    assert [flash._width(r) for r in flash.ROWS] == [2, 2, 4, 4] + [8] * 4 + [
+        12
+    ] * 4 + [16] * 4
     # TP2 builds no 8-row launch: a wider step runs the model's own forward
     lm, built = _built(tp=2, widths=(2, 4))
     out = built.forward(_plan(8), "ids", "positions", "batch")
@@ -118,6 +121,16 @@ def test_a_verify_step_of_other_draft_chains_runs_the_model_s_forward():
     lm, built = _built(tp=2, widths=(2, 4), verify=4)
     out = built.forward(_plan(8, tokens=4), "ids", "positions", "batch")
     assert out == "the model's forward" and len(lm.ran) == 1
+
+
+def test_a_verify_step_refuses_a_page_table_that_does_not_repeat_its_rows():
+    # the DSA backend's verify page table: 3 requests, each row repeated for its 4 rows
+    page_table = torch.arange(3 * 5, dtype=torch.int32).reshape(3, 5)
+    page_table = page_table.repeat_interleave(4, dim=0)
+    flash.check_verify_page_table(page_table, 4)
+    page_table[5, 2] += 1
+    with pytest.raises(RuntimeError, match="no longer repeats"):
+        flash.check_verify_page_table(page_table, 4)
 
 
 def test_a_step_from_embeddings_runs_the_model_s_forward():

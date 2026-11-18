@@ -8,7 +8,7 @@
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import rocdl
-from flydsl.expr.typing import T
+from flydsl.expr.typing import T, as_ir_value
 
 from sgl_amd_mono.common.ops import CM_NT
 
@@ -35,6 +35,35 @@ def code_ceil(v):
 def rcp_pow2(code):
     """Return 1 / ``pow2(code)`` exactly (code in [1, 253])."""
     return ((254 - code) << 23).bitcast(fx.Float32)
+
+
+def e8m0_roundup(amax):
+    """AITER's MXFP4 activation scale (``_e8m0_roundup(amax, 6)``): the E8M0 code of
+    the smallest power of two >= amax * f32(1 / 6), at most 254."""
+    wi = (amax * fx.Float32(1.0 / 6.0)).bitcast(fx.Int32)
+    b = fx.Int32(fx.Uint32(wi + fx.Int32(0x7FFFFF)) >> fx.Uint32(23)) & 0xFF
+    return fx.min(b, fx.Int32(254))
+
+
+def e8m0_even(amax):
+    """AITER's Triton MXFP4 scale (``_mxfp4_scale_from_amax``): the E8M0 code of
+    amax's exponent once 2^21 is added to its bits, over 4, in [0, 254]."""
+    bits = (amax.bitcast(fx.Int32) + fx.Int32(0x200000)) & fx.Int32(0x7F800000)
+    return fx.max(fx.min((bits >> 23) - fx.Int32(2), fx.Int32(254)), fx.Int32(0))
+
+
+def fp4x2(a, b, code):
+    """The E2M1 byte of f32 ``a`` (low nibble) and ``b`` over the E8M0 scale ``code``,
+    rounded to nearest even and saturating, as AITER's MXFP4 quants round."""
+    pair = rocdl.cvt_scalef32_pk_fp4_f32(
+        T.i32,
+        as_ir_value(fx.Int32(0)),
+        as_ir_value(fx.Float32(a)),
+        as_ir_value(fx.Float32(b)),
+        as_ir_value((fx.Int32(code) << 23).bitcast(fx.Float32)),
+        0,
+    )
+    return fx.Int32(pair) & 0xFF
 
 
 def scale_index(row, col, cols):

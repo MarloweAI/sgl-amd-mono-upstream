@@ -192,8 +192,12 @@ def layout(
     tokens: bool = False,
     head_vocab: int = 0,
     eh_tiles: int = 0,
+    act_fp4: bool = False,
 ):
     """Return byte offsets for per-rank scratch and symmetric peer buffers.
+
+    ``act_fp4``: the experts' activations and mid as MXFP4 too, an E8M0 scale a
+    32 values.
 
     ``tokens``: also the layer input's rows, which the token's owner rank pushes
     (``xin``, two slots by launch parity). ``eh_tiles``: the NextN entry's rows of
@@ -235,14 +239,20 @@ def layout(
         ("xq", samples * HIDDEN // 4 * pair_bytes),
         (
             "xqs",
-            samples * (XQ_GROUPS if native_fp4_mfma else XQ_BLOCKS) * pair_bytes,
+            samples
+            * (XQ_GROUPS if native_fp4_mfma or act_fp4 else XQ_BLOCKS)
+            * pair_bytes,
         ),
         ("sel", samples * MOE_SLOTS * pair_bytes),
         ("prob", samples * MOE_SLOTS * pair_bytes),
         ("mid", samples * MOE_SLOTS * inter * pair_bytes),
-        # mid's FP8 blocks (four values a pair) and their scales
+        # mid's FP8 blocks (four values a pair) and their scales; MXFP4: eight
+        # values a pair, an E8M0 code a 32
         ("midq", samples * MOE_SLOTS * inter // 4 * pair_bytes),
-        ("midqs", samples * MOE_SLOTS * inter // 128 * pair_bytes),
+        (
+            "midqs",
+            samples * MOE_SLOTS * inter // (32 if act_fp4 else 128) * pair_bytes,
+        ),
         ("ugp", BLOCKS * samples * 2 * UG_TILE * pair_bytes),
         ("xqd", samples * HIDDEN * 4),
     ]

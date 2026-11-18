@@ -130,7 +130,7 @@ class TestMonokernelVerify(_Serving, CustomTestCase):
 
     def test_passkey_deep_in_a_long_prompt(self):
         # a fact a fifth into a long prompt: every answering step must select its block
-        from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+        from sglang.srt.hf_transformers.tokenizer import get_tokenizer
 
         tok = get_tokenizer(MODEL, trust_remote_code=True)
         ids = get_input_ids(

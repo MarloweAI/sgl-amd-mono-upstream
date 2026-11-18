@@ -155,9 +155,12 @@ def _fake_layer(*, gate=True, kda=False):
 
 
 def _reasons(monkeypatch, layer):
-    import sglang.srt.utils.common as common
+    from sglang.srt.layers import dp_attention
+    from sglang.srt.utils import common
 
-    monkeypatch.setattr(common, "require_mlp_sync", lambda: False)
+    # where spec.py imports it from (common: SGLang before sgl-project/sglang#48781)
+    source = dp_attention if hasattr(dp_attention, "require_mlp_sync") else common
+    monkeypatch.setattr(source, "require_mlp_sync", lambda: False)
     model = SimpleNamespace(model=SimpleNamespace(layers={i: layer for i in range(93)}))
     return k3._model_disable_reasons(model, K3, {})
 

@@ -381,8 +381,8 @@ def _rel(a: torch.Tensor, b: torch.Tensor) -> float:
 
 
 def unshuffle(w: torch.Tensor) -> torch.Tensor:
-    """A [rows, K] FP8 weight from AITER's (16, 16) layout ([rows / 16, K / 32, 2,
-    16 rows, 16 bytes]) back to row-major."""
+    """A [rows, K] byte weight (FP8, or MXFP4's packed pairs) from AITER's (16, 16)
+    layout ([rows / 16, K / 32, 2, 16 rows, 16 bytes]) back to row-major."""
     n, k = w.shape
     b = w.view(torch.uint8).view(n // 16, k // 32, 2, 16, 16)
     return b.permute(0, 3, 1, 2, 4).reshape(n, k).view(w.dtype)
@@ -430,6 +430,29 @@ def slices_f32(w: torch.Tensor, s: torch.Tensor, shuffled: bool) -> torch.Tensor
         w = torch.stack([unshuffle(t) for t in w])
     s = s.float().repeat_interleave(128, -2).repeat_interleave(128, -1)
     return w.float() * s[:, : w.shape[1], : w.shape[2]]
+
+
+E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+
+
+def mx_f32(w: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+    """f32 of row-major MXFP4 [..., rows, K / 2] bytes (low nibble first) with their
+    E8M0 codes [..., rows, K / 32]."""
+    table = torch.tensor(E2M1, device=w.device)
+    nib = torch.stack([w & 0xF, w >> 4], -1).flatten(-2).long()
+    v = table[nib & 7] * (1 - 2 * (nib >> 3)).float()
+    return v * torch.exp2(s.float() - 127).repeat_interleave(32, -1)
+
+
+def mx_slices_f32(w: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+    """f32 of MXFP4 expert-shaped slices [n, rows, K / 2] in AITER's layouts: the
+    bytes ``shuffle_weight`` (16, 16), the codes ``e8m0_shuffle``'d over the slices'
+    rows together."""
+    n, rows, _ = w.shape
+    w = torch.stack([unshuffle(t) for t in w])
+    k32 = s.shape[-1]
+    s = s.reshape(n * rows // 32, k32 // 8, 4, 16, 2, 2).permute(0, 5, 3, 1, 4, 2)
+    return mx_f32(w, s.reshape(n, rows, k32))
 
 
 def dense_parts(runtime, w, S: int) -> dict:
@@ -485,9 +508,11 @@ def dense(L, op, ref: dict, out: torch.Tensor, S: int) -> None:
     f32 gate | up on its own FP8 activations (``dense.mid.rel``), its output (output
     minus FFN input) against the f32 down projection of its own quantized mid
     (``dense.x.rel``), and both its output and SGLang's MLP on the same FFN input
-    against an f32 MLP (``dense.x_vs_fp32.rel``, ``dense.stock_vs_fp32.rel``; their
+    (a bf16 MLP: SGLang's FP8 MLP on the launch's copy) against an f32 MLP
+    (``dense.x_vs_fp32.rel``, ``dense.stock_vs_fp32.rel``; their
     ratio less one is ``dense.excess.rel``). Every rank its shard, summed over the TP
-    group."""
+    group. An MXFP4 MLP has no ``dense.mid`` or ``dense.x``: its MXFP4 input and mid
+    are SGLang's quantization bitwise (``check_mxfp4.py``)."""
     from sglang.srt.distributed.communication_op import (
         tensor_model_parallel_all_reduce,
     )
@@ -498,31 +523,51 @@ def dense(L, op, ref: dict, out: torch.Tensor, S: int) -> None:
     if not L.module.self_attn.o_proj.reduce_results:
         o_ref = tensor_model_parallel_all_reduce(o_ref.contiguous())
     a = ffn_input(runtime, S)
-    parts = dense_parts(runtime, L.w, S)
     x = _rms(a, L.module.post_attention_layernorm.weight)
-    wug = slices_f32(L.w.w_ug, L.w.s_ug, L.w.shuffled)
-    wdn = slices_f32(L.w.w_dn, L.w.s_dn, L.w.shuffled)
+    if L.w.mxfp4:
+        parts = None
+        wug = mx_slices_f32(L.w.w_ug, L.w.s_ug)
+        wdn = mx_slices_f32(L.w.w_dn, L.w.s_dn)
+    else:
+        parts = dense_parts(runtime, L.w, S)
+        wug = slices_f32(L.w.w_ug, L.w.s_ug, L.w.shuffled)
+        wdn = slices_f32(L.w.w_dn, L.w.s_dn, L.w.shuffled)
     inter = wug.shape[1] // 2
     gu = torch.einsum("sk,njk->snj", x, wug)
     mid32 = torch.nn.functional.silu(gu[..., :inter]) * gu[..., inter:]
-    both = torch.cat(
-        [parts["down"], torch.einsum("sni,nhi->sh", mid32, wdn)], 0
-    ).contiguous()
-    both = tensor_model_parallel_all_reduce(both)
-    down, f32 = both[:S], both[S:]
-    stock = mlp(x.to(torch.bfloat16))
-    # SGLang fuses the dense MLP's TP reduce into the next residual add and norm
-    if not mlp.down_proj.reduce_results:
-        stock = tensor_model_parallel_all_reduce(stock.contiguous())
+    f32 = torch.einsum("sni,nhi->sh", mid32, wdn)
+    own = [] if parts is None else [parts["down"]]
+    # A bf16 MLP (GLM-5.2's MXFP4 checkpoint) runs on the launch's block-FP8 copy,
+    # which the f32 MLP reads too: against it SGLang's bf16 MLP would carry the copy's
+    # rounding, not an FP8 MLP's. Its stock side is SGLang's per-128 FP8 MLP on the copy.
+    copied = mlp.gate_up_proj.weight.dtype == torch.bfloat16
+    rest = []
+    if copied:
+        gq = torch.einsum("sk,njk->snj", _q128(x.to(torch.bfloat16)), wug)
+        mid_q = torch.nn.functional.silu(gq[..., :inter]) * gq[..., inter:]
+        rest = [torch.einsum("sni,nhi->sh", _q128(mid_q), wdn)]
+    both = tensor_model_parallel_all_reduce(
+        torch.cat(own + [f32] + rest, 0).contiguous()
+    )
+    at = len(own) * S
+    f32 = both[at : at + S]
+    if copied:
+        stock = both[at + S :]
+    else:
+        stock = mlp(x.to(torch.bfloat16))
+        # SGLang fuses the dense MLP's TP reduce into the next residual add and norm
+        if not mlp.down_proj.reduce_results:
+            stock = tensor_model_parallel_all_reduce(stock.contiguous())
     mine = out.float() - a.float()
     values = {
         "dense.attn.rel": _rel(launch_o_proj(op, S), o_ref),
         "dense.mlp_in.rel": _rel(x.to(torch.bfloat16), ref["mlp_in"]),
-        "dense.mid.rel": _rel(parts["mid"], parts["mid_ref"]),
-        "dense.x.rel": _rel(mine, down),
         "dense.x_vs_fp32.rel": _rel(mine, f32),
         "dense.stock_vs_fp32.rel": _rel(stock, f32),
     }
+    if parts is not None:
+        values["dense.mid.rel"] = _rel(parts["mid"], parts["mid_ref"])
+        values["dense.x.rel"] = _rel(mine, both[:S])
     values["dense.excess.rel"] = (
         values["dense.x_vs_fp32.rel"] / max(values["dense.stock_vs_fp32.rel"], 1e-30)
         - 1
@@ -639,6 +684,8 @@ def entry_values(m, e: torch.Tensor, h: torch.Tensor, x: torch.Tensor):
     """A NextN entry's rows ``x`` against SGLang's eh_proj on its enorm | hnorm of
     the e and h rows, and against an f32 entry; and SGLang's rows."""
     stock = m.eh_proj(torch.cat((m.enorm(e), m.hnorm(h)), -1))
+    if isinstance(stock, tuple):  # a ReplicatedLinear's (output, bias)
+        stock = stock[0]
     f32 = torch.cat((_rms(e, m.enorm.weight), _rms(h, m.hnorm.weight)), -1)
     f32 = f32 @ m.eh_proj.weight.float().t()
     values = {
