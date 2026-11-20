@@ -240,6 +240,9 @@ def test_the_scratch_regions_are_disjoint_at_every_width(rows, front_rows):
             for x_in in (False, True):
                 key = mf.MlaFrontBuild(tokens=s, nblocks=nb, scale=1.0, x_in=x_in)
                 assert mf.scratch_bytes(key) <= reg["front"][1], (s, nb, x_in)
+    from sgl_amd_mono.kimi_k3.gfx950.attention import mla_tail as mt
+
+    assert mt.scratch_bytes() <= reg["mla_tail"][1]
 
 
 def test_every_launch_takes_its_region_from_the_one_layout():

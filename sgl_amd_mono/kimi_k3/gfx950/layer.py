@@ -231,13 +231,16 @@ def scratch_regions(
     - ``k1``: K1's own launches (``k1.scratch_bytes``);
     - ``mla_pre``: the MLA projection front;
     - ``front``: the DCP MLA front (``mla_front.scratch_layout`` inside it),
-      the spec's builds and the ``x_in`` ones inside SGLang's attention.
+      the spec's builds and the ``x_in`` ones inside SGLang's attention;
+    - ``mla_tail``: the MLA tail past SGLang's decode at the wider verify
+      steps (``mla_tail.scratch_layout``, the same at every width).
 
     Every launch takes its offset from here, and the end sizes the runner's
     allocation (``scratch_alloc_bytes``)."""
     from sgl_amd_mono.kimi_k3.gfx950 import k1
     from sgl_amd_mono.kimi_k3.gfx950.attention import mla_front as mf
     from sgl_amd_mono.kimi_k3.gfx950.attention import mla_pre
+    from sgl_amd_mono.kimi_k3.gfx950.attention import mla_tail
 
     widths = range(1, rows + 1)
     sizes = {
@@ -253,6 +256,7 @@ def scratch_regions(
             for s in range(mf.G_ROWS, min(front_rows, mf.G_ROWS * mf.MAX_REQS) + 1, mf.G_ROWS)
             for nb, x_in in ((MAX_BLOCKS, False), (0, True))
         ),
+        "mla_tail": mla_tail.scratch_bytes(),
     }
     out, off = {}, 0
     for name, n in sizes.items():
