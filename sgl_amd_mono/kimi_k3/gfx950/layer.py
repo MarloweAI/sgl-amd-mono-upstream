@@ -139,6 +139,10 @@ class K2Build(msgspec.Struct, frozen=True):
     # an MLA layer's K2 in the attention front's launch: each core chunk is read
     # once its (request, local head) box (CBOX) holds this launch's tag
     core_box: bool = False
+    # o_proj's tasks rotated: CTA b takes CTA b + o_shift's (mod BLOCKS), so CTAs
+    # BLOCKS - o_shift .. + O_TWO0 - 1 take one task, the rest two (a launch
+    # whose CTAs there carry other work first)
+    o_shift: int = 0
 
 
 def peer_layout(s):
@@ -254,10 +258,13 @@ def scratch_bytes(key: K2Build) -> int:
 
 
 @flyc.jit
-def stage_oproj(c, bid):
-    """o_proj task ``bid``, and ``bid + O_SECOND`` from CTA ``O_TWO0`` on: both
-    tasks' weights in flight at once (one memory latency, not two), then the
-    MFMAs, a token tile at a time."""
+def stage_oproj(c, cta):
+    """o_proj task ``bid`` (the CTA rotated by ``o_shift``), and ``bid +
+    O_SECOND`` from ``bid`` ``O_TWO0`` on: both tasks' weights in flight at once
+    (one memory latency, not two), then the MFMAs, a token tile at a time."""
+    bid = cta
+    if const_expr(c["o_shift"]):
+        bid = (cta + c["o_shift"]) % BLOCKS
     two = bid >= O_TWO0
     t1 = fx.min(bid + O_SECOND, OTASKS - 1)
     ops = [k2a.o_loads(c, bid), k2a.o_loads(c, t1)]
@@ -497,6 +504,7 @@ def k2_body(key: K2Build, k2_lds: K2Lds, scratch_base, args: dict) -> None:
             peer[region + "_own"] = shift(preg(own, off, region), fx.Int64(par) * half)
         c = {
             "S": s,
+            "o_shift": key.o_shift,
             "NS": ns,
             "NB": key.nblocks,
             "OK": key.kin,
@@ -773,6 +781,7 @@ def build(key: K2Build):
         + ("_f1" if key.fold else "")
         + (f"_o{key.opt}" if key.opt else "")
         + ("_cb" if key.core_box else "")
+        + (f"_os{key.o_shift}" if key.o_shift else "")
     )
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])

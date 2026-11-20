@@ -101,6 +101,9 @@ def attn_scratch(akey: kw.KdaWideBuild, scratch):
     return scratch[off : off + n]
 
 
+# the KDA task CTAs (from TASK0, the last to start K2) take one o_proj task each
+O_SHIFT = BLOCKS - kw.TASK0
+
 _BUILDS: dict = {}
 _STREAM = fx.Stream(None)
 
@@ -233,5 +236,7 @@ def run_layer(attn: Attn, kkey: k2.K2Build, k2_vals: tuple) -> None:
     """The layer's one launch: ``attn`` from K1, ``k2_vals`` K2's kernel
     arguments as ``layer.k2_launch`` passes them (its core ``core_view``)."""
     assert not kkey.core_box, "the layer's K2 key is its own launch's"
-    key = KdaLayerBuild(attn=attn.key, k2=msgspec.structs.replace(kkey, core_box=True))
+    key = KdaLayerBuild(
+        attn=attn.key, k2=msgspec.structs.replace(kkey, core_box=True, o_shift=O_SHIFT)
+    )
     build(key)(*attn.vals, *k2_vals, stream=torch.cuda.current_stream())
