@@ -144,9 +144,14 @@ QB_ROUNDS = QB_HI  # q_b groups a CTA at most
 QB_HI_N = QBG - NA * QB_SEAM - G_LAT * QB_LO  # 80 qkv_a CTAs with 7
 ABS_BLK = KV // 128  # 4 absorb tasks a head
 ABS = NHA * ABS_BLK  # 384
-HQ = 16  # heads an attention item: 96 (row, head) columns
-NCT = 6  # an item's 16-column MFMA tiles: tile T = row pair T % 3 x head octet T // 3
-NHG = NHA // HQ  # 6 head groups
+# heads an attention item: 16 (96 (row, head) columns) past one request, 8 (48)
+# for one (its 12 head groups x splits fill the CTAs); a column's arithmetic is
+# the same either way. An item's 16-column MFMA tiles: tile T = row pair T % 3
+# x head octet T // 3.
+
+
+def heads_of(s: int) -> int:
+    return 8 if reqs_of(s) == 1 else 16
 BK = 64  # keys a block
 KT = BK // 16  # 16-key QK tiles a block
 KC = BK // 32  # 32-key PV steps a block
@@ -199,7 +204,7 @@ def reqs_of(s: int) -> int:
     return s // G_ROWS
 
 
-assert NHG * MAX_SPLITS <= ATT_CTAS
+assert (NHA // 8) * MAX_SPLITS <= ATT_CTAS
 
 
 @dataclass(frozen=True)
@@ -227,7 +232,7 @@ def scratch_layout(key: MlaFrontBuild) -> dict:
         "qrdy": QBG,
         "absrdy": ABS,
         "kvrdy": nreq,
-        "itrdy": NHG * MAX_SPLITS * nreq,
+        "itrdy": (NHA // heads_of(s)) * MAX_SPLITS * nreq,
     }
     lay = pair_layout(pairs.items())
     end = max(o + n for o, n in lay.values())
@@ -520,6 +525,7 @@ def blocks_of(lr, own):
 def item_bases(c):
     """Each request's (first attention item, splits), its items (head group
     hg, split sp) at first + hg n + sp; and the items in all."""
+    HQ, NCT, NHG = c["HQ"], c["NCT"], c["NHG"]
     out = []
     base = fx.Int32(0)
     for r in range(c["NREQ"]):
@@ -777,7 +783,7 @@ def stage3(c, task, wt):
 
 KV_SLOTS = RWK * 4 // 16  # 37 16-byte LDS slots a key: its 36 pieces, then pad
 DMA_N = BK * KV_SLOTS // 64  # 37 wave-wide DMAs a block
-DMA_W0 = NCT  # the DMA wave: 6 (QK + softmax on waves 0 .. 5, a tile each)
+PATCH_W = WAVES - 1  # the wave that patches a block's new token
 PV_DIMS = KV // WAVES  # 64 value dims a wave in P V
 KV_BUFS = 2  # LDS record buffers: block i in QK / P V, i + 1 in flight
 VTW = BK // 4 + 2  # i32 words a value dim's row of the transposed block: its keys + pad
@@ -822,7 +828,7 @@ def _kv_dma(c, rows, kvl):
 def _kv_patch(c, rq, lr, own, blk, kvl):
     """Request rq's new token's record from its NEWKV into its slot, where block
     ``blk`` holds it."""
-    e = c["tid"] - DMA_W0 * 64  # a thread of the DMA waves
+    e = c["tid"] - PATCH_W * 64  # a thread of the patching wave
     if (own < G_ROWS) & (lr // BK == blk) & (e >= 0) & (e < DQK // 16):
         v = _ld4(c["newkv"], rq * (DQK // 4) + 4 * e, CM_DEV)
         fx.ptr_store(v, kvl + ((lr % BK) * RWK + 4 * e))
@@ -947,10 +953,11 @@ def _scaled(v, a):
     return fx.Vector.from_elements([v[i] * a for i in range(4)], fx.Float32)
 
 
-def _pv(lane, wave, vt, pl, al, acc):
+def _pv(c, lane, wave, vt, pl, al, acc):
     """The block's P V (values transposed at ``vt``, P at ``pl``, the factors
     at ``al``) onto this wave's accumulators, rescaled first: dims 64 wave +
     16 dt + .., every tile's 16 columns; acc[4 ct + dt]."""
+    HQ, NCT, NHG = c["HQ"], c["NCT"], c["NHG"]
     g, r16 = lane // 16, lane % 16
     out = list(acc)
     for ct in range_constexpr(NCT):
@@ -974,9 +981,9 @@ def _pv(lane, wave, vt, pl, al, acc):
     return out
 
 
-def _col(ct, r16, row0, hg):
-    """Tile ct's column r16: (row, head)."""
-    return row0 + 2 * (ct % 3) + r16 // 8, hg * HQ + (ct // 3) * 8 + r16 % 8
+def _col(ct, r16, row0, hg, hq):
+    """Tile ct's column r16 of an hq-head item: (row, head)."""
+    return row0 + 2 * (ct % 3) + r16 // 8, hg * hq + (ct // 3) * 8 + r16 % 8
 
 
 @flyc.jit
@@ -984,19 +991,20 @@ def _partial_out(c, lane, wave, sp, hg, row0, acc, mll):
     """Each (row, head)'s partial over its own sum (the (max, sum) pairs at
     ``mll``), f16, to PV [split][row][head][512] (the request's rows from
     ``row0``): this wave's dims 64 wave + 16 dt + 4 g + i; wave 0 the ML."""
+    HQ, NCT, NHG = c["HQ"], c["NCT"], c["NHG"]
     s = c["S"]
     g, r16 = lane // 16, lane % 16
     for ct in range_constexpr(NCT):
         ll = fx.ptr_load(mll + 2 * (ct * 16 + r16) + 1).bitcast(fx.Float32)
         inv = (ll > fx.Float32(0.0)).select(fx.Float32(1.0) / ll, fx.Float32(0.0))
-        r, head = _col(ct, r16, row0, hg)
+        r, head = _col(ct, r16, row0, hg, HQ)
         o0 = ((sp * s + r) * NHA + head) * KV + PV_DIMS * wave + 4 * g
         for dt in range_constexpr(4):
             hv = fx.Vector.from_elements([acc[4 * ct + dt][i] * inv for i in range(4)], fx.Float32)
             bo.buffer_store(hv.to(fx.Float16).bitcast(fx.Int32), rsrc(c["pv"]), (o0 + 16 * dt) // 2, cache_modifier=CM_DEV)
     if (wave == 0) & (g == 0):
         for ct in range_constexpr(NCT):
-            r, head = _col(ct, r16, row0, hg)
+            r, head = _col(ct, r16, row0, hg, HQ)
             bo.buffer_store(
                 fx.Vector.from_elements(
                     [fx.ptr_load(mll + 2 * (ct * 16 + r16)), fx.ptr_load(mll + 2 * (ct * 16 + r16) + 1)], fx.Int32
@@ -1012,6 +1020,7 @@ def _qk_softmax(c, kx, blk, kend, m, l, qf, t, lr, own, qk_scale, pl, al):
     """Block ``blk`` (LDS ``kx``; past the run it scores nothing): QK and the
     online softmax on waves 0 .. 5 (a 16-column tile each): P to ``pl``, the
     factors of the earlier sums to ``al``."""
+    HQ, NCT, NHG = c["HQ"], c["NCT"], c["NHG"]
     lane, wave = c["lane"], c["wave"]
     g, r16 = lane // 16, lane % 16
     if wave < NCT:
@@ -1025,17 +1034,18 @@ def _qk_softmax(c, kx, blk, kend, m, l, qf, t, lr, own, qk_scale, pl, al):
 @flyc.jit
 def _empty_out(c, lane, wave, sp, hg, row0):
     """A split with no block: zero partials, (max, sum) = (NEG, 0)."""
+    HQ, NCT, NHG = c["HQ"], c["NCT"], c["NHG"]
     s = c["S"]
     g, r16 = lane // 16, lane % 16
     zero = fx.Vector.filled(2, 0, fx.Int32)
     for ct in range_constexpr(NCT):
-        r, head = _col(ct, r16, row0, hg)
+        r, head = _col(ct, r16, row0, hg, HQ)
         o0 = ((sp * s + r) * NHA + head) * KV + PV_DIMS * wave + 4 * g
         for dt in range_constexpr(4):
             bo.buffer_store(zero, rsrc(c["pv"]), (o0 + 16 * dt) // 2, cache_modifier=CM_DEV)
     if (wave == 0) & (g == 0):
         for ct in range_constexpr(NCT):
-            r, head = _col(ct, r16, row0, hg)
+            r, head = _col(ct, r16, row0, hg, HQ)
             bo.buffer_store(
                 fx.Vector.from_elements([fx.Float32(NEG), fx.Float32(0.0)], fx.Float32),
                 rsrc(c["ml"]),
@@ -1064,6 +1074,7 @@ def attention(c, rq, hg, sa, sb):
     split's online softmax and accumulators start afresh at its first block,
     so a split's bits are those of the split alone. Each split's partial and
     (max, sum); then ITRDY for every item."""
+    HQ, NCT, NHG = c["HQ"], c["NCT"], c["NHG"]
     s, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
     g, r16 = lane // 16, lane % 16
     _, lr, own, n, kvp = request(c, rq)
@@ -1102,7 +1113,7 @@ def attention(c, rq, hg, sa, sb):
         e = fx.min(tid + THREADS * j, NCT * 16 * qrow - 1)
         rr = e // qrow
         pq = e % qrow
-        tq, hq = _col(rr // 16, rr % 16, row0, hg)
+        tq, hq = _col(rr // 16, rr % 16, row0, hg, HQ)
         v = _ld4(c["q8"], (tq * (NHA * DQK) + hq * DQK) // 4 + 4 * pq, CM_DEV)
         if tid + THREADS * j < NCT * 16 * qrow:
             fx.ptr_store(v, c["qll"] + (rr * RWK + 4 * pq))
@@ -1151,7 +1162,7 @@ def attention(c, rq, hg, sa, sb):
             _bar()
             if const_expr(c["on"]):
                 ts.append(clock())
-            acc = _pv(lane, wave, kx, pl0, al0, acc)
+            acc = _pv(c, lane, wave, kx, pl0, al0, acc)
             if const_expr(c["on"]):
                 ts.append(clock())
             rocdl.s_waitcnt(vmcnt=0)
@@ -1181,6 +1192,7 @@ def cta_items(c, bid):
     """CTA bid's attention items [k0, k1): item bid when the items fit the
     CTAs, else a contiguous range from the item boundary nearest bid / 256 of
     all the items' cost (an item's blocks + ``ITEM_COST``; items in order)."""
+    HQ, NCT, NHG = c["HQ"], c["NCT"], c["NHG"]
     bases, total = item_bases(c)
 
     def start(b):
@@ -1211,7 +1223,7 @@ def cta_items(c, bid):
     return k0, k1, bases
 
 
-def group_of(bases, k):
+def group_of(bases, k, NHG):
     """Item k's (request, head group) as one index 12 r + hg."""
     r = fx.Int32(0)
     for j in range(1, len(bases)):
@@ -1298,6 +1310,7 @@ def stage_uv(c, task):
     merged in split order a row -> the bf16 latent output in LDS and the head's
     LSE; then W_UV for value columns 64 (task % 2) .. -> ``send`` (bf16), the
     LSE word with the first half."""
+    HQ, NCT, NHG = c["HQ"], c["NCT"], c["NHG"]
     s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
     a = c["args"]
     nreq = c["NREQ"]
@@ -1373,6 +1386,8 @@ def build(key: MlaFrontBuild):
     s = key.tokens
     nreq = reqs_of(s)
     wd = wide(s)
+    hq = heads_of(s)
+    nct, nhg = hq * G_ROWS // 16, NHA // hq
     ns = key.nblocks + 1
     lay = scratch_layout(key)
     # the GEMV x rows: every row (narrow), or a 16-row tile of a K segment and
@@ -1402,10 +1417,10 @@ def build(key: MlaFrontBuild):
     @fx.struct
     class CoreLds:
         kv: fx.Array[fx.Int32, KV_BUFS * BK * RWK, 16]
-        p: fx.Array[fx.Int32, NCT * 16 * PW, 16]
-        alpha: fx.Array[fx.Int32, NCT * 16, 16]
-        ml: fx.Array[fx.Int32, 2 * NCT * 16, 16]
-        q: fx.Array[fx.Int32, NCT * 16 * RWK, 16]
+        p: fx.Array[fx.Int32, nct * 16 * PW, 16]
+        alpha: fx.Array[fx.Int32, nct * 16, 16]
+        ml: fx.Array[fx.Int32, 2 * nct * 16, 16]
+        q: fx.Array[fx.Int32, nct * 16 * RWK, 16]
 
     @fx.struct
     class UvLds:
@@ -1453,7 +1468,7 @@ def build(key: MlaFrontBuild):
             "lane": tid % 64, "wave": tid // 64, "delta": False, "debug": False,
             "eps": key.eps, "out_eps": key.out_eps, "q_eps": key.q_eps,
             "kv_eps": key.kv_eps, "write_idx": key.write_idx, "gate_local": not wd,
-            "vals_bf16": wd, "NREQ": nreq,
+            "vals_bf16": wd, "NREQ": nreq, "HQ": hq, "NCT": nct, "NHG": nhg,
             "qlora_out": False, "qn": False, "put": mb.put, "poll": mb.poll,
             # every role but the attention's starts with the same red (offset 0)
             "red": al.red.ptr, "vals": al.vals.ptr, "xl": gl.xl.ptr,
@@ -1545,17 +1560,17 @@ def build(key: MlaFrontBuild):
         stamp(on, tls, tid, 5)
         if const_expr(nreq == 1):
             _, _, _, n, _ = request(c)
-            if bid < NHG * n:
+            if bid < nhg * n:
                 attention(c, 0, bid // n, bid % n, bid % n + 1)
         else:
             # runs of one (request, head group)'s consecutive splits
             k0, k1, bases = cta_items(c, bid)
-            g0 = group_of(bases, k0)
-            nruns = (k1 > k0).select(group_of(bases, k1 - 1) - g0 + 1, fx.Int32(0))
+            g0 = group_of(bases, k0, nhg)
+            nruns = (k1 > k0).select(group_of(bases, k1 - 1, nhg) - g0 + 1, fx.Int32(0))
             for gi in range(nruns):
                 grp = g0 + gi
-                rq = grp // NHG
-                hg = grp % NHG
+                rq = grp // nhg
+                hg = grp % nhg
                 gfirst = pick([f for f, _ in bases], rq) + hg * pick([n for _, n in bases], rq)
                 sa = fx.max(k0 - gfirst, fx.Int32(0))
                 sb = fx.min(k1 - gfirst, pick([n for _, n in bases], rq))
