@@ -1984,6 +1984,8 @@ def fold_wide(c, rgd):
                         [y0, y1],
                     )
     gpu.barrier()
+    # K2's point (the standalone MoE launch has TL_POINTS)
+    stamp(c["tl_on"] and c.get("tl_k2", False), c["tls"], tid, 30)  # TL_FOLD
 
 
 
@@ -2109,22 +2111,33 @@ def run_sdown_first(c, bid, w_sd):
             stage_sdown(c, j1, ops1)
 
 
+# a wide step's shared-down CTAs, the latent norm's and up's excluded: the
+# CTAs without a fold first (they are free first), then the others
+SD_LATE = tuple(range(DOWN_TASKS, BLOCKS)) + tuple(range(LN0 + LN_TASKS, DOWN_TASKS))
+
+
 @flyc.jit
-def run_sdown_wide(c, bid, w_sd):
-    """A wide step's shared down, after down on every CTA: tasks
-    k = bid, bid + BLOCKS (row group (k + 56 rank) % 448; up's 56 are k < 56,
-    on CTAs 0 .. 55), both tasks' weights in flight before H is polled. The
-    same tasks and arithmetic as ``run_sdown``: placement only."""
+def run_sdown_late(c, bid, w_sd):
+    """A wide step's shared down after the fold: tasks k (row group
+    (k + 56 rank) % 448; up's 56 are k < 56) round robin over SD_LATE, so up's
+    land first on the CTAs that finish first; every task's weights in flight
+    before H is polled. The same tasks and arithmetic as ``run_sdown``:
+    placement only."""
+    n = len(SD_LATE)
     lo = c["rank"] * UP_TASKS
-    k1 = bid + BLOCKS
-    j0 = (bid + lo) % SD_TASKS
-    j1 = (fx.min(k1, SD_TASKS - 1) + lo) % SD_TASKS
-    ops0 = gemv.loads(c["lane"], c["wave"], w_sd, j0 * ROWS, SI)
-    ops1 = gemv.loads(c["lane"], c["wave"], w_sd, j1 * ROWS, SI)
-    load_h(c)
-    stage_sdown(c, j0, ops0)
-    if k1 < SD_TASKS:
-        stage_sdown(c, j1, ops1, False)
+    # this CTA's place in SD_LATE (the CTAs past the down tasks come first)
+    pos = (bid >= DOWN_TASKS).select(bid - DOWN_TASKS, bid - (LN0 + LN_TASKS) + (BLOCKS - DOWN_TASKS))
+    if bid >= LN0 + LN_TASKS:
+        rounds = (SD_TASKS + n - 1) // n
+        ks = [pos + n * r for r in range(rounds)]
+        ops = [
+            gemv.loads(c["lane"], c["wave"], w_sd, ((fx.min(k, SD_TASKS - 1) + lo) % SD_TASKS) * ROWS, SI)
+            for k in ks
+        ]
+        load_h(c)
+        for r in range_constexpr(rounds):
+            if ks[r] < SD_TASKS:
+                stage_sdown(c, (ks[r] + lo) % SD_TASKS, ops[r])
 
 
 @flyc.jit
@@ -2179,6 +2192,7 @@ def stage_lnorm(c, j):
         if mine & (lane == 0):
             c["put"](c["lmsq"], j * s + t, sq)
         items.append((mine, t, lo, hi, sidx))
+    stamp(c["tl_on"] and c.get("tl_k2", False), c["tls"], tid, 31)  # TL_LN_IN
     gpu.barrier()
     for g in range_constexpr(len(items)):
         mine, t = items[g][0], items[g][1]
@@ -2186,6 +2200,7 @@ def stage_lnorm(c, j):
             v = c["poll"]([(c["lmsq"], lane * s + t, 1)])[0][0]
             fx.ptr_store(f32_of(v), red + (t * 32 + lane))
     gpu.barrier()
+    stamp(c["tl_on"] and c.get("tl_k2", False), c["tls"], tid, 32)  # TL_LN_SQ
     w0 = fx.Float32(
         fx.BFloat16(bo.buffer_load(rsrc(a["ln_w"]), col, vec_width=1, dtype=T.bf16))
     )

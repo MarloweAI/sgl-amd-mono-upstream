@@ -76,7 +76,7 @@ SD0 = k2b.DOWN_TASKS  # 224: the shared down's CTAs
 # timeline points: 0 start, 1 o_proj done / AR reduced, 2 early done / slice,
 # 3 ug, 4 down/sdown, 5 lnorm, 6 up, 7 reduce, 8 gate, 9 mix (x published),
 # 10 route, 11 route table, 12 latent quant, 13 route starts
-TL_POINTS = 30  # + 20-24 router: x / LDS / GEMV / parts / pushed; + 14 route logits in, 15 INTER loaded, 16 down done, 17-19 route keys / select / rank
+TL_POINTS = 33  # + 30 fold done, 31 lnorm sums in, 32 lnorm squares in; + 20-24 router: x / LDS / GEMV / parts / pushed; + 14 route logits in, 15 INTER loaded, 16 down done, 17-19 route keys / select / rank
 TL_OPROJ = (
     25  # o_proj CTAs: the last task's GEMV done, before its AR pushes (point 1: pushed)
 )
@@ -86,6 +86,9 @@ TL_AR_WAIT = 26  # AttnRes CTAs: the AR poll starts (point 1: reduced)
 TL_TAIL_PART = 27
 TL_TAIL_GATE = 28
 TL_TAIL_X = 29
+TL_FOLD = 30  # wide down CTAs: their latent rows folded, LATR pushed
+TL_LN_IN = 31  # lnorm CTAs: every rank's LATR summed
+TL_LN_SQ = 32  # lnorm CTAs: every task's sum of squares in
 
 assert E0 + k2b.R_TASKS + k2b.L_TASKS <= BLOCKS and k2b.G_TASKS <= E0 - O0
 
@@ -643,6 +646,7 @@ def k2_body(key: K2Build, k2_lds: K2Lds, scratch_base, args: dict) -> None:
             "xbuf": scratch_base + fx.Int64(lay["xrow"][0]),
             "xflags": NA,
             "tl_on": key.timeline,
+            "tl_k2": True,
             "tls": lds.tls.ptr,
             "tl_push": TL_OPROJ,
             "ln": scratch_base + fx.Int64(lay["ln"][0]),
@@ -827,10 +831,10 @@ def k2_body(key: K2Build, k2_lds: K2Lds, scratch_base, args: dict) -> None:
             stamp(on, tls, tid, 3)
             k2b.run_down_wide(c, nu)
             stamp(on, tls, tid, 16)
-            # the shared down while the last down tasks land
-            k2b.run_sdown_wide(c, bid, w_sd)
             if bid < k2b.DOWN_TASKS:
                 k2b.fold_wide(c, bid)
+            # the shared down while the latent norm runs, off its CTAs and up's
+            k2b.run_sdown_late(c, bid, w_sd)
         else:
             stamp(on, tls, tid, 3)
             if bid < k2b.DOWN_TASKS:
