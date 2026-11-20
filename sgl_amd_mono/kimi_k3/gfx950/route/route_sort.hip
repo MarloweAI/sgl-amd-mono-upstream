@@ -158,21 +158,46 @@ __device__ void route_row(const Params &p, int row, WaveLds &w) {
         pivot = n3 >= TOPK ? c3 : n2 >= TOPK ? c2 : n1 >= TOPK ? c1 : pivot;
     }
     // candidates (score >= pivot) to LDS, slot-major
-    int n = 0;
+    auto collect = [&](auto take) {
+        int n = 0;
 #pragma unroll
-    for (int j = 0; j < PAIRS; ++j) {
+        for (int j = 0; j < PAIRS; ++j) {
 #pragma unroll
-        for (int i = 0; i < 2; ++i) {
-            const bool     c   = key[j][i] >= pivot;
-            const uint64_t bal = __ballot(c);
-            const int      at  = n + __builtin_amdgcn_mbcnt_hi(uint32_t(bal >> 32), __builtin_amdgcn_mbcnt_lo(uint32_t(bal), 0));
-            if (c && at < WAVE) {
-                w.key[at] = key[j][i];
-                w.id[at]  = expert_of(lane, j, i);
-                w.sig[at] = sig[j][i];
+            for (int i = 0; i < 2; ++i) {
+                const bool     c   = take(j, i);
+                const uint64_t bal = __ballot(c);
+                const int      at  = n + __builtin_amdgcn_mbcnt_hi(uint32_t(bal >> 32),
+                                                                    __builtin_amdgcn_mbcnt_lo(uint32_t(bal), 0));
+                if (c && at < WAVE) {
+                    w.key[at] = key[j][i];
+                    w.id[at]  = expert_of(lane, j, i);
+                    w.sig[at] = sig[j][i];
+                }
+                n += __popcll(bal);
             }
-            n += __popcll(bal);
         }
+        return n;
+    };
+    int n = collect([&](int j, int i) { return key[j][i] >= pivot; });
+    if (n > WAVE) {
+        // ties at the pivot score: the pivot on the full route key (distinct for every expert) instead
+        uint64_t lmax64 = 0;
+#pragma unroll
+        for (int j = 0; j < PAIRS; ++j)
+#pragma unroll
+            for (int i = 0; i < 2; ++i) {
+                const uint64_t K = route_key(key[j][i], expert_of(lane, j, i));
+                lmax64           = K > lmax64 ? K : lmax64;
+            }
+        uint64_t pv = 0;
+        for (int b = 62; b >= 0; b -= 2) {
+            const uint64_t c1 = pv | (1ull << b), c2 = pv | (2ull << b), c3 = pv | (3ull << b);
+            const int      n1 = __popcll(__ballot(lmax64 >= c1)), n2 = __popcll(__ballot(lmax64 >= c2)),
+                           n3 = __popcll(__ballot(lmax64 >= c3));
+            pv = n3 >= TOPK ? c3 : n2 >= TOPK ? c2 : n1 >= TOPK ? c1 : pv;
+        }
+        __builtin_amdgcn_wave_barrier();
+        n = collect([&](int j, int i) { return route_key(key[j][i], expert_of(lane, j, i)) >= pv; });
     }
     __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
     __builtin_amdgcn_wave_barrier();
@@ -203,7 +228,8 @@ __device__ void route_row(const Params &p, int row, WaveLds &w) {
         rid  = lane < TOPK ? w.out_id[lane] : 0;
         rsig = lane < TOPK ? w.out_sig[lane] : 0.0f;
     } else {
-        // more ties at the pivot than lanes: 16 rounds of the wave's best remaining route
+        // more than a wave of candidates even so (one lane holds many of the top routes): 16 rounds of the wave's
+        // best remaining route
         uint64_t K[PAIRS][2];
 #pragma unroll
         for (int j = 0; j < PAIRS; ++j)

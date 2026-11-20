@@ -282,8 +282,13 @@ def check_time(dev):
         bias = torch.randn(E, generator=gen, device=dev) * 0.05
         out = torch.empty(m, LAT, dtype=torch.bfloat16, device=dev)
         route.route_sort(lg, bias, out)  # build, counter made outside the graph
+        # every score tied (one logit, no bias): the tie rank alone orders the routes
+        tied = torch.full((m, E), 0.5, device=dev)
+        zb = torch.zeros_like(bias)
         res.append(dict(m=m, stock_us=graph_us(lambda: stock(lg, bias, out)),
-                        fused_us=graph_us(lambda: route.route_sort(lg, bias, out))))
+                        fused_us=graph_us(lambda: route.route_sort(lg, bias, out)),
+                        stock_tied_us=graph_us(lambda: stock(tied, zb, out)),
+                        fused_tied_us=graph_us(lambda: route.route_sort(tied, zb, out))))
         print(json.dumps(res[-1]), flush=True)
     return res
 
