@@ -124,8 +124,12 @@ class DrafterLayers:
         self.scratch_pre = torch.zeros(D.scratch_bytes(D.dp_scratch_layout()), dtype=torch.uint8, device=dev)
         self.scratch_mlp = torch.zeros(D.scratch_bytes(D.dm_scratch_layout()), dtype=torch.uint8, device=dev)
         # collective: every rank builds them in this order
-        self.sym_post = PeerBuffer(D.sym_bytes() + guard.FLAG_BYTES, group, rank, D.TP, dev)
-        self.sym_mlp = PeerBuffer(D.sym_bytes() + guard.FLAG_BYTES, group, rank, D.TP, dev)
+        # sentinel regions: armed to all ones before any peer can push into them
+        def arm(buf):
+            buf.fill_(0xFF)
+
+        self.sym_post = PeerBuffer(D.sym_bytes() + guard.FLAG_BYTES, group, rank, D.TP, dev, init=arm)
+        self.sym_mlp = PeerBuffer(D.sym_bytes() + guard.FLAG_BYTES, group, rank, D.TP, dev, init=arm)
         n = D.MAX_TOKENS
 
         def rows(width):

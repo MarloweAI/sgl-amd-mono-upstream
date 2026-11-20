@@ -41,10 +41,12 @@ from sgl_amd_mono.common.ops import (
     CM_DEV,
     CM_NT,
     bf2_f32,
+    bf16_pair,
     bf16_round,
     butterfly,
     hw_exp2,
     hw_rsq,
+    load_ptr64,
     mfma_bf16,
     peer_bases,
     row_sum,
@@ -61,7 +63,17 @@ from sgl_amd_mono.common.plan import (
     key_tuple,
     pair_layout,
 )
-from sgl_amd_mono.common.sync import FLAG_STRIDE, Mailbox, preg, publish, sreg
+from sgl_amd_mono.common.sync import (
+    FLAG_STRIDE,
+    Mailbox,
+    poll_sent,
+    preg,
+    publish,
+    put_sent,
+    sent_ix,
+    sent_word,
+    sreg,
+)
 from sgl_amd_mono.kimi_k3.gfx950.stamps import stamp, stamp_begin, stamp_flush
 from sgl_amd_mono.kimi_k3.gfx950.tag import step_tag
 
@@ -162,9 +174,14 @@ def dp_scratch_layout() -> dict:
 
 
 def sym_layout() -> dict:
-    """A rank's peer-symmetric region of D-post or D-MLP: [source rank][token][H / 2]
-    bf16 pairs."""
-    return pair_layout([("ar", TP * MAX_TOKENS * H // 2)], align=256)
+    """A rank's peer-symmetric regions of D-post or D-MLP's all-reduce (all armed to
+    all ones): the one-shot's ``ar1`` [source rank][token][H / 2] tagged bf16 pairs;
+    the two-shot's sentinel words (``sync.sent_ix``, a bf16 pair each) ``ar``
+    [source rank][token][H / 2] (written by every rank) and ``ag`` [token][H / 2]
+    (every reduced column, from its owner rank). Sizes in 8-byte pairs."""
+    return pair_layout(
+        [("ar1", TP * MAX_TOKENS * H // 2), ("ar", TP * MAX_TOKENS * H // 4), ("ag", MAX_TOKENS * H // 4)], align=256
+    )
 
 
 def sym_bytes() -> int:
@@ -406,34 +423,72 @@ def stage_gu(c, rg, kp, cur, tail):
 
 @flyc.jit
 def stage_ar(c, bid, nrows, vals_of):
-    """Rows ``nrows`` bid .. for every token: this rank's values (``vals_of(t, j)``:
-    the pair at rows 2j, 2j + 1 of the CTA's) pushed as bf16 pairs to every rank's
-    ``ar`` region, the ranks' summed in fp32 in rank order, bf16 (the all-reduce's
-    result), added to the residual stream ``res`` -> ``res_out`` (bf16); the sums
-    of squares of the CTA's columns -> ``ss_out`` [token][bid]."""
+    """Rows ``nrows`` bid .. for every token, all-reduced (``two_shot``, past one
+    request's rows, through sentinel words: a bf16 pair a word, re-armed by its
+    reader; one shot as tagged pairs at one request's, a hop fewer): this rank's values
+    (``vals_of(t, j)``: the pair at rows 2j, 2j + 1 of the CTA's) pushed to the
+    ``ar`` region of the rank that owns the CTA's columns (rank bid % TP); the owner
+    sums the ranks' in fp32 in rank order, bf16 (the all-reduce's result), and
+    pushes that to every rank's ``ag`` region; the result
+    added to the residual stream ``res`` -> ``res_out`` (bf16); the sums of squares
+    of the CTA's columns -> ``ss_out`` [token][bid]. A rank so sends its partial
+    once and an eighth of the columns' results to each peer."""
     S, tid, poll, put_bf = c["S"], c["tid"], c["poll"], c["put_bf"]
     ssp = c["ssp"]
     a = c["args"]
     PAIRS = nrows // 2
     N = PAIRS * S
+    P = -(-N // THREADS)
     r_res, r_out = rsrc(a["res"]), rsrc(a["res_out"])
-    for p in range_constexpr(-(-N // THREADS)):
+    items = []
+    for p in range_constexpr(P):
         idx = fx.min(tid + p * THREADS, N - 1)
         j, t = idx % PAIRS, idx // PAIRS
-        col = bid * nrows + 2 * j
-        v0, v1 = vals_of(t, j)
-        live = tid + p * THREADS < N
-        if live:
-            for pe in range_constexpr(TP):
-                put_bf(c["peer_ar"][pe], (c["rank"] * MAX_TOKENS + t) * H + col, [v0, v1])
+        items.append((idx, t, bid * nrows + 2 * j, tid + p * THREADS < N, j))
+    if const_expr(c["two_shot"]):
+        for p in range_constexpr(P):
+            idx, t, col, live, j = items[p]
+            v0, v1 = vals_of(t, j)
+            if live:
+                put_sent(c["ar_to"], sent_ix(c["rank"], col, t, S, H), sent_word(bf16_pair(v0, v1)))
+        owner = (bid % TP) == c["rank"]
+        if owner:
+            for p in range_constexpr(P):
+                idx, t, col, live, j = items[p]
+                ws = poll_sent(c["own_ar"], [sent_ix(src, col, t, S, H) for src in range(TP)], lives=[live] * TP)
+                d0, d1 = bf2_f32(ws[0])
+                for src in range_constexpr(1, TP):
+                    lo, hi = bf2_f32(ws[src])
+                    d0, d1 = d0 + lo, d1 + hi
+                if live:
+                    for pe in range_constexpr(TP):
+                        put_sent(c["peer_ag"][pe], sent_ix(0, col, t, S, H), sent_word(bf16_pair(d0, d1)))
+        sums = []
+        for p in range_constexpr(P):
+            idx, t, col, live, j = items[p]
+            sums.append(bf2_f32(poll_sent(c["own_ag"], [sent_ix(0, col, t, S, H)], lives=[live])[0]))
+    else:
+        # one shot: every rank's partial to every rank as tagged pairs (a hop fewer;
+        # the rows' bytes x 7 a rank, small at one request's rows)
+        sums = []
+        for p in range_constexpr(P):
+            idx, t, col, live, j = items[p]
+            v0, v1 = vals_of(t, j)
+            if live:
+                for pe in range_constexpr(TP):
+                    put_bf(c["peer_ar1"][pe], (c["rank"] * MAX_TOKENS + t) * H + col, [v0, v1])
 
-        def pair_at(src):
-            return ((src * MAX_TOKENS + t) * H + col) // 2
+            def pair_at(src, t=t, col=col):
+                return ((src * MAX_TOKENS + t) * H + col) // 2
 
-        d0, d1 = sum_partials(poll, c["own_ar"], pair_at, TP)
+            d0, d1 = sum_partials(poll, c["own_ar1"], pair_at, TP)
+            sums.append((bf16_round(d0), bf16_round(d1)))
+    for p in range_constexpr(P):
+        idx, t, col, live, j = items[p]
+        d0, d1 = sums[p]
         rr = bf2_f32(fx.Int32(bo.buffer_load(r_res, (t * H + col) // 2, vec_width=1, dtype=T.i32)))
-        x0 = bf16_round(rr[0] + bf16_round(d0))
-        x1 = bf16_round(rr[1] + bf16_round(d1))
+        x0 = bf16_round(rr[0] + d0)
+        x1 = bf16_round(rr[1] + d1)
         if live:
             bo.buffer_store(
                 fx.Vector.from_elements([x0, x1], fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)[0],
@@ -762,7 +817,7 @@ def build(key: DrafterBuild):
     keyed = key_tuple(key, SOURCES)
     Lds = _lds(key)
     layout = {"pre": dp_scratch_layout(), "mlp": dm_scratch_layout(), "post": {}}[key.kind]
-    ar_off = sym_layout()["ar"][0]
+    ar1_off, ar_off, ag_off = (sym_layout()[r][0] for r in ("ar1", "ar", "ag"))
     kind = key.kind
     points, on = TL_POINTS[kind], key.timeline
 
@@ -775,7 +830,7 @@ def build(key: DrafterBuild):
             c = {
                 "S": S, "tid": tid, "bid": fx.block_idx.x, "lane": tid % 64, "wave": tid // 64,
                 "put": mb.put, "put_bf": mb.put_bf, "poll": mb.poll, "args": kw, "red": lds.red.ptr,
-                "tl_on": on, "tls": lds.tls.ptr, "first": key.first,
+                "tl_on": on, "tls": lds.tls.ptr, "first": key.first, "two_shot": S > BLOCK,
             }  # fmt: skip
             stamp_begin(on, c["tls"], tid, points)
             c["ssp"] = lds.ssp.ptr
@@ -784,8 +839,14 @@ def build(key: DrafterBuild):
                 c.update(hbuf=lds.hbuf.ptr, ssl=lds.ssl.ptr, nf=lds.nf.ptr)
             if kind != "pre":
                 c["rank"] = kw["rank"]
+                bases = peer_bases(kw["peers"], TP)
+                c["own_ar1"] = preg(kw["sym"], ar1_off, "ar1")
+                c["peer_ar1"] = [preg(b, ar1_off, "ar1") for b in bases]
                 c["own_ar"] = preg(kw["sym"], ar_off, "ar")
-                c["peer_ar"] = [preg(b, ar_off, "ar") for b in peer_bases(kw["peers"], TP)]
+                # the rank that reduces this CTA's columns in a two-shot all-reduce
+                c["ar_to"] = preg(load_ptr64(kw["peers"], fx.block_idx.x % TP), ar_off, "ar")
+                c["own_ag"] = preg(kw["sym"], ag_off, "ag")
+                c["peer_ag"] = [preg(b, ag_off, "ag") for b in bases]
             for region, (off, _) in layout.items():
                 c[region[3:]] = sreg(kw["scratch"], off, region)  # "dm_gpart" -> c["gpart"]
             {"pre": run_dpre, "post": run_dpost, "mlp": run_dmlp}[kind](c)
