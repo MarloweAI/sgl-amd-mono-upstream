@@ -208,7 +208,6 @@ def scratch_layout(key: MlaFrontBuild) -> dict:
         "absrdy": ABS,
         "kvrdy": 1,
         "itrdy": ATT_CTAS,
-        "grdy": mc.GATE_GROUPS,
     }
     lay = pair_layout(pairs.items())
     end = max(o + n for o, n in lay.values())
@@ -219,13 +218,14 @@ def scratch_layout(key: MlaFrontBuild) -> dict:
         end = lay[name][0] + nbytes
 
     add("x", s * HIDDEN * 2)
-    add("g", s * GATE * 2)
     add("lat", s * LATW * 2)
     add("qb", s * NHA * QHD * 2)
     add("q8", s * NHA * DQK)
     add("newkv", DQK)
     add("pv", MAX_SPLITS * s * NHA * KV * 2)
     add("ml", MAX_SPLITS * s * NHA * 2 * 4)
+    add("g", s * GATE * 2)
+    add("grdy", mc.GATE_GROUPS * 8)
     return lay
 
 
@@ -830,7 +830,8 @@ def attention(c, item):
     hg = item // nd
     sp = (item // d) % n
     dr = item % d
-    nbl = (lr + (own < G_ROWS).select(fx.Int32(1), fx.Int32(0)) + BK - 1) // BK
+    # a rank with no key of the request (P < 2) still runs one fully masked block
+    nbl = fx.max((lr + (own < G_ROWS).select(fx.Int32(1), fx.Int32(0)) + BK - 1) // BK, fx.Int32(1))
     b0 = sp * nbl // n
     b1 = (sp + 1) * nbl // n
     kvp = uniform(_ld(a["kv_ptr"], 0))
