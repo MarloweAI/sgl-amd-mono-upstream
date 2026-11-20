@@ -179,6 +179,7 @@ class Wide:
     """The wide launch on the same weights and pools."""
 
     def __init__(self, w, S, device, debug=False, depth=0, layer=1, timeline=False):
+        from sgl_amd_mono.common.peer import PeerBuffer
         from sgl_amd_mono.kimi_k3.gfx950.attention import kda_wide as kw
 
         self.kw = kw
@@ -190,7 +191,9 @@ class Wide:
         self.tl = (
             torch.zeros(kw.BLOCKS, kw.TL_POINTS, dtype=torch.int64, device=device) if timeline else None
         )
-        self.scratch = torch.zeros(kw.scratch_bytes(self.key), dtype=torch.uint8, device=device)
+        # uncached, as the layer runner's scratch
+        self._scratch = PeerBuffer(kw.scratch_bytes(self.key), None, 0, 1, device)
+        self.scratch = self._scratch.bytes
         self.layer = layer
         self.S = S
         self.dbg = (

@@ -41,6 +41,8 @@ from flydsl.expr.typing import Int32, Int64, T
 
 from sgl_amd_mono.common.ops import (
     CM_NT,
+    bf2_f32,
+    bf16_pair,
     butterfly,
     hw_exp2,
     ld_i32,
@@ -56,7 +58,7 @@ from sgl_amd_mono.common.plan import (
     key_tuple,
     pair_layout,
 )
-from sgl_amd_mono.common.sync import Mailbox, sreg
+from sgl_amd_mono.common.sync import _SCOPE_CM, Mailbox, _spin, sreg
 from sgl_amd_mono.kimi_k3.gfx950.attention.kda import (
     BETA_0,
     CONV_W,
@@ -81,6 +83,7 @@ HSTEPS = HIDDEN // KSTEP // WAVES  # 14 steps a wave a set
 UNITS = SETS * HSTEPS  # 1834 (set, step) units
 NMAX = (UNITS + BLOCKS - 1) // BLOCKS  # 8: a CTA's run is 7 or 8 units
 TASK0 = 128  # the first KDA task's CTA
+WT = 6  # tokens a hand-off word: a request's verify rows (L <= WT)
 SCALE = HD**-0.5
 # timeline points: start, gemv MFMAs done (every wave), gemv emitted, task inputs issued,
 # conv inputs polled, conv done, gates + l2norm done, recurrence done, norm done
@@ -116,9 +119,53 @@ KPT = 16  # K columns a lane holds of a state row, at every width
 
 
 def scratch_layout(key: KdaWideBuild) -> dict:
+    """16-B tagged words: ``proj`` a (request, in_proj row) (its L bf16 rows),
+    ``part`` two a (CTA, group row, request) (its L f32 piece sums)."""
+    r = key.tokens // key.qlen
     return pair_layout(
-        [("proj", key.tokens * NPROJ), ("part", BLOCKS * G * ROWS * key.tokens)]
+        [("proj", r * NPROJ * 2), ("part", BLOCKS * G * ROWS * r * 2 * 2)], align=16
     )
+
+
+def put_word(a, i, ws, tag):
+    """16-B word ``i`` of region ``a`` := (ws, tag) in one store."""
+    bo.buffer_store(
+        fx.Vector.from_elements([fx.Int32(w) for w in ws] + [tag], fx.Int32),
+        rsrc(a.value),
+        fx.Int32(i) * 4,
+        cache_modifier=_SCOPE_CM[a.space],
+    )
+
+
+def poll_words(a, idxs, tag):
+    """Words ``idxs`` of region ``a`` once each carries ``tag`` (a 16-B load sees
+    a word whole); their three payload words each."""
+    cm = _SCOPE_CM[a.space]
+
+    def load_all():
+        ws = []
+        for i in idxs:
+            v = fx.Vector(
+                bo.buffer_load(
+                    rsrc(a.value), fx.Int32(i) * 4, vec_width=4, dtype=T.i32, cache_modifier=cm
+                )
+            )
+            ws += [v[e] for e in range(4)]
+        return fx.Vector.from_elements(ws, fx.Int32)
+
+    def pending(v):
+        bad = v[3] != tag
+        for e in range_constexpr(7, 4 * len(idxs), 4):
+            bad = bad | (v[e] != tag)
+        return bad
+
+    v = _spin(load_all, pending)
+    return [[v[4 * k + e] for e in range(3)] for k in range(len(idxs))]
+
+
+def bf16_words(word3):
+    """A proj word's WT bf16 rows as f32."""
+    return [x for w in word3 for x in bf2_f32(w)]
 
 
 def scratch_bytes(key: KdaWideBuild) -> int:
@@ -262,20 +309,21 @@ def gemv_loop(c):
 def gemv_emit(c):
     """The run's pieces: a piece that starts its set's K is the set's head,
     and its CTA adds the set's later pieces (published by the next one or two
-    CTAs) in order -> bf16 PROJ pairs. The split depends on the CTA alone,
-    never on the width."""
-    s, tid, nt, bid = c["S"], c["tid"], c["T"], c["bid"]
+    CTAs) in order -> bf16 PROJ words. A thread a (group row, request), its L
+    tokens. The split depends on the CTA alone, never on the width."""
+    s, L, tid, nt, bid = c["S"], c["L"], c["tid"], c["T"], c["bid"]
+    tag = c["tag"]
+    R = s // L
     u0, u1 = uniform(_u0(bid)), uniform(_u0(bid + 1))
     red = c["red"]
     slot_w = _slot_w(c)
     pa, hsa = u0 // HSTEPS, u0 % HSTEPS
     crosses = (u1 - 1) // HSTEPS != pa
     # slot 0: the first piece when the run crosses; slot 1: the last piece
-    n = G * ROWS * s
+    n = G * ROWS * R
     per = (n + THREADS - 1) // THREADS
 
-    def piece_sum(slot, e):
-        gs, r, tok = e // (ROWS * s), e % ROWS, (e // ROWS) % s
+    def piece_sum(slot, gs, r, tok):
         base = slot * (slot_w // 256) + (gs * nt + tok // 16) * WAVES
         tot = fx.Float32(0.0)
         for w in range_constexpr(WAVES):
@@ -283,31 +331,53 @@ def gemv_emit(c):
         return tot
 
     es = [fx.min(tid + THREADS * it, n - 1) for it in range(per)]
+    cs = [(e // (ROWS * R), e % ROWS, (e // ROWS) % R) for e in es]
+
+    def pieces(slot, it):
+        gs, r, q = cs[it]
+        return [piece_sum(slot, gs, r, q * L + j) for j in range(L)] + [fx.Float32(0.0)] * (WT - L)
+
     # a piece that is not its set's head: published for the head's CTA
     pub_slot = crosses.select(0, 1)
     if crosses | (hsa != 0):
         for it in range_constexpr(per):
-            v = piece_sum(pub_slot, es[it])
+            v = pieces(pub_slot, it)
             if tid + THREADS * it < n:
-                c["put"](c["part"], bid * n + es[it], v)
+                for hh in range_constexpr(2):
+                    put_word(
+                        c["part"], (bid * n + es[it]) * 2 + hh,
+                        [x.bitcast(fx.Int32) for x in v[3 * hh : 3 * hh + 3]], tag,
+                    )  # fmt: skip
     # the head this CTA owns (the last piece), and its set's later pieces
     ph = crosses.select(pa + 1, pa)
     if crosses | (hsa == 0):
         nb1, nb2 = fx.min(bid + 1, BLOCKS - 1), fx.min(bid + 2, BLOCKS - 1)
         two = (bid + 2 < BLOCKS) & (_u0(bid + 2) < (ph + 1) * HSTEPS)
-        got1 = c["poll"]([(c["part"], nb1 * n + e, 1) for e in es])
-        got2 = c["poll"]([(c["part"], two.select(nb2, nb1) * n + e, 1) for e in es])
+        nb2 = two.select(nb2, nb1)
+        got1 = poll_words(c["part"], [(nb1 * n + e) * 2 + hh for e in es for hh in (0, 1)], tag)
+        got2 = poll_words(c["part"], [(nb2 * n + e) * 2 + hh for e in es for hh in (0, 1)], tag)
         for it in range_constexpr(per):
-            e = es[it]
-            tot = piece_sum(1, e) + f32_of(got1[it][0])
-            tot = two.select(tot + f32_of(got2[it][0]), tot)
-            v = bf16r(tot)
-            gs, r, tok = e // (ROWS * s), e % ROWS, (e // ROWS) % s
+            own = pieces(1, it)
+            g1 = [f32_of(w) for w in got1[2 * it] + got1[2 * it + 1]]
+            g2 = [f32_of(w) for w in got2[2 * it] + got2[2 * it + 1]]
+            vs = []
+            for j in range_constexpr(WT):
+                tot = own[j] + g1[j]
+                vs.append(bf16r(two.select(tot + g2[j], tot)))
+            gs, r, q = cs[it]
             row = (G * ph + gs) * ROWS + r
             if tid + THREADS * it < n:
-                c["put"](c["proj"], tok * NPROJ + row, v)
+                put_word(
+                    c["proj"], q * NPROJ + row,
+                    [bf16_pair(vs[2 * k], vs[2 * k + 1]).bitcast(fx.Int32) for k in range(WT // 2)],
+                    tag,
+                )  # fmt: skip
                 if const_expr(c["debug"]):
-                    bo.buffer_store(v.to(fx.BFloat16), rsrc(c["args"]["proj_dbg"]), tok * NPROJ + row)
+                    for j in range_constexpr(L):
+                        bo.buffer_store(
+                            vs[j].to(fx.BFloat16), rsrc(c["args"]["proj_dbg"]),
+                            (q * L + j) * NPROJ + row,
+                        )  # fmt: skip
     lds_barrier()
     stamp(c["on"], c["tls"], tid, 2)
 
@@ -413,22 +483,20 @@ def kda_task(c, req, h, k):
     rpt = HD * HD // (THREADS * kp)  # state rows a thread
     grp, k0 = tid // lpr, (tid % lpr) * kp
 
-    # every in_proj value the task reads, one poll batch a thread: its conv
-    # channel's L inputs, two of f_a [L][128], beta of token tid, two of its
-    # wave's token's output gate (clamped indices poll a pair that is written)
-    row0 = req * L * NPROJ
-    n_fa = L * HD
-    assert n_fa <= 2 * THREADS
-    fa_e = [fx.min(tid + THREADS * u, n_fa - 1) for u in range(2)]
+    # every in_proj word the task reads, one poll batch a thread: its conv
+    # channel's, f_a channel tid % 128's, the head's beta and output gate
+    # channel tid % 128's (each word a channel's L tokens)
+    pr = req * NPROJ
     jn = fx.min(wave, L - 1)
-    specs = [(c["proj"], row0 + j * NPROJ + chan, 1) for j in range(L)]
-    specs += [(c["proj"], row0 + (e // HD) * NPROJ + FA_0 + e % HD, 1) for e in fa_e]
-    specs += [(c["proj"], row0 + fx.min(tid, L - 1) * NPROJ + BETA_0 + h, 1)]
-    specs += [
-        (c["proj"], row0 + jn * NPROJ + G2_0 + h * HD + lane + 64 * u, 1) for u in range(2)
-    ]
-    got = [f32_of(g[0]) for g in c["poll"](specs)]
-    xv, fav, bv, g2 = got[:L], got[L : L + 2], got[L + 2], got[L + 3 :]
+    got = poll_words(
+        c["proj"],
+        [pr + chan, pr + FA_0 + tid % HD, pr + BETA_0 + h, pr + G2_0 + h * HD + tid % HD],
+        c["tag"],
+    )
+    xv, fav, bvs, g2v = (bf16_words(g) for g in got)
+    bv = bvs[0]
+    for j in range_constexpr(1, L):
+        bv = (tid == j).select(bvs[j], bv)
     stamp(c["on"], c["tls"], tid, 4)
 
     # conv: thread < 384 owns channel (part, d) of the head
@@ -459,9 +527,10 @@ def kda_task(c, req, h, k):
                 fx.ptr_store(outs[j], qkl + ((2 * j + part) * HD + d))
             if part == 2:
                 fx.ptr_store(outs[j], vloc + (j * HD + d))
-    for u in range_constexpr(2):
-        if tid + THREADS * u < n_fa:
-            fx.ptr_store(fav[u], fa_l + fa_e[u])
+    if tid < HD:
+        for j in range_constexpr(L):
+            fx.ptr_store(fav[j], fa_l + (j * HD + tid))
+            fx.ptr_store(g2v[j], c["g2l"] + (j * HD + tid))
     b = sigmoid(bv)
     if tid < L:
         fx.ptr_store(b, beta + tid)
@@ -563,7 +632,7 @@ def kda_task(c, req, h, k):
     if wave < L:
         for u, x in ((0, x0), (1, x1)):
             e = lane + 64 * u
-            y = x * rr * on_w[u] * sigmoid(g2[u])
+            y = x * rr * on_w[u] * sigmoid(fx.ptr_load(c["g2l"] + (jn * HD + e)))
             bo.buffer_store(
                 y.to(fx.BFloat16), rsrc(a["core_out"]), (req * L + jn) * PROJ + h * HD + e
             )
@@ -580,7 +649,7 @@ def build(key: KdaWideBuild):
     if key in _BUILDS:
         return _BUILDS[key]
     s, L = key.tokens, key.qlen
-    assert s % L == 0 and 1 <= L <= 8, (s, L)
+    assert s % L == 0 and 1 <= L <= WT, (s, L)
     ntasks = s // L * NH
     assert ntasks <= BLOCKS - TASK0, "one KDA task a CTA"
     nt = tiles(key)
@@ -597,6 +666,7 @@ def build(key: KdaWideBuild):
         decay: fx.Array[fx.Float32, L * HD, 16]
         vloc: fx.Array[fx.Float32, L * HD, 16]
         ol: fx.Array[fx.Float32, L * HD, 16]
+        g2l: fx.Array[fx.Float32, L * HD, 16]
         beta: fx.Array[fx.Float32, 16, 16]
 
     # the KDA task's LDS reuses the in_proj partials' once they are emitted
@@ -671,14 +741,14 @@ def build(key: KdaWideBuild):
             "debug": key.debug,
             "lb": key.lower_bound,
             "onorm_eps": key.onorm_eps,
-            "put": mb.put,
-            "poll": mb.poll,
+            "tag": mb.tag,
             "red": gl.red.ptr,
             "fa": kl.fa.ptr,
             "qkl": kl.qkl.ptr,
             "decay": kl.decay.ptr,
             "vloc": kl.vloc.ptr,
             "ol": kl.ol.ptr,
+            "g2l": kl.g2l.ptr,
             "beta": kl.beta.ptr,
             "on": key.timeline,
             "tls": lds.tls.ptr,
