@@ -3,11 +3,12 @@
 (S = R L rows, R >= 1): the layer input (after ``input_layernorm``) to the gated
 core output, on the ReplaySSM ring. One launch, ``BLOCKS`` CTAs x ``THREADS``.
 
-    gemv    in_proj (6288 rows in 393 groups of 16): CTAs 0 .. 136 take two
-            groups, the rest one. A CTA's groups share every x load; wave w
-            streams K 896 w .. 896 (w + 1); the waves' partial sums are added
-            in wave order -> bf16 PROJ pairs
-    kda     a task a (request, head), from CTA 137 (the one-group CTAs): its
+    gemv    in_proj: 197 pairs of 16-row groups x 14 K steps of 64 a wave
+            (wave w streams K 896 w .. 896 (w + 1)), 2758 units in equal runs
+            of 10 or 11 over the CTAs; the two groups share every x load. A
+            run's pieces are summed in wave order; a pair's head CTA adds the
+            pieces of the next one or two CTAs in order -> bf16 PROJ pairs
+    kda     a task a (request, head) on CTA 128 + t (at most 10 requests): its
             state, conv window, f_b rows and constants loaded first, then
             conv + SiLU of the head's q|k|v (verify windows to SGLang's
             ``intermediate_conv_window``, k / v to the ring), q / k l2norm,
@@ -51,7 +52,6 @@ from sgl_amd_mono.common.plan import (
     BLOCKS,
     THREADS,
     WAVES,
-    first_task,
     kernel_sources,
     key_tuple,
     pair_layout,
@@ -62,7 +62,6 @@ from sgl_amd_mono.kimi_k3.gfx950.attention.kda import (
     CONV_W,
     FA_0,
     G2_0,
-    KCH,
     NPROJ,
     ld_bf,
     ld_f32,
@@ -75,14 +74,18 @@ from sgl_amd_mono.kimi_k3.gfx950.tag import step_tag
 SOURCES = kernel_sources(__name__)
 
 GROUPS = NPROJ // ROWS  # 393
-PAIRED = GROUPS - BLOCKS  # 137 CTAs take two groups
-CHUNKS = HIDDEN // KCH // WAVES  # 7 K chunks a wave
+PAIRS = (GROUPS + 1) // 2  # 197; the last pair's second group is past the rows
+KSTEP = 64  # K a wave's step
+HSTEPS = HIDDEN // KSTEP // WAVES  # 14 steps a wave a pair
+UNITS = PAIRS * HSTEPS  # 2758 (pair, step) units
+NMAX = (UNITS + BLOCKS - 1) // BLOCKS  # 11: a CTA's run is 10 or 11 units
+TASK0 = 128  # the first KDA task's CTA
 SCALE = HD**-0.5
-# timeline points: start, gemv MFMAs done, gemv emitted, task inputs issued,
+# timeline points: start, gemv MFMAs done (every wave), gemv emitted, task inputs issued,
 # conv inputs polled, conv done, gates + l2norm done, recurrence done, norm done
 TL_POINTS = 9
 
-assert GROUPS * ROWS == NPROJ and 0 < PAIRED <= BLOCKS
+assert GROUPS * ROWS == NPROJ and NMAX < HSTEPS  # a pair spans at most 3 CTAs
 
 _STREAM = fx.Stream(None)
 
@@ -103,14 +106,16 @@ def tiles(key):
 
 
 def depth(key):
-    return key.depth or max(1, 3 - tiles(key))
+    return key.depth or (5, 3, 2)[tiles(key) - 1]
 
 
 KPT = 16  # K columns a lane holds of a state row, at every width
 
 
 def scratch_layout(key: KdaWideBuild) -> dict:
-    return pair_layout([("proj", key.tokens * NPROJ)])
+    return pair_layout(
+        [("proj", key.tokens * NPROJ), ("part", BLOCKS * 2 * ROWS * key.tokens)]
+    )
 
 
 def scratch_bytes(key: KdaWideBuild) -> int:
@@ -135,99 +140,153 @@ def exp_(z):
 
 
 # ---------------------------------------------------------------- gemv
-def _chunk(c, i):
-    """Byte offset (wave-uniform) of this wave's i-th K chunk: wave w streams the
-    contiguous K range w * 896 .., in an order rotated by the CTA's index (fixed
-    per group, so every width reduces a row the same way)."""
-    return uniform((c["wave"] * CHUNKS + (i + c["rot"]) % CHUNKS) * KCH * 2)
+def _u0(c_idx):
+    """First unit of CTA ``c_idx`` (traced): CTAs take equal runs of units."""
+    return UNITS * c_idx // BLOCKS
 
 
-def _w_loads(c, g, i, live=None):
-    """Chunk i of this wave, rows 16 g ..: a lane 4 x 16 B of its row (zeros,
-    with no memory read, unless ``live``)."""
-    lane = c["lane"]
-    base = ((g * ROWS + lane % ROWS) * HIDDEN + (lane // ROWS) * 8) // 2
-    nb = None if live is None else live.select(fx.Int64(NPROJ * HIDDEN * 2), fx.Int64(0))
-    r = rsrc(c["args"]["w_in"], nb)
-    soff = _chunk(c, i)
-    return [
-        fx.Vector(
-            bo.buffer_load(
-                r, base + 16 * q, vec_width=4, dtype=T.i32, cache_modifier=CM_NT,
-                soffset_bytes=soff,
-            )
-        )
-        for q in range(4)
-    ]  # fmt: skip
+def _soff(c, hs):
+    """Byte offset (wave-uniform) of K step ``hs``: wave w streams K 896 w .."""
+    return uniform((c["wave"] * HSTEPS + hs) * KSTEP * 2)
 
 
-def _x_loads(c, i):
-    """Chunk i of this wave: every token tile's x operands (rows past S clamped)."""
+def _loads(c, p, hs, live):
+    """One step of this wave: rows 16 (2 p + g) .. of both groups and every token
+    tile's x, 2 x 16 B a lane each (zeros, with no memory read, unless ``live``;
+    the rows past in_proj's last are zeros too)."""
     lane, s = c["lane"], c["S"]
-    r = rsrc(c["args"]["x"])
-    soff = _chunk(c, i)
-    out = []
-    for tt in range(c["T"]):
-        tok = fx.min(tt * 16 + lane % 16, s - 1)
-        base = (tok * HIDDEN + (lane // ROWS) * 8) // 2
-        out.append(
-            [
-                fx.Vector(
-                    bo.buffer_load(r, base + 16 * q, vec_width=4, dtype=T.i32, soffset_bytes=soff)
+    soff = _soff(c, hs)
+    wr = rsrc(c["args"]["w_in"], live.select(fx.Int64(NPROJ * HIDDEN * 2), fx.Int64(0)))
+    xr = rsrc(c["args"]["x"], live.select(fx.Int64(s * HIDDEN * 2), fx.Int64(0)))
+    k8 = (lane // ROWS) * 8
+
+    def ld(r, row, cm):
+        base = (row * HIDDEN + k8) // 2
+        return [
+            fx.Vector(
+                bo.buffer_load(
+                    r, base + 16 * q, vec_width=4, dtype=T.i32, cache_modifier=cm,
+                    soffset_bytes=soff,
                 )
-                for q in range(4)
-            ]
-        )
-    return out
+            )
+            for q in range(KSTEP // 32)
+        ]  # fmt: skip
+
+    ws = [ld(wr, (2 * p + g) * ROWS + lane % ROWS, CM_NT) for g in range(2)]
+    xs = [ld(xr, fx.min(tt * 16 + lane % 16, s - 1), 0) for tt in range(c["T"])]
+    return ws, xs
+
+
+def _slot_w(c):
+    return 2 * c["T"] * WAVES * 64 * 4  # LDS floats a piece
 
 
 @flyc.jit
-def stage_gemv(c, g0, g1, two):
-    """Groups g0 and g1 (g1 emitted only when ``two``) -> bf16 PROJ pairs."""
-    s, tid, lane, wave, nt, d = c["S"], c["tid"], c["lane"], c["wave"], c["T"], c["D"]
-    groups = ((g0, None), (g1, two))
+def gemv_loop(c):
+    """This CTA's run of units (pair of groups, K step): the waves' partial
+    sums of its one or two pieces -> LDS."""
+    tid, lane, wave, nt, d, bid = c["tid"], c["lane"], c["wave"], c["T"], c["D"], c["bid"]
+    u0, u1 = uniform(_u0(bid)), uniform(_u0(bid + 1))
+    red = c["red"]
+    slot_w = _slot_w(c)
+
+    def unit(i):
+        u = u0 + i
+        return u // HSTEPS, u % HSTEPS, u < u1
+
     acc = [[fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(nt)] for _ in range(2)]
+
+    def spill(slot):
+        for gs in range_constexpr(2):
+            for tt in range_constexpr(nt):
+                fx.ptr_store(
+                    acc[gs][tt],
+                    red + slot * slot_w + (((gs * nt + tt) * WAVES + wave) * 64 + lane) * 4,
+                )
+
     pend = {}
-    for i in range_constexpr(min(d, CHUNKS)):
-        pend[i] = ([_w_loads(c, g, i, lv) for g, lv in groups], _x_loads(c, i))
-    # the barriers keep each chunk's loads ``d`` chunks ahead of its MFMAs (the
+    for i in range_constexpr(min(d, NMAX)):
+        p, hs, live = unit(i)
+        pend[i] = _loads(c, p, hs, live)
+    # the barriers keep each step's loads ``d`` steps ahead of its MFMAs (the
     # scheduler would otherwise sink them to their use)
     rocdl.sched_barrier(0)
-    for i in range_constexpr(CHUNKS):
-        if const_expr(i + d < CHUNKS):
-            pend[i + d] = ([_w_loads(c, g, i + d, lv) for g, lv in groups], _x_loads(c, i + d))
+    for i in range_constexpr(NMAX):
+        if const_expr(i + d < NMAX):
+            p, hs, live = unit(i + d)
+            pend[i + d] = _loads(c, p, hs, live)
         rocdl.sched_barrier(0)
         ws, xs = pend.pop(i)
-        for q in range_constexpr(4):
+        if const_expr(i > 0):
+            # the run crosses into the next pair here: the first piece is done
+            p, hs, live = unit(i)
+            cross = (hs == 0) & live
+            if cross:
+                spill(0)
+            for gs in range_constexpr(2):
+                for tt in range_constexpr(nt):
+                    acc[gs][tt] = cross.select(fx.Vector.filled(4, 0.0, fx.Float32), acc[gs][tt])
+        for q in range_constexpr(KSTEP // 32):
             for tt in range_constexpr(nt):
                 xb = xs[tt][q].bitcast(fx.BFloat16)
                 for gs in range_constexpr(2):
                     acc[gs][tt] = mfma_bf16(ws[gs][q].bitcast(fx.BFloat16), xb, acc[gs][tt])
         rocdl.sched_barrier(0)
-    stamp(c["on"], c["tls"], tid, 1)
-    red = c["red"]
-    for gs in range_constexpr(2):
-        for tt in range_constexpr(nt):
-            fx.ptr_store(acc[gs][tt], red + (((gs * nt + tt) * WAVES + wave) * 64 + lane) * 4)
+    spill(1)
     lds_barrier()
+    stamp(c["on"], c["tls"], tid, 1)
+
+
+@flyc.jit
+def gemv_emit(c):
+    """The run's pieces: a piece that starts its pair's K is the pair's head,
+    and its CTA adds the pair's later pieces (published by the next one or two
+    CTAs) in order -> bf16 PROJ pairs. The split depends on the CTA alone,
+    never on the width."""
+    s, tid, nt, bid = c["S"], c["tid"], c["T"], c["bid"]
+    u0, u1 = uniform(_u0(bid)), uniform(_u0(bid + 1))
+    red = c["red"]
+    slot_w = _slot_w(c)
+    pa, hsa = u0 // HSTEPS, u0 % HSTEPS
+    crosses = (u1 - 1) // HSTEPS != pa
+    # slot 0: the first piece when the run crosses; slot 1: the last piece
     n = 2 * ROWS * s
-    for it in range_constexpr((n + THREADS - 1) // THREADS):
-        e = fx.min(tid + THREADS * it, n - 1)
-        gs = e // (ROWS * s)
-        r = e % ROWS
-        tok = (e // ROWS) % s
-        base = (gs * nt + tok // 16) * WAVES
+    per = (n + THREADS - 1) // THREADS
+
+    def piece_sum(slot, e):
+        gs, r, tok = e // (ROWS * s), e % ROWS, (e // ROWS) % s
+        base = slot * (slot_w // 256) + (gs * nt + tok // 16) * WAVES
         tot = fx.Float32(0.0)
         for w in range_constexpr(WAVES):
             tot = tot + fx.ptr_load(red + (((base + w) * 64 + 16 * (r // 4) + tok % 16) * 4 + r % 4))
-        v = bf16r(tot)
-        g = (gs == 0).select(g0, g1)
-        if (tid + THREADS * it < n) & ((gs == 0) | two):
-            c["put"](c["proj"], tok * NPROJ + g * ROWS + r, v)
-            if const_expr(c["debug"]):
-                bo.buffer_store(
-                    v.to(fx.BFloat16), rsrc(c["args"]["proj_dbg"]), tok * NPROJ + g * ROWS + r
-                )
+        return tot
+
+    es = [fx.min(tid + THREADS * it, n - 1) for it in range(per)]
+    # a piece that is not its pair's head: published for the head's CTA
+    pub_slot = crosses.select(0, 1)
+    if crosses | (hsa != 0):
+        for it in range_constexpr(per):
+            v = piece_sum(pub_slot, es[it])
+            if tid + THREADS * it < n:
+                c["put"](c["part"], bid * n + es[it], v)
+    # the head this CTA owns (the last piece), and its pair's later pieces
+    ph = crosses.select(pa + 1, pa)
+    if crosses | (hsa == 0):
+        nb1, nb2 = fx.min(bid + 1, BLOCKS - 1), fx.min(bid + 2, BLOCKS - 1)
+        two = (bid + 2 < BLOCKS) & (_u0(bid + 2) < (ph + 1) * HSTEPS)
+        got1 = c["poll"]([(c["part"], nb1 * n + e, 1) for e in es])
+        got2 = c["poll"]([(c["part"], two.select(nb2, nb1) * n + e, 1) for e in es])
+        for it in range_constexpr(per):
+            e = es[it]
+            tot = piece_sum(1, e) + f32_of(got1[it][0])
+            tot = two.select(tot + f32_of(got2[it][0]), tot)
+            v = bf16r(tot)
+            gs, r, tok = e // (ROWS * s), e % ROWS, (e // ROWS) % s
+            row = (2 * ph + gs) * ROWS + r
+            if (tid + THREADS * it < n) & (row < NPROJ):
+                c["put"](c["proj"], tok * NPROJ + row, v)
+                if const_expr(c["debug"]):
+                    bo.buffer_store(v.to(fx.BFloat16), rsrc(c["args"]["proj_dbg"]), tok * NPROJ + row)
     lds_barrier()
     stamp(c["on"], c["tls"], tid, 2)
 
@@ -255,25 +314,30 @@ def group_sum(v, lanes):
     return _dpp_add(v, 0x140) if lanes == 16 else v
 
 
-@flyc.jit
-def kda_task(c, req, h):
-    """One (request, head) task."""
+def kda_pre(c, req, h, has):
+    """The (request, head) task's inputs that need no hand-off, issued under
+    the CTA's in_proj emit: f_b rows, constants, the state, the conv window
+    (no memory read unless ``has``)."""
     L, tid, kp = c["L"], c["tid"], c["KPT"]
     lane, wave = tid % 64, tid // 64
     a = c["args"]
     fa_l, qkl, decay, vloc, ol, beta = (
         c["fa"], c["qkl"], c["decay"], c["vloc"], c["ol"], c["beta"],
     )  # fmt: skip
-    slot = uniform(ld_i32(a["st_idx"], req))
+    slot = has.select(uniform(ld_i32(a["st_idx"], req)), fx.Int32(-1))
     live = slot >= 0
     sl = fx.max(slot, 0)
     w_row = uniform(ld_i32(a["win_row"], req))
 
-    # inputs that need no hand-off: f_b rows, constants, the state, conv window
     fr = h * HD + wave * 16 + lane % 16
     fbw = (fr * HD + (lane // 16) * 32) // 2
     fb = [
-        fx.Vector(bo.buffer_load(rsrc(a["w_fb"]), fbw + 4 * q, vec_width=4, dtype=T.i32))
+        fx.Vector(
+            bo.buffer_load(
+                rsrc(a["w_fb"], has.select(fx.Int64(PROJ * HD * 2), fx.Int64(0))),
+                fbw + 4 * q, vec_width=4, dtype=T.i32,
+            )
+        )
         for q in range(4)
     ]
     aa = exp_(ld_f32(a["a_log"], h))
@@ -281,7 +345,10 @@ def kda_task(c, req, h):
     lpr = HD // kp  # lanes a state row
     rpt = HD * HD // (THREADS * kp)  # state rows a thread
     grp, k0 = tid // lpr, (tid % lpr) * kp
-    base0 = rsrc(a["rstate"] + fx.Int64(sl) * fx.Int64(a["rs_seq"]) * 4)
+    base0 = rsrc(
+        a["rstate"] + fx.Int64(sl) * fx.Int64(a["rs_seq"]) * 4,
+        live.select(fx.Int64(NH * HD * HD * 4), fx.Int64(0)),
+    )
     st = []
     for i in range_constexpr(rpt):
         row = []
@@ -302,6 +369,28 @@ def kda_task(c, req, h):
     win = [ld_bf(cs, co + j * a["cs_tok"]) for j in range(CONV_W - 1)]
     on_w = [ld_bf(a["on_w"], lane + 64 * u) for u in range(2)]
     stamp(c["on"], c["tls"], tid, 3)
+    return dict(
+        slot=slot, live=live, sl=sl, w_row=w_row, fb=fb, aa=aa, dtb=dtb, st=st,
+        part=part, d=d, chan=chan, cw=cw, win=win, on_w=on_w,
+    )  # fmt: skip
+
+
+@flyc.jit
+def kda_task(c, req, h, k):
+    """One (request, head) task."""
+    L, tid, kp = c["L"], c["tid"], c["KPT"]
+    lane, wave = tid % 64, tid // 64
+    a = c["args"]
+    fa_l, qkl, decay, vloc, ol, beta = (
+        c["fa"], c["qkl"], c["decay"], c["vloc"], c["ol"], c["beta"],
+    )  # fmt: skip
+    live, sl, w_row, fb, aa, dtb, st = (
+        k["live"], k["sl"], k["w_row"], k["fb"], k["aa"], k["dtb"], list(k["st"]),
+    )  # fmt: skip
+    part, d, chan, cw, win, on_w = k["part"], k["d"], k["chan"], k["cw"], k["win"], k["on_w"]
+    lpr = HD // kp  # lanes a state row
+    rpt = HD * HD // (THREADS * kp)  # state rows a thread
+    grp, k0 = tid // lpr, (tid % lpr) * kp
 
     # every in_proj value the task reads, one poll batch a thread: its conv
     # channel's L inputs, two of f_a [L][128], beta of token tid, two of its
@@ -317,14 +406,14 @@ def kda_task(c, req, h):
     specs += [
         (c["proj"], row0 + jn * NPROJ + G2_0 + h * HD + lane + 64 * u, 1) for u in range(2)
     ]
-    got = [g[0] for g in c["poll"](specs)]
+    got = [f32_of(g[0]) for g in c["poll"](specs)]
     xv, fav, bv, g2 = got[:L], got[L : L + 2], got[L + 2], got[L + 3 :]
     stamp(c["on"], c["tls"], tid, 4)
 
     # conv: thread < 384 owns channel (part, d) of the head
     # the task's global loads are all issued by now: a load behind a store
     # would wait for its acknowledgement
-    seq = win + [f32_of(xv[j]) for j in range(L)]
+    seq = win + list(xv)
     outs = [_conv_silu(seq, cw, j) for j in range(L)]
     ring_len = a["ring_len"]
     if live & (tid < 3 * HD):
@@ -351,8 +440,8 @@ def kda_task(c, req, h):
                 fx.ptr_store(outs[j], vloc + (j * HD + d))
     for u in range_constexpr(2):
         if tid + THREADS * u < n_fa:
-            fx.ptr_store(f32_of(fav[u]), fa_l + fa_e[u])
-    b = sigmoid(f32_of(bv))
+            fx.ptr_store(fav[u], fa_l + fa_e[u])
+    b = sigmoid(bv)
     if tid < L:
         fx.ptr_store(b, beta + tid)
         if live:
@@ -453,19 +542,12 @@ def kda_task(c, req, h):
     if wave < L:
         for u, x in ((0, x0), (1, x1)):
             e = lane + 64 * u
-            y = x * rr * on_w[u] * sigmoid(f32_of(g2[u]))
+            y = x * rr * on_w[u] * sigmoid(g2[u])
             bo.buffer_store(
                 y.to(fx.BFloat16), rsrc(a["core_out"]), (req * L + jn) * PROJ + h * HD + e
             )
     lds_barrier()
     stamp(c["on"], c["tls"], tid, 8)
-
-
-@flyc.jit
-def kda_tasks(c):
-    """Every (request, head) task, task t on CTA (t + PAIRED) % BLOCKS."""
-    for task in range(first_task(c["bid"], PAIRED), (c["S"] // c["L"]) * NH, BLOCKS):
-        kda_task(c, task // NH, task % NH)
 
 
 # ---------------------------------------------------------------- kernel
@@ -478,12 +560,14 @@ def build(key: KdaWideBuild):
         return _BUILDS[key]
     s, L = key.tokens, key.qlen
     assert s % L == 0 and 1 <= L <= 8, (s, L)
+    ntasks = s // L * NH
+    assert ntasks <= BLOCKS - TASK0, "one KDA task a CTA"
     nt = tiles(key)
     lay = scratch_layout(key)
 
     @fx.struct
     class Smem:
-        red: fx.Array[fx.Float32, 2 * nt * WAVES * 64 * 4, 16]
+        red: fx.Array[fx.Float32, 2 * 2 * nt * WAVES * 64 * 4, 16]
         fa: fx.Array[fx.Float32, L * HD, 16]
         qkl: fx.Array[fx.Float32, 2 * L * HD, 16]
         decay: fx.Array[fx.Float32, L * HD, 16]
@@ -548,7 +632,6 @@ def build(key: KdaWideBuild):
             "bid": bid,
             "lane": tid % 64,
             "wave": uniform(tid // 64),
-            "rot": uniform(bid % CHUNKS),
             "debug": key.debug,
             "lb": key.lower_bound,
             "onorm_eps": key.onorm_eps,
@@ -564,6 +647,7 @@ def build(key: KdaWideBuild):
             "on": key.timeline,
             "tls": lds.tls.ptr,
             "proj": sreg(scratch, lay["proj"][0], "proj"),
+            "part": sreg(scratch, lay["part"][0], "part"),
             "args": {
                 "x": x,
                 "w_in": w_in,
@@ -598,12 +682,16 @@ def build(key: KdaWideBuild):
                 "ring_len": ring_len,
             },
         }
-        two = bid < PAIRED
-        g0 = two.select(2 * bid, bid + PAIRED)
-        g1 = two.select(2 * bid + 1, bid + PAIRED)
         stamp_begin(key.timeline, lds.tls.ptr, tid, TL_POINTS)
-        stage_gemv(c, g0, g1, two)
-        kda_tasks(c)
+        gemv_loop(c)
+        # task t = (request, head) on CTA TASK0 + t, its inputs in flight under the emit
+        t = bid - TASK0
+        has = (t >= 0) & (t < ntasks)
+        tc = fx.max(fx.min(t, ntasks - 1), 0)
+        k = kda_pre(c, tc // NH, tc % NH, has)
+        gemv_emit(c)
+        if has:
+            kda_task(c, tc // NH, tc % NH, k)
         stamp_flush(key.timeline, lds.tls.ptr, tl, tid, bid, TL_POINTS)
 
     @flyc.jit

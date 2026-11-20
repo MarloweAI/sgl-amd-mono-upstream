@@ -53,6 +53,9 @@ def main():
             torch.cuda.synchronize()
             t = wide.tl.cpu()
             t0 = int(t[:, 0][t[:, 0] > 0].min())
+            v1 = (t[:, 1] - t0).double() / 100.0
+            xcd = [round(float(v1[x::8].median()), 1) for x in range(8)]
+            rows.setdefault("xcd", []).append(xcd)
             for i, p in enumerate(POINTS):
                 v = t[:, i]
                 v = (v[v > 0] - t0).double() / 100.0  # 100 MHz -> µs
@@ -62,6 +65,7 @@ def main():
             got = [r for r in rows[p][1:] if r is not None]
             if got:
                 out[p] = [round(statistics.median(r[k] for r in got), 2) for k in range(3)]
+        out["mfma_by_xcd"] = rows["xcd"][-1]
         print("KDA_WIDE_TL", json.dumps(out), flush=True)
 
 
