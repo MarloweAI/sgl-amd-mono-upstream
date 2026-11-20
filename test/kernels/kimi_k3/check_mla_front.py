@@ -570,7 +570,12 @@ def x_in_suite(w, args, device, epoch):
                 bx = [Batch([reqs[i] for i in ids], o, device) for o in range(DCP)]
                 frx = run_ranks(w, st, bx, epoch, args.layer, x=x)
                 for r in range(DCP):
-                    dd = [n for n in names if n != "x" and not torch.equal(u8(frx[r][n]), u8(frs[r][n]))]
+                    dd = [n for n in names if n not in ("x", "pv", "ml") and not torch.equal(u8(frx[r][n]), u8(frs[r][n]))]
+                    # pv / ml: the split slots each request writes (the rest
+                    # of the scratch is another layout's, x_in having no blocks)
+                    dd += [n for n in ("pv", "ml") if not all(
+                        torch.equal(u8(frx[r][n][:k, G * j : G * j + G]), u8(frs[r][n][:k, G * j : G * j + G]))
+                        for j, k in enumerate(frs[r]["splits"]))]
                     dd += [] if torch.equal(u8(bx[r].pool), u8(bs[r].pool)) else ["pool"]
                     print(f"XIN P={p} S={s_} rank={r}: x_in vs seam build bitwise {not dd} {dd}"
                           f" (x the same on every rank {xs_eq})", flush=True)

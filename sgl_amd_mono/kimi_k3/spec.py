@@ -165,7 +165,7 @@ SGLANG_READS = {
         "language_model",
         # _SglFronts: the MLA attention's forward it stands in for, and the
         # gated o_proj wrapper's gate input it leaves unset
-        "class KimiK3MLAAttention(",
+        "KimiK3MLAAttention",
         "_gate_hidden_states",
     ),
     "srt/model_executor/forward_mode.py": (
