@@ -643,18 +643,24 @@ def build(key: K2Build):
             # whose early work ends first (the AttnRes / route CTAs start ug last)
             task = BLOCKS - 1 - bid
             ops = k2b.ug_loads(c, fx.min(task, last))
-            while task < total:
-                nxt = task + BLOCKS
-                if const_expr(wide):
-                    # the unit's latent rows before the next task's weights
-                    bq = k2b.ug_b_loads(c, task)
+            if const_expr(wide):
+                # a task's latent rows are issued with its weights, a task ahead
+                bq = k2b.ug_b_loads(c, fx.min(task, last))
+                while task < total:
+                    nxt = task + BLOCKS
                     ops_n = k2b.ug_loads(c, fx.min(nxt, last))
+                    bq_n = k2b.ug_b_loads(c, fx.min(nxt, last))
                     k2b.stage_ug_w(c, task, ops, bq)
-                else:
+                    task = nxt
+                    ops = ops_n
+                    bq = bq_n
+            else:
+                while task < total:
+                    nxt = task + BLOCKS
                     ops_n = k2b.ug_loads(c, fx.min(nxt, last))
                     k2b.stage_ug(c, task, ops)
-                task = nxt
-                ops = ops_n
+                    task = nxt
+                    ops = ops_n
             if const_expr(wide):
                 k2b.ug_done(c)
             stamp(on, tls, tid, 3)

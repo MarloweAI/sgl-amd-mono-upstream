@@ -1508,7 +1508,7 @@ def stage_down(c, rgd, nu, ops0):
 # not fit a CTA's LDS: the latent is copied once into a compact scratch copy
 # (LQC), ug and down read their operands from L2 a unit at a time, and the
 # route table lists each expert's picking tokens, cut into units of <= 16.
-DOWN_BATCH_W = 3  # a wave's units in flight together (their INTER in registers)
+DOWN_BATCH_W = 2  # a wave's units a batch (w2 and INTER a batch ahead in registers)
 UG_BQ = (ROWS * (LQ_WORDS // 4) + THREADS - 1) // THREADS  # 16 B pieces a thread
 
 
@@ -1649,7 +1649,7 @@ def unit_of(c, u):
 def ug_b_loads(c, task):
     """Task's latent rows (its unit's tokens' LQC rows), this thread's share in
     16 B pieces; a row past the unit reads zeros without touching memory.
-    Issued before the next task's weights."""
+    Issued with the task's weights, a task ahead."""
     s, tid = c["S"], c["tid"]
     st0, n = unit_of(c, task // UG_GROUPS)
     qw = LQ_WORDS // 4
@@ -1751,22 +1751,35 @@ def wait_ug(c):
     gpu.barrier()
 
 
-def down_b_loads(c, units, lives):
-    """Each unit's INTER words and ISC codes for this lane (the unit's token
-    lane % 16): (picked, pick, words, codes); a lane past the unit reads zeros
-    without touching memory."""
+def down_units(b0, nu):
+    """A wave's batch from unit b0 (b0, b0 + 8, ...; past the units the last
+    one's): (units, live)."""
+    units = [fx.min(b0 + WAVES * j, nu - 1) for j in range(DOWN_BATCH_W)]
+    lives = [(b0 + WAVES * j) < nu for j in range(DOWN_BATCH_W)]
+    return units, lives
+
+
+def down_pick(c, u, live):
+    """This lane's pick of unit u (its token lane % 16): (picked, pick)."""
+    lane = c["lane"]
+    st0, n = unit_of(c, u)
+    p = fx.ptr_load(c["rt"]["toks"] + (st0 + fx.min(lane % 16, n - 1)))
+    return live & (lane % 16 < n), p
+
+
+def down_b_loads(c, b0, nu):
+    """The batch's INTER words (6 x 16 B a unit) and ISC codes (3) for this
+    lane, flat; a lane past its unit reads zeros without touching memory."""
     s, lane = c["S"], c["lane"]
     kb = lane // 16
     nbi = s * TOPK * IW * 4
     nbc = s * TOPK * UG_GROUPS * 4
     ri = rsrc(c["inter"].value, nbi)
     rc = rsrc(c["isc"].value, nbc)
-    out = []
-    for j in range(len(units)):
-        st0, n = unit_of(c, units[j])
-        ok = lives[j] & (lane % 16 < n)
-        p = fx.ptr_load(c["rt"]["toks"] + (st0 + fx.min(lane % 16, n - 1)))
-        words, codes = [], []
+    words, codes = [], []
+    units, lives = down_units(b0, nu)
+    for j in range(DOWN_BATCH_W):
+        ok, p = down_pick(c, units[j], lives[j])
         for st in range(W2_STEPS):
             for h in range(2):
                 at = ok.select(p * IW + st * 32 + 4 * kb + 16 * h, fx.Int32(nbi // 4))
@@ -1785,36 +1798,37 @@ def down_b_loads(c, units, lives):
                     )
                 )
             )
-        out.append((ok, p, words, codes))
-    return out
+    return words + codes
 
 
 @flyc.jit
 def stage_down_w(c, rgd, nu, ops0):
     """``stage_down`` over units: latent rows 16 rgd .. of every unit's expert
-    against its picks' INTER from L2 (each batch's issued before the next
-    batch's w2) -> the same contributions -> ``fold_latr``."""
+    against its picks' INTER from L2 (a batch's issued with its w2, a batch
+    ahead) -> the same contributions -> ``fold_latr``."""
     sent_latr = c.get("sent_latr", False)
     lane, wave = c["lane"], c["wave"]
     rt = c["rt"]
     nbs = DOWN_BATCH_W * W2_STEPS
+    nwd = DOWN_BATCH_W * W2_STEPS * 2
     b0 = wave
     ops = ops0
+    bl = down_b_loads(c, b0, nu)
     while b0 < nu:
         nb = b0 + WAVES * DOWN_BATCH_W
-        units = [fx.min(b0 + WAVES * j, nu - 1) for j in range(DOWN_BATCH_W)]
-        lives = [(b0 + WAVES * j) < nu for j in range(DOWN_BATCH_W)]
-        bl = down_b_loads(c, units, lives)
         ops_n = down_loads(c, rgd, nu, fx.min(nb, nu - 1), DOWN_BATCH_W)
+        bl_n = down_b_loads(c, fx.min(nb, nu - 1), nu)
+        units, lives = down_units(b0, nu)
         for j in range_constexpr(DOWN_BATCH_W):
-            ok, p, words, codes = bl[j]
+            ok, p = down_pick(c, units[j], lives[j])
             acc = fx.Vector.filled(4, 0.0, fx.Float32)
             for st in range_constexpr(W2_STEPS):
+                w0 = bl[(j * W2_STEPS + st) * 2]
+                w1 = bl[(j * W2_STEPS + st) * 2 + 1]
                 bw = fx.Vector.from_elements(
-                    [words[2 * st + h][d] for h in range(2) for d in range(4)],
-                    fx.Int32,
+                    [w0[d] for d in range(4)] + [w1[d] for d in range(4)], fx.Int32
                 )
-                sb = ok.select(codes[st], fx.Int32(UNIT_SCALE))
+                sb = ok.select(bl[nwd + j * W2_STEPS + st], fx.Int32(UNIT_SCALE))
                 acc = mfma_scaled(
                     ops[j * W2_STEPS + st],
                     bw,
@@ -1839,6 +1853,7 @@ def stage_down_w(c, rgd, nu, ops0):
                     )
         b0 = nb
         ops = ops_n
+        bl = bl_n
     gpu.barrier()
     fold_latr(c, rgd, sent_latr)
 
