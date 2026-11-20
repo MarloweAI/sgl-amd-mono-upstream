@@ -19,7 +19,7 @@ import torch
 sys.path.insert(0, os.path.dirname(__file__))
 import kda_wide_case as kc  # noqa: E402
 
-POINTS = ("start", "mfma", "emit", "issued", "polled", "conv", "gates", "recur", "norm")
+POINTS = ("start", "mfma", "emit", "issued", "polled", "conv", "gates", "recur", "norm", "pub")
 
 
 def main():

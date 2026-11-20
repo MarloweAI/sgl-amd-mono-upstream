@@ -5,18 +5,21 @@ core output, on the ReplaySSM ring. One launch, ``BLOCKS`` CTAs x ``THREADS``.
 
     gemv    in_proj: 131 sets of three 16-row groups x 14 K steps of 64 a
             wave (wave w streams K 896 w .. 896 (w + 1)), 1834 units in equal
-            runs of 7 or 8 over the CTAs, read from ``pack_w_in``'s layout (a
-            run's weights contiguous); a set's groups share every x load, x
-            read from ``pack_x``'s layout (1 KB an instruction). A run's pieces are summed in wave order; a set's head CTA adds the
-            pieces of the next one or two CTAs in order -> bf16 PROJ words
-            (16-B tagged words, a request's L rows of a channel)
-    kda     a task a (request, head) on CTA 128 + t (at most 10 requests): its
-            state, conv window, f_b rows and constants loaded first, then
-            conv + SiLU of the head's q|k|v (verify windows to SGLang's
-            ``intermediate_conv_window``, k / v to the ring), q / k l2norm,
-            f_b MFMA + lower-bound gate (ring g, beta), the delta-rule
-            recurrence with the 128 x 128 state in registers (read only), the
-            gated RMSNorm -> core_out
+            runs of 7 or 8 over the CTAs, the weights read from ``pack_w_in``'s
+            layout (a run's weights contiguous) and x from ``pack_x``'s (1 KB
+            an instruction); a set's groups share every x load. A run's pieces
+            are summed in wave order; a set's head CTA adds the pieces of the
+            next one or two CTAs in order -> bf16 PROJ words (16-B tagged
+            words, a request's L rows of a channel)
+    kda     a task a (request, head), in two halves on CTAs TASK0 + 16 (t // 8)
+            + t % 8 and 8 past it (at most 8 requests), each with 64 rows of
+            the state: its state rows, conv window, f_b rows and constants
+            loaded first, then conv + SiLU of the head's q|k|v (verify windows
+            to SGLang's ``intermediate_conv_window``, k / v to the ring), q / k
+            l2norm, f_b MFMA + lower-bound gate (ring g, beta), the delta-rule
+            recurrence of its rows with the state in registers (read only), the
+            halves' outputs swapped (16-B tagged words), the gated RMSNorm of
+            its 64 channels -> core_out
 
 The conv, gate, l2norm and recurrence follow SGLang's ``kda_verify_gfx950``
 operation by operation: conv products and sums rounded one at a time, its
@@ -47,7 +50,6 @@ from sgl_amd_mono.common.ops import (
     bf16_pair,
     butterfly,
     hw_exp2,
-    ld_i32,
     mfma_bf16,
     rsrc,
     uniform,
@@ -67,7 +69,6 @@ from sgl_amd_mono.kimi_k3.gfx950.attention.kda import (
     FA_0,
     G2_0,
     NPROJ,
-    ld_bf,
     ld_f32,
 )
 from sgl_amd_mono.kimi_k3.gfx950.stages.dims import HD, HIDDEN, LOG2E, NH, PROJ, ROWS
@@ -84,12 +85,15 @@ KSTEP = 64  # K a wave's step
 HSTEPS = HIDDEN // KSTEP // WAVES  # 14 steps a wave a set
 UNITS = SETS * HSTEPS  # 1834 (set, step) units
 NMAX = (UNITS + BLOCKS - 1) // BLOCKS  # 8: a CTA's run is 7 or 8 units
-TASK0 = 128  # the first KDA task's CTA
 WT = 6  # tokens a hand-off word: a request's verify rows (L <= WT)
+TASK0 = 64  # the first KDA task CTA: a task's two halves on CTAs b, b + 8 (one XCD)
+HALF = HD // 2  # state rows a task half
+OXW = WT * HALF // 3  # 16-B words of a half's outputs
 SCALE = HD**-0.5
 # timeline points: start, gemv MFMAs done (every wave), gemv emitted, task inputs issued,
-# conv inputs polled, conv done, gates + l2norm done, recurrence done, norm done
-TL_POINTS = 9
+# conv inputs polled, conv done, gates + l2norm done, recurrence done, norm done, the run's
+# non-head piece published (thread 0)
+TL_POINTS = 10
 
 # a set spans at most 3 CTAs; a run at most 2 sets
 assert GROUPS * ROWS == NPROJ and SETS * G == GROUPS
@@ -130,10 +134,16 @@ def kp_(c):
 
 def scratch_layout(key: KdaWideBuild) -> dict:
     """16-B tagged words: ``proj`` a (request, in_proj row) (its L bf16 rows),
-    ``part`` two a (CTA, group row, request) (its L f32 piece sums)."""
+    ``part`` two a (CTA, group row, request) (its L f32 piece sums), ``ox`` a
+    task half's outputs."""
     r = key.tokens // key.qlen
     return pair_layout(
-        [("proj", r * NPROJ * 2), ("part", BLOCKS * G * ROWS * r * 2 * 2)], align=16
+        [
+            ("proj", r * NPROJ * 2),
+            ("part", BLOCKS * G * ROWS * r * 2 * 2),
+            ("ox", r * NH * 2 * OXW * 2),
+        ],
+        align=16,
     )
 
 
@@ -290,10 +300,18 @@ def gemv_loop(c):
                     red + slot * slot_w + (((gs * nt + tt) * WAVES + wave) * 64 + lane) * 4,
                 )
 
+    # the KDA task's slot and window row: loaded ahead of the stream, read once
+    # the first steps' loads are out
+    a, req = c["args"], c["req"]
+    idx = [
+        fx.Int32(bo.buffer_load(rsrc(a[n]), req, vec_width=1, dtype=T.i32))
+        for n in ("st_idx", "win_row")
+    ]
     pend = {}
     for i in range_constexpr(min(d, NMAX)):
         p, hs, live = unit(i)
         pend[i] = _loads(c, p, hs, live)
+    c["slot0"], c["w_row"] = (uniform(v) for v in idx)
     # the barriers keep each step's loads ``d`` steps ahead of its MFMAs (the
     # scheduler would otherwise sink them to their use)
     rocdl.sched_barrier(0)
@@ -366,6 +384,9 @@ def gemv_emit(c):
                         c["part"], (bid * n + es[it]) * 2 + hh,
                         [x.bitcast(fx.Int32) for x in v[3 * hh : 3 * hh + 3]], tag,
                     )  # fmt: skip
+    stamp(c["on"], c["tls"], tid, 9)
+    # the task's inputs go out once the piece is published
+    c["k"] = c["pre"]()
     # the head this CTA owns (the last piece), and its set's later pieces
     ph = crosses.select(pa + 1, pa)
     if crosses | (hsa == 0):
@@ -423,20 +444,21 @@ def group_sum(v, lanes):
     return _dpp_add(v, 0x140) if lanes == 16 else v
 
 
-def kda_pre(c, req, h, has):
+def kda_pre(c, req, h, hf, has, slot0, w_row):
     """The (request, head) task's inputs that need no hand-off, issued under
-    the CTA's in_proj emit: f_b rows, constants, the state, the conv window
-    (no memory read unless ``has``)."""
+    the CTA's in_proj emit and not waited on there: f_b rows, constants, the
+    state, the conv window (the state and f_b with no memory read unless
+    ``has``; zeros then). ``slot0`` / ``w_row``: the request's slot and window
+    row."""
     L, tid, kp = c["L"], c["tid"], c["KPT"]
     lane, wave = tid % 64, tid // 64
     a = c["args"]
     fa_l, qkl, decay, vloc, ol, beta = (
         c["fa"], c["qkl"], c["decay"], c["vloc"], c["ol"], c["beta"],
     )  # fmt: skip
-    slot = has.select(uniform(ld_i32(a["st_idx"], req)), fx.Int32(-1))
+    slot = has.select(slot0, fx.Int32(-1))
     live = slot >= 0
     sl = fx.max(slot, 0)
-    w_row = uniform(ld_i32(a["win_row"], req))
 
     fr = h * HD + wave * 16 + lane % 16
     fbw = (fr * HD + (lane // 16) * 32) // 2
@@ -449,57 +471,70 @@ def kda_pre(c, req, h, has):
         )
         for q in range(4)
     ]
-    aa = exp_(ld_f32(a["a_log"], h))
+    a_log = ld_f32(a["a_log"], h)
     dtb = [ld_f32(a["dt_bias"], h * HD + wave * 16 + 4 * (lane // 16) + i) for i in range(4)]
     lpr = HD // kp  # lanes a state row
-    rpt = HD * HD // (THREADS * kp)  # state rows a thread
+    rpt = HALF * HD // (THREADS * kp)  # state rows a thread
     grp, k0 = tid // lpr, (tid % lpr) * kp
+    r0 = hf * HALF + grp * rpt  # the thread's first state row
     base0 = rsrc(
         a["rstate"] + fx.Int64(sl) * fx.Int64(a["rs_seq"]) * 4,
         live.select(fx.Int64(NH * HD * HD * 4), fx.Int64(0)),
     )
-    st = []
-    for i in range_constexpr(rpt):
-        row = []
-        for q in range_constexpr(kp // 4):
-            v = fx.Vector(
+    st = [
+        [
+            fx.Vector(
                 bo.buffer_load(
-                    base0, (h * HD + grp * rpt + i) * HD + k0 + 4 * q, vec_width=4, dtype=T.f32
+                    base0, (h * HD + r0 + i) * HD + k0 + 4 * q, vec_width=4, dtype=T.f32
                 )
             )
-            row += [live.select(v[e], fx.Float32(0.0)) for e in range(4)]
-        st.append(row)
+            for q in range(kp // 4)
+        ]
+        for i in range(rpt)
+    ]
     ct = fx.min(tid, 3 * HD - 1)
     part, d = ct // HD, ct % HD
     chan = part * PROJ + h * HD + d
     cs = a["conv_st"] + fx.Int64(sl) * fx.Int64(a["cs_seq"]) * 2
     co = chan * a["cs_dim"]
     cw = fx.Vector(bo.buffer_load(rsrc(a["conv_w"]), chan * CONV_W, vec_width=4, dtype=T.f32))
-    win = [ld_bf(cs, co + j * a["cs_tok"]) for j in range(CONV_W - 1)]
-    on_w = [ld_bf(a["on_w"], lane + 64 * u) for u in range(2)]
+    win = [
+        bo.buffer_load(rsrc(cs), co + j * a["cs_tok"], vec_width=1, dtype=T.bf16)
+        for j in range(CONV_W - 1)
+    ]
+    on_w = [
+        bo.buffer_load(rsrc(a["on_w"]), lane + 64 * u, vec_width=1, dtype=T.bf16) for u in range(2)
+    ]
     stamp(c["on"], c["tls"], tid, 3)
     return dict(
-        slot=slot, live=live, sl=sl, w_row=w_row, fb=fb, aa=aa, dtb=dtb, st=st,
+        slot=slot, live=live, sl=sl, w_row=w_row, fb=fb, a_log=a_log, dtb=dtb, st=st,
         part=part, d=d, chan=chan, cw=cw, win=win, on_w=on_w,
     )  # fmt: skip
 
 
 @flyc.jit
-def kda_task(c, req, h, k):
-    """One (request, head) task."""
+def kda_task(c, task, req, h, hf, k):
+    """Half ``hf`` of the (request, head) task ``task``: state rows 64 hf .. 64 hf + 63."""
     L, tid, kp = c["L"], c["tid"], c["KPT"]
     lane, wave = tid % 64, tid // 64
     a = c["args"]
     fa_l, qkl, decay, vloc, ol, beta = (
         c["fa"], c["qkl"], c["decay"], c["vloc"], c["ol"], c["beta"],
     )  # fmt: skip
-    live, sl, w_row, fb, aa, dtb, st = (
-        k["live"], k["sl"], k["w_row"], k["fb"], k["aa"], k["dtb"], list(k["st"]),
-    )  # fmt: skip
-    part, d, chan, cw, win, on_w = k["part"], k["d"], k["chan"], k["cw"], k["win"], k["on_w"]
+    live, sl, w_row, fb, dtb = k["live"], k["sl"], k["w_row"], k["fb"], k["dtb"]
+    part, d, chan, cw = k["part"], k["d"], k["chan"], k["cw"]
+    aa = exp_(k["a_log"])
+    st = [[v[e] for v in row for e in range(4)] for row in k["st"]]
+    win = [fx.Float32(fx.BFloat16(v)) for v in k["win"]]
+    on_w = [fx.Float32(fx.BFloat16(v)) for v in k["on_w"]]
     lpr = HD // kp  # lanes a state row
-    rpt = HD * HD // (THREADS * kp)  # state rows a thread
+    rpt = HALF * HD // (THREADS * kp)  # state rows a thread
     grp, k0 = tid // lpr, (tid % lpr) * kp
+    r0 = hf * HALF + grp * rpt  # the thread's first state row
+    # the half's share of the global writes: q / k windows and ring k on half 0,
+    # v windows and ring v of the half's rows, ring g and beta on half 0
+    mine = ((part < 2) & (hf == 0)) | ((part == 2) & (d // HALF == hf))
+    first = hf == 0
 
     # every in_proj word the task reads, one poll batch a thread: its conv
     # channel's, f_a channel tid % 128's, the head's beta and output gate
@@ -523,7 +558,7 @@ def kda_task(c, req, h, k):
     seq = win + list(xv)
     outs = [_conv_silu(seq, cw, j) for j in range(L)]
     ring_len = a["ring_len"]
-    if live & (tid < 3 * HD):
+    if live & (tid < 3 * HD) & mine:
         if w_row >= 0:
             # token j's window: the CONV_W - 1 inputs after its first
             wb = rsrc(a["conv_win"] + fx.Int64(fx.max(w_row, 0)) * fx.Int64(a["cw_seq"]) * 2)
@@ -552,7 +587,7 @@ def kda_task(c, req, h, k):
     b = sigmoid(bv)
     if tid < L:
         fx.ptr_store(b, beta + tid)
-        if live:
+        if live & first:
             bo.buffer_store(
                 b, rsrc(a["ring_b"] + fx.Int64(sl) * fx.Int64(a["rb_seq"]) * 4), h * ring_len + tid
             )
@@ -573,7 +608,7 @@ def kda_task(c, req, h, k):
         gate = fx.Float32(c["lb"]) * sigmoid(aa * (bf16r(gacc[i]) + dtb[i]))
         if lane % 16 < L:
             fx.ptr_store(exp_(gate), decay + (t * HDP + kp_(kk)))
-            if live:
+            if live & first:
                 bo.buffer_store(gate, rg, (h * ring_len + t) * HD + kk)
     # l2norm: (token, q / k) row r = tid / 16 of the 2 L rows, 8 channels a lane
     if tid < 2 * L * 16:
@@ -617,7 +652,7 @@ def kda_task(c, req, h, k):
         kv = lds_pairs(qkl + ((2 * j + 1) * HDP + kp_(k0)))
         dk = lds_pairs(decay + (j * HDP + kp_(k0)))
         bj = fx.ptr_load(beta + j)
-        vs = [fx.ptr_load(vloc + (j * HD + grp * rpt + i)) for i in range(rpt)]
+        vs = [fx.ptr_load(vloc + (j * HD + r0 + i)) for i in range(rpt)]
         for i in range_constexpr(rpt):
             s_ = [sp[i][e] * dk[e] for e in range(kp // 2)]
             u = group_sum(dot2(s_, kv), lpr)
@@ -629,13 +664,32 @@ def kda_task(c, req, h, k):
     if tid % lpr == 0:
         for j in range_constexpr(L):
             for i in range_constexpr(rpt):
-                fx.ptr_store(os_[j * rpt + i], ol + (j * HD + grp * rpt + i))
+                fx.ptr_store(os_[j * rpt + i], ol + (j * HD + r0 + i))
     lds_barrier()
     stamp(c["on"], c["tls"], tid, 7)
+    # the other half's outputs: 16-B tagged words, three
+    # f32 of the half's (token, row) a word
+    if tid < OXW:
+        fs = [3 * tid + e for e in range(3)]
+        mine_o = [
+            fx.ptr_load(ol + (fx.min(f // HALF, L - 1) * HD + hf * HALF + f % HALF)) for f in fs
+        ]
+        put_word(
+            c["ox"], (task * 2 + hf) * OXW + tid, [v.bitcast(fx.Int32) for v in mine_o], c["tag"]
+        )
+        gox = poll_words(c["ox"], [(task * 2 + 1 - hf) * OXW + tid], c["tag"])[0]
+        for e in range_constexpr(3):
+            f = fs[e]
+            if f // HALF < L:
+                fx.ptr_store(
+                    gox[e].bitcast(fx.Float32),
+                    ol + (fx.min(f // HALF, L - 1) * HD + (1 - hf) * HALF + f % HALF),
+                )
+    lds_barrier()
     if const_expr(c["debug"]):
         for i in range_constexpr((L * HD + THREADS - 1) // THREADS):
             e = fx.min(tid + THREADS * i, L * HD - 1)
-            if tid + THREADS * i < L * HD:
+            if first & (tid + THREADS * i < L * HD):
                 bo.buffer_store(
                     fx.ptr_load(ol + e).to(fx.BFloat16),
                     rsrc(a["o_dbg"]),
@@ -650,8 +704,8 @@ def kda_task(c, req, h, k):
     rr = fx.Float32(1.0) / fx.Float32(
         fmath.sqrt(ss * fx.Float32(1.0 / HD) + fx.Float32(c["onorm_eps"]))
     )
-    if wave < L:
-        for u, x in ((0, x0), (1, x1)):
+    for u, x in ((0, x0), (1, x1)):
+        if (wave < L) & (hf == u):
             e = lane + 64 * u
             y = x * rr * on_w[u] * sigmoid(fx.ptr_load(c["g2l"] + (jn * HD + e)))
             bo.buffer_store(
@@ -672,7 +726,7 @@ def build(key: KdaWideBuild):
     s, L = key.tokens, key.qlen
     assert s % L == 0 and 1 <= L <= WT, (s, L)
     ntasks = s // L * NH
-    assert ntasks <= BLOCKS - TASK0, "one KDA task a CTA"
+    assert 2 * 8 * ((ntasks + 7) // 8) <= BLOCKS - TASK0, "a KDA task half a CTA"
     nt = tiles(key)
     lay = scratch_layout(key)
 
@@ -775,6 +829,7 @@ def build(key: KdaWideBuild):
             "tls": lds.tls.ptr,
             "proj": sreg(scratch, lay["proj"][0], "proj"),
             "part": sreg(scratch, lay["part"][0], "part"),
+            "ox": sreg(scratch, lay["ox"][0], "ox"),
             "args": {
                 "x": x,
                 "w_in": w_in,
@@ -810,15 +865,19 @@ def build(key: KdaWideBuild):
             },
         }
         stamp_begin(key.timeline, lds.tls.ptr, tid, TL_POINTS)
+        # task t = (request, head), half hf on CTA TASK0 + 16 (t // 8) + 8 hf + t % 8,
+        # its inputs in flight under the emit
+        o = fx.max(bid - TASK0, 0)
+        hf = (o % 16) // 8
+        t = o // 16 * 8 + o % 8
+        has = (bid >= TASK0) & (t < ntasks)
+        tc = uniform(fx.min(t, ntasks - 1))
+        c["req"] = tc // NH
         gemv_loop(c)
-        # task t = (request, head) on CTA TASK0 + t, its inputs in flight under the emit
-        t = bid - TASK0
-        has = (t >= 0) & (t < ntasks)
-        tc = fx.max(fx.min(t, ntasks - 1), 0)
-        k = kda_pre(c, tc // NH, tc % NH, has)
+        c["pre"] = lambda: kda_pre(c, tc // NH, tc % NH, hf, has, c["slot0"], c["w_row"])
         gemv_emit(c)
         if has:
-            kda_task(c, tc // NH, tc % NH, k)
+            kda_task(c, tc, tc // NH, tc % NH, hf, c["k"])
         stamp_flush(key.timeline, lds.tls.ptr, tl, tid, bid, TL_POINTS)
 
     @flyc.jit
