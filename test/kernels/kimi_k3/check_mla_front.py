@@ -1034,9 +1034,9 @@ def print_stamps(tl, tag):
     if live.any():
         # 100 MHz ticks a step, the median over the CTAs that ran attention steps
         per = lambda k: (tl[live, k].double() / steps[live] / 100.0).median().item()  # noqa: E731
-        roles = ["QK", "QK", "QK", "DMA", "PV", "PV", "PV", "PV"]
-        cells = [f"w{w} {roles[w]} {per(mf.TL_ROLE + 2 * w):.2f}+{per(mf.TL_ROLE + 2 * w + 1):.2f}" for w in range(8)]
-        print(f"  ROLES {tag} (us a step, role + barrier; steps a CTA median {steps[live].median().item():.0f}): "
+        ph = ["qk", "vt", "pv", "dma"]
+        cells = [f"w{w} " + "/".join(f"{per(mf.TL_ROLE + mf.TL_PHASES * w + k):.2f}" for k in range(mf.TL_PHASES)) for w in range(8)]
+        print(f"  PHASES {tag} (us a step: " + " / ".join(ph) + f"; steps a CTA median {steps[live].median().item():.0f}): "
               + ", ".join(cells), flush=True)
 
 
