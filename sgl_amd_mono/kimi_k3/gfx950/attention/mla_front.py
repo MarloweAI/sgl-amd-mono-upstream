@@ -138,7 +138,8 @@ S1_GATE0 = G_LAT
 # The CTA roles before the attention (every CTA then takes an attention item):
 #   0 .. 55      the seam
 #   56 .. 187    a fused_qkv_a group at launch
-#   188 .. 255   g_proj, off the q path: a group each, 188 .. 215 a second one
+#   188 .. 255   g_proj, off the q path: a group each, 188 .. 215 a second one;
+#                254 then the new KV record
 #   0 .. 143     a q_b group of this rank's 12 heads; 144 .. 187 and 216 .. 219
 #                an absorb task
 #   255          the q all-gather's flags
@@ -180,7 +181,7 @@ UV_CTAS = 192  # a W_UV task a CTA, on CTAs 0 .. 191
 UV_ROW = UV_HALF + 8  # bf16 a W_UV tile row in LDS
 ABS_ROW = 128 + 8  # bf16 an absorb tile row in LDS
 OL_ROW = KV + 8  # bf16 a latent output row in LDS
-KV_CTA = NA - 1  # a seam CTA with no stage-1 group
+KV_CTA = QG_FLAG_CTA - 1  # 254: the new KV record, after its g_proj group (no q path work)
 NEG = -3.4028234663852886e38
 LOG2E = 1.4426950408889634
 LN2 = 0.6931471805599453
@@ -1933,8 +1934,6 @@ def build(key: MlaFrontBuild):
                     if bid < s:
                         stage_gate(c, bid)
                 stage_mix(c, bid)
-                if bid == KV_CTA:
-                    stage_kv(c)
             if (bid >= QKV0) & (bid < GP0):
                 # fused_qkv_a: the q path's first weights, at launch
                 ops = s1_loads(c, bid - QKV0)
@@ -1959,6 +1958,8 @@ def build(key: MlaFrontBuild):
                         stage1_wide(c, S1_GATE0 + BLOCKS - GP0 + bid - GP0, ops2)
                     else:
                         stage1(c, S1_GATE0 + BLOCKS - GP0 + bid - GP0, ops2)
+            if bid == KV_CTA:
+                stage_kv(c)
             stamp(on, tls, tid, 2)
             # stage 2: this rank's 144 q_b groups, one a CTA on CTAs 0 .. 143 (a
             # group index past them loads nothing)
