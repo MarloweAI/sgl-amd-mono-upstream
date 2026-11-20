@@ -126,8 +126,7 @@ SGLANG_READS = {
         "written_residual",
     ),
     "srt/runtime_context.py": ("get_parallel",),
-    # the DCP front's glue: this step's DCP verify metadata, the KV rows, and the
-    # all-to-all, LSE combine and output gate after the launch
+    # the DCP front's glue: this step's DCP verify metadata and the KV rows
     "srt/model_executor/forward_context.py": ("get_attn_backend",),
     "srt/layers/attention/hybrid_linear_attn_backend.py": ("full_attn_backend",),
     "srt/layers/attention/base_attn_backend.py": ("kv_layers",),
@@ -136,9 +135,6 @@ SGLANG_READS = {
         "cprr_kv_indptr",
         "global_kv_indptr",
     ),
-    "srt/distributed/parallel_state.py": ('"dcp_group"',),
-    "kernels/ops/attention/dcp_kernels.py": ("dcp_lse_combine_triton",),
-    "kernels/ops/elementwise/mla_output_gate.py": ("covered", "kimi_k3_mla_output_gate"),
     # the attention stops here and the launch runs o_proj; both attention
     # classes expose it. The rest are what the forward and the checks read.
     "srt/models/kimi_k3.py": (
@@ -330,16 +326,24 @@ def _build(model, hf_config, ctx):
     runner = K3MonoRunner(p.tp_size, p.tp_rank, p.tp_group.cpu_group, device)
     runner.set_deadline(ctx.deadline_s)
     runner.dcp_rank = p.attn_dcp_rank if p.attn_dcp_size > 1 else 0
+    front_off = _dcp_front_disable_reason(p)
+    if front_off is not None and p.attn_dcp_size > 1:
+        logger.info("monokernel: no DCP front: %s", front_off)
     mla_off = _mla_front_disable_reason(p)
     if mla_off is not None:
         logger.info("monokernel: no MLA projection front: %s", mla_off)
-    dcp = p.attn_dcp_size > 1
+    dcp = p.attn_dcp_size > 1 and front_off is None
     layers, batches = {}, {}
     for rows in ctx.widths:
+        fronts = 0
         for i in _covered_layers(hf_config):
             packed = _weights(
                 backbone.layers[i], i, rows, runner, mla_off is None, dcp
             )
+            if packed.front is not None:
+                # the front layers' all-to-all regions alternate copies
+                packed.a2a_par = fronts % 2
+                fronts += 1
             layers.setdefault(rows, {})[i] = packed
         # FlyDSL compiles a launcher on its first call, and the first real call
         # is inside a CUDA graph capture, where compiling aborts the process.
@@ -510,8 +514,9 @@ class _Layer(msgspec.Struct):
     k1: Any = None  # the KDA front launch (gfx950/k1.py), where it applies
     mla: Any = None  # (MlaPreBuild, weights): an MLA layer's projection front
     # (MlaFrontBuild, weights): an MLA layer's attention under DCP8, up to the
-    # all-to-all's send records (gfx950/attention/mla_front.py)
+    # gated core (gfx950/attention/mla_front.py)
     front: Any = None
+    a2a_par: int = 0  # the front's all-to-all region copy
 
 
 def _k2_blocks(layer) -> int:
@@ -531,6 +536,20 @@ def _mla_front_disable_reason(parallel) -> str | None:
         # and computes all their q itself (the replicated q_b); the projection
         # front hands over this rank's 12 heads' q
         return "DCP is on: the projection front computes only this rank's 12 heads' q"
+    return None
+
+
+def _dcp_front_disable_reason(parallel) -> str | None:
+    """Why the MLA layers do not take the DCP front, or None: its all-to-all
+    pushes to the DCP ranks through the TP peer buffers, so the DCP group must
+    be the TP group, rank for rank."""
+    if parallel.attn_dcp_size <= 1:
+        return "DCP is off"
+    if parallel.attn_dcp_size != parallel.tp_size or parallel.attn_dcp_rank != parallel.tp_rank:
+        return (
+            f"DCP {parallel.attn_dcp_size} rank {parallel.attn_dcp_rank} is not "
+            f"TP {parallel.tp_size} rank {parallel.tp_rank}"
+        )
     return None
 
 
@@ -688,18 +707,11 @@ def _front_build(layer, rows: int):
     return (key, w)
 
 
-def _front_buffers(rows: int, device) -> dict:
-    """The DCP front's outputs and SGLang's all-to-all receive buffer, a width."""
+def _front_core_buffer(rows: int, device) -> torch.Tensor:
+    """The DCP front's gated core, a width."""
     from sgl_amd_mono.kimi_k3.gfx950.attention import mla_front as mf
 
-    def rec():
-        return torch.zeros(mf.DCP, rows, mf.NHL, mf.REC, dtype=torch.bfloat16, device=device)
-
-    return {
-        "send": rec(),
-        "recv": rec(),
-        "gate": torch.zeros(rows, mf.GATE, dtype=torch.bfloat16, device=device),
-    }
+    return torch.zeros(rows, mf.GATE, dtype=torch.bfloat16, device=device)
 
 
 def _front_warmup(runner, packed, rows: int, blocks) -> None:
@@ -708,7 +720,6 @@ def _front_warmup(runner, packed, rows: int, blocks) -> None:
 
     dev = runner.device
     key, w = packed.front
-    buf = _front_buffers(rows, dev)
     mf.mla_front_launch(
         key, prefix=runner.prefix[:rows], blocks=blocks, w=w,
         kv=torch.zeros(64, mf.DQK, dtype=torch.uint8, device=dev),
@@ -716,8 +727,9 @@ def _front_warmup(runner, packed, rows: int, blocks) -> None:
         kv_ptr=torch.tensor([0, 1], dtype=torch.int32, device=dev),
         g_kv_ptr=torch.tensor([0, rows], dtype=torch.int32, device=dev),
         loc=torch.zeros(rows, dtype=torch.int64, device=dev),
-        gate=buf["gate"], send=buf["send"], scratch=runner.scratch,
-        rank=runner.dcp_rank, layer=packed.i, epoch=runner.epoch,
+        core=_front_core_buffer(rows, dev), scratch=runner.scratch,
+        peers=runner.peer.addresses, rank=runner.dcp_rank, a2a_par=packed.a2a_par,
+        layer=packed.i, epoch=runner.epoch,
     )  # fmt: skip
 
 
@@ -909,7 +921,7 @@ class _Built:
             if any(p.mla is not None for p in packed.values())
         }
         self._front_buf = {
-            rows: _front_buffers(rows, dev)
+            rows: _front_core_buffer(rows, dev)
             for rows, packed in by_width.items()
             if any(p.front is not None for p in packed.values())
         }
@@ -1059,20 +1071,16 @@ class _Built:
         return self._pre_o_proj(layer, x, forward_batch, zero_allocator)
 
     def _front_core(self, layer, packed, hidden, bank, forward_batch):
-        """An MLA layer under DCP8: the front launch up to the all-to-all's send
-        records and g_proj, then SGLang's all-to-all, LSE combine and output
-        gate: the gated core, o_proj's input."""
-        from sglang.kernels.ops.attention.dcp_kernels import dcp_lse_combine_triton
-        from sglang.kernels.ops.elementwise import mla_output_gate
+        """An MLA layer under DCP8: the front launch, through its all-to-all,
+        LSE combine and output gate, to the gated core, o_proj's input."""
         from sglang.srt.layers.layer_boundary.residual.batch import set_written
         from sglang.srt.model_executor.forward_context import get_attn_backend
-        from sglang.srt.runtime_context import get_parallel
 
         from sgl_amd_mono.kimi_k3.gfx950.attention import mla_front as mf
 
         key, w = packed.front
         rows = hidden.shape[0]
-        buf = self._front_buf[rows]
+        core = self._front_buf[rows]
         attn = layer.self_attn
         # the MLA layers' backend: the hybrid model's full-attention one
         backend = get_attn_backend()
@@ -1085,26 +1093,13 @@ class _Built:
             key, prefix=hidden, blocks=bank.block_residual, w=w,
             kv=kv.view(-1, mf.DQK), kv_idx=fm.cprr_kv_indices,
             kv_ptr=fm.cprr_kv_indptr, g_kv_ptr=fm.global_kv_indptr,
-            loc=forward_batch.out_cache_loc, gate=buf["gate"], send=buf["send"],
-            scratch=self.runner.scratch, rank=self.runner.dcp_rank, layer=packed.i,
-            epoch=self.runner.epoch,
+            loc=forward_batch.out_cache_loc, core=core, scratch=self.runner.scratch,
+            peers=self.runner.peer.addresses, rank=self.runner.dcp_rank,
+            a2a_par=packed.a2a_par, layer=packed.i, epoch=self.runner.epoch,
         )  # fmt: skip
         if key.write_idx >= 0:
             bank._count_write(None)  # the launch wrote the bank row
-        send, recv = buf["send"], buf["recv"]
-        get_parallel().dcp_group.all_to_all_single(
-            recv.view(-1).view(torch.uint8), send.view(-1).view(torch.uint8)
-        )
-        comb, _ = dcp_lse_combine_triton(
-            recv[..., : mf.VD],
-            recv.view(torch.float32)[..., mf.VD // 2],
-            is_lse_base_on_e=True,
-        )
-        x = comb.flatten(1, 2)
-        gate = buf["gate"]
-        if mla_output_gate.covered(x, gate):
-            return mla_output_gate.kimi_k3_mla_output_gate(x, gate)
-        return x * torch.sigmoid(gate)
+        return core
 
     def _mla_core(self, layer, packed, hidden, bank, forward_batch, zero_allocator):
         """An MLA layer: the projection front as one launch, then SGLang's MLA
