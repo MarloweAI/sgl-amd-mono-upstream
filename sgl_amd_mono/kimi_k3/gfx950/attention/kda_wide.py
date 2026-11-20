@@ -109,6 +109,8 @@ SCALE = HD**-0.5
 # timeline points: start, gemv MFMAs done (every wave), gemv emitted, task inputs issued,
 # conv inputs polled, conv done, gates + l2norm done, recurrence done, norm done, the run's
 # non-head piece published (thread 0); the front's slice, gate and mix done, x ready
+# (the GEMM form, which has no front: the last fold's sums in LDS, its pieces
+# published, the head's poll returned, the first task round done)
 TL_POINTS = 14
 
 # a set spans at most 3 CTAs; a run at most 2 sets
@@ -687,6 +689,8 @@ def gemm_fold(c, acc, p, last):
                         tot[k], red + ((gs * ROWS + 4 * (ln // 16) + k) * SP + 16 * tl + ln % 16)
                     )
         lds_barrier()
+        if const_expr(last and t0 + ntc == npt):
+            stamp(c["on"], c["tls"], tid, 10)
         items = G * ROWS * rqc
         for it in range_constexpr((items + THREADS - 1) // THREADS):
             e = fx.min(tid + THREADS * it, items - 1)
@@ -706,6 +710,7 @@ def gemm_fold(c, acc, p, last):
             held.append((v, ok, ge, gs, r, q))
     lds_barrier()
     if const_expr(last):
+        stamp(c["on"], c["tls"], tid, 11)
         gemm_head(c, held, head, crosses, pa, n)
 
 
@@ -721,6 +726,7 @@ def gemm_head(c, held, head, crosses, pa, n):
     if head:
         pidx = [(nb * n + h[2]) * 2 + hh for h in held for nb in (nb1, nb2) for hh in (0, 1)]
         got = poll_words(c["part"], pidx, tag)
+        stamp(c["on"], c["tls"], c["tid"], 12)
         for k in range_constexpr(len(held)):
             v, ok, ge, gs, r, q = held[k]
             g1 = [f32_of(w) for w in got[4 * k] + got[4 * k + 1]]
@@ -785,6 +791,8 @@ def gemm_tasks(c):
             nxt = pre(k + 1)
         if has:
             kda_task(c, tc, req, tc % NH, hf, kk)
+        if const_expr(k == 0):
+            stamp(c["on"], c["tls"], c["tid"], 13)
 
 
 # ---------------------------------------------------------------- kda
