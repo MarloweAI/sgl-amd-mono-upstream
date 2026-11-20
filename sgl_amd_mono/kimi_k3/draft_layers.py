@@ -10,8 +10,14 @@ cache rows are the target's, written after verify), D-post (o_proj, its all-redu
 and the post norm's residual add) and D-MLP (the post norm, gate / up, SiLU, down,
 its all-reduce and the next norm's residual add). The embedding and the final norm
 (on the residual stream, the add done) stay SGLang's. A draft block step (a
-TARGET_VERIFY batch) of up to ``MAX_TOKENS`` rows takes the launches; any other
-step runs the model's own forward.
+TARGET_VERIFY batch) of up to ``FUSED_ROWS`` rows takes the launches; any other
+step runs the model's own forward, without the block's K / V store either.
+
+``FUSED_ROWS`` is the measured crossover (served, 8 ranks; tier 0): per layer the
+launches beat SGLang's 11 at 5 rows (about 47 against 61 µs, the dropped store
+aside) and 20 rows (about 56 against 62) and lose at 40 (about 72 against 69), where
+the fused gate / up and down stream their weights slower than hipBLASLt. The
+choice is fixed per width.
 """
 
 from __future__ import annotations
@@ -24,6 +30,8 @@ import torch
 from sgl_amd_mono.kimi_k3.gfx950 import drafter as D
 
 logger = logging.getLogger(__name__)
+
+FUSED_ROWS = 4 * D.BLOCK  # up to 4 requests
 
 # RadixArk/Kimi-K3-DSpark
 DRAFT_CONFIG = dict(
@@ -202,7 +210,7 @@ def install(model, group, deadline_s: float = 20.0) -> bool:
 
     def forward(self, input_ids, positions, forward_batch, input_embeds=None, *args, **kwargs):
         s = positions.shape[0]
-        if not forward_batch.forward_mode.is_target_verify() or s == 0 or s > D.MAX_TOKENS:
+        if not forward_batch.forward_mode.is_target_verify() or s == 0 or s > FUSED_ROWS:
             return original(input_ids, positions, forward_batch, input_embeds, *args, **kwargs)
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
@@ -213,5 +221,10 @@ def install(model, group, deadline_s: float = 20.0) -> bool:
 
     model.forward = types.MethodType(forward, model)
     model.__dict__["_k3_drafter_layers"] = runner
-    logger.info("kimi_k3 drafter layers: installed (up to %d rows)", D.MAX_TOKENS)
+    # the draft attention reads the block's K / V as arguments and the target's
+    # commit rewrites those cache rows before any draft reads them: no store, at
+    # every width (the model's own forward too)
+    for layer in model.layers:
+        layer.self_attn.save_kv_cache = False
+    logger.info("kimi_k3 drafter layers: installed (up to %d rows)", FUSED_ROWS)
     return True
