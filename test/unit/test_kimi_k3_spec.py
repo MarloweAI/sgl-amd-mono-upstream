@@ -203,6 +203,62 @@ def test_the_guard_flags_sit_past_every_width(monkeypatch):
     assert off == max(layer.peer_bytes(K2_MAX_ROWS), moe.peer_bytes(K2_MAX_ROWS))
 
 
+@pytest.mark.parametrize(
+    "rows,front_rows",
+    [(K2_MAX_ROWS, K2_MAX_ROWS), (12, 30), (18, 18), (18, 30), (24, 30), (48, 48)],
+)
+def test_the_scratch_regions_are_disjoint_at_every_width(rows, front_rows):
+    """No launch family's scratch overlaps another's at any built width.
+
+    The DCP front's pv rows once covered K2's tagged x rows: a front word left
+    there could pass for a pair of K2's tag. Each region holds its family's
+    layout at every width and bank depth it is built for.
+    """
+    from sgl_amd_mono.kimi_k3 import MAX_BLOCKS
+    from sgl_amd_mono.kimi_k3.gfx950 import k1, kda_layer, layer
+    from sgl_amd_mono.kimi_k3.gfx950.attention import kda_wide as kw
+    from sgl_amd_mono.kimi_k3.gfx950.attention import mla_front as mf
+    from sgl_amd_mono.kimi_k3.gfx950.stages.dims import HIDDEN
+
+    reg = layer.scratch_regions(rows, front_rows)
+    spans = sorted(reg.values())
+    assert all(o % 4096 == 0 for o, _ in spans)
+    for (o0, n0), (o1, _) in zip(spans, spans[1:]):
+        assert o0 + n0 <= o1, reg
+    blocks = range(1, MAX_BLOCKS + 1)
+    k2_end = max(
+        layer.scratch_bytes(layer.K2Build(tokens=s, nblocks=nb, core_box=cb))
+        for s in range(1, rows + 1) for nb in blocks for cb in (False, True)
+    )  # fmt: skip
+    assert k2_end <= reg["k2"][1]
+    assert reg["xt"][1] == rows * HIDDEN // 2 * 8
+    assert k1.scratch_bytes(rows) <= reg["k1"][1]
+    fronts = [s for s in range(mf.G_ROWS, front_rows + 1, mf.G_ROWS) if s // mf.G_ROWS <= mf.MAX_REQS]
+    for s in fronts:
+        for nb in blocks:
+            key = mf.MlaFrontBuild(tokens=s, nblocks=nb, scale=1.0)
+            assert mf.scratch_bytes(key) <= reg["front"][1], (s, nb)
+    for s in range(k1.WIDE_FROM_REQS * kw.WT, rows + 1, kw.WT):
+        for nb in blocks:
+            akey = kw.KdaWideBuild(tokens=s, qlen=kw.WT, front=True, nblocks=nb)
+            assert kda_layer.region_bytes(akey) <= reg["attn"][1], (s, nb)
+
+
+def test_every_launch_takes_its_region_from_the_one_layout():
+    """The offsets the kernels and the runner read are the layout's."""
+    from sgl_amd_mono.kimi_k3 import MAX_BLOCKS
+    from sgl_amd_mono.kimi_k3.gfx950 import kda_layer, layer
+    from sgl_amd_mono.kimi_k3.gfx950.attention import kda_wide as kw
+
+    reg = layer.scratch_regions()
+    assert layer.tag_offset() == reg["xt"][0]
+    assert kda_layer.attn_offset() == reg["attn"][0]
+    assert layer.scratch_alloc_bytes() >= max(o + n for o, n in reg.values())
+    akey = kw.KdaWideBuild(tokens=K2_MAX_ROWS // kw.WT * kw.WT, qlen=kw.WT, front=True, nblocks=MAX_BLOCKS)
+    o, n = reg["attn"]
+    assert all(o <= a and a + b <= o + n for a, b in kda_layer.scratch_layout(akey).values())
+
+
 # A TP8 + DCP8 DSpark server on the ReplaySSM ring, as SGLang's feature probes
 # read it.
 TP8_DCP8 = SimpleNamespace(

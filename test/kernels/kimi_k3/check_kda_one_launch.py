@@ -302,7 +302,7 @@ def main():
     epoch[guard.GUARD_DEADLINE] = lo - (1 << 32) if lo >= 1 << 31 else lo
     epoch[guard.GUARD_DEADLINE + 1] = ticks >> 32
     # the runner's scratch: uncached, every launch's layout in it
-    sbuf = PeerBuffer((kl.scratch_end() + 255) // 256 * 256, None, 0, 1, device)
+    sbuf = PeerBuffer(k2.scratch_alloc_bytes(), None, 0, 1, device)
     sbuf.bytes.zero_()
     env = (sbuf.bytes, addresses, epoch)
     gen = torch.Generator(device=device).manual_seed(0)

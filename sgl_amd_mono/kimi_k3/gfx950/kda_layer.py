@@ -7,10 +7,10 @@ behind each (request, local head) box (``K2Build.core_box``). A CTA runs its
 attention role, then its K2 role: the CTAs with no KDA task start K2, and so its
 o_proj weight stream, while the tasks still run.
 
-Scratch, the runner's: K2's layout from 0, as its own launch has it (its CBOX
-among it, its tagged x rows at ``tag_offset``); the attention's from
-``attn_offset``, past every other launch's; then the core [S, 1536] bf16
-(device-scope stores and loads).
+Scratch, the runner's (``layer.scratch_regions``): K2's layout from 0, as its
+own launch has it (its CBOX among it, its tagged x rows at ``tag_offset``); the
+attention's in its own region from ``attn_offset``, then the core [S, 1536]
+bf16 (device-scope stores and loads).
 
 LDS: one union of the attention's (``kda_wide.lds_types``) and K2's
 (``layer.lds_types``).
@@ -56,39 +56,25 @@ class Attn(NamedTuple):
     vals: tuple
 
 
-def _up(n: int, a: int = 4096) -> int:
-    return -(-n // a) * a
-
-
 def attn_offset() -> int:
-    """Where the attention's scratch starts: past K2's tagged x rows and the
-    MLA front's scratch, so no other launch's word sits where these keep tags."""
-    from sgl_amd_mono.kimi_k3 import K2_MAX_ROWS, MAX_BLOCKS
-    from sgl_amd_mono.kimi_k3.gfx950.attention import mla_front
+    """Where the attention's scratch starts: its region (``layer.scratch_regions``)."""
+    return k2.scratch_regions()["attn"][0]
 
-    # the front at its widest step, as the runner sizes it
-    reqs = min(mla_front.MAX_REQS, K2_MAX_ROWS // mla_front.G_ROWS)
-    front = mla_front.scratch_bytes(
-        mla_front.MlaFrontBuild(tokens=mla_front.G_ROWS * reqs, nblocks=MAX_BLOCKS, scale=1.0)
-    )
-    return _up(max(k2.scratch_alloc_bytes(), front))
+
+def _rel_layout(akey: kw.KdaWideBuild) -> dict:
+    n = kw.scratch_bytes(akey)
+    return {"attn": (0, n), "core": (-(-n // 256) * 256, akey.tokens * PROJ * 2)}
+
+
+def region_bytes(akey: kw.KdaWideBuild) -> int:
+    """The attention's region a launch of ``akey`` takes: its scratch, then its core."""
+    return max(o + n for o, n in _rel_layout(akey).values())
 
 
 def scratch_layout(akey: kw.KdaWideBuild) -> dict:
     """name -> (byte offset, bytes) in the runner's scratch: ``attn``, ``core``."""
     o = attn_offset()
-    n = kw.scratch_bytes(akey)
-    return {"attn": (o, n), "core": (_up(o + n, 256), akey.tokens * PROJ * 2)}
-
-
-def scratch_end() -> int:
-    """The runner's scratch the widest one-launch layer needs."""
-    from sgl_amd_mono.kimi_k3 import K1_MAX_ROWS, MAX_BLOCKS
-
-    widest = kw.KdaWideBuild(
-        tokens=K1_MAX_ROWS // kw.WT * kw.WT, qlen=kw.WT, front=True, nblocks=MAX_BLOCKS
-    )
-    return max(o + n for o, n in scratch_layout(widest).values())
+    return {name: (o + r, n) for name, (r, n) in _rel_layout(akey).items()}
 
 
 def core_view(akey: kw.KdaWideBuild, scratch):
@@ -122,7 +108,6 @@ def build(key: KdaLayerBuild):
     # a core box is a request's verify rows of a local head
     assert akey.qlen == oproj.CORE_REQ_ROWS and s // akey.qlen <= kw.WIDE_REQS
     cbox_off, cbox_n = k2.scratch_layout(kkey)["cbox"]
-    assert cbox_off + cbox_n <= attn_offset()
     at, kt = kw.lds_types(akey), k2.lds_types(kkey)
 
     @fx.struct

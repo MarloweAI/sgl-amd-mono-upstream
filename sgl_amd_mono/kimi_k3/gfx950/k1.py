@@ -527,15 +527,15 @@ def warmup(runner, packed: K1Layer, prefix, blocks, k2=None) -> None:
     state tensors are not available yet at build, so they are stand-ins of the
     right shape; only the build key reaches the compiler.
     """
+    from sgl_amd_mono.kimi_k3.gfx950 import layer
     from sgl_amd_mono.kimi_k3.gfx950.attention import kda
 
     if is_wide(packed):
         _warmup_wide(runner, packed, prefix, blocks, k2)
         return
-    need = kda.scratch_bytes(packed.key)
-    assert need <= runner.scratch.numel(), (
-        f"K1 layer {packed.i} needs {need} B of scratch, the runner has "
-        f"{runner.scratch.numel()}"
+    need, have = kda.scratch_bytes(packed.key), layer.scratch_regions()["k1"][1]
+    assert need <= have, (
+        f"K1 layer {packed.i} needs {need} B of scratch, its region has {have}"
     )
     # A block-write layer stores its bank row at block write_idx: the bank must
     # hold that block, or the last token's row lands past the allocation.
@@ -586,7 +586,7 @@ def warmup(runner, packed: K1Layer, prefix, blocks, k2=None) -> None:
             else None
         ),
         core_out=torch.empty(rows, kda.PROJ, dtype=torch.bfloat16, device=device),
-        scratch=runner.scratch,
+        scratch=layer.scratch_region(runner.scratch, "k1"),
         epoch=runner.epoch,
         layer=packed.i,
     )
@@ -613,13 +613,14 @@ def _warmup_wide(runner, packed: K1Layer, prefix, blocks, k2=None) -> None:
     """The wide form's warmup launch: stand-in state of one slot (every request
     reads and writes slot 0), throwaway outputs; a one-launch layer's inside
     ``k2`` (as ``launch`` takes it)."""
+    from sgl_amd_mono.kimi_k3.gfx950 import layer
     from sgl_amd_mono.kimi_k3.gfx950.attention import kda, kda_wide as kw
 
     key, device = packed.key, runner.device
     need = kw.scratch_bytes(key)
-    assert need <= runner.scratch.numel(), (
-        f"K1 layer {packed.i} needs {need} B of scratch, the runner has "
-        f"{runner.scratch.numel()}"
+    have = layer.scratch_regions()["attn" if packed.one_launch else "k1"][1]
+    assert need <= have, (
+        f"K1 layer {packed.i} needs {need} B of scratch, its region has {have}"
     )
     assert key.write_idx < blocks.shape[1]
     rows, L = key.tokens, key.qlen
@@ -995,6 +996,7 @@ def launch(runner, packed: K1Layer, prefix, attn_res, state, k2=None) -> torch.T
     host sync, which a CUDA graph capture rejects, and this runs inside a
     captured decode graph.
     """
+    from sgl_amd_mono.kimi_k3.gfx950 import layer
     from sgl_amd_mono.kimi_k3.gfx950.attention import kda
 
     if is_wide(packed):
@@ -1036,7 +1038,7 @@ def launch(runner, packed: K1Layer, prefix, attn_res, state, k2=None) -> torch.T
         ),
         init_slot=state["slot_i32"] if packed.key.init_committed else None,
         core_out=core,
-        scratch=runner.scratch,
+        scratch=layer.scratch_region(runner.scratch, "k1"),
         epoch=runner.epoch,
         # K2 takes slot 128 + i. The slots below it are free for exactly one
         # more launch a layer. A tag only has to tell apart the pairs live at
@@ -1084,7 +1086,7 @@ def _run_wide(runner, packed: K1Layer, k2, **kw_args) -> torch.Tensor:
     """The wide form's launch (``kda_wide.launch_values``' arguments but its
     core and scratch); returns the core. A one-launch layer's runs in ``k2``,
     its core in the runner's scratch."""
-    from sgl_amd_mono.kimi_k3.gfx950 import kda_layer
+    from sgl_amd_mono.kimi_k3.gfx950 import kda_layer, layer
     from sgl_amd_mono.kimi_k3.gfx950.attention import kda, kda_wide as kw
 
     key = packed.key
@@ -1097,5 +1099,5 @@ def _run_wide(runner, packed: K1Layer, k2, **kw_args) -> torch.Tensor:
         k2(core, kda_layer.Attn(key=key, vals=vals))
         return core
     core = torch.empty(key.tokens, kda.PROJ, dtype=torch.bfloat16, device=runner.device)
-    kw.kda_wide(key, core_out=core, scratch=runner.scratch, **kw_args)
+    kw.kda_wide(key, core_out=core, scratch=layer.scratch_region(runner.scratch, "k1"), **kw_args)
     return core
