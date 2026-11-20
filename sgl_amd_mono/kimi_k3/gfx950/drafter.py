@@ -91,10 +91,13 @@ RED_FLOATS = WAVES * 64 * 4  # one tile's MFMA accumulators in LDS
 # K over the hidden size: 14 parts of 512, 64 a wave, 2 MFMA steps
 K_PARTS, K_PART, K_PER_WAVE = 14, 512, 64
 K_STEPS = K_PER_WAVE // K_STEP
-# D-MLP: gate / up (16 row groups of 224 x 14 K parts), act, down (32 row groups of 224 x 7 K parts of 256), out
-G_RGS, G_ROWS, G_ROUND = 16, 224, 7
-G_TILES = G_ROWS // ROWS  # 14
-G_TASKS = G_RGS * K_PARTS  # 224
+# D-MLP gate / up: 32 row groups of 112 x 7 K parts of 1024 (128 a wave, 4 MFMA steps), in rounds of 4 + 3 tiles
+G_KPARTS, G_KPART, G_KPW = 7, 1024, 128
+G_KSTEPS = G_KPW // K_STEP  # 4
+G_RGS, G_ROWS = 32, 112
+G_TILES = G_ROWS // ROWS  # 7
+G_ROUNDS = (4, 3)
+G_TASKS = G_RGS * G_KPARTS  # 224
 ACT_CTAS, ACT_DIMS = 224, 8
 # down: 224 tasks of 32 rows over the whole K (224 a wave)
 DN_ROWS = 32
@@ -114,7 +117,8 @@ O_TASKS = H // O_ROWS  # 224
 O_STEPS = Q_K // WAVES // K_STEP  # 2
 
 assert K_PARTS * K_PART == H and K_PART == WAVES * K_PER_WAVE
-assert G_RGS * G_ROWS == GU_ROWS and G_TILES % G_ROUND == 0 and G_TASKS <= BLOCKS
+assert G_RGS * G_ROWS == GU_ROWS and sum(G_ROUNDS) == G_TILES and G_TASKS <= BLOCKS
+assert G_KPARTS * G_KPART == H and G_KPART == WAVES * G_KPW
 assert ACT_CTAS * ACT_DIMS == I and ACT_DIMS % 2 == 0
 assert DN_TASKS == G_TASKS == ACT_CTAS and DN_STEPS * K_STEP * WAVES == I
 assert A_RGS * A_ROWS == QKV_ROWS and A_TASKS <= BLOCKS
@@ -132,12 +136,13 @@ def scratch_bytes(layout: dict) -> int:
 
 def dm_scratch_layout() -> dict:
     """D-MLP's scratch regions (pairs) at MAX_TOKENS: the K parts' sums of squares,
-    the gate / up partials, the activations (bf16 [token][I], plain words) and the
+    the gate / up partials (plain fp32) and their tasks' flags, the activations (bf16 [token][I], plain words) and the
     activation CTAs' flags (a 128-byte line each)."""
     return pair_layout(
         [
             ("dm_ss", K_PARTS * MAX_TOKENS),
-            ("dm_gpart", K_PARTS * MAX_TOKENS * GU_ROWS),
+            ("dm_gpart", G_KPARTS * MAX_TOKENS * GU_ROWS // 2),
+            ("dm_gflags", G_TASKS * FLAG_STRIDE),
             ("dm_act", MAX_TOKENS * I // 4),
             ("dm_flags", ACT_CTAS * FLAG_STRIDE),
         ],
@@ -218,9 +223,9 @@ def gemv_tiles(c, w, xb_of, tiles, ksteps, publish):
         gpu.barrier()  # ``red`` is reused
 
 
-def lds_b(c, base, row):
+def lds_b(c, base, row, kpw=K_PER_WAVE, ksteps=K_STEPS):
     """B operands from the LDS bf16 rows ``base`` (``row`` elements a row): token
-    tile t's lane token, this wave's K steps of the part."""
+    tile t's lane token, this wave's ``ksteps`` K steps (``kpw`` a wave) of the part."""
     V8B = fx.Vector.make_type(8, fx.BFloat16)
     S, lane, wave = c["S"], c["lane"], c["wave"]
 
@@ -229,48 +234,52 @@ def lds_b(c, base, row):
         return [
             fx.Vector(
                 fx.ptr_load(
-                    base + (tok * row + wave * K_PER_WAVE + kc * K_STEP + 8 * (lane // 16)),
+                    base + (tok * row + wave * kpw + kc * K_STEP + 8 * (lane // 16)),
                     result_type=V8B,
                 )
             )
-            for kc in range(K_STEPS)
+            for kc in range(ksteps)
         ]  # fmt: skip
 
     return xb_of
 
 
 @flyc.jit
-def stage_norm_in(c, kp, nparts, prefetch):
-    """h = RMSNorm(res) w on K part ``kp`` -> ``hbuf`` [token][512] bf16, the token's
+def stage_norm_in(c, kp, nparts, prefetch, kw=K_PART):
+    """h = RMSNorm(res) w on K part ``kp`` (``kw`` wide) -> ``hbuf`` [token][kw] bf16, the token's
     sum of squares from the producer's ``nparts`` slots of ``ss`` (lane partials in
     slot order, then the wave's butterfly: every CTA the same). ``prefetch()``: the
     next stage's weight loads, issued after this stage's own; returned."""
     S, lane, wave = c["S"], c["lane"], c["wave"]
     hbuf = c["hbuf"]
     a = c["args"]
-    ch = kp * K_PART + 8 * lane
+    chs = [kp * kw + 512 * q + 8 * lane for q in range(kw // 512)]  # this lane's channels, 8 a chunk
     r_x, r_ss = rsrc(a["x"]), rsrc(a["ss"])
-    wv = fx.Vector(bo.buffer_load(rsrc(a["w_norm"]), ch // 2, vec_width=4, dtype=T.i32)).bitcast(fx.BFloat16)
+    wvs = [fx.Vector(bo.buffer_load(rsrc(a["w_norm"]), ch // 2, vec_width=4, dtype=T.i32)).bitcast(fx.BFloat16)
+           for ch in chs]  # fmt: skip
     TPW = -(-S // WAVES)
     rows = []
     for j in range_constexpr(TPW):
         t = fx.min(wave + WAVES * j, S - 1)
-        xv = fx.Vector(bo.buffer_load(r_x, (t * H + ch) // 2, vec_width=4, dtype=T.i32)).bitcast(fx.BFloat16)
+        xvs = [fx.Vector(bo.buffer_load(r_x, (t * H + ch) // 2, vec_width=4, dtype=T.i32)).bitcast(fx.BFloat16)
+               for ch in chs]  # fmt: skip
         sv = fx.Vector(bo.buffer_load(r_ss, t * SS_PARTS + 4 * fx.min(lane, nparts // 4 - 1), vec_width=4, dtype=T.f32))
-        rows.append((t, xv, sv))
+        rows.append((t, xvs, sv))
     # the scheduler would sink the loads to their uses: pin the issue order
     rocdl.sched_barrier(0)
     ahead = prefetch()
     rocdl.sched_barrier(0)
     for j in range_constexpr(TPW):
-        t, xv, sv = rows[j]
+        t, xvs, sv = rows[j]
         part = (sv[0] + sv[1]) + (sv[2] + sv[3])
         tot = butterfly((lane < nparts // 4).select(part, fx.Float32(0.0)), (32, 16, 8, 4, 2, 1))
         f = hw_rsq(tot / float(H) + EPS)
-        hv = fx.Vector.from_elements([fx.Float32(xv[e]) * f * fx.Float32(wv[e]) for e in range(8)], fx.Float32).to(
-            fx.BFloat16
-        )
-        fx.ptr_store(hv, hbuf + (t * K_PART + 8 * lane))
+        for q in range_constexpr(kw // 512):
+            xv, wv = xvs[q], wvs[q]
+            hv = fx.Vector.from_elements([fx.Float32(xv[e]) * f * fx.Float32(wv[e]) for e in range(8)], fx.Float32).to(
+                fx.BFloat16
+            )
+            fx.ptr_store(hv, hbuf + (t * kw + 512 * q + 8 * lane))
     gpu.barrier()
     return ahead
 
@@ -365,6 +374,37 @@ def stage_split_gemv(c, w, rows0, tiles, rounds, kp, part, width, cur, tail=None
 
 
 @flyc.jit
+def stage_gu(c, rg, kp, cur, tail):
+    """Gate / up task (``rg``, ``kp``): rows 112 rg .. of W_gu over K part kp (1024)
+    against ``hbuf``, in rounds of 4 and 3 tiles (``cur``: the first round's weights;
+    the next in flight while one computes; ``tail()``, the down weights, with the
+    last); fp32 partials (device scope) to ``gpart`` [kp][token][row], then the
+    task's flag. Returns the tail's loads."""
+    xb_of = lds_b(c, c["hbuf"], G_KPART, G_KPW, G_KSTEPS)
+    r_p = rsrc(c["gpart"].value)
+    k0 = kp * G_KPART
+    rows0 = rg * G_ROWS
+    extra = None
+    for rd in range_constexpr(len(G_ROUNDS)):
+        t0 = sum(G_ROUNDS[:rd])
+        rocdl.sched_barrier(0)
+        if const_expr(rd + 1 < len(G_ROUNDS)):
+            nxt = w_loads(c, c["args"]["w_gu"], H, rows0 + (t0 + G_ROUNDS[rd]) * ROWS, G_ROUNDS[rd + 1], k0, G_KPW, G_KSTEPS)
+        else:
+            extra = tail()
+        rocdl.sched_barrier(0)
+
+        def emit(r, tk, v, t0=t0):
+            bo.buffer_store(v, r_p, (kp * MAX_TOKENS + tk) * GU_ROWS + rows0 + t0 * ROWS + r, cache_modifier=CM_DEV)
+
+        gemv_tiles(c, cur, xb_of, G_ROUNDS[rd], G_KSTEPS, emit)
+        if const_expr(rd + 1 < len(G_ROUNDS)):
+            cur = nxt
+    publish(c["put"], c["gflags"], (rg * G_KPARTS + kp) * FLAG_STRIDE, fx.Int32(1), c["tid"] == 0)
+    return extra
+
+
+@flyc.jit
 def stage_ar(c, bid, nrows, vals_of):
     """Rows ``nrows`` bid .. for every token: this rank's values (``vals_of(t, j)``:
     the pair at rows 2j, 2j + 1 of the CTA's) pushed as bf16 pairs to every rank's
@@ -416,25 +456,34 @@ def stage_act(c, bid):
     partials summed in part order, bf16, a = bf16(silu(g)) u -> ``act`` [token][I]
     bf16 (two dims a thread, device scope), then this CTA's flag."""
     S, tid, poll = c["S"], c["tid"], c["poll"]
-    gpart = c["gpart"]
+    r_g = rsrc(c["gpart"].value)
     r_act = rsrc(c["act"].value)
+    # the 14 gate / up tasks this CTA's dims come from: (the gate rows' group, the
+    # up rows' group) x 7 K parts, one thread a flag
+    d_lo = bid * ACT_DIMS
+    if tid < 2 * G_KPARTS:
+        grp = (tid < G_KPARTS).select(d_lo // G_ROWS, (I + d_lo) // G_ROWS)
+        poll([(c["gflags"], (grp * G_KPARTS + tid % G_KPARTS) * FLAG_STRIDE, 1)])
+    gpu.barrier()
+    llvm.FenceOp(llvm.AtomicOrdering.acquire, syncscope="workgroup")
     PAIRS = ACT_DIMS // 2
     N = PAIRS * S
     for p in range_constexpr(-(-N // THREADS)):
         idx = fx.min(tid + p * THREADS, N - 1)
         j, t = idx % PAIRS, idx // PAIRS
         d0 = bid * ACT_DIMS + 2 * j
-        gu = poll(
-            [(gpart, (kp * MAX_TOKENS + t) * GU_ROWS + d0, 2) for kp in range(K_PARTS)]
-            + [(gpart, (kp * MAX_TOKENS + t) * GU_ROWS + I + d0, 2) for kp in range(K_PARTS)],
-            batch=2 * K_PARTS,
-        )
-        g0, g1, u0, u1 = fx.Float32(0.0), fx.Float32(0.0), fx.Float32(0.0), fx.Float32(0.0)
-        for kp in range_constexpr(K_PARTS):
-            g0 = g0 + gu[kp][0].bitcast(fx.Float32)
-            g1 = g1 + gu[kp][1].bitcast(fx.Float32)
-            u0 = u0 + gu[K_PARTS + kp][0].bitcast(fx.Float32)
-            u1 = u1 + gu[K_PARTS + kp][1].bitcast(fx.Float32)
+
+        def pair(off):
+            return fx.Vector(bo.buffer_load(r_g, off, vec_width=2, dtype=T.f32, cache_modifier=CM_DEV))
+
+        gs = [pair((kp * MAX_TOKENS + t) * GU_ROWS + d0) for kp in range(G_KPARTS)]
+        us = [pair((kp * MAX_TOKENS + t) * GU_ROWS + I + d0) for kp in range(G_KPARTS)]
+        g0, g1, u0, u1 = gs[0][0], gs[0][1], us[0][0], us[0][1]
+        for kp in range_constexpr(1, G_KPARTS):
+            g0 = g0 + gs[kp][0]
+            g1 = g1 + gs[kp][1]
+            u0 = u0 + us[kp][0]
+            u1 = u1 + us[kp][1]
         g0, g1, u0, u1 = bf16_round(g0), bf16_round(g1), bf16_round(u0), bf16_round(u1)
         a0 = bf16_round(g0 * sigmoid(g0)) * u0
         a1 = bf16_round(g1 * sigmoid(g1)) * u1
@@ -502,16 +551,14 @@ def run_dmlp(c):
     round with the norm's loads, down's (a task's 114 KB) with gate / up's last."""
     bid, on, tls, tid = c["bid"], c["tl_on"], c["tls"], c["tid"]
     a = c["args"]
-    rg, kp = bid // K_PARTS, bid % K_PARTS
+    rg, kp = bid // G_KPARTS, bid % G_KPARTS
     if bid < G_TASKS:
         gw = stage_norm_in(
-            c, kp, O_TASKS, lambda: w_loads(c, a["w_gu"], H, rg * G_ROWS, G_ROUND, kp * K_PART, K_PER_WAVE, K_STEPS)
+            c, kp, O_TASKS, lambda: w_loads(c, a["w_gu"], H, rg * G_ROWS, G_ROUNDS[0], kp * G_KPART, G_KPW, G_KSTEPS),
+            kw=G_KPART,
         )  # fmt: skip
         stamp(on, tls, tid, 1)
-        dw = stage_split_gemv(
-            c, a["w_gu"], rg * G_ROWS, G_ROUND, G_TILES // G_ROUND, kp, c["gpart"], GU_ROWS, gw,
-            tail=lambda: dn_loads(c, bid),
-        )  # fmt: skip
+        dw = stage_gu(c, rg, kp, gw, lambda: dn_loads(c, bid))
         stamp(on, tls, tid, 2)
         stage_act(c, bid)
         stamp(on, tls, tid, 3)
@@ -672,12 +719,12 @@ def _lds(key: DrafterBuild):
             tls: fx.Array[fx.Int64, 8, 16]
 
         return Lds
-    tiles = G_ROUND if key.kind == "mlp" else A_TILES
+    tiles = max(G_ROUNDS) if key.kind == "mlp" else A_TILES
 
     @fx.struct
     class Lds:
         red: fx.Array[fx.Float32, tiles * RED_FLOATS, 16]
-        hbuf: fx.Array[fx.BFloat16, S * K_PART, 16]
+        hbuf: fx.Array[fx.BFloat16, S * (G_KPART if key.kind == "mlp" else K_PART), 16]
         ssl: fx.Array[fx.Float32, S * K_PARTS, 16]
         nf: fx.Array[fx.Float32, S, 16]
         ssp: fx.Array[fx.Float32, S * DN_ROWS // 2, 16]
