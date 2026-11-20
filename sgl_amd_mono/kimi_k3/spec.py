@@ -142,9 +142,10 @@ SGLANG_READS = {
         "global_kv_indptr",
         # the verify plan the front makes for itself (_skip_verify_plan)
         "AiterAttnBackend",
-        "def make_mla_meta_data(",
-        "is_cp_round_robin",
-        "nhead_override",
+        "AiterAttnBackend.make_mla_meta_data(qo_indptr)",
+        "AiterAttnBackend.make_mla_meta_data(max_q_len)",
+        "AiterAttnBackend.make_mla_meta_data(is_cp_round_robin)",
+        "AiterAttnBackend.make_mla_meta_data(nhead_override)",
         "cprr_kernel_heads",
     ),
     # the attention stops here and the launch runs o_proj; both attention
