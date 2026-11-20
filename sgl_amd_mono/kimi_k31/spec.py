@@ -20,24 +20,18 @@ import msgspec
 import torch
 
 try:
-    from sglang.kernels.plugin_kernels.amd.spec import Feature, Numerics
+    from sglang.kernels.plugin_kernels.amd.spec import Numerics
 except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
-    from sglang.srt.monokernels.spec import Feature, Numerics
+    from sglang.srt.monokernels.spec import Numerics
 
 from sgl_amd_mono.kimi_k3 import spec as k3
 from sgl_amd_mono.kimi_k31 import wide
 
 SGLANG_READS = {
-    "kernels/plugin_kernels/amd/spec.py|srt/monokernels/spec.py": (
-        "Feature",
-        "Numerics",
-    ),
+    "kernels/plugin_kernels/amd/spec.py|srt/monokernels/spec.py": ("Numerics",),
     "srt/models/kimi_k3.py": ("KimiK31ForConditionalGeneration", "_qkvgbfa_layer"),
     "srt/runtime_context.py": ("get_parallel",),
 }
-
-# The decode context parallel sizes the launches were checked at.
-DCP_SIZES = (1, 8)
 
 NUMERICS = Numerics(
     k3.NUMERICS.kind,
@@ -57,14 +51,6 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
     reasons = k3._config_disable_reasons(cfg, hf_config)
     if not getattr(k3._text_config(hf_config), "dsa_config", None):
         reasons.append("no dsa_config: a Kimi-K3 checkpoint, served by kimi_k3")
-    dcp = getattr(cfg, "dcp_size", 1) or 1
-    if dcp not in DCP_SIZES:
-        reasons.append(f"--dcp-size {dcp} is not one of {list(DCP_SIZES)}")
-    if (getattr(cfg, "attn_cp_size", 1) or 1) > 1 or getattr(
-        cfg, "enable_prefill_cp", False
-    ):
-        # CONTEXT_PARALLEL is accepted for DCP; attention CP reshapes the decode rows
-        reasons.append("attention context parallel is on; only --dcp-size is accepted")
     tokens = getattr(cfg, "speculative_num_draft_tokens", None)
     if tokens not in wide.SUPPORTED_L:
         reasons.append(
@@ -162,8 +148,6 @@ SPEC = msgspec.structs.replace(
             widths=k3.SPEC.devices["gfx950"].widths + wide.wide_widths(),
         )
     },
-    # DCP (CONTEXT_PARALLEL) shards the DSA layers' KV, which run on SGLang's path
-    features=k3.SPEC.features | {Feature.CONTEXT_PARALLEL},
     requires=msgspec.structs.replace(
         k3.SPEC.requires,
         attention_backends=frozenset({"dsa"}),

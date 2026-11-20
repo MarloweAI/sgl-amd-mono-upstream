@@ -79,6 +79,9 @@ from sgl_amd_mono.kimi_k3 import (
 logger = logging.getLogger(__name__)
 
 TP_SIZE = 8
+# The decode context parallel sizes the launches run at. Under DCP the attention
+# hands o_proj the same TP-local 12-head core as without it.
+DCP_SIZES = (1, 8)
 # K2's OPT_* bits (gfx950/layer.py: sentinel all-reduces, preloads, tagged x rows,
 # router partials, batched polls), each bit for bit the launch without it; unset
 # is layer.K2_OPT, all of them.
@@ -211,6 +214,18 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
         reasons.append("needs SGLANG_AITER_K3_OPT=1")
     if importlib.util.find_spec("flydsl") is None:
         reasons.append("needs FlyDSL")
+    dcp = getattr(cfg, "dcp_size", 1) or 1
+    if dcp not in DCP_SIZES:
+        reasons.append(f"--dcp-size {dcp} is not one of {list(DCP_SIZES)}")
+    if (getattr(cfg, "attn_cp_size", 1) or 1) > 1 or getattr(
+        cfg, "enable_prefill_cp", False
+    ):
+        # CONTEXT_PARALLEL is accepted for DCP; attention CP reshapes the decode rows
+        reasons.append("attention context parallel is on; only --dcp-size is accepted")
+    if (getattr(cfg, "kda_dwdp_size", None) or 1) > 1:
+        # DWDP shards the KDA in-projection, o_proj and shared experts per rank
+        # and gathers them in layer hooks; the launches read them whole
+        reasons.append("--kda-dwdp-size is on; the launches read unsharded weights")
     return reasons
 
 
@@ -302,10 +317,13 @@ def _build(model, hf_config, ctx):
     # the peer handshake is collective: every rank reaches it here
     runner = K3MonoRunner(p.tp_size, p.tp_rank, p.tp_group.cpu_group, device)
     runner.set_deadline(ctx.deadline_s)
+    mla_off = _mla_front_disable_reason(p)
+    if mla_off is not None:
+        logger.info("monokernel: no MLA front: %s", mla_off)
     layers, batches = {}, {}
     for rows in ctx.widths:
         for i in _covered_layers(hf_config):
-            packed = _weights(backbone.layers[i], i, rows, runner)
+            packed = _weights(backbone.layers[i], i, rows, runner, mla_off is None)
             layers.setdefault(rows, {})[i] = packed
         # FlyDSL compiles a launcher on its first call, and the first real call
         # is inside a CUDA graph capture, where compiling aborts the process.
@@ -438,8 +456,9 @@ SPEC = MonoSpec(
         )
     },
     # The measured win is on DSpark target-verify steps; a plain decode step of
-    # at most K2_MAX_ROWS rows takes the same launch.
-    features=frozenset({Feature.SPECULATIVE_DECODING}),
+    # at most K2_MAX_ROWS rows takes the same launch. DCP (CONTEXT_PARALLEL)
+    # shards the MLA layers' KV, whose attention runs on SGLang's path.
+    features=frozenset({Feature.SPECULATIVE_DECODING, Feature.CONTEXT_PARALLEL}),
     requires=Requirements(
         dtypes=frozenset({"bfloat16"}),
         attention_backends=frozenset({"aiter"}),
@@ -481,7 +500,19 @@ def _k2_blocks(layer) -> int:
     return layer.prev_valid_blocks + int(layer.is_block_write_layer)
 
 
-def _weights(layer, i: int, rows: int, runner) -> _Layer:
+def _mla_front_disable_reason(parallel) -> str | None:
+    """Why no MLA layer takes the projection front, or None."""
+    if not MLA_PRE:
+        return "SGLANG_AMD_MONO_K3_MLA_PRE=0"
+    if parallel.attn_dcp_size > 1:
+        # SGLang's DCP MLA forward attends every head over this rank's KV shard
+        # and computes all their q itself (the replicated q_b); the front hands
+        # over this rank's 12 heads' q
+        return "DCP is on: the front computes only this rank's 12 heads' q"
+    return None
+
+
+def _weights(layer, i: int, rows: int, runner, mla: bool) -> _Layer:
     """This layer's build key at one launch width. The weights themselves are
     read in place at launch, so nothing is packed or copied here."""
     from sgl_amd_mono.kimi_k3.gfx950 import k1 as k1_mod
@@ -494,7 +525,7 @@ def _weights(layer, i: int, rows: int, runner) -> _Layer:
     front = rows <= MAX_ROWS
     return _Layer(
         k1=k1_mod.build(layer, i, rows) if K1 and front else None,
-        mla=_mla_build(layer, rows) if MLA_PRE and front else None,
+        mla=_mla_build(layer, rows) if mla and front else None,
         i=i,
         key=K2Build(
             tokens=rows,
@@ -515,8 +546,6 @@ def _weights(layer, i: int, rows: int, runner) -> _Layer:
 def _mla_build(layer, rows: int):
     """An MLA layer's projection-front key and the weights it reads in place, or
     None (a KDA layer, or weights the launch does not take: SGLang's path)."""
-    from sglang.srt.runtime_context import get_parallel
-
     from sgl_amd_mono.kimi_k3.gfx950.attention import mla_pre as mp
     from sgl_amd_mono.kimi_k3.gfx950.stages.dims import HIDDEN
 
@@ -524,10 +553,6 @@ def _mla_build(layer, rows: int):
     idx = getattr(attn, "indexer", None)
     fused = getattr(attn, "fused_qkv_a_proj_with_mqa", None)
     if hasattr(attn, "qkv_conv1d") or idx is None or fused is None:
-        return None
-    if get_parallel().attn_dcp_size > 1:
-        # under DCP SGLang's MLA forward computes every head's q itself (the
-        # replicated q_b); the front hands over this rank's 12
         return None
     w = {
         "ares_nw": layer.self_attention_res_norm.weight,

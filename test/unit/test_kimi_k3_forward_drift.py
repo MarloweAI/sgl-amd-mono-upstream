@@ -29,15 +29,15 @@ PINNED = {
         "_Built.forward",
     ),
     ("KimiK3LinearForCausalLM", "forward"): (
-        "e30a51aa0f01f5a0",
+        "427cb949b79cf431",
         "_Built.language_forward",
     ),
     ("KimiK3LinearModel", "forward"): (
-        "9a6d94921969be24",
+        "6d19ecd8cf8bb53e",
         "_Built._backbone",
     ),
     ("KimiK3DecoderLayer", "forward"): (
-        "04f140797269349c",
+        "373da46f0dd3bf07",
         "_Built._layer",
     ),
     ("KimiK3DecoderLayer", "_run_self_attn"): (

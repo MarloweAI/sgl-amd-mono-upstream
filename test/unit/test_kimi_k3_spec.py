@@ -195,3 +195,67 @@ def test_the_guard_flags_sit_past_every_width(monkeypatch):
         assert moe.peer_bytes(width) <= off, width
     # the widest launch ends exactly there: a larger offset wastes a peer page
     assert off == max(layer.peer_bytes(MAX_ROWS), moe.peer_bytes(MAX_ROWS))
+
+
+# A TP8 + DCP8 DSpark server, as SGLang's feature probes read it.
+TP8_DCP8 = SimpleNamespace(
+    tp_size=8, dcp_size=8, attn_cp_size=1, enable_prefill_cp=False, pp_size=1,
+    nnodes=1, attn_dp_size=1, ep_size=1, enable_eplb=False,
+    speculative_algorithm="DSPARK", enable_two_batch_overlap=False,
+    enable_single_batch_overlap=False, enable_lora=False, lora_paths=None,
+    disaggregation_mode="null", enable_return_routed_experts=False,
+    enable_return_indexer_topk=False, enable_hierarchical_cache=False,
+    disaggregation_decode_enable_offload_kvcache=False, enable_lmcache=False,
+    enable_flexkv=False, enable_memory_saver=False, enable_weights_cpu_backup=False,
+    cpu_offload_gb=0, offload_group_size=0, enable_torch_compile=False,
+)  # fmt: skip
+
+
+def _config_reasons(monkeypatch, cfg):
+    """The config reasons with the ROCm image's environment: aiter's interleaved
+    experts, SGLANG_AITER_K3_OPT and FlyDSL."""
+    import importlib.util
+
+    from sglang.srt.layers.quantization import mxfp4
+
+    monkeypatch.setattr(mxfp4, "_aiter_situ_uses_gu_interleaved_weights", lambda: True)
+    monkeypatch.setenv("SGLANG_AITER_K3_OPT", "1")
+    find = importlib.util.find_spec
+    monkeypatch.setattr(
+        importlib.util,
+        "find_spec",
+        lambda name, *a: object() if name == "flydsl" else find(name, *a),
+    )
+    return k3._config_disable_reasons(cfg, K3)
+
+
+def test_dcp8_is_accepted(monkeypatch):
+    # SGLang counts --dcp-size > 1 as CONTEXT_PARALLEL and refuses a spec that
+    # does not declare it
+    binding = pytest.importorskip("sglang.srt.kernel_plugins.amd.binding")
+    monkeypatch.setenv("SGLANG_RAGGED_VERIFY_MODE", "static")
+    assert binding.features_in_use(TP8_DCP8) - k3.SPEC.features == set()
+    assert _config_reasons(monkeypatch, TP8_DCP8) == []
+    assert _reasons(monkeypatch, _fake_layer()) == []
+    assert _reasons(monkeypatch, _fake_layer(kda=True)) == []
+
+
+def test_other_context_parallel_shapes_are_refused(monkeypatch):
+    dcp4 = SimpleNamespace(**{**vars(TP8_DCP8), "dcp_size": 4})
+    assert any("--dcp-size 4" in r for r in _config_reasons(monkeypatch, dcp4))
+    cp = SimpleNamespace(**{**vars(TP8_DCP8), "attn_cp_size": 2})
+    assert any("attention context" in r for r in _config_reasons(monkeypatch, cp))
+
+
+def test_kda_dwdp_is_refused(monkeypatch):
+    dwdp = SimpleNamespace(**{**vars(TP8_DCP8), "kda_dwdp_size": 8})
+    assert any("--kda-dwdp-size" in r for r in _config_reasons(monkeypatch, dwdp))
+
+
+def test_the_mla_front_is_off_under_dcp():
+    # the front computes only this rank's 12 heads' q; SGLang's DCP MLA forward
+    # needs all 96, so those layers keep SGLang's MLA attention
+    reason = k3._mla_front_disable_reason(SimpleNamespace(attn_dcp_size=8))
+    assert reason is not None and "DCP" in reason
+    if k3.MLA_PRE:
+        assert k3._mla_front_disable_reason(SimpleNamespace(attn_dcp_size=1)) is None
