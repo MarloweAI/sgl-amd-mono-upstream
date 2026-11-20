@@ -13,7 +13,7 @@ import torch
 
 from sgl_amd_mono.common import guard
 from sgl_amd_mono.common.peer import PeerBuffer
-from sgl_amd_mono.kimi_k3 import MAX_ROWS
+from sgl_amd_mono.kimi_k3 import K2_MAX_ROWS
 
 
 class K3MonoRunner:
@@ -65,7 +65,7 @@ class K3MonoRunner:
         self.peer.bytes[layer.peer_alloc_bytes() :].zero_()
         # One prefix buffer, not one a layer: the layers run in sequence.
         self.prefix = torch.empty(
-            MAX_ROWS, layer.HIDDEN, dtype=torch.bfloat16, device=device
+            K2_MAX_ROWS, layer.HIDDEN, dtype=torch.bfloat16, device=device
         )
 
     def set_deadline(self, seconds: float) -> None:

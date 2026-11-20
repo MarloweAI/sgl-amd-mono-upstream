@@ -71,6 +71,7 @@ from sgl_amd_mono.common.plan import BLOCKS
 from sgl_amd_mono.kimi_k3 import (
     CORE,
     HF_CONFIG,
+    K2_MAX_ROWS,
     LINEAR_ATTN_CONFIG,
     MAX_BLOCKS,
     MAX_ROWS,
@@ -474,14 +475,14 @@ SPEC = MonoSpec(
     name="kimi_k3_hip",
     devices={
         "gfx950": DeviceLimits(
-            widths=tuple(range(1, MAX_ROWS + 1)),
+            widths=tuple(range(1, K2_MAX_ROWS + 1)),
             tp_sizes=(TP_SIZE,),
             resident_blocks=BLOCKS,
         )
     },
     # The measured win is on DSpark target-verify steps; a plain decode step of
-    # at most MAX_ROWS rows takes the same launch. DCP (CONTEXT_PARALLEL) shards
-    # the MLA layers' KV, whose attention runs on SGLang's path.
+    # at most K2_MAX_ROWS rows takes the same launch. DCP (CONTEXT_PARALLEL)
+    # shards the MLA layers' KV.
     features=frozenset({Feature.SPECULATIVE_DECODING, Feature.CONTEXT_PARALLEL}),
     requires=Requirements(
         dtypes=frozenset({"bfloat16"}),
@@ -548,9 +549,12 @@ def _weights(layer, i: int, rows: int, runner, mla: bool, dcp: bool) -> _Layer:
     from sgl_amd_mono.kimi_k3.gfx950.layer import K2Build
 
     moe = layer.mlp
+    # K1 and the MLA front take up to MAX_ROWS rows; a wider step keeps
+    # SGLang's attention and enters the layer launch at o_proj's input
+    narrow = rows <= MAX_ROWS
     return _Layer(
-        k1=k1_mod.build(layer, i, rows) if K1 else None,
-        mla=_mla_build(layer, rows) if mla else None,
+        k1=k1_mod.build(layer, i, rows) if K1 and narrow else None,
+        mla=_mla_build(layer, rows) if mla and narrow else None,
         front=_front_build(layer, rows) if dcp else None,
         i=i,
         key=K2Build(

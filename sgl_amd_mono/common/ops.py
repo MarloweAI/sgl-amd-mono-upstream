@@ -139,6 +139,15 @@ class KernArgs:
         return SimpleNamespace(**got)
 
 
+def lds_barrier():
+    """``s_barrier`` for an LDS hand-off between waves: fenced, so no LDS access
+    moves across it, while the waves' global loads and stores stay in flight
+    (``gpu.barrier`` waits for every one of them)."""
+    fx.memory_fence(ordering=fx.AtomicOrdering.Release, syncscope="workgroup")
+    rocdl.s_barrier()
+    fx.memory_fence(ordering=fx.AtomicOrdering.Acquire, syncscope="workgroup")
+
+
 def uniform(v):
     return fx.Int32(rocdl.readfirstlane(T.i32, fx.Int32(v)))
 

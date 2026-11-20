@@ -262,7 +262,7 @@ def main():
     # later, so consecutive launches take layers of alternating parity.
     served = dict(fold=True, guint=False)
     bits = [
-        k2.OPT_SENT, k2.OPT_PRELOAD, k2.OPT_TAG_X, k2.OPT_SENT_LATR,
+        k2.OPT_SENT, k2.OPT_TAG_X, k2.OPT_SENT_LATR,
         k2.OPT_SENT_FINAL, k2.OPT_SDOWN_FIRST, k2.OPT_RLOG_PARTS, k2.OPT_BATCH,
         k2.K2_OPT,
     ]  # fmt: skip

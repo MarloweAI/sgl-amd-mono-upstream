@@ -89,37 +89,11 @@ def _slice_item(c, task, i):
     return (tid + THREADS * i) < n, e, row, t, row % ns, task * COLS + (e % QC) * 4
 
 
-def slice_loads(c, task):
-    """``stage_slice``'s loads that wait on nothing in this launch: every round's
-    block and incoming-prefix words, and the norm / qk words (the same columns
-    every round: THREADS % QC == 0). K2 issues them before the o_proj poll."""
-    s, ns, nb = c["S"], c["NS"], c["NB"]
-    a = c["args"]
-    pre_in = a["prefix_in"] if "prefix_in" in a else a["prefix"]
-    blk, pre = [], []
-    for i in range((s * ns * QC + THREADS - 1) // THREADS):
-        _, _, _, t, src, col = _slice_item(c, task, i)
-        blk.append(
-            _raw4(
-                a["blocks"], t * a["blk_sm"] + fx.min(src, nb - 1) * a["blk_sr"] + col
-            )
-        )
-        pre.append(_raw4(pre_in, t * HIDDEN + col))
-    _, _, _, _, _, col = _slice_item(c, task, 0)
-    return {
-        "blk": blk,
-        "pre": pre,
-        "w": _raw4(a["ares_nw"], col),
-        "q": _raw4(a["ares_qk"], col),
-    }
-
-
 @flyc.jit
-def stage_slice(c, task, ld=None):
+def stage_slice(c, task):
     """Columns 128 task ..: every token's sources into LDS ``vals`` (4 columns a
     thread), the prefix (+ delta) rounded to bf16 and stored back, per-(token,
-    source) partial sum of squares and qk dot -> PART. ``ld``: the loads
-    ``slice_loads`` issued earlier (else each round loads its own)."""
+    source) partial sum of squares and qk dot -> PART."""
     s, ns, nb, lane = c["S"], c["NS"], c["NB"], c["lane"]
     a = c["args"]
     vals_bf16 = c.get("vals_bf16", False)
@@ -132,13 +106,10 @@ def stage_slice(c, task, ld=None):
     for i in range_constexpr((n + THREADS - 1) // THREADS):
         live, e, row, t, src, col = _slice_item(c, task, i)
         is_pre = src == nb
-        if const_expr(ld is None):
-            blk = ld_bf4(
-                a["blocks"], t * a["blk_sm"] + fx.min(src, nb - 1) * a["blk_sr"] + col
-            )
-            pre = ld_bf4(pre_in, t * HIDDEN + col)
-        else:
-            blk, pre = _f4(ld["blk"][i]), _f4(ld["pre"][i])
+        blk = ld_bf4(
+            a["blocks"], t * a["blk_sm"] + fx.min(src, nb - 1) * a["blk_sr"] + col
+        )
+        pre = ld_bf4(pre_in, t * HIDDEN + col)
         if const_expr(c["delta"]):
             if const_expr(c.get("delta_lds") is not None and vals_bf16):
                 # the delta reduced into LDS first, as packed bf16 pairs
@@ -177,11 +148,8 @@ def stage_slice(c, task, ld=None):
             live.select(is_pre.select(pre[j], blk[j]), fx.Float32(0.0))
             for j in range(4)
         ]
-        if const_expr(ld is None):
-            w = ld_bf4(a["ares_nw"], col)
-            q = ld_bf4(a["ares_qk"], col)
-        else:
-            w, q = _f4(ld["w"]), _f4(ld["q"])
+        w = ld_bf4(a["ares_nw"], col)
+        q = ld_bf4(a["ares_qk"], col)
         # a thread past the end holds a clamped copy of the last element: it
         # must not store (it raced the owner with zeros)
         if const_expr(vals_bf16):
@@ -206,6 +174,123 @@ def stage_slice(c, task, ld=None):
             at = ((task * s + t) * ns + src) * 2
             c["put"](c["part"], at, sq)
             c["put"](c["part"], at + 1, dt)
+    gpu.barrier()
+
+
+# ---------------------------------------------------------------- split slice
+# ``stage_slice`` in two halves, the same values and stores: the block sources
+# (which wait on nothing in this launch) before the o_proj poll, the prefix
+# source (prefix + delta) after it.
+def _block_item(c, task, i):
+    """Round i's block-source item of this thread: (live, e, token, source, column)."""
+    s, nb, tid = c["S"], c["NB"], c["tid"]
+    n = s * nb * QC
+    e = fx.min(tid + THREADS * i, n - 1)
+    row = e // QC  # (token, block)
+    return (tid + THREADS * i) < n, e, row // nb, row % nb, task * COLS + (e % QC) * 4
+
+
+def _prefix_item(c, task, i):
+    """Round i's prefix-source item of this thread: (live, e, token, column)."""
+    s, tid = c["S"], c["tid"]
+    n = s * QC
+    e = fx.min(tid + THREADS * i, n - 1)
+    return (tid + THREADS * i) < n, e, e // QC, task * COLS + (e % QC) * 4
+
+
+def split_slice_loads(c, task):
+    """The split slice's loads: every block item's words, every prefix item's
+    incoming prefix words, the norm / qk words (the same columns every item)."""
+    s, nb = c["S"], c["NB"]
+    a = c["args"]
+    pre_in = a["prefix_in"] if "prefix_in" in a else a["prefix"]
+    blk = []
+    for i in range((s * nb * QC + THREADS - 1) // THREADS):
+        _, _, t, src, col = _block_item(c, task, i)
+        blk.append(_raw4(a["blocks"], t * a["blk_sm"] + src * a["blk_sr"] + col))
+    pre = []
+    for i in range((s * QC + THREADS - 1) // THREADS):
+        _, _, t, col = _prefix_item(c, task, i)
+        pre.append(_raw4(pre_in, t * HIDDEN + col))
+    # every item's columns are its thread's (THREADS % QC == 0)
+    col = task * COLS + (c["tid"] % QC) * 4
+    return {
+        "blk": blk,
+        "pre": pre,
+        "w": _raw4(a["ares_nw"], col),
+        "q": _raw4(a["ares_qk"], col),
+    }
+
+
+@flyc.jit
+def _slice_out(c, task, live, e, t, src, v, w, q):
+    """An item's values -> LDS ``vals``, its (token, source) sum of squares and
+    qk dot -> PART (``stage_slice``'s)."""
+    s, ns, lane = c["S"], c["NS"], c["lane"]
+    row = t * ns + src
+    if const_expr(c.get("vals_bf16", False)):
+        if live:
+            fx.ptr_store(bf4_words(v), c["vals"] + (row * COLS + (e % QC) * 4) // 2)
+    elif live:
+        for j in range_constexpr(4):
+            fx.ptr_store(v[j], c["vals"] + (row * COLS + (e % QC) * 4 + j))
+    sq = v[0] * v[0] + v[1] * v[1] + v[2] * v[2] + v[3] * v[3]
+    dt = (
+        v[0] * (w[0] * q[0])
+        + v[1] * (w[1] * q[1])
+        + v[2] * (w[2] * q[2])
+        + v[3] * (w[3] * q[3])
+    )
+    sq = butterfly(sq, (16, 8, 4, 2, 1))
+    dt = butterfly(dt, (16, 8, 4, 2, 1))
+    if live & (lane % 32 == 0):
+        at = ((task * s + t) * ns + src) * 2
+        c["put"](c["part"], at, sq)
+        c["put"](c["part"], at + 1, dt)
+
+
+@flyc.jit
+def slice_blocks(c, task, ld):
+    """The split slice's block sources (``split_slice_loads``' words)."""
+    s, nb = c["S"], c["NB"]
+    w, q = _f4(ld["w"]), _f4(ld["q"])
+    for i in range_constexpr((s * nb * QC + THREADS - 1) // THREADS):
+        live, e, t, src, _ = _block_item(c, task, i)
+        blk = _f4(ld["blk"][i])
+        v = [live.select(blk[j], fx.Float32(0.0)) for j in range(4)]
+        _slice_out(c, task, live, e, t, src, v, w, q)
+
+
+@flyc.jit
+def slice_prefix(c, task, ld):
+    """The split slice's prefix source: prefix + the reduced delta (LDS),
+    rounded to bf16 and stored back (device-coherent under ``fold``)."""
+    s, nb = c["S"], c["NB"]
+    a = c["args"]
+    vals_bf16 = c.get("vals_bf16", False)
+    pre_cm = CM_DEV if c.get("fold", False) else 0
+    w, q = _f4(ld["w"]), _f4(ld["q"])
+    for i in range_constexpr((s * QC + THREADS - 1) // THREADS):
+        live, e, t, col = _prefix_item(c, task, i)
+        pre = _f4(ld["pre"][i])
+        at = t * COLS + (e % QC) * 4
+        if const_expr(vals_bf16):
+            dl = _f4(lds_words2(c["delta_lds"], at // 2))
+        else:
+            dl = [fx.ptr_load(c["delta_lds"] + (at + j)) for j in range(4)]
+        if const_expr(c.get("reset", False)):
+            pre = dl
+        else:
+            pre = [bf16r(pre[j] + dl[j]) for j in range(4)]
+        if live:
+            bo.buffer_store(
+                bf4_words(pre),
+                rsrc(a["prefix"]),
+                (t * HIDDEN + col) // 2,
+                cache_modifier=pre_cm,
+            )
+        v = [live.select(pre[j], fx.Float32(0.0)) for j in range(4)]
+        _slice_out(c, task, live, e, t, nb, v, w, q)
     gpu.barrier()
 
 
