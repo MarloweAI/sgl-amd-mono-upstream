@@ -177,11 +177,70 @@ def emulate_main(args):
               flush=True)
     err = [int(w) for w in epoch[: guard.GUARD_WORDS].tolist()]
     print("EMU guard words", err, flush=True)
-    ok = all(r["pre_bad"] == 0 and r["rel_fused"] <= 1.05 * r["rel_stock"] + 1e-6 for r in results)
+    moe_ok = emulate_moe(args, dev)
+    ok = moe_ok and all(r["pre_bad"] == 0 and r["rel_fused"] <= 1.05 * r["rel_stock"] + 1e-6 for r in results)
     if args.json:
         with open(args.json, "w") as f:
             json.dump({"mode": "emulate", "cases": results}, f, indent=1)
     print("EMU", "PASS" if ok else "FAIL", flush=True)
+    return ok
+
+
+LAT, SHR = 3584, 7168
+
+
+def moe_inputs(m, s, dev):
+    g = torch.Generator(device=dev).manual_seed(777 + 13 * m + s)
+    xl = (torch.randn(TP, m, LAT, generator=g, device=dev) * 0.3).to(BF)
+    xs = (torch.randn(TP, m, SHR, generator=g, device=dev) * 0.3).to(BF)
+    return xl, xs
+
+
+def moe_refs(xl, xs, w, eps):
+    """(latent sum, shared sum) in rank order, SGLang's RMSNorm of the latent sum, and its f64 norm."""
+    al, as_ = ar_rank_order(xl), ar_rank_order(xs)
+    n = stock_rmsnorm(LAT, eps, w)(al.clone())
+    a64 = xl.double().sum(0)
+    r64 = a64 / torch.sqrt((a64 * a64).mean(-1, keepdim=True) + eps) * w.double()
+    return al, as_, n, r64
+
+
+def emulate_moe(args, dev):
+    from sgl_amd_mono.common import guard
+    from sgl_amd_mono.common.peer import PeerBuffer
+    from sgl_amd_mono.kimi_k3.gfx950.stages import ar_norm as N
+
+    blocks, mr = 32, N.MAX_ROWS
+    launch = N.build_moe(args.eps, 2, blocks=blocks, emulate=True)
+    bufs = [PeerBuffer(N.moe_peer_bytes(), None, 0, 1, dev, init=N.moe_arm) for _ in range(TP)]
+    table = torch.tensor([b.local for b in bufs], dtype=torch.int64, device=dev)
+    ep = torch.zeros(guard.GUARD_WORDS, dtype=torch.int32, device=dev)
+    ep[guard.GUARD_DEADLINE] = guard.deadline_ticks(args.deadline) & 0x7FFFFFFF
+    w = (1 + 0.1 * torch.randn(LAT, device=dev)).to(BF)
+    ok = True
+    for m in args.rows:
+        for s in range(SETS):
+            xl, xs = moe_inputs(m, s, dev)
+            pl = torch.zeros(TP, mr, LAT, dtype=BF, device=dev)
+            ps = torch.zeros(TP, mr, SHR, dtype=BF, device=dev)
+            pl[:, :m].copy_(xl)
+            ps[:, :m].copy_(xs)
+            ol, on, os_ = torch.zeros_like(pl), torch.zeros_like(pl), torch.zeros_like(ps)
+            ep[0:1].add_(1)
+            for slot in range(2):
+                launch(pl.data_ptr(), ps.data_ptr(), w.data_ptr(), ol.data_ptr(), os_.data_ptr(), on.data_ptr(), m,
+                       table.data_ptr(), 0, ep.data_ptr(), slot, stream=torch.cuda.current_stream())
+            torch.cuda.synchronize()
+            al, as_, n, r64 = moe_refs(xl, xs, w, args.eps)
+            bl = int((ol[:, :m].view(torch.int16) != al.view(torch.int16)).sum())
+            bs = int((os_[:, :m].view(torch.int16) != as_.view(torch.int16)).sum())
+            bn = int((on[:, :m].view(torch.int16) != n.view(torch.int16)).sum())
+            rf = max(rel_l2(on[r, :m], r64) for r in range(TP))
+            rs_ = rel_l2(n, r64)
+            ok &= bl == 0 and bs == 0 and rf <= 1.05 * rs_ + 1e-6
+            print(f"EMU moe m={m:3d} set {s} latent_bad={bl} shared_bad={bs} norm_vs_stock_bad={bn} "
+                  f"rel_fused={rf:.3e} rel_stock={rs_:.3e}", flush=True)
+    print("EMU moe guard", ep[:8].tolist(), flush=True)
     return ok
 
 
@@ -486,6 +545,63 @@ def moe_halves(args, cpu, dev, rank, record, nl, m, ca, out):
         torch.cuda.synchronize()
         record(f"stock_moe_{h}{'_ar+norm' if norm else '_ar'}", m, e0.elapsed_time(e1) * 1000 / (args.reps * nl))
         peer.close()
+    # the flat [latent | shared] all-reduce in one launch, the latent's RMSNorm in it
+    launch = N.build_moe(args.eps, nl)
+    peer = PeerBuffer(N.moe_peer_bytes(), cpu, rank, TP, dev, init=N.moe_arm)
+    ep = torch.zeros(guard.GUARD_WORDS, dtype=torch.int32, device=dev)
+    ep[guard.GUARD_DEADLINE] = guard.deadline_ticks(args.deadline) & 0x7FFFFFFF
+    xl, xs = moe_inputs(m, 0, dev)
+    w = (1 + 0.1 * torch.randn(LAT, device=dev)).to(BF)
+    dist.broadcast(w, 0)
+    al, as_, n, r64 = moe_refs(xl, xs, w, args.eps)
+    pl = xl[rank].unsqueeze(0).expand(nl, m, LAT).contiguous()
+    ps = xs[rank].unsqueeze(0).expand(nl, m, SHR).contiguous()
+    ol, on, os_ = torch.empty_like(pl), torch.empty_like(pl), torch.empty_like(ps)
+
+    def body():
+        ep[0:1].add_(1)
+        for i in range(nl):
+            launch(pl[i].data_ptr(), ps[i].data_ptr(), w.data_ptr(), ol[i].data_ptr(), os_[i].data_ptr(),
+                   on[i].data_ptr(), m, peer.addresses.data_ptr(), rank, ep.data_ptr(), i,
+                   stream=torch.cuda.current_stream())
+
+    us = graph_time(body, args.reps, nl)
+    bad = torch.tensor([int((ol.view(torch.int16) != al.view(torch.int16)).sum()),
+                        int((os_.view(torch.int16) != as_.view(torch.int16)).sum()),
+                        int((on.view(torch.int16) != n.view(torch.int16)).sum())], dtype=torch.int64, device=dev)
+    dist.all_reduce(bad)
+    rel = rel_l2(on[0], r64)
+    if rank == 0:
+        print(f"CHECK moe flat m={m:3d} latent_bad={int(bad[0])} shared_bad={int(bad[1])} "
+              f"norm_vs_stock_bad={int(bad[2])} rel_fused={rel:.3e} rel_stock={rel_l2(n, r64):.3e}", flush=True)
+    out["check"].append({"moe": "flat", "m": m, "bad": bad.tolist(), "rel_fused": rel, "rel_stock": rel_l2(n, r64)})
+    record("fused_moe_flat+norm", m, us)
+    snorm = stock_rmsnorm(LAT, args.eps, w)
+    flats = [torch.cat([xl[rank].reshape(-1), xs[rank].reshape(-1)]) for _ in range(nl)]
+
+    def stock_body():
+        for i in range(nl):
+            r = ca.custom_all_reduce(flats[i])
+            snorm(r[: m * LAT].view(m, LAT))
+
+    stock_body()
+    torch.cuda.synchronize()
+    gr = torch.cuda.CUDAGraph()
+    with ca.capture():
+        with torch.cuda.graph(gr):
+            stock_body()
+    for _ in range(3):
+        gr.replay()
+    torch.cuda.synchronize()
+    dist.barrier()
+    e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    e0.record()
+    for _ in range(args.reps):
+        gr.replay()
+    e1.record()
+    torch.cuda.synchronize()
+    record("stock_moe_flat_ar+norm", m, e0.elapsed_time(e1) * 1000 / (args.reps * nl))
+    peer.close()
 
 
 def time_gather(args, cpu, dev, rank, record, nl):
