@@ -68,6 +68,7 @@ from sgl_amd_mono.common.plan import (
     pair_layout,
 )
 from sgl_amd_mono.common.sync import _SCOPE_CM, Mailbox, _spin, sreg
+from sgl_amd_mono.kimi_k3.gfx950.attention import kda as _kda
 from sgl_amd_mono.kimi_k3.gfx950.attention.kda import (
     BETA_0,
     CONV_W,
@@ -109,6 +110,8 @@ TL_POINTS = 14
 
 # a set spans at most 3 CTAs; a run at most 2 sets
 assert GROUPS * ROWS == NPROJ and SETS * G == GROUPS
+# K1's one-request form reads the same packed in_proj (``kda.w_piece``)
+assert (_kda.W_G, _kda.W_KSTEP, _kda.W_HSTEPS) == (G, KSTEP, HSTEPS)
 assert NMAX < HSTEPS <= 2 * (UNITS // BLOCKS)
 
 _STREAM = fx.Stream(None)
