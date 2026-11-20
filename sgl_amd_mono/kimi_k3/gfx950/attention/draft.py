@@ -98,7 +98,7 @@ def _kv(
 
 
 @triton.jit
-def _split(
+def _k3_draft_attn_split(
     Q,
     K_Buf,
     V_Buf,
@@ -192,7 +192,7 @@ def _split(
 
 
 @triton.jit
-def _merge(
+def _k3_draft_attn_merge(
     Q,
     K_Ext,
     V_Ext,
@@ -337,7 +337,7 @@ class DraftAttention:
         bs = qo_indptr.shape[0] - 1
         assert bs <= self.max_bs
         units = triton.cdiv(TARGET + bs, XCDS) * XCDS
-        self.split_kernel = _split[(H_KV * units,)](
+        self.split_kernel = _k3_draft_attn_split[(H_KV * units,)](
             q,
             k_buf,
             v_buf,
@@ -364,7 +364,7 @@ class DraftAttention:
 
     def merge(self, q, k_ext, v_ext, o, qo_indptr, kv_indptr, sm_scale):
         bs = qo_indptr.shape[0] - 1
-        self.merge_kernel = _merge[(bs, H_Q * self.rows)](
+        self.merge_kernel = _k3_draft_attn_merge[(bs, H_Q * self.rows)](
             q,
             k_ext,
             v_ext,
