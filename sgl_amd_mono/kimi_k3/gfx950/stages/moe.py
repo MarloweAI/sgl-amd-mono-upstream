@@ -1751,19 +1751,45 @@ def stage_ug_w(c, task, ops, bq):
     lds_barrier()
 
 
+def ug_late_rounds(s):
+    """The ug rounds the shared gate/up CTAs sit out: from three token tiles
+    their GEMV (x streamed a K segment a tile) ends ~10 us after the route
+    table, about two ug tasks."""
+    return 2 if len(gemv.tiles(s)) >= 3 else 0
+
+
+def ug_task(c, i):
+    """This CTA's i-th ug task. The first ``ug_late_rounds`` rounds go to the
+    CTAs that are not the shared gate/up's (G_TASKS from NA), then every CTA
+    takes BLOCKS - 1 - bid + BLOCKS j: rising in i."""
+    bid = c["bid"]
+    rev = BLOCKS - 1 - bid
+    r0 = ug_late_rounds(c["S"])
+    if r0 == 0:
+        return rev + BLOCKS * i
+    ng = BLOCKS - G_TASKS
+    is_g = (bid >= NA) & (bid < NA + G_TASKS)
+    # its place among the others, the high CTAs first
+    pos = (bid >= NA + G_TASKS).select(rev, ng - 1 - bid)
+    late = is_g.select(rev + BLOCKS * i, rev + BLOCKS * (i - r0))
+    return ((~is_g) & (i < r0)).select(pos + ng * i, r0 * ng + late)
+
+
 @flyc.jit
 def run_ug_wide(c, total):
-    """This CTA's ug tasks BLOCKS - 1 - bid + BLOCKS i, a task's weights and
-    latent rows a task ahead (the first task's weights in flight while the
-    latent copy lands)."""
+    """This CTA's ug tasks (``ug_task``), a task's weights and latent rows a
+    task ahead (the first task's weights in flight while the latent copy
+    lands)."""
     last = total - 1
-    task = BLOCKS - 1 - c["bid"]
+    i = fx.Int32(0)
+    task = ug_task(c, i)
     ops = ug_loads(c, fx.min(task, last))
     wait_latq(c)
     stamp(c["tl_on"], c["tls"], c["tid"], 12)
     bq = ug_b_loads(c, fx.min(task, last))
     while task < total:
-        nxt = task + BLOCKS
+        i = i + 1
+        nxt = ug_task(c, i)
         ops_n = ug_loads(c, fx.min(nxt, last))
         bq_n = ug_b_loads(c, fx.min(nxt, last))
         stage_ug_w(c, task, ops, bq)
