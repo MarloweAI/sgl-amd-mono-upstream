@@ -9,8 +9,9 @@ hook; the block's keys and values come in as arguments and are not stored: the
 cache rows are the target's, written after verify), D-post (o_proj, its all-reduce
 and the post norm's residual add) and D-MLP (the post norm, gate / up, SiLU, down,
 its all-reduce and the next norm's residual add). The embedding and the final norm
-(on the residual stream, the add done) stay SGLang's. A step of more than
-``MAX_TOKENS`` rows runs the model's own forward.
+(on the residual stream, the add done) stay SGLang's. A draft block step (a
+TARGET_VERIFY batch) of up to ``MAX_TOKENS`` rows takes the launches; any other
+step runs the model's own forward.
 """
 
 from __future__ import annotations
@@ -197,7 +198,7 @@ def install(model, group, deadline_s: float = 20.0) -> bool:
 
     def forward(self, input_ids, positions, forward_batch, input_embeds=None, *args, **kwargs):
         s = positions.shape[0]
-        if s == 0 or s > D.MAX_TOKENS:
+        if not forward_batch.forward_mode.is_target_verify() or s == 0 or s > D.MAX_TOKENS:
             return original(input_ids, positions, forward_batch, input_embeds, *args, **kwargs)
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
