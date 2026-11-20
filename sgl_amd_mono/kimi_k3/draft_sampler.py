@@ -21,7 +21,7 @@ DRAFT = "sglang.srt.models.dspark"
 # by file under sglang/ (the attributes this module reads)
 SGLANG_READS = {
     "srt/kernel_plugins/nvidia/binding.py": ("built_megakernel", '"_megakernel"'),
-    "srt/kernel_plugins/nvidia/dspark_binding.py": ("draft_sampler",),
+    "kernels/plugin_kernels/nvidia/spec.py": ("draft_sampler",),
     "srt/models/dspark.py": (
         "VanillaMarkov",
         "markov_head",
