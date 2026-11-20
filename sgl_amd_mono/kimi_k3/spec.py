@@ -1029,7 +1029,7 @@ class _Built:
         from sgl_amd_mono.kimi_k3.gfx950 import inproj
 
         try:
-            # a packed KDA layer: SGLang's own attention, in_proj unpacked
+            # a packed KDA layer: SGLang's own attention, on the packed buffer as it is
             return inproj.stock_pre_o_proj(attn)(
                 hidden_states=x,
                 positions=self._positions,
