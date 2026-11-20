@@ -350,8 +350,8 @@ def lds_types(key: K2Build) -> K2LdsTypes:
             av: fx.Array[fx.Float32, THREADS, 16]
 
         @fx.struct
-        class DownLds:
-            contrib: fx.Array[fx.Float32, s * k2b.TOPK * k2b.ROWS, 16]
+        class DownLds:  # two units' INTER / ISC tiles
+            tile: fx.Array[fx.Int32, 2 * k2b.ROWS * k2b.TILE_W, 16]
 
         @fx.struct
         class TableLds:  # the route table's build
@@ -541,7 +541,6 @@ def k2_body(key: K2Build, k2_lds: K2Lds, scratch_base, args: dict) -> None:
             "delta_lds": al.dl.ptr,
             "latq": ul.latq.ptr,
             "av": ul.av.ptr,
-            "contrib": dl.contrib.ptr,
             "scan": rl.scan.ptr,
             "vals_bf16": wide,
             "rt": {
@@ -592,7 +591,10 @@ def k2_body(key: K2Build, k2_lds: K2Lds, scratch_base, args: dict) -> None:
             c["rt"]["toff"] = tb.toff.ptr
             c["rt"]["sexp"] = tb.sexp.ptr
             c["lqc"] = scratch_base + fx.Int64(lay["lqc"][0])
+            c["contrib"] = scratch_base + fx.Int64(lay["contrib"][0])
+            c["dtile"] = dl.tile.ptr
         else:
+            c["contrib"] = dl.contrib.ptr
             c["rt"]["kof"] = rl.kof.ptr
             c["latsc"] = ul.latsc.ptr
             c["interq"] = dl.interq.ptr
@@ -632,6 +634,7 @@ def k2_body(key: K2Build, k2_lds: K2Lds, scratch_base, args: dict) -> None:
             "shrdy",
             "lqr",
             "ugd",
+            "dnd",
         ):
             c[region] = sreg(scratch_base, lay[region][0], region)
         on, tls = key.timeline, lds.tls.ptr
@@ -702,21 +705,7 @@ def k2_body(key: K2Build, k2_lds: K2Lds, scratch_base, args: dict) -> None:
         # reversed placement: the round's leftover tasks go to the high CTAs,
         # whose early work ends first (the AttnRes / route CTAs start ug last)
         if const_expr(wide):
-            task = BLOCKS - 1 - bid
-            # the first task's weights in flight while the latent copy lands;
-            # a task's latent rows are issued with its weights, a task ahead
-            ops = k2b.ug_loads(c, fx.min(task, last))
-            k2b.wait_latq(c)
-            stamp(on, tls, tid, 12)
-            bq = k2b.ug_b_loads(c, fx.min(task, last))
-            while task < total:
-                nxt = task + BLOCKS
-                ops_n = k2b.ug_loads(c, fx.min(nxt, last))
-                bq_n = k2b.ug_b_loads(c, fx.min(nxt, last))
-                k2b.stage_ug_w(c, task, ops, bq)
-                task = nxt
-                ops = ops_n
-                bq = bq_n
+            k2b.run_ug_wide(c, total)
         else:
             task = BLOCKS - 1 - bid
             ops = k2b.ug_loads(c, fx.min(task, last))
@@ -728,25 +717,21 @@ def k2_body(key: K2Build, k2_lds: K2Lds, scratch_base, args: dict) -> None:
                 ops = ops_n
         if const_expr(wide):
             k2b.ug_done(c)
-        stamp(on, tls, tid, 3)
-        if bid < k2b.DOWN_TASKS:
-            if const_expr(wide):
-                dops = k2b.down_loads(
-                    c, bid, nu, fx.min(c["wave"], nu - 1), k2b.DOWN_BATCH_W
-                )
-                k2b.wait_ug(c)
-                stamp(on, tls, tid, 15)
-                k2b.stage_down_w(c, bid, nu, dops)
-            else:
+            stamp(on, tls, tid, 3)
+            k2b.run_down_wide(c, nu)
+            stamp(on, tls, tid, 16)
+            # the shared down while the last down tasks land
+            k2b.run_sdown_wide(c, bid, w_sd)
+            if bid < k2b.DOWN_TASKS:
+                k2b.fold_wide(c, bid)
+        else:
+            stamp(on, tls, tid, 3)
+            if bid < k2b.DOWN_TASKS:
                 dops = k2b.down_loads(c, bid, nu, fx.min(c["wave"], nu - 1))
                 k2b.load_inter(c)
                 stamp(on, tls, tid, 15)
                 k2b.stage_down(c, bid, nu, dops)
-            stamp(on, tls, tid, 16)
-        if const_expr(wide):
-            # the shared down on the CTAs with no down task, during down
-            k2b.run_sdown_late(c, bid, w_sd)
-        else:
+                stamp(on, tls, tid, 16)
             if const_expr(key.opt & OPT_SDOWN_FIRST):
                 k2b.run_sdown_first(c, bid, w_sd)
                 k2b.run_sdown_rest(c, bid, w_sd)
