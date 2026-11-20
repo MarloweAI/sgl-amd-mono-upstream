@@ -37,12 +37,12 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl.expr import gpu, range_constexpr
+from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
 from sgl_amd_mono.common.ops import CM_DEV, CM_SYS, bf16_pair, bf_hi, bf_lo, rsrc, sfresh64, sload64
-from sgl_amd_mono.common.sync import SENT, sent_word
+from sgl_amd_mono.common.sync import SENT, Mailbox, sent_word
 from sgl_amd_mono.kimi_k3.gfx950.stamps import stamp
 
 DCP = 8
@@ -57,8 +57,6 @@ REQ_ROWS = 6  # a request's verify rows
 MAX_A2A_ROWS = 48  # the widest build's rows: one copy of the region fits it
 GATE_GROUPS = GATE // 16  # 96 g_proj groups of 16 rows
 LOG2E = 1.4426950408889634
-# the launch's stamp points: g seen, the records seen, core stored
-TL_G, TL_RECORDS, TL_CORE = 14, 15, 16
 NEG_INF = float("-inf")
 
 
@@ -72,7 +70,8 @@ def a2a_copy_bytes() -> int:
 
 
 def peer_offset() -> int:
-    """Where the A2A region starts in a rank's peer buffer: past K2's."""
+    """Where the A2A region starts in a rank's peer buffer: past K2's (the
+    room the front's q all-gather leaves before its QG copies)."""
     from sgl_amd_mono.kimi_k3.gfx950 import layer
 
     return -(-layer.peer_alloc_bytes() // 4096) * 4096
@@ -243,6 +242,11 @@ def stage_combine(c, task):
     s, tid = c["S"], c["tid"]
     a = c["args"]
     red = c["red"]
+    # read before the traced branches (a dict lookup inside one is carried state)
+    box = c.get("core_box")
+    pre_wait = c.get("pre_wait")
+    # the launch's stamp points (g seen, records seen, core stored), if any
+    tlp = c.get("comb_tl")
     b = task // NHL
     hl = task % NHL
     gpr = VD // 16  # g_proj groups a local head
@@ -250,7 +254,11 @@ def stage_combine(c, task):
     if tid < gpr:
         c["poll"]([(c["grdy"], hl * gpr + tid, 1)])
     gpu.barrier()
-    stamp(c["on"], c["tls"], tid, TL_G)
+    if const_expr(tlp is not None):
+        stamp(c["on"], c["tls"], tid, tlp[0])
+    # the launch's own work for the CTA's idle waves (3 ..) during the wait
+    if const_expr(pre_wait is not None):
+        pre_wait(c)
     own = c["a2a_peer"][c["rank"]]
     lt = b * REQ_ROWS + fx.min(tid // DCP, REQ_ROWS - 1)
     lcell = a2a_cell(tid % DCP, lt, hl, LSE_CELL, s)
@@ -270,10 +278,19 @@ def stage_combine(c, task):
     vcells = [a2a_cell(src, t, hl, u, s) for src in range(DCP)]
     if live:
         got = _spin_cells(own, vcells)
-        stamp(c["on"], c["tls"], tid, TL_RECORDS)
+        if const_expr(tlp is not None):
+            stamp(c["on"], c["tls"], tid, tlp[1])
         _rearm(own, vcells)
         lws = [fx.Int32(fx.ptr_load(red + (tr * DCP + src)).bitcast(fx.Int32)) for src in range(DCP)]
         ow = combine4(got, lws, gw)
-        bo.buffer_store(ow, rsrc(a["core"]), (t * GATE + col) // 2)
+        bo.buffer_store(
+            ow, rsrc(a["core"]), (t * GATE + col) // 2,
+            cache_modifier=0 if box is None else CM_DEV,
+        )  # fmt: skip
     gpu.barrier()
-    stamp(c["on"], c["tls"], tid, TL_CORE)
+    if const_expr(tlp is not None):
+        stamp(c["on"], c["tls"], tid, tlp[2])
+    # o_proj in the same launch: the (request, local head) box, after the stores
+    if const_expr(box is not None):
+        if tid == 0:
+            Mailbox(box[1]).put(box[0], task, fx.Int32(1))

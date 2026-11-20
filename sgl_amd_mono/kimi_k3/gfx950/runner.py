@@ -36,7 +36,11 @@ class K3MonoRunner:
         # The launches run one after another, so one buffer the widest of them
         # fits, then K2's tagged x rows.
         front = mla_front.scratch_bytes(
-            mla_front.MlaFrontBuild(tokens=mla_front.G_ROWS, nblocks=MAX_BLOCKS, scale=1.0)
+            mla_front.MlaFrontBuild(
+                tokens=mla_front.G_ROWS * min(mla_front.MAX_REQS, K2_MAX_ROWS // mla_front.G_ROWS),
+                nblocks=MAX_BLOCKS,
+                scale=1.0,
+            )
         )
         # and the one-launch KDA layer's attention part past every other's
         ends = (layer.scratch_alloc_bytes(), front, kda_layer.scratch_end())
@@ -55,10 +59,13 @@ class K3MonoRunner:
         # has no queue -- and this is here for the kernel checks' MoE launch.
         self.queue = torch.zeros(moe.QUEUE_BYTES // 4, dtype=torch.int32, device=device)
         # past the two parity halves, the guard's flag word a rank, then K2's
-        # sentinel regions, then the MLA front's all-to-all cells. The kernels
-        # read them at the same offsets, from the same functions.
-        self.peer = PeerBuffer(mla_combine.peer_end(), group, rank, tp, device)
-        layer.init_peer(self.peer.bytes)
+        # sentinel regions. The kernel reads them at the same offsets, from the
+        # same functions.
+        # ... and the DCP front's q all-gather (QG) copies past them
+        self.peer = PeerBuffer(max(layer.peer_alloc_bytes(), mla_front.peer_end()), group, rank, tp, device)
+        layer.init_peer(self.peer.bytes[: layer.peer_alloc_bytes()])
+        self.peer.bytes[layer.peer_alloc_bytes() :].zero_()
+        # ... and the front's all-to-all (A2A) cells before them, armed
         mla_combine.init_peer(self.peer.bytes)
         # One prefix buffer, not one a layer: the layers run in sequence.
         self.prefix = torch.empty(

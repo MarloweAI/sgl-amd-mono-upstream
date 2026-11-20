@@ -147,6 +147,41 @@ def rows_to_lds(tid, src, k, s, xl, xrow, cm=0, ldk=None, k0=0, t0=0):
     gpu.barrier()
 
 
+def rows_load(tid, src, k, s, cm=0, ldk=None, k0=0, t0=0):
+    """``rows_to_lds``' loads (16 B a lane), for ``rows_store``."""
+    ldk = k if ldk is None else ldk
+    words = s * k // 8
+    out = []
+    for i in range_constexpr((words + THREADS - 1) // THREADS):
+        e = fx.min(tid + THREADS * i, words - 1)
+        t = e // (k // 8)
+        kk = e % (k // 8) * 8
+        out.append(
+            fx.Vector(
+                bo.buffer_load(
+                    rsrc(src),
+                    ((t0 + t) * ldk + k0 + kk) // 2,
+                    vec_width=4,
+                    dtype=T.i32,
+                    cache_modifier=cm,
+                )
+            )
+        )
+    return out
+
+
+@flyc.jit
+def rows_store(tid, vals, k, s, xl, xrow):
+    """``rows_load``'s words -> LDS rows 0 .. s - 1 (``xrow`` a row), no barrier."""
+    words = s * k // 8
+    for i in range_constexpr(len(vals)):
+        e = fx.min(tid + THREADS * i, words - 1)
+        t = e // (k // 8)
+        kk = e % (k // 8) * 8
+        if tid + THREADS * i < words:
+            fx.ptr_store(vals[i], xl + (t * xrow + kk) // 2)
+
+
 def dev_rows_to_lds(tid, src, k, s, xl, xrow, t0=0):
     """``rows_to_lds`` at device scope: rows another CTA of this launch wrote."""
     rows_to_lds(tid, src, k, s, xl, xrow, CM_DEV, t0=t0)

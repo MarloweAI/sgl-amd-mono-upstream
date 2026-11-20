@@ -39,6 +39,7 @@ launch once on real weights, not through FlyDSL's compile-only mode
 
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
 import logging
 import os
@@ -137,6 +138,12 @@ SGLANG_READS = {
         "cprr_kv_indices",
         "cprr_kv_indptr",
         "global_kv_indptr",
+        # the verify plan the front makes for itself (_skip_verify_plan)
+        "AiterAttnBackend",
+        "def make_mla_meta_data(",
+        "is_cp_round_robin",
+        "nhead_override",
+        "cprr_kernel_heads",
     ),
     # the attention stops here and the launch runs o_proj; both attention
     # classes expose it. The rest are what the forward and the checks read.
@@ -347,22 +354,23 @@ def _build(model, hf_config, ctx):
     if mla_off is not None:
         logger.info("monokernel: no MLA projection front: %s", mla_off)
     dcp = p.attn_dcp_size > 1 and front_off is None
+    vcs = _front_vcs(backbone, _covered_layers(hf_config), p.dcp_group) if dcp else {}
     layers, batches = {}, {}
     covered = _covered_layers(hf_config)
     for rows in ctx.widths:
-        fronts = 0
         for i in covered:
             # K1 takes a layer whose prefix the launch in front wrote: not the
             # first covered one, whose prefix the dense layer owes
             k1 = K1 and i - 1 in covered
             packed = _weights(
-                backbone.layers[i], i, rows, runner, mla_off is None, k1, dcp
+                backbone.layers[i], i, rows, runner, mla_off is None, k1, dcp, vcs.get(i)
             )
-            if packed.front is not None:
-                # the front layers' all-to-all regions alternate copies
-                packed.a2a_par = fronts % 2
-                fronts += 1
             layers.setdefault(rows, {})[i] = packed
+        # consecutive DCP fronts take alternate QG copies (mla_front.peer_end)
+        fronts = [p for _, p in sorted(layers[rows].items()) if p.front is not None]
+        for n, p in enumerate(fronts):
+            key, w = p.front
+            p.front = (dataclasses.replace(key, qg_par=n % 2), w)
         # FlyDSL compiles a launcher on its first call, and the first real call
         # is inside a CUDA graph capture, where compiling aborts the process.
         # A compile-only call cannot stand in: with zero arguments the buffer
@@ -507,7 +515,7 @@ SPEC = MonoSpec(
     },
     # The measured win is on DSpark target-verify steps; a plain decode step of
     # at most K2_MAX_ROWS rows takes the same launch. DCP (CONTEXT_PARALLEL)
-    # shards the MLA layers' KV, whose attention runs on SGLang's path.
+    # shards the MLA layers' KV.
     features=frozenset({Feature.SPECULATIVE_DECODING, Feature.CONTEXT_PARALLEL}),
     requires=Requirements(
         dtypes=frozenset({"bfloat16"}),
@@ -544,7 +552,6 @@ class _Layer(msgspec.Struct):
     # (MlaFrontBuild, weights): an MLA layer's attention under DCP8, up to the
     # gated core (gfx950/attention/mla_front.py)
     front: Any = None
-    a2a_par: int = 0  # the front's all-to-all region copy
 
 
 def _k2_blocks(layer) -> int:
@@ -582,23 +589,24 @@ def _dcp_front_disable_reason(parallel) -> str | None:
 
 
 def _weights(
-    layer, i: int, rows: int, runner, mla: bool, k1: bool, dcp: bool
+    layer, i: int, rows: int, runner, mla: bool, k1: bool, dcp: bool, vc=None
 ) -> _Layer:
     """This layer's build key at one launch width. The weights themselves are
-    read in place at launch, so nothing is packed or copied here."""
+    read in place at launch, so nothing is packed or copied here; ``vc`` is the
+    DCP front's all-head W_UV (_front_vcs)."""
     from sgl_amd_mono.kimi_k3.gfx950 import k1 as k1_mod
     from sgl_amd_mono.kimi_k3.gfx950 import layer as k2
     from sgl_amd_mono.kimi_k3.gfx950.layer import K2Build
 
     moe = layer.mlp
-    # K1 decides its own widths (k1.build); the MLA front takes up to MAX_ROWS
-    # rows. A step a front does not take keeps SGLang's attention and enters the
-    # layer launch at o_proj's input.
-    front = rows <= MAX_ROWS
+    # K1 decides its own widths (k1.build); the MLA projection front takes up
+    # to MAX_ROWS rows. A step a front does not take keeps SGLang's attention
+    # and enters the layer launch at o_proj's input.
+    narrow = rows <= MAX_ROWS
     return _Layer(
         k1=k1_mod.build(layer, i, rows) if k1 else None,
-        mla=_mla_build(layer, rows) if mla and front else None,
-        front=_front_build(layer, rows) if dcp else None,
+        mla=_mla_build(layer, rows) if mla and narrow else None,
+        front=_front_build(layer, rows, vc) if dcp else None,
         i=i,
         key=K2Build(
             tokens=rows,
@@ -692,16 +700,37 @@ def _mla_outputs(rows: int, device) -> dict:
     }  # fmt: skip
 
 
-def _front_build(layer, rows: int):
+def _front_vcs(backbone, layers, group) -> dict:
+    """Each MLA layer's W_UV for all 96 heads, [96, 512, 128] bf16: the DCP
+    ranks' 12-head shards gathered in rank order. SGLang's own full-head copy
+    (dcp_replicate_q_proj) is made only after this build. A collective: every
+    rank gathers the same layers in the same order."""
+    out = {}
+    for i in layers:
+        attn = getattr(backbone.layers[i], "self_attn", None)
+        w = getattr(attn, "w_vc", None)
+        if hasattr(attn, "qkv_conv1d") or not isinstance(w, torch.Tensor):
+            continue
+        if w.dtype == torch.bfloat16:
+            out[i] = group.all_gather(w.contiguous(), dim=0)
+    return out
+
+
+def _front_build(layer, rows: int, vc):
     """An MLA layer's DCP8 front key and the weights it reads in place, or None:
-    a KDA layer, a width other than one request's verify block, or weights the
-    launch does not take (SGLang's path)."""
+    a KDA layer, a width other than 1 .. 8 requests' verify blocks, or weights
+    the launch does not take (SGLang's path). Each width has its own build."""
     from sgl_amd_mono.kimi_k3.gfx950.attention import mla_front as mf
     from sgl_amd_mono.kimi_k3.gfx950.stages.dims import HIDDEN
 
     attn = layer.self_attn
     fused = getattr(attn, "fused_qkv_a_proj_with_mqa", None)
-    if rows != mf.G_ROWS or hasattr(attn, "qkv_conv1d") or fused is None:
+    if (
+        rows % mf.G_ROWS
+        or rows // mf.G_ROWS > mf.MAX_REQS
+        or hasattr(attn, "qkv_conv1d")
+        or fused is None
+    ):
         return None
     mqa = getattr(attn, "attn_mqa", None)
     w = {
@@ -712,18 +741,14 @@ def _front_build(layer, rows: int):
         "w_g": getattr(getattr(attn, "g_proj", None), "weight", None),
         "q_nw": attn.q_a_layernorm.weight,
         "kv_nw": attn.kv_a_layernorm.weight,
-        "w_qb": getattr(attn, "q_b_proj_qrep_weight", None),
-        "w_kc": getattr(attn, "w_kc_qrep", None),
-        "w_vc": getattr(attn, "w_vc_qrep", None),
+        # this rank's 12 heads' shards (the q all-gather covers the rest)
+        "w_qb": getattr(getattr(attn, "q_b_proj", None), "weight", None),
+        "w_kc": getattr(attn, "w_kc", None),
+        "w_vc": vc,
     }
-    for n, shp in mf.WEIGHT_SHAPES.items():
+    for n in mf.WEIGHT_SHAPES:
         t = w[n]
-        if (
-            not isinstance(t, torch.Tensor)
-            or t.dtype != torch.bfloat16
-            or tuple(t.shape) != shp
-            or not t.is_contiguous()
-        ):
+        if not mf.weight_ok(n, t):
             logger.info("monokernel: no DCP front for layer %d: %s is %s", layer.layer_id if hasattr(layer, "layer_id") else -1, n, None if t is None else (t.dtype, tuple(t.shape)))  # fmt: skip
             return None
     if mqa is None or getattr(attn, "rotary_emb", None) is not None:
@@ -741,6 +766,76 @@ def _front_build(layer, rows: int):
     return (key, w)
 
 
+# The step widths at which every MLA layer runs the DCP front, and the target's
+# MLA backends the front has run on: there SGLang's verify attention plan
+# (make_mla_meta_data, aiter's get_mla_metadata_v1) has no reader. Set with
+# the plan's skip at the front's first launch (_front_plan_skip).
+_FRONT_ROWS: frozenset = frozenset()
+_FRONT_BACKENDS = None
+
+
+def _front_plan_skip(built, backend) -> None:
+    """This module's skip of SGLang's verify plan, from the widths ``built``
+    fronts every MLA layer at; ``backend`` among the backends it applies to."""
+    import weakref
+
+    global _FRONT_ROWS, _FRONT_BACKENDS
+    if _FRONT_BACKENDS is None:
+        _FRONT_ROWS = frozenset(
+            rows for rows, packed in built._by_width.items()
+            if _every_mla_layer_fronted(built.backbone, packed)
+        )  # fmt: skip
+        _FRONT_BACKENDS = weakref.WeakSet()
+        _skip_verify_plan()
+    _FRONT_BACKENDS.add(backend)
+
+
+def _every_mla_layer_fronted(backbone, packed_layers: dict) -> bool:
+    """Whether every MLA (full-attention) layer this process runs has the DCP
+    front at this width (a layer it does not hold has no attention)."""
+    mla = [
+        i for i, layer in enumerate(backbone.layers)
+        if hasattr(layer, "self_attn") and not hasattr(layer.self_attn, "qkv_conv1d")
+    ]  # fmt: skip
+    return bool(mla) and all(
+        i in packed_layers and packed_layers[i].front is not None for i in mla
+    )
+
+
+def _skip_verify_plan() -> None:
+    """SGLang's DCP verify plan is skipped for the target backends the front
+    runs on, at its widths: the cp round-robin call with the asm verify's
+    head count, whose step is ``_FRONT_ROWS`` rows. Every other call (the
+    drafter's backend, decode, extend, other widths) runs as SGLang's, and so
+    does every call while another copy of this module is the loaded one (a
+    hot swap's other arm)."""
+    import functools
+    import inspect
+    import sys
+
+    from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
+
+    mod = sys.modules[__name__]
+    orig = AiterAttnBackend.make_mla_meta_data
+    sig = inspect.signature(getattr(orig, "__wrapped__", orig))
+
+    @functools.wraps(orig)
+    def make_mla_meta_data(self, *args, **kwargs):
+        if sys.modules.get(__name__) is mod and self in _FRONT_BACKENDS:
+            a = sig.bind(self, *args, **kwargs).arguments
+            rows = (a["qo_indptr"].numel() - 1) * int(a["max_q_len"])
+            if (
+                a.get("is_cp_round_robin", False)
+                and a.get("nhead_override") is not None
+                and a["nhead_override"] == self.cprr_kernel_heads
+                and rows in _FRONT_ROWS
+            ):
+                return None
+        return orig(self, *args, **kwargs)
+
+    AiterAttnBackend.make_mla_meta_data = make_mla_meta_data
+
+
 def _front_core_buffer(rows: int, device) -> torch.Tensor:
     """The DCP front's gated core, a width."""
     from sgl_amd_mono.kimi_k3.gfx950.attention import mla_front as mf
@@ -749,21 +844,22 @@ def _front_core_buffer(rows: int, device) -> torch.Tensor:
 
 
 def _front_warmup(runner, packed, rows: int, blocks) -> None:
-    """The DCP front once, on throwaway KV and a request at P = 0."""
+    """The DCP front once, on throwaway KV and every request at P = 0."""
     from sgl_amd_mono.kimi_k3.gfx950.attention import mla_front as mf
 
     dev = runner.device
     key, w = packed.front
+    nreq = rows // mf.G_ROWS
     mf.mla_front_launch(
         key, prefix=runner.prefix[:rows], blocks=blocks, w=w,
         kv=torch.zeros(64, mf.DQK, dtype=torch.uint8, device=dev),
         kv_idx=torch.zeros(8, dtype=torch.int32, device=dev),
-        kv_ptr=torch.tensor([0, 1], dtype=torch.int32, device=dev),
-        g_kv_ptr=torch.tensor([0, rows], dtype=torch.int32, device=dev),
+        kv_ptr=torch.tensor([0] + [1] * nreq, dtype=torch.int32, device=dev),
+        g_kv_ptr=torch.arange(nreq + 1, dtype=torch.int32, device=dev) * mf.G_ROWS,
         loc=torch.zeros(rows, dtype=torch.int64, device=dev),
         core=_front_core_buffer(rows, dev), scratch=runner.scratch,
-        peers=runner.peer.addresses, rank=runner.dcp_rank, a2a_par=packed.a2a_par,
-        layer=packed.i, epoch=runner.epoch,
+        peers=runner.peer.addresses, rank=runner.dcp_rank, layer=packed.i,
+        epoch=runner.epoch,
     )  # fmt: skip
 
 
@@ -1090,6 +1186,11 @@ class _Built:
         state = self._k1_state
         if packed.front is not None and _mla_covered(packed.front, hidden, bank):
             return self._front_core(layer, packed, hidden, bank, forward_batch)
+        # At these widths SGLang's verify plan is not made: an MLA layer must
+        # take the front
+        assert packed.front is None or hidden.shape[0] not in _FRONT_ROWS, (
+            "an MLA layer declined the DCP front at a width without SGLang's plan"
+        )
         if packed.mla is not None and _mla_covered(packed.mla, hidden, bank):
             return self._mla_core(
                 layer, packed, hidden, bank, forward_batch, zero_allocator
@@ -1155,6 +1256,7 @@ class _Built:
         # the MLA layers' backend: the hybrid model's full-attention one
         backend = get_attn_backend()
         backend = getattr(backend, "full_attn_backend", backend)
+        _front_plan_skip(self, backend)
         fm = backend.forward_metadata
         kv = backend.kv_layers.read(attn.attn_mqa.layer_id).key()
         # The launch reads the stream and does not add to it, as K1 does.
@@ -1163,9 +1265,9 @@ class _Built:
             key, prefix=hidden, blocks=bank.block_residual, w=w,
             kv=kv.view(-1, mf.DQK), kv_idx=fm.cprr_kv_indices,
             kv_ptr=fm.cprr_kv_indptr, g_kv_ptr=fm.global_kv_indptr,
-            loc=forward_batch.out_cache_loc, core=core, scratch=self.runner.scratch,
-            peers=self.runner.peer.addresses, rank=self.runner.dcp_rank,
-            a2a_par=packed.a2a_par, layer=packed.i, epoch=self.runner.epoch,
+            loc=forward_batch.out_cache_loc, core=core,
+            scratch=self.runner.scratch, peers=self.runner.peer.addresses,
+            rank=self.runner.dcp_rank, layer=packed.i, epoch=self.runner.epoch,
         )  # fmt: skip
         if key.write_idx >= 0:
             bank._count_write(None)  # the launch wrote the bank row
