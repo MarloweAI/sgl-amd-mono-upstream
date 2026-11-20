@@ -3,10 +3,10 @@
 (S = R L rows, R >= 1): the layer input (after ``input_layernorm``) to the gated
 core output, on the ReplaySSM ring. One launch, ``BLOCKS`` CTAs x ``THREADS``.
 
-    gemv    in_proj: 197 pairs of 16-row groups x 14 K steps of 64 a wave
-            (wave w streams K 896 w .. 896 (w + 1)), 2758 units in equal runs
-            of 10 or 11 over the CTAs; the two groups share every x load. A
-            run's pieces are summed in wave order; a pair's head CTA adds the
+    gemv    in_proj: 131 sets of three 16-row groups x 14 K steps of 64 a
+            wave (wave w streams K 896 w .. 896 (w + 1)), 1834 units in equal
+            runs of 7 or 8 over the CTAs; a set's groups share every x load.
+            A run's pieces are summed in wave order; a set's head CTA adds the
             pieces of the next one or two CTAs in order -> bf16 PROJ pairs
     kda     a task a (request, head) on CTA 128 + t (at most 10 requests): its
             state, conv window, f_b rows and constants loaded first, then
@@ -74,18 +74,21 @@ from sgl_amd_mono.kimi_k3.gfx950.tag import step_tag
 SOURCES = kernel_sources(__name__)
 
 GROUPS = NPROJ // ROWS  # 393
-PAIRS = (GROUPS + 1) // 2  # 197; the last pair's second group is past the rows
+G = 3  # groups a unit: their rows share every x load
+SETS = GROUPS // G  # 131 sets of three groups
 KSTEP = 64  # K a wave's step
-HSTEPS = HIDDEN // KSTEP // WAVES  # 14 steps a wave a pair
-UNITS = PAIRS * HSTEPS  # 2758 (pair, step) units
-NMAX = (UNITS + BLOCKS - 1) // BLOCKS  # 11: a CTA's run is 10 or 11 units
+HSTEPS = HIDDEN // KSTEP // WAVES  # 14 steps a wave a set
+UNITS = SETS * HSTEPS  # 1834 (set, step) units
+NMAX = (UNITS + BLOCKS - 1) // BLOCKS  # 8: a CTA's run is 7 or 8 units
 TASK0 = 128  # the first KDA task's CTA
 SCALE = HD**-0.5
 # timeline points: start, gemv MFMAs done (every wave), gemv emitted, task inputs issued,
 # conv inputs polled, conv done, gates + l2norm done, recurrence done, norm done
 TL_POINTS = 9
 
-assert GROUPS * ROWS == NPROJ and NMAX < HSTEPS  # a pair spans at most 3 CTAs
+# a set spans at most 3 CTAs; a run at most 2 sets
+assert GROUPS * ROWS == NPROJ and SETS * G == GROUPS
+assert NMAX < HSTEPS <= 2 * (UNITS // BLOCKS)
 
 _STREAM = fx.Stream(None)
 
@@ -106,7 +109,7 @@ def tiles(key):
 
 
 def depth(key):
-    return key.depth or (5, 3, 2)[tiles(key) - 1]
+    return key.depth or (3, 2, 1)[tiles(key) - 1]
 
 
 KPT = 16  # K columns a lane holds of a state row, at every width
@@ -114,7 +117,7 @@ KPT = 16  # K columns a lane holds of a state row, at every width
 
 def scratch_layout(key: KdaWideBuild) -> dict:
     return pair_layout(
-        [("proj", key.tokens * NPROJ), ("part", BLOCKS * 2 * ROWS * key.tokens)]
+        [("proj", key.tokens * NPROJ), ("part", BLOCKS * G * ROWS * key.tokens)]
     )
 
 
@@ -172,18 +175,18 @@ def _loads(c, p, hs, live):
             for q in range(KSTEP // 32)
         ]  # fmt: skip
 
-    ws = [ld(wr, (2 * p + g) * ROWS + lane % ROWS, CM_NT) for g in range(2)]
+    ws = [ld(wr, (G * p + g) * ROWS + lane % ROWS, CM_NT) for g in range(G)]
     xs = [ld(xr, fx.min(tt * 16 + lane % 16, s - 1), 0) for tt in range(c["T"])]
     return ws, xs
 
 
 def _slot_w(c):
-    return 2 * c["T"] * WAVES * 64 * 4  # LDS floats a piece
+    return G * c["T"] * WAVES * 64 * 4  # LDS floats a piece
 
 
 @flyc.jit
 def gemv_loop(c):
-    """This CTA's run of units (pair of groups, K step): the waves' partial
+    """This CTA's run of units (set of groups, K step): the waves' partial
     sums of its one or two pieces -> LDS."""
     tid, lane, wave, nt, d, bid = c["tid"], c["lane"], c["wave"], c["T"], c["D"], c["bid"]
     u0, u1 = uniform(_u0(bid)), uniform(_u0(bid + 1))
@@ -194,10 +197,10 @@ def gemv_loop(c):
         u = u0 + i
         return u // HSTEPS, u % HSTEPS, u < u1
 
-    acc = [[fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(nt)] for _ in range(2)]
+    acc = [[fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(nt)] for _ in range(G)]
 
     def spill(slot):
-        for gs in range_constexpr(2):
+        for gs in range_constexpr(G):
             for tt in range_constexpr(nt):
                 fx.ptr_store(
                     acc[gs][tt],
@@ -218,18 +221,18 @@ def gemv_loop(c):
         rocdl.sched_barrier(0)
         ws, xs = pend.pop(i)
         if const_expr(i > 0):
-            # the run crosses into the next pair here: the first piece is done
+            # the run crosses into the next set here: the first piece is done
             p, hs, live = unit(i)
             cross = (hs == 0) & live
             if cross:
                 spill(0)
-            for gs in range_constexpr(2):
+            for gs in range_constexpr(G):
                 for tt in range_constexpr(nt):
                     acc[gs][tt] = cross.select(fx.Vector.filled(4, 0.0, fx.Float32), acc[gs][tt])
         for q in range_constexpr(KSTEP // 32):
             for tt in range_constexpr(nt):
                 xb = xs[tt][q].bitcast(fx.BFloat16)
-                for gs in range_constexpr(2):
+                for gs in range_constexpr(G):
                     acc[gs][tt] = mfma_bf16(ws[gs][q].bitcast(fx.BFloat16), xb, acc[gs][tt])
         rocdl.sched_barrier(0)
     spill(1)
@@ -239,8 +242,8 @@ def gemv_loop(c):
 
 @flyc.jit
 def gemv_emit(c):
-    """The run's pieces: a piece that starts its pair's K is the pair's head,
-    and its CTA adds the pair's later pieces (published by the next one or two
+    """The run's pieces: a piece that starts its set's K is the set's head,
+    and its CTA adds the set's later pieces (published by the next one or two
     CTAs) in order -> bf16 PROJ pairs. The split depends on the CTA alone,
     never on the width."""
     s, tid, nt, bid = c["S"], c["tid"], c["T"], c["bid"]
@@ -250,7 +253,7 @@ def gemv_emit(c):
     pa, hsa = u0 // HSTEPS, u0 % HSTEPS
     crosses = (u1 - 1) // HSTEPS != pa
     # slot 0: the first piece when the run crosses; slot 1: the last piece
-    n = 2 * ROWS * s
+    n = G * ROWS * s
     per = (n + THREADS - 1) // THREADS
 
     def piece_sum(slot, e):
@@ -262,14 +265,14 @@ def gemv_emit(c):
         return tot
 
     es = [fx.min(tid + THREADS * it, n - 1) for it in range(per)]
-    # a piece that is not its pair's head: published for the head's CTA
+    # a piece that is not its set's head: published for the head's CTA
     pub_slot = crosses.select(0, 1)
     if crosses | (hsa != 0):
         for it in range_constexpr(per):
             v = piece_sum(pub_slot, es[it])
             if tid + THREADS * it < n:
                 c["put"](c["part"], bid * n + es[it], v)
-    # the head this CTA owns (the last piece), and its pair's later pieces
+    # the head this CTA owns (the last piece), and its set's later pieces
     ph = crosses.select(pa + 1, pa)
     if crosses | (hsa == 0):
         nb1, nb2 = fx.min(bid + 1, BLOCKS - 1), fx.min(bid + 2, BLOCKS - 1)
@@ -282,8 +285,8 @@ def gemv_emit(c):
             tot = two.select(tot + f32_of(got2[it][0]), tot)
             v = bf16r(tot)
             gs, r, tok = e // (ROWS * s), e % ROWS, (e // ROWS) % s
-            row = (2 * ph + gs) * ROWS + r
-            if (tid + THREADS * it < n) & (row < NPROJ):
+            row = (G * ph + gs) * ROWS + r
+            if tid + THREADS * it < n:
                 c["put"](c["proj"], tok * NPROJ + row, v)
                 if const_expr(c["debug"]):
                     bo.buffer_store(v.to(fx.BFloat16), rsrc(c["args"]["proj_dbg"]), tok * NPROJ + row)
@@ -566,14 +569,26 @@ def build(key: KdaWideBuild):
     lay = scratch_layout(key)
 
     @fx.struct
-    class Smem:
-        red: fx.Array[fx.Float32, 2 * 2 * nt * WAVES * 64 * 4, 16]
+    class GemvLds:
+        red: fx.Array[fx.Float32, 2 * G * nt * WAVES * 64 * 4, 16]
+
+    @fx.struct
+    class KdaLds:
         fa: fx.Array[fx.Float32, L * HD, 16]
         qkl: fx.Array[fx.Float32, 2 * L * HD, 16]
         decay: fx.Array[fx.Float32, L * HD, 16]
         vloc: fx.Array[fx.Float32, L * HD, 16]
         ol: fx.Array[fx.Float32, L * HD, 16]
         beta: fx.Array[fx.Float32, 16, 16]
+
+    # the KDA task's LDS reuses the in_proj partials' once they are emitted
+    @fx.union
+    class RoleLds:
+        gemv: GemvLds
+        kda: KdaLds
+
+    @fx.struct
+    class Smem:
         tls: fx.Array[fx.Int64, TL_POINTS, 16]
 
     keyed = key_tuple(key, SOURCES)
@@ -620,7 +635,10 @@ def build(key: KdaWideBuild):
         _ = keyed
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
-        lds = fx.SharedAllocator().allocate(Smem).peek()
+        alloc = fx.SharedAllocator()
+        lds = alloc.allocate(Smem).peek()
+        role = alloc.allocate(RoleLds)
+        gl, kl = role.gemv.peek(), role.kda.peek()
         mb = Mailbox(step_tag(epoch, layer) - 1)
         c = {
             "S": s,
@@ -637,13 +655,13 @@ def build(key: KdaWideBuild):
             "onorm_eps": key.onorm_eps,
             "put": mb.put,
             "poll": mb.poll,
-            "red": lds.red.ptr,
-            "fa": lds.fa.ptr,
-            "qkl": lds.qkl.ptr,
-            "decay": lds.decay.ptr,
-            "vloc": lds.vloc.ptr,
-            "ol": lds.ol.ptr,
-            "beta": lds.beta.ptr,
+            "red": gl.red.ptr,
+            "fa": kl.fa.ptr,
+            "qkl": kl.qkl.ptr,
+            "decay": kl.decay.ptr,
+            "vloc": kl.vloc.ptr,
+            "ol": kl.ol.ptr,
+            "beta": kl.beta.ptr,
             "on": key.timeline,
             "tls": lds.tls.ptr,
             "proj": sreg(scratch, lay["proj"][0], "proj"),
