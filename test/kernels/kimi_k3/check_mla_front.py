@@ -24,9 +24,16 @@ same KV slice and the same rows and positions:
   3 and 7 others of mixed contexts (12, 24, 48 rows, at different places in the
   batch): every output of the request bit for bit the same at every width, and
   the widest batch run to run.
+* ``--digest``: a hash of every launch's outputs (the written split slots of
+  pv / ml, this rank's heads of q_b), equal in every process on the same
+  arguments (``check_mla_front_xproc.py``); ``--scratch-fill``: every launch's
+  scratch filled with that byte first, so no output may read a byte the launch
+  did not write.
 """
 
 import argparse
+import atexit
+import hashlib
 import math
 import sys
 import types
@@ -313,10 +320,14 @@ class Peers:
             self.buf.bytes[o * self.stride + self.mc.peer_offset() : o * self.stride + self.mc.peer_end()].fill_(0xFF)
 
     def stand_in(self, o, tag):
-        """Rank o's (source, request) flags as the launch tagged ``tag`` reads them."""
+        """The other sources' (source, request) flags in rank o's copy as the
+        launch tagged ``tag`` reads them. Its own its launch raises once its q
+        is in: raised here, its attention would read its q before it lands."""
         f = self.flags(o)
-        f[..., 0] = 1
-        f[..., 1] = tag
+        for src in range(DCP):
+            if src != o:
+                f[src, :, 0] = 1
+                f[src, :, 1] = tag
 
 
 _PEERS = {}
@@ -358,6 +369,8 @@ def launch_one(w, st, b, epoch, layer, peers, *, timeline=False, x=None):
     key = front_key(w, s, timeline, x_in=x is not None)
     dev = b.pool.device
     scratch = scratch_for(key, dev)
+    if SCRATCH_FILL[0] is not None:
+        scratch.fill_(SCRATCH_FILL[0])
     core = torch.zeros(s, NHL * VD, dtype=BF, device=dev)
     send = torch.zeros(DCP, s, NHL, mf.REC, dtype=BF, device=dev)
     tl = torch.zeros(256, mf.TL_POINTS, dtype=torch.int64, device=dev) if timeline else None
@@ -372,7 +385,7 @@ def launch_one(w, st, b, epoch, layer, peers, *, timeline=False, x=None):
     torch.cuda.synchronize()
     v = lambda n, dt, shp: mf.scratch_view(key, scratch, n, dt, shp).clone()  # noqa: E731
     reqs = getattr(b, "reqs", [b])
-    return {
+    out = {
         "key": key, "gate": v("g", BF, (s, NHL * VD)), "send": send, "core": core, "tl": tl,
         "x": v("x", BF, (s, HIDDEN)) if x is None else x.clone(),
         "lat": v("lat", BF, (s, LATW)),
@@ -382,6 +395,26 @@ def launch_one(w, st, b, epoch, layer, peers, *, timeline=False, x=None):
         "ml": v("ml", torch.float32, (mf.MAX_SPLITS, s, NHA, 2)),
         "splits": [mf.splits_of(rk.p) for rk in reqs],
     }  # fmt: skip
+    if DIGEST[0] is not None:
+        digest_add(out, b.r)
+    return out
+
+
+# --digest: one hash over every launch's outputs; --scratch-fill: the byte
+DIGEST, SCRATCH_FILL = [None], [None]
+
+
+def digest_add(out, r):
+    """Every output a launch writes: the split slots each request writes, this
+    rank's heads of q_b."""
+    written = lambda t: torch.cat(  # noqa: E731
+        [t[:n, G * j : G * j + G].reshape(-1) for j, n in enumerate(out["splits"])]
+    )
+    parts = [out[n] for n in ("core", "send", "gate", "x", "lat", "q8")]
+    parts += [out["qb"][:, NHL * r : NHL * (r + 1)], written(out["pv"]), written(out["ml"])]
+    for t in parts:
+        DIGEST[0][0].update(t.contiguous().view(torch.uint8).cpu().numpy().tobytes())
+    DIGEST[0][1] += 1
 
 
 def run_ranks(w, st, bs, epoch, layer, *, timeline_rank=None, x=None):
@@ -418,10 +451,13 @@ def front_closure(w, st, b, epoch, layer):
     # the other ranks' records stand in as zero words, set before each launch
     own = peers.a2a(b.r, s)
 
+    others = [o for o in range(DCP) if o != b.r]
+
     def front():
         epoch[0].add_(1)
-        f[..., 0].fill_(1)
-        f[..., 1].copy_(((epoch[0] % (1 << 22)) * 256 + layer).expand(f.shape[:2]))
+        # every source's flags but this rank's own (its launch raises that)
+        f[others, :, 0] = 1
+        f[others, :, 1] = ((epoch[0] % (1 << 22)) * 256 + layer).expand(len(others), f.shape[1])
         own[: b.r].zero_()
         own[b.r + 1 :].zero_()
         mf.mla_front_launch(
@@ -973,8 +1009,14 @@ def main():
     ap.add_argument("--time-wide", action="store_true", help="time the front at 4 and 8 requests")
     ap.add_argument("--max-reqs", type=int, default=8)
     ap.add_argument("--qg-par", type=int, default=0, choices=(0, 1), help="the QG copy the launches take")
+    ap.add_argument("--digest", action="store_true", help="print a hash of every launch's outputs")
+    ap.add_argument("--scratch-fill", type=int, default=None, help="fill each launch's scratch with this byte first")
     args = ap.parse_args()
     QG_PAR[0] = args.qg_par
+    SCRATCH_FILL[0] = args.scratch_fill
+    if args.digest:
+        DIGEST[0] = [hashlib.sha256(), 0]
+        atexit.register(lambda: print(f"DIGEST {DIGEST[0][0].hexdigest()} launches={DIGEST[0][1]}", flush=True))
     device = torch.device("cuda", 0)
     torch.cuda.set_device(device)
     from sgl_amd_mono.common.peer import PeerBuffer
