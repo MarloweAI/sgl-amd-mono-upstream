@@ -28,9 +28,9 @@ g_proj and this rank's new KV record.
                      task, e4m3 into Q8 [S, 96, 576]
     attention, CTAs 128 ..
                      an item a (16-head group, key split, dim range): e4m3 QK
-                     and PV over 32-key blocks, the online softmax, the new
-                     token from NEWKV; a partial (f16, over its own sum) and its
-                     (max, sum) to PART / ML
+                     and bf16 PV (V widened exactly) over 32-key blocks, the
+                     online softmax, the new token from NEWKV; a partial (f16,
+                     over its own sum) and its (max, sum) to PART / ML
     W_UV, CTAs 0 .. 127
                      a (head, 64 value columns) a task: the head's split
                      partials merged in split order to the bf16 latent output,
@@ -58,6 +58,7 @@ from flydsl.expr.typing import Int32, Int64, T
 
 from sgl_amd_mono.common.ops import (
     CM_DEV,
+    fp8_to_bf16x8,
     bf16_round,
     global_load,
     hw_exp2,
@@ -127,9 +128,11 @@ ABS_BLK = KV // 128  # 4 absorb tasks a head
 ABS = NHA * ABS_BLK  # 384
 HT = 16  # heads an attention item
 NHG = NHA // HT  # 6 head groups
-BK = 32  # keys a block
+BK = 64  # keys a block
+KT = BK // 16  # 16-key QK tiles a block
+KC = BK // 32  # 32-key PV steps a block
 RWK = DQK // 4 + 4  # i32 words a key in LDS: its record + 16 bytes of pad
-PW = 10  # i32 words a (row, head)'s e4m3 P in LDS: 32 keys + pad
+PW = BK // 2 + 2  # i32 words a (row, head)'s bf16 P in LDS: its keys + pad
 ATT_CTAS = BLOCKS  # every CTA takes an attention item (at most one)
 MAX_SPLITS = 21  # the most splits whose items (at two dim ranges) fit the CTAs
 KEYS_PER_SPLIT = 256  # local keys a split aims at
@@ -144,9 +147,6 @@ NEG = -3.4028234663852886e38
 LOG2E = 1.4426950408889634
 LN2 = 0.6931471805599453
 EMPTY_LSE = -1e30  # SGLang's LSE of a row with no key on this rank
-# P is cast to e4m3 times this power of two, which keeps the small terms out of
-# the subnormal range; the partial divides it out with the sum
-P_SCALE = 256.0
 # start, x seen, stage 1, q latent normed, q_b, absorb, attention q seen,
 # attention done, W_UV partials seen, W_UV done
 TL_POINTS = 14
@@ -274,16 +274,8 @@ def _ld4(ptr, i, cm=0):
     )
 
 
-def _mfma8(a, b, c):
-    return fx.Vector(rocdl.mfma_f32_16x16x32_fp8_fp8(T.vec(4, T.f32), [a, b, c, 0, 0, 0]))
-
-
 def _mfma16(a, b, c):
     return fx.Vector(rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b, c]))
-
-
-def _i64(words2):
-    return fx.Vector(words2).bitcast(fx.Int64)[0]
 
 
 def _pack_bytes(words, sh):
@@ -588,7 +580,7 @@ def stage3(c, task, wt):
 # ---------------------------------------------------------------- attention
 
 
-MAX_SPLIT_BLOCKS = 64  # a split's blocks at most (its rows' indices in LDS)
+MAX_SPLIT_BLOCKS = 32  # a split's blocks at most (its rows' indices in LDS)
 
 
 def _kv_piece_addr(c, lr, own, b0, blk, piece):
@@ -644,7 +636,7 @@ def _kv_store(c, loads, kvl):
 
 
 QK_STEPS = -(-DQK // 128)  # 5 K = 128 e4m3 MFMAs a key tile (the last half zero)
-QK_AHEAD = 1  # QK steps whose LDS reads are in flight under a step's MFMAs
+QK_AHEAD = 0  # QK steps whose LDS reads are in flight under a step's MFMAs
 
 
 def _mfma128(a, b, c):
@@ -668,11 +660,11 @@ def _k128(lane, words8, kc):
 
 def _qk(lane, kvl, ql):
     """The block's scores against one row's 16 heads (``ql``: the row's q in
-    LDS, a head a key-sized row): two 16-key tiles C[key][head] (element i of
+    LDS, a head a key-sized row): KT 16-key tiles C[key][head] (element i of
     tile kt: key 16 kt + 4 (lane / 16) + i, head lane % 16)."""
     g, r16 = lane // 16, lane % 16
     v4 = fx.Vector.make_type(4, fx.Int32)
-    acc = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(2)]
+    acc = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(KT)]
 
     def row32(base, kc):
         # past the record the reads stay in the row (its pad, then the next row)
@@ -682,15 +674,15 @@ def _qk(lane, kvl, ql):
         return _k128(lane, fx.Vector.from_elements([lo[e] for e in range(4)] + [hi[e] for e in range(4)], fx.Int32), kc)
 
     def rd(kc):
-        return [row32(kvl + (16 * kt + r16) * RWK, kc) for kt in range(2)] + [row32(ql + r16 * RWK, kc)]
+        return [row32(kvl + (16 * kt + r16) * RWK, kc) for kt in range(KT)] + [row32(ql + r16 * RWK, kc)]
 
     ahead = [rd(kc) for kc in range(QK_AHEAD)]
     for kc in range_constexpr(QK_STEPS):
         if const_expr(kc + QK_AHEAD < QK_STEPS):
             ahead.append(rd(kc + QK_AHEAD))
-        cur = ahead.pop(0)
-        for kt in range_constexpr(2):
-            acc[kt] = _mfma128(cur[kt], cur[2], acc[kt])
+        cur = ahead.pop(0) if ahead else rd(kc)
+        for kt in range_constexpr(KT):
+            acc[kt] = _mfma128(cur[kt], cur[KT], acc[kt])
         rocdl.sched_barrier(0)
     return acc
 
@@ -700,34 +692,35 @@ def _softmax(lane, t, blk, kend, sacc, lr, own, m, l, qk_scale, prow):
     earlier sums); its P (e4m3, keys the row does not see 0) to the row's LDS."""
     g = lane // 16
     sv = []
-    for kt in range_constexpr(2):
+    for kt in range_constexpr(KT):
         for i in range_constexpr(4):
             kk = blk * BK + 16 * kt + 4 * g + i
             ok = ((kk < lr) | ((kk == lr) & (own <= t))) & (kk < kend)
             sv.append(ok.select(sacc[kt][i] * qk_scale, fx.Float32(NEG)))
     mb = sv[0]
-    for e in range_constexpr(1, 8):
+    for e in range_constexpr(1, 4 * KT):
         mb = fx.max(mb, sv[e])
     # xred reduces an f32 as f32 only when it is typed so
     mb = xred(xred(fx.Float32(mb), 16, fx.max), 32, fx.max)
     mn = fx.max(m, mb)
     a = hw_exp2(m - mn)
-    ps = [(sv[e] > fx.Float32(NEG)).select(hw_exp2(sv[e] - mn), fx.Float32(0.0)) for e in range(8)]
+    ps = [(sv[e] > fx.Float32(NEG)).select(hw_exp2(sv[e] - mn), fx.Float32(0.0)) for e in range(4 * KT)]
     ls = (ps[0] + ps[1]) + (ps[2] + ps[3])
-    ls = ls + ((ps[4] + ps[5]) + (ps[6] + ps[7]))
+    for kt in range_constexpr(1, KT):
+        ls = ls + ((ps[4 * kt] + ps[4 * kt + 1]) + (ps[4 * kt + 2] + ps[4 * kt + 3]))
     ls = xred(xred(fx.Float32(ls), 16, lambda x, y: x + y), 32, lambda x, y: x + y)
-    for kt in range_constexpr(2):
-        pq = [ps[4 * kt + i] * fx.Float32(P_SCALE) for i in range(4)]
-        fx.ptr_store(e4m3x4(pq), prow + (4 * kt + g))
+    for kt in range_constexpr(KT):
+        pw = fx.Vector.from_elements(ps[4 * kt : 4 * kt + 4], fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)
+        fx.ptr_store(pw, prow + (8 * kt + 2 * g))
     return mn, l * a + ls, a
 
 
-def _v_ops(lane, kvl, dbase, nt):
-    """PV's A operands of the block for ``nt`` 16-dim tiles: tile dt holds dim
-    dbase + nt (lane % 16) + dt at keys 8 (lane / 16) .. + 8 (e4m3 bytes)."""
+def _v_ops(lane, kvl, dbase, nt, kc):
+    """PV's A operands of 32-key step kc for ``nt`` 16-dim tiles: tile dt holds
+    dim dbase + nt (lane % 16) + dt at keys 32 kc + 8 (lane / 16) .. + 8 (e4m3)."""
     g, r16 = lane // 16, lane % 16
     dim = dbase + nt * r16
-    ws = [fx.ptr_load(kvl + ((8 * g + j) * RWK + dim // 4)) for j in range(8)]
+    ws = [fx.ptr_load(kvl + ((32 * kc + 8 * g + j) * RWK + dim // 4)) for j in range(8)]
     sh0 = (dim % 4) * 8
     return [_pack_bytes(ws, sh0 + 8 * dt) for dt in range(nt)]
 
@@ -745,14 +738,24 @@ def _pv(lane, wave, kx, pl, al, dr, acc, nt):
     """The block's P V onto every row's accumulators (rescaled first) for this
     wave's ``nt`` 16-dim tiles."""
     g, r16 = lane // 16, lane % 16
-    vops = _v_ops(lane, kx, _dbase(wave, dr, nt), nt)
+    # V widened to bf16 (exact), P in bf16
+    vops = [
+        [
+            fp8_to_bf16x8(*[fx.Vector.from_elements([v], fx.Int64).bitcast(fx.Int32)[e] for e in range(2)])
+            for v in _v_ops(lane, kx, _dbase(wave, dr, nt), nt, kc)
+        ]
+        for kc in range(KC)
+    ]
     out = list(acc)
     for r in range_constexpr(G_ROWS):
         alpha = fx.ptr_load(al + (r * HT + r16)).bitcast(fx.Float32)
-        pw = fx.ptr_load(pl + ((r * HT + r16) * PW + 2 * g), result_type=fx.Vector.make_type(2, fx.Int32))
-        pb = _i64(pw)
         for dt in range_constexpr(nt):
-            out[r * 2 + dt] = _mfma8(vops[dt], pb, _scaled(acc[r * 2 + dt], alpha))
+            out[r * 2 + dt] = _scaled(acc[r * 2 + dt], alpha)
+        for kc in range_constexpr(KC):
+            pw = fx.ptr_load(pl + ((r * HT + r16) * PW + 16 * kc + 4 * g), result_type=fx.Vector.make_type(4, fx.Int32))
+            pb = fx.Vector(pw).bitcast(fx.BFloat16)
+            for dt in range_constexpr(nt):
+                out[r * 2 + dt] = _mfma16(vops[kc][dt], pb, out[r * 2 + dt])
     return out
 
 
@@ -766,7 +769,7 @@ def _partial_out(c, lane, wave, dr, sp, head, acc, nt):
     mll = c["mll"]
     for r in range_constexpr(G_ROWS):
         ll = fx.ptr_load(mll + 2 * (r * HT + r16) + 1).bitcast(fx.Float32)
-        inv = (ll > fx.Float32(0.0)).select(fx.Float32(1.0) / (ll * fx.Float32(P_SCALE)), fx.Float32(0.0))
+        inv = (ll > fx.Float32(0.0)).select(fx.Float32(1.0) / ll, fx.Float32(0.0))
         vals = [None] * (4 * nt)
         for i in range_constexpr(4):
             for dt in range_constexpr(nt):
@@ -843,7 +846,7 @@ def attention(c, item):
         v = _ld4(c["q8"], (tq * (NHA * DQK) + (hg * HT + hq) * DQK) // 4 + 4 * pq, CM_DEV)
         if tid + THREADS * j < G_ROWS * HT * qrow:
             fx.ptr_store(v, c["qll"] + ((tq * HT + hq) * RWK + 4 * pq))
-    qf = c["qll"] + t * (HT * RWK)
+    ql = c["qll"] + t * (HT * RWK)
     qk_scale = c["scale"] * LOG2E
     # this item's 16-dim tiles a wave: 512 / d dims over 8 waves
     nt = (d == 4).select(fx.Int32(1), fx.Int32(2))
@@ -856,20 +859,21 @@ def attention(c, item):
     _kv_store(c, pend, kvl0)
     _bar()
     kend = b1 * BK
-    kv1 = kvl0 + BK * RWK
-    # two blocks a round, the LDS buffers and the load registers alternating
-    # statically: block blk in LDS, blk + 1 and blk + 2 in flight
+    # two blocks a round, the load registers alternating statically: block blk
+    # in LDS, blk + 1 and blk + 2 in flight
     for pr in range(0, (b1 - b0 + 1) // 2):
         blk = b0 + 2 * pr
         p3 = _kv_loads(c, lr, own, b0, fx.min(blk + 2, b1 - 1))
         stamp(c["on"], c["tls"], tid, 10)
-        m, l, acc = _step(c, kvl0, blk, kend, m, l, acc, qf, t, lr, own, nt, dr, qk_scale)
+        m, l, acc = _step(c, kvl0, blk, kend, m, l, acc, ql, t, lr, own, nt, dr, qk_scale)
         stamp(c["on"], c["tls"], tid, 12)
-        _kv_store(c, p2, kv1)
+        _bar()
+        _kv_store(c, p2, kvl0)
         _bar()
         stamp(c["on"], c["tls"], tid, 13)
         p2 = _kv_loads(c, lr, own, b0, fx.min(blk + 3, b1 - 1))
-        m, l, acc = _step(c, kv1, blk + 1, kend, m, l, acc, qf, t, lr, own, nt, dr, qk_scale)
+        m, l, acc = _step(c, kvl0, blk + 1, kend, m, l, acc, ql, t, lr, own, nt, dr, qk_scale)
+        _bar()
         _kv_store(c, p3, kvl0)
         _bar()
     stamp(c["on"], c["tls"], tid, 7)
@@ -1041,7 +1045,7 @@ def build(key: MlaFrontBuild):
 
     @fx.struct
     class CoreLds:
-        kv: fx.Array[fx.Int32, 2 * BK * RWK, 16]
+        kv: fx.Array[fx.Int32, BK * RWK, 16]
         p: fx.Array[fx.Int32, G_ROWS * HT * PW, 16]
         alpha: fx.Array[fx.Int32, G_ROWS * HT, 16]
         ml: fx.Array[fx.Int32, 2 * G_ROWS * HT, 16]
