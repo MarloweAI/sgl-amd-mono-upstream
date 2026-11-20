@@ -122,8 +122,11 @@ def main():
     w = layer_weights(args, device)
     wr = rank_weights(w, rank)
     epoch = new_epoch(device)
+    from sgl_amd_mono.kimi_k3.gfx950.attention import mla_combine as mc
+
     peers = PeerBuffer(mf.peer_end(), cpu, rank, DCP, device)
     peers.bytes.zero_()
+    mc.init_peer(peers.bytes)
     torch.cuda.synchronize()
     dist.barrier(cpu)
     rng = np.random.default_rng(args.seed * 1000 + rank)
@@ -144,11 +147,11 @@ def main():
         st = batch_stream(range(len(ctxs)), args.seed, device)
         key = front_key(w, bt.s)
         keys = [dataclasses.replace(key, qg_par=q) for q in (0, 1)] if hasattr(key, "qg_par") else [key]
-        gate = torch.zeros(bt.s, NHL * VD, dtype=BF, device=device)
+        core = torch.zeros(bt.s, NHL * VD, dtype=BF, device=device)
         send = torch.zeros(DCP, bt.s, NHL, mf.REC, dtype=BF, device=device)
         common = dict(  # noqa: C408
             prefix=st["prefix"], blocks=st["blocks"], w=wr, kv=bt.pool, kv_idx=bt.kv_idx,
-            kv_ptr=bt.kv_ptr, g_kv_ptr=bt.g_kv_ptr, loc=bt.loc, gate=gate, send=send,
+            kv_ptr=bt.kv_ptr, g_kv_ptr=bt.g_kv_ptr, loc=bt.loc, core=core, send=send,
             scratch=scratch_for(key, device), rank=rank, epoch=epoch, peers=peers.addresses,
         )  # fmt: skip
         # the reference: one front, every rank started together
@@ -157,7 +160,7 @@ def main():
             epoch[0].add_(1)
             mf.mla_front_launch(k, layer=layers[0], **common)
             torch.cuda.synchronize()
-        ref = (bits_sum(send).item(), bits_sum(gate).item())
+        ref = (bits_sum(send).item(), bits_sum(core).item())
         e = int(epoch[0].item())
         n = args.steps * args.fronts
         sums = torch.zeros(n, 2, dtype=torch.int64, device=device)
@@ -195,7 +198,7 @@ def main():
                 mf.mla_front_launch(keys[j % len(keys)], layer=layers[j], **common)
                 i = step * args.fronts + j
                 sums[i, 0] = bits_sum(send)
-                sums[i, 1] = bits_sum(gate)
+                sums[i, 1] = bits_sum(core)
                 evs.append((torch.cuda.current_stream().record_event(), (step, j, e)))
             # keep the host at most 8 fronts ahead; a front that never finishes is a hang
             while len(evs) > 8 and hung is None:

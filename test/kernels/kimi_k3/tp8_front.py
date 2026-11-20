@@ -114,8 +114,11 @@ def main():
     epoch = new_epoch(device)
     extra = {}
     if gathered:
+        from sgl_amd_mono.kimi_k3.gfx950.attention import mla_combine as mc
+
         peers = PeerBuffer(mf.peer_end(), cpu, rank, DCP, device)
         peers.bytes.zero_()
+        mc.init_peer(peers.bytes)
         torch.cuda.synchronize()
         dist.barrier(cpu)
         extra = {"peers": peers.addresses}
@@ -127,17 +130,14 @@ def main():
         b = Batch([(p, bank[997 * i : 997 * i + p], args.seed + 13 * i) for i, p in enumerate(ctxs)], rank, device)
         st = batch_stream(range(len(ctxs)), args.seed, device)
         s = b.s
-        key = front_key(w, s)
+        key = front_key(w, s, records=False)
         # consecutive fronts (MLA layers) take alternate QG copies, where the tree has them
         keys = [dataclasses.replace(key, qg_par=q) for q in (0, 1)] if hasattr(key, "qg_par") else [key]
         scratch = scratch_for(key, device)
-        gate = torch.zeros(s, NHL * VD, dtype=BF, device=device)
-        send = torch.zeros(DCP, s, NHL, mf.REC, dtype=BF, device=device)
-        recv = torch.zeros_like(send)
         core = torch.zeros(s, NHL * VD, dtype=BF, device=device)
         common = dict(
             prefix=st["prefix"], blocks=st["blocks"], w=wr, kv=b.pool, kv_idx=b.kv_idx,
-            kv_ptr=b.kv_ptr, g_kv_ptr=b.g_kv_ptr, loc=b.loc, gate=gate, send=send,
+            kv_ptr=b.kv_ptr, g_kv_ptr=b.g_kv_ptr, loc=b.loc, core=core,
             scratch=scratch, rank=rank, layer=args.layer, epoch=epoch, **extra,
         )  # fmt: skip
 
@@ -147,12 +147,10 @@ def main():
             mf.mla_front_launch(keys[nth[0] % len(keys)], **common)
             nth[0] += 1
 
-        def step(front=front, send=send, recv=recv, gate=gate, core=core):
+        def step(front=front):
+            # the front's own all-to-all, combine and gate are in the launch
             epoch[0].add_(1)
             front()
-            dist.all_to_all_single(recv.view(-1).view(torch.uint8), send.view(-1).view(torch.uint8))
-            comb, _ = dcp_lse_combine_triton(recv[..., :VD], recv.view(torch.float32)[..., VD // 2], is_lse_base_on_e=True)
-            core.copy_(mla_output_gate.kimi_k3_mla_output_gate(comb.flatten(1, 2), gate))
 
         def front_only(front=front):
             epoch[0].add_(1)
@@ -163,7 +161,7 @@ def main():
         t = graph_time(step, cpu, args.sets, args.reps, args.warmup)
         phase(rank, f"{name} front")
         t_front = graph_time(front_only, cpu, args.sets, args.reps, args.warmup)
-        tkey = front_key(w, s, timeline=True)
+        tkey = front_key(w, s, timeline=True, records=False)
         tl = torch.zeros(256, mf.TL_POINTS, dtype=torch.int64, device=device)
         align = torch.zeros(1, device=device)
         phase(rank, f"{name} stamps")

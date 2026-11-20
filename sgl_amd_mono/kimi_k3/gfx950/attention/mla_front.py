@@ -90,6 +90,7 @@ from sgl_amd_mono.common.plan import (
 )
 from sgl_amd_mono.common import guard
 from sgl_amd_mono.common.sync import Addr, Mailbox, Space, sreg
+from sgl_amd_mono.kimi_k3.gfx950.attention import mla_combine as mc
 from sgl_amd_mono.kimi_k3.gfx950.attention.mla_pre import load_qlora, load_x
 from sgl_amd_mono.kimi_k3.gfx950.stages import gemv
 from sgl_amd_mono.kimi_k3.gfx950.stages.dims import COLS, HIDDEN, LDS_PAD, NA, ROWS
@@ -205,7 +206,7 @@ assert GP2 >= 0 and ABS1 >= 188 + GP2 and ABS1 + ABS_L - ABS_N0 <= QG_FLAG_CTA
 QG_REC = DQK  # bytes a (source, request, local head, row) q record
 QG_DATA = DCP * MAX_REQS * NHL * G_ROWS * QG_REC  # one copy's records
 QG_COPY = -(-(QG_DATA + DCP * MAX_REQS * 8) // 4096) * 4096  # records, then the flag pairs
-QG_RESERVE = 4 << 20  # room past K2's region for the DCP all-to-all's (merged later)
+QG_RESERVE = 4 << 20  # room past K2's region for the DCP all-to-all's A2A copies (mla_combine)
 
 
 def qg_offset() -> int:
@@ -220,6 +221,9 @@ def _flags_offset() -> int:
     from sgl_amd_mono.kimi_k3.gfx950 import layer
 
     return layer.flags_offset()
+
+
+assert mc.a2a_copy_bytes() * 2 <= QG_RESERVE
 
 
 def peer_end() -> int:
@@ -270,6 +274,9 @@ class MlaFrontBuild:
     # the QG copy: the parity of the layer's ordinal among the step's MLA fronts
     qg_par: int = 0
     timeline: bool = False
+    # checks only: the W_UV records also to ``send`` in SGLang's all-to-all
+    # layout [8, S, 12, 130]
+    records: bool = False
 
 
 def scratch_layout(key: MlaFrontBuild) -> dict:
@@ -301,6 +308,8 @@ def scratch_layout(key: MlaFrontBuild) -> dict:
     add("newkv", nreq * DQK)
     add("pv", MAX_SPLITS * s * NHA * KV * 2)
     add("ml", MAX_SPLITS * s * NHA * 2 * 4)
+    add("g", s * GATE * 2)
+    add("grdy", mc.GATE_GROUPS * 8)
     return lay
 
 
@@ -526,7 +535,7 @@ def s1_out(c, g, acc, t0, sj):
     if mine & is_lat:
         _st_bf(c["lat"], (t0 + t) * LATW + g * ROWS + r, v, CM_DEV)
     if mine & (g >= S1_GATE0):
-        _st_bf(a["gate"], (t0 + t) * GATE + (g - S1_GATE0) * ROWS + r, v)
+        _st_bf(a["gate"], (t0 + t) * GATE + (g - S1_GATE0) * ROWS + r, v, CM_DEV)
     gpu.barrier()
     if mine:
         fx.ptr_store(v * v, red + tid)
@@ -1688,7 +1697,7 @@ MERGE_THREADS = UV_DMA_W0 * 64  # the merge's threads (a row's 64 x 8 dims a rou
 def _merge(c, e, h, half, n):
     """Merge item e (row e / 64, 8 dims at 8 (e % 64)) of head h: its n split
     partials in split order -> the bf16 latent output in LDS; the row's LSE
-    into ``send`` with the first value half."""
+    beside it, pushed with the first value half."""
     s = c["S"]
     a = c["args"]
     t = e // (KV // 8)
@@ -1724,15 +1733,16 @@ def _merge(c, e, h, half, n):
             (mx + fx.Float32(fmath.log2(lsum))) * fx.Float32(LN2),
             fx.Float32(EMPTY_LSE),
         )
-        bo.buffer_store(lse, rsrc(a["send"]), ((owner * s + t) * NHL + hl) * (REC // 2) + VD // 2)
+        # in the row's pad: pushed with the values, after the GEMV
+        fx.ptr_store(lse.bitcast(fx.Int32), c["xl"] + (t * OL_ROW + KV) // 2)
 
 
 @flyc.jit
 def stage_uv(c, task):
     """Head task // 2's split partials (its group's items, every request's)
     merged in split order a row -> the bf16 latent output in LDS and the head's
-    LSE; then W_UV for value columns 64 (task % 2) .. -> ``send`` (bf16), the
-    LSE word with the first half."""
+    LSE; then W_UV for value columns 64 (task % 2) ..: the values, and with
+    the first half the LSE, pushed to the head's owner rank (mla_combine)."""
     HQ, NCT, NHG = c["HQ"], c["NCT"], c["NHG"]
     s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
     a = c["args"]
@@ -1788,9 +1798,16 @@ def stage_uv(c, task):
                     for q in range_constexpr(4):
                         tot = tot + fx.ptr_load(red + (((2 * q + wave) * 64 + lane) * 8 + 4 * dt + i))
                     vals[2 * i + dt] = tot
-            ob = fx.Vector.from_elements(vals, fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)
             col = half * UV_HALF + 32 * wave + 8 * g
-            bo.buffer_store(ob, rsrc(a["send"]), (((owner * s + t0 + r16) * NHL + hl) * REC + col) // 2)
+            mc.push_values(c, owner, hl, t0 + r16, col, vals)
+            if (wave == 0) & (g == 0) & (half == 0):
+                lse = fx.Int32(fx.ptr_load(xl + ((t0 + r16) * OL_ROW + KV) // 2)).bitcast(fx.Float32)
+                mc.push_lse(c, owner, hl, t0 + r16, lse)
+                if const_expr(c["records"]):
+                    bo.buffer_store(lse, rsrc(a["send"]), ((owner * s + t0 + r16) * NHL + hl) * (REC // 2) + VD // 2)
+            if const_expr(c["records"]):
+                ob = fx.Vector.from_elements(vals, fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)
+                bo.buffer_store(ob, rsrc(a["send"]), (((owner * s + t0 + r16) * NHL + hl) * REC + col) // 2)
         gpu.barrier()
 
 
@@ -1878,7 +1895,7 @@ def build(key: MlaFrontBuild):
     keyed = key_tuple(key, SOURCES)
     name = (
         f"k3_mono_mla_front_s{s}_nb{key.nblocks}_w{int(key.write_idx >= 0)}"
-        f"_t{int(key.timeline)}"
+        f"_t{int(key.timeline)}_r{int(key.records)}"
     )
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
@@ -1886,7 +1903,7 @@ def build(key: MlaFrontBuild):
         prefix: Int64, blocks: Int64, blk_sm: Int32, blk_sr: Int32, ares_nw: Int64,
         ares_qk: Int64, in_nw: Int64, w_qkv: Int64, w_g: Int64, q_nw: Int64,
         kv_nw: Int64, w_qb: Int64, w_kc: Int64, w_vc: Int64, kv: Int64, kv_idx: Int64,
-        kv_ptr: Int64, g_kv_ptr: Int64, loc: Int64, gate: Int64, send: Int64,
+        kv_ptr: Int64, g_kv_ptr: Int64, loc: Int64, core: Int64, send: Int64,
         scratch: Int64, peers: Int64, rank: Int32, layer: Int32, epoch: Int64, tl: Int64,
     ):  # fmt: skip
         _ = keyed
@@ -1906,6 +1923,7 @@ def build(key: MlaFrontBuild):
             al, gl = role.attn.peek(), role.gemv.peek()
             abl, cl, ul = role.absorb.peek(), role.core.peek(), role.uv.peek()
             mb = Mailbox(step_tag(epoch, layer) - 1)
+            gate = scratch + fx.Int64(lay["g"][0])
             c = {
                 "S": s, "NS": ns, "NB": key.nblocks, "tid": tid, "bid": bid,
                 "lane": tid % 64, "wave": tid // 64, "delta": False, "debug": False,
@@ -1926,16 +1944,18 @@ def build(key: MlaFrontBuild):
                 "ml": scratch + fx.Int64(lay["ml"][0]),
                 "kvl": cl.kv.ptr, "pl": cl.p.ptr, "al": cl.alpha.ptr, "mll": cl.ml.ptr,
                 "qll": cl.q.ptr if nreq == 1 else None, "vt": cl.vt.ptr if nreq > 1 else None,
+                "records": key.records, "gate0": S1_GATE0, "gbuf": gate,
+                "a2a_peer": mc.PeerRegions(peers, key.qg_par),
                 "args": {
                     "prefix": prefix, "delta": 0, "blocks": blocks, "blk_sm": blk_sm,
                     "blk_sr": blk_sr, "ares_nw": ares_nw, "ares_qk": ares_qk, "in_nw": in_nw,
                     "x_dbg": 0, "w_qkv": w_qkv, "w_g": w_g, "q_nw": q_nw, "kv_nw": kv_nw,
                     "w_qb": w_qb, "w_kc": w_kc, "w_vc": w_vc, "kv": kv, "kv_idx": kv_idx,
                     "kv_ptr": kv_ptr, "g_kv_ptr": g_kv_ptr, "loc": loc, "gate": gate,
-                    "send": send, "q_lora": 0, "peers": peers,
+                    "send": send, "core": core, "q_lora": 0, "peers": peers,
                 },
             }  # fmt: skip
-            for region in ("part", "wgt", "msq", "xrdy", "ss", "qrdy", "absrdy", "kvrdy", "itrdy"):
+            for region in ("part", "wgt", "msq", "xrdy", "ss", "qrdy", "absrdy", "kvrdy", "itrdy", "grdy"):
                 c[region] = sreg(scratch, lay[region][0], region)
             on, tls = key.timeline, lds.tls.ptr
             c["on"], c["tls"] = on, tls
@@ -1964,12 +1984,14 @@ def build(key: MlaFrontBuild):
                 else:
                     load_x(c)
                     stage1(c, S1_GATE0 + bid - GP0, ops)
+                mc.gate_ready(c, S1_GATE0 + bid - GP0)
                 if bid < GP0 + GP2:
                     ops2 = s1_loads(c, S1_GATE0 + BLOCKS - GP0 + bid - GP0)
                     if const_expr(wd):
                         stage1_wide(c, S1_GATE0 + BLOCKS - GP0 + bid - GP0, ops2)
                     else:
                         stage1(c, S1_GATE0 + BLOCKS - GP0 + bid - GP0, ops2)
+                    mc.gate_ready(c, S1_GATE0 + BLOCKS - GP0 + bid - GP0)
             if bid == KV_CTA:
                 stage_kv(c)
             stamp(on, tls, tid, 2)
@@ -2024,6 +2046,11 @@ def build(key: MlaFrontBuild):
             if bid < UV_CTAS:
                 stage_uv(c, bid)
             stamp(on, tls, tid, 9)
+            # the owner's combine and output gate, a (request, local head) a
+            # task on the last CTAs
+            comb0 = BLOCKS - mc.combine_tasks(s)
+            if bid >= comb0:
+                mc.stage_combine(c, bid - comb0)
             stamp_flush(on, tls, tl, tid, bid, TL_POINTS)
 
     @flyc.jit
@@ -2031,14 +2058,14 @@ def build(key: MlaFrontBuild):
         prefix: Int64, blocks: Int64, blk_sm: Int32, blk_sr: Int32, ares_nw: Int64,
         ares_qk: Int64, in_nw: Int64, w_qkv: Int64, w_g: Int64, q_nw: Int64,
         kv_nw: Int64, w_qb: Int64, w_kc: Int64, w_vc: Int64, kv: Int64, kv_idx: Int64,
-        kv_ptr: Int64, g_kv_ptr: Int64, loc: Int64, gate: Int64, send: Int64,
+        kv_ptr: Int64, g_kv_ptr: Int64, loc: Int64, core: Int64, send: Int64,
         scratch: Int64, peers: Int64, rank: Int32, layer: Int32, epoch: Int64, tl: Int64,
         stream: fx.Stream = _STREAM,
     ):  # fmt: skip
         _ = keyed
         mla_front(
             prefix, blocks, blk_sm, blk_sr, ares_nw, ares_qk, in_nw, w_qkv, w_g, q_nw,
-            kv_nw, w_qb, w_kc, w_vc, kv, kv_idx, kv_ptr, g_kv_ptr, loc, gate, send,
+            kv_nw, w_qb, w_kc, w_vc, kv, kv_idx, kv_ptr, g_kv_ptr, loc, core, send,
             scratch, peers, rank, layer, epoch, tl,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)  # fmt: skip
 
@@ -2069,7 +2096,7 @@ def weight_ok(name, t) -> bool:
 
 def mla_front_launch(
     key: MlaFrontBuild, *, prefix, blocks, w, kv, kv_idx, kv_ptr, g_kv_ptr, loc,
-    gate, send, scratch, peers, rank, layer, epoch, tl=None,
+    core, scratch, peers, rank, layer, epoch, send=None, tl=None,
 ):  # fmt: skip
     """Host launcher. ``w``: ares_nw, ares_qk, in_nw, q_nw, kv_nw and the
     ``WEIGHT_SHAPES`` weights (bf16, contiguous); ``kv``: this rank's e4m3 KV
@@ -2077,10 +2104,11 @@ def mla_front_launch(
     local rows by position (int32, ragged: SGLang's DCP verify indices);
     ``g_kv_ptr``: their global KV indptr (int32, verify rows included);
     ``loc``: the rows' KV slots (int64);
-    ``gate`` [S, 1536] bf16 out; ``send`` [8, S, 12, 130] bf16 out; ``peers``:
-    the DCP ranks' peer buffers (int64 [8], ``peer_end`` bytes each: the q
-    all-gather's QG copies, ``key.qg_par`` the one this launch uses); ``w_qb`` /
-    ``w_kc`` this rank's 12 heads' shards."""
+    ``core`` [S, 1536] bf16 out (the gated core); ``peers``: the DCP ranks'
+    peer buffers (int64 [8], ``peer_end`` bytes each: the q all-gather's QG
+    copies and the all-to-all's A2A copies, ``key.qg_par`` the one this launch
+    uses); ``send`` [8, S, 12, 130] bf16 out, a ``records`` build only;
+    ``w_qb`` / ``w_kc`` this rank's 12 heads' shards."""
     assert key.write_idx < blocks.shape[1]
     for n, shp in WEIGHT_SHAPES.items():
         assert weight_ok(n, w[n]), (n, tuple(w[n].shape), w[n].stride(), w[n].dtype)
@@ -2090,8 +2118,10 @@ def mla_front_launch(
     assert peers.dtype == torch.int64 and peers.numel() == DCP and key.qg_par in (0, 1)
     nreq = reqs_of(key.tokens)
     assert kv_ptr.numel() >= nreq + 1 and g_kv_ptr.numel() >= nreq + 1 and loc.numel() >= key.tokens
-    assert tuple(send.shape) == (DCP, key.tokens, NHL, REC) and send.dtype == torch.bfloat16
-    assert tuple(gate.shape) == (key.tokens, GATE) and gate.dtype == torch.bfloat16
+    assert (send is not None) == key.records
+    if send is not None:
+        assert tuple(send.shape) == (DCP, key.tokens, NHL, REC) and send.dtype == torch.bfloat16
+    assert tuple(core.shape) == (key.tokens, GATE) and core.dtype == torch.bfloat16 and core.is_contiguous()
     f = build(key)
     f(
         prefix.data_ptr(), blocks.data_ptr(), blocks.stride(0), blocks.stride(1),
@@ -2099,7 +2129,7 @@ def mla_front_launch(
         w["w_qkv"].data_ptr(), w["w_g"].data_ptr(), w["q_nw"].data_ptr(),
         w["kv_nw"].data_ptr(), w["w_qb"].data_ptr(), w["w_kc"].data_ptr(),
         w["w_vc"].data_ptr(), kv.data_ptr(), kv_idx.data_ptr(), kv_ptr.data_ptr(),
-        g_kv_ptr.data_ptr(), loc.data_ptr(), gate.data_ptr(), send.data_ptr(),
+        g_kv_ptr.data_ptr(), loc.data_ptr(), core.data_ptr(), ptr(send),
         scratch.data_ptr(), peers.data_ptr(), rank, layer, epoch.data_ptr(), ptr(tl),
         stream=torch.cuda.current_stream(),
     )  # fmt: skip

@@ -26,7 +26,7 @@ class K3MonoRunner:
     def __init__(self, tp: int, rank: int, group, device) -> None:
         from sgl_amd_mono.kimi_k3 import MAX_BLOCKS
         from sgl_amd_mono.kimi_k3.gfx950 import layer
-        from sgl_amd_mono.kimi_k3.gfx950.attention import mla_front
+        from sgl_amd_mono.kimi_k3.gfx950.attention import mla_combine, mla_front
         from sgl_amd_mono.kimi_k3.gfx950.stages import moe
 
         self.tp, self.rank, self.device = tp, rank, device
@@ -37,7 +37,7 @@ class K3MonoRunner:
         # fits, then K2's tagged x rows.
         front = mla_front.scratch_bytes(
             mla_front.MlaFrontBuild(
-                tokens=mla_front.G_ROWS * min(mla_front.MAX_REQS, MAX_ROWS // mla_front.G_ROWS),
+                tokens=mla_front.G_ROWS * min(mla_front.MAX_REQS, K2_MAX_ROWS // mla_front.G_ROWS),
                 nblocks=MAX_BLOCKS,
                 scale=1.0,
             )
@@ -63,6 +63,8 @@ class K3MonoRunner:
         self.peer = PeerBuffer(max(layer.peer_alloc_bytes(), mla_front.peer_end()), group, rank, tp, device)
         layer.init_peer(self.peer.bytes[: layer.peer_alloc_bytes()])
         self.peer.bytes[layer.peer_alloc_bytes() :].zero_()
+        # ... and the front's all-to-all (A2A) cells before them, armed
+        mla_combine.init_peer(self.peer.bytes)
         # One prefix buffer, not one a layer: the layers run in sequence.
         self.prefix = torch.empty(
             K2_MAX_ROWS, layer.HIDDEN, dtype=torch.bfloat16, device=device

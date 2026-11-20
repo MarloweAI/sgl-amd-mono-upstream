@@ -241,12 +241,13 @@ def new_epoch(device, seconds=30.0):
     return epoch
 
 
-def front_key(w, s, timeline=False):
+def front_key(w, s, timeline=False, records=True):
     from sgl_amd_mono.kimi_k3.gfx950.attention import mla_front as mf
 
     return mf.MlaFrontBuild(
         tokens=s, nblocks=NVB, scale=w["scale"], eps=w["eps"], out_eps=w["out_eps"],
         q_eps=w["q_eps"], kv_eps=w["kv_eps"], qg_par=QG_PAR[0], timeline=timeline,
+        records=records,
     )  # fmt: skip
 
 
@@ -269,12 +270,14 @@ class Peers:
 
     def __init__(self, device):
         from sgl_amd_mono.common.peer import PeerBuffer
+        from sgl_amd_mono.kimi_k3.gfx950.attention import mla_combine as mc
         from sgl_amd_mono.kimi_k3.gfx950.attention import mla_front as mf
 
-        self.mf = mf
+        self.mf, self.mc = mf, mc
         self.stride = mf.peer_end()
         self.buf = PeerBuffer(DCP * self.stride, None, 0, 1, device)
         self.buf.bytes.zero_()
+        self.rearm()
         self.table = torch.tensor(
             [self.buf.local + o * self.stride for o in range(DCP)], dtype=torch.int64, device=device
         )
@@ -292,6 +295,22 @@ class Peers:
     def flags(self, o):
         mf = self.mf
         return self._copy(o)[mf.QG_DATA : mf.QG_DATA + DCP * mf.MAX_REQS * 8].view(torch.int32).view(DCP, mf.MAX_REQS, 2)
+
+    def a2a(self, o, s):
+        """Rank o's all-to-all cells of an s-row step, int32 [src][row][head][cell][2]."""
+        mc = self.mc
+        off = o * self.stride + mc.peer_offset() + QG_PAR[0] * mc.a2a_copy_bytes()
+        return self.buf.bytes[off : off + mc.a2a_cells(s) * 8].view(torch.int32).view(DCP, s, NHL, mc.REC_CELLS, 2)
+
+    def a2a_stand_in(self, o, s, srcs):
+        """Rank o's records from ``srcs`` as zero words (sources that run later)."""
+        a = self.a2a(o, s)
+        for src in srcs:
+            a[src, ..., : self.mc.LSE_CELL + 1, :] = 0
+
+    def rearm(self):
+        for o in range(DCP):
+            self.buf.bytes[o * self.stride + self.mc.peer_offset() : o * self.stride + self.mc.peer_end()].fill_(0xFF)
 
     def stand_in(self, o, tag):
         """Rank o's (source, request) flags as the launch tagged ``tag`` reads them."""
@@ -338,7 +357,7 @@ def launch_one(w, st, b, epoch, layer, peers, *, timeline=False):
     key = front_key(w, s, timeline)
     dev = b.pool.device
     scratch = scratch_for(key, dev)
-    gate = torch.empty(s, NHL * VD, dtype=BF, device=dev)
+    core = torch.zeros(s, NHL * VD, dtype=BF, device=dev)
     send = torch.zeros(DCP, s, NHL, mf.REC, dtype=BF, device=dev)
     tl = torch.zeros(256, mf.TL_POINTS, dtype=torch.int64, device=dev) if timeline else None
     peers.stand_in(b.r, next_tag(epoch, layer))
@@ -346,14 +365,14 @@ def launch_one(w, st, b, epoch, layer, peers, *, timeline=False):
     mf.mla_front_launch(
         key, prefix=st["prefix"], blocks=st["blocks"], w=rank_weights(w, b.r), kv=b.pool,
         kv_idx=b.kv_idx, kv_ptr=b.kv_ptr, g_kv_ptr=b.g_kv_ptr, loc=b.loc,
-        gate=gate, send=send, scratch=scratch, peers=peers.table, rank=b.r, layer=layer,
+        core=core, send=send, scratch=scratch, peers=peers.table, rank=b.r, layer=layer,
         epoch=epoch, tl=tl,
     )  # fmt: skip
     torch.cuda.synchronize()
     v = lambda n, dt, shp: mf.scratch_view(key, scratch, n, dt, shp).clone()  # noqa: E731
     reqs = getattr(b, "reqs", [b])
     return {
-        "key": key, "gate": gate, "send": send, "tl": tl,
+        "key": key, "gate": v("g", BF, (s, NHL * VD)), "send": send, "core": core, "tl": tl,
         "x": v("x", BF, (s, HIDDEN)),
         "lat": v("lat", BF, (s, LATW)),
         "qb": v("qb", BF, (s, NHA, QHD)),
@@ -366,12 +385,20 @@ def launch_one(w, st, b, epoch, layer, peers, *, timeline=False):
 
 def run_ranks(w, st, bs, epoch, layer, *, timeline_rank=None):
     """The eight ranks' launches (``bs``: each rank's share) one after another,
-    twice: the first pass lands every rank's q in every QG copy, the second's
-    outputs are a DCP8 step's."""
+    three times: the first pass lands every rank's q in every QG copy (rank o's
+    combine reads zeros for the later ranks' records); the second pushes every
+    rank's real records (its combines still read some of the first's); the
+    third's outputs are a DCP8 step's, every combine reading real records."""
     peers = peers_for(bs[0].pool.device)
-    for b in bs:
-        launch_one(w, st, b, epoch, layer, peers)
-    return [launch_one(w, st, b, epoch, layer, peers, timeline=b.r == timeline_rank) for b in bs]
+    s = getattr(bs[0], "s", G)
+    for o in range(DCP):
+        peers.a2a_stand_in(o, s, range(o + 1, DCP))
+    for _ in range(2):
+        for b in bs:
+            launch_one(w, st, b, epoch, layer, peers)
+    out = [launch_one(w, st, b, epoch, layer, peers, timeline=b.r == timeline_rank) for b in bs]
+    peers.rearm()
+    return out
 
 
 def front_closure(w, st, b, epoch, layer):
@@ -382,21 +409,24 @@ def front_closure(w, st, b, epoch, layer):
 
     peers = peers_for(b.pool.device)
     s = getattr(b, "s", G)
-    key = front_key(w, s)
+    key = front_key(w, s, records=False)
     scratch = scratch_for(key, b.pool.device)
-    gate = torch.empty(s, NHL * VD, dtype=BF, device=b.pool.device)
-    send = torch.zeros(DCP, s, NHL, mf.REC, dtype=BF, device=b.pool.device)
+    core = torch.zeros(s, NHL * VD, dtype=BF, device=b.pool.device)
     f = peers.flags(b.r)
     wr = rank_weights(w, b.r)
+    # the other ranks' records stand in as zero words, set before each launch
+    own = peers.a2a(b.r, s)
 
     def front():
         epoch[0].add_(1)
         f[..., 0].fill_(1)
         f[..., 1].copy_(((epoch[0] % (1 << 22)) * 256 + layer).expand(f.shape[:2]))
+        own[: b.r].zero_()
+        own[b.r + 1 :].zero_()
         mf.mla_front_launch(
             key, prefix=st["prefix"], blocks=st["blocks"], w=wr, kv=b.pool,
             kv_idx=b.kv_idx, kv_ptr=b.kv_ptr, g_kv_ptr=b.g_kv_ptr, loc=b.loc,
-            gate=gate, send=send, scratch=scratch, peers=peers.table, rank=b.r, layer=layer,
+            core=core, scratch=scratch, peers=peers.table, rank=b.r, layer=layer,
             epoch=epoch,
         )  # fmt: skip
 
@@ -418,6 +448,7 @@ def request_view(fr, b, j):
         "x": u8(fr["x"][sl]), "lat": u8(fr["lat"][sl]),
         "qb": u8(fr["qb"][sl][:, NHL * b.r : NHL * (b.r + 1)]),
         "q8": u8(fr["q8"][sl]), "gate": u8(fr["gate"][sl]), "send": u8(fr["send"][:, sl]),
+        "core": u8(fr["core"][sl]),
         "pv": u8(fr["pv"][:n, sl]), "ml": u8(fr["ml"][:n, sl]),
     }  # fmt: skip
     row = b.own_row(j)
@@ -877,6 +908,7 @@ def main():
             keys = make_keys(w, p, args.seed + p, device, temp)
             ranks = list(range(DCP)) if args.ranks == DCP else args.rank
             sends, stock_sends, gates, stock_gates, refs, emus = {}, {}, {}, {}, {}, {}
+            cores = {}
 
             def all_ranks():
                 """Every rank's launch (one request); each rank's outputs as the
@@ -987,7 +1019,7 @@ def main():
                 # run to run
                 for rep_ in again:
                     fr2 = rep_[r][1]
-                    names = ("x", "lat", "qb", "q8", "pv", "ml", "gate", "send")
+                    names = ("x", "lat", "qb", "q8", "pv", "ml", "gate", "send", "core")
                     # bit patterns: the send records' LSE words read as bf16 can be NaNs
                     diff = [n for n in names if not torch.equal(fr2[n].view(torch.uint8), fr[n].view(torch.uint8))]
                     same = not diff
@@ -996,10 +1028,11 @@ def main():
                     print(f"{tag}: run to run bitwise {same} {diff}", flush=True)
                 sends[r], stock_sends[r] = fr["send"], sk["send"]
                 gates[r], stock_gates[r] = fr["gate"], sk["gate"]
+                cores[r] = fr["core"]
                 refs[r] = (rproj_sr, rlse_s, gref, o_f, lse_f, sk["out"], sk["lse"], ref_s, proj_f, sk["proj"],
                            rproj_fr, rlse_f, ref_f)
             if args.ranks == DCP:
-                fails += emulate(sends, stock_sends, gates, stock_gates, refs, f"P={p} temp={temp}", emus)
+                fails += emulate(sends, stock_sends, gates, stock_gates, refs, f"P={p} temp={temp}", emus, cores)
     print("ALL PASS" if not fails else f"FAILED: {fails}", flush=True)
     sys.exit(1 if fails else 0)
 
@@ -1142,7 +1175,7 @@ def print_stamps(tl, tag):
               + ", ".join(cells), flush=True)
 
 
-def emulate(sends, stock_sends, gates, stock_gates, refs, tag, emus=None):
+def emulate(sends, stock_sends, gates, stock_gates, refs, tag, emus=None, cores=None):
     """SGLang's a2a (a copy), LSE combine and output gate on the eight ranks'
     records: every owner's core, front and stock, against the fp32 combine of
     the ranks' fp32 partials gated by the fp32 g_proj."""
@@ -1215,7 +1248,20 @@ def emulate(sends, stock_sends, gates, stock_gates, refs, tag, emus=None):
         f"{'ok' if ok else 'FAIL'}; front vs stock {rel(c_f, c_s):.3e}; combine repeat bitwise {again}",
         flush=True,
     )
-    return [] if ok else [tag + " core"]
+    fails = [] if ok else [tag + " core"]
+    if cores is not None:
+        mine = torch.stack([cores[o] for o in range(DCP)])
+        neq = (mine.view(torch.int16) != c_f.view(torch.int16)).sum().item()
+        e_m = rel(mine, c_rf)
+        ok_m = neq == 0 and e_m <= 1.25 * e_s
+        print(
+            f"{tag}: in-launch core: {mine.numel() - neq}/{mine.numel()} equal to SGLang's combine + gate "
+            f"of the same records; rel to fp32 {e_m:.3e} (stock {e_s:.3e}) {'ok' if ok_m else 'FAIL'}",
+            flush=True,
+        )
+        if not ok_m:
+            fails.append(tag + " in-launch core")
+    return fails
 
 
 if __name__ == "__main__":
