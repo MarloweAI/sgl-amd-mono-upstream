@@ -514,16 +514,21 @@ def stage_down_ar(c, bid, w):
     # orders the loads below after the polls (device-scope loads: L2 holds no stale copy)
     llvm.FenceOp(llvm.AtomicOrdering.acquire, syncscope="workgroup")
     r_act = rsrc(c["act"].value)
-    for t in range_constexpr(token_tiles(S)):
+    nt = token_tiles(S)
+    # every token tile's activations in flight at once
+    xbs = []
+    for t in range_constexpr(nt):
         tok = fx.min(t * TILE + lane % 16, S - 1)
-        xb = [
+        xbs.append([
             fx.Vector(
                 bo.buffer_load(r_act, (tok * I + wave * DN_KW + i * K_STEP + 8 * (lane // 16)) // 2, vec_width=4,
                                dtype=T.i32, cache_modifier=CM_DEV)
             )
             for i in range(DN_STEPS)
-        ]  # fmt: skip
-        rocdl.sched_barrier(0)
+        ])  # fmt: skip
+    rocdl.sched_barrier(0)
+    for t in range_constexpr(nt):
+        xb = xbs[t]
         for it in range_constexpr(DN_TILES):
             acc = fx.Vector.filled(4, 0.0, fx.Float32)
             for i in range_constexpr(DN_STEPS):
