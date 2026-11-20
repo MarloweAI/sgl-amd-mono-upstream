@@ -380,20 +380,112 @@ def tp8_main(args):
 
                     record(f"coll_ar_{fmt}_{h}", m, graph_time(cbody, args.reps, nl))
                     cp.close()
+        for m in args.rows:
+            try:
+                moe_halves(args, cpu, dev, rank, record, nl, m, ca, out)
+            except Exception as e:  # noqa: BLE001  a bench section's failure leaves the others' numbers
+                print(f"MOE m={m} rank {rank} failed: {type(e).__name__}: {e}", flush=True)
         if args.gather_rows:
-            time_gather(args, cpu, dev, rank, record, nl)
+            try:
+                time_gather(args, cpu, dev, rank, record, nl)
+            except Exception as e:  # noqa: BLE001
+                print(f"GATHER rank {rank} failed: {type(e).__name__}: {e}", flush=True)
     every = [None] * TP
     dist.all_gather_object(every, out, group=cpu)
     if rank == 0 and args.json:
         with open(args.json, "w") as f:
             json.dump(every, f, indent=1)
-    ok = all(c["pre_bad_all"] == 0 and c["rel_fused_all"] <= 1.05 * c["rel_stock"] + 1e-6 for c in out["check"])
+    ok = all(c["pre_bad_all"] == 0 and c["rel_fused_all"] <= 1.05 * c["rel_stock"] + 1e-6
+             for c in out["check"] if "pre_bad_all" in c)
     bad = torch.tensor([int(not ok)], device=dev)
     dist.all_reduce(bad, op=dist.ReduceOp.MAX)
     if rank == 0:
         print("TP8", "PASS" if not bad.item() else "FAIL", flush=True)
     dist.destroy_process_group()
     return not bad.item()
+
+
+def stock_rmsnorm(h, eps, w):
+    """SGLang's RMSNorm module (the latent MoE's routed_expert_norm) with weight ``w``."""
+    from sglang.srt.layers.layernorm import RMSNorm
+
+    norm = RMSNorm(h, eps=eps).to(w.device)
+    norm.weight.data.copy_(w)
+    return norm
+
+
+def moe_halves(args, cpu, dev, rank, record, nl, m, ca, out):
+    """The MoE's two all-reduces once split (latent [m, 3584] + its RMSNorm, shared [m, 7168]):
+    sgl-amd-mono's ar_norm launch against aiter's all-reduce (+ SGLang's RMSNorm); check and time."""
+    from sgl_amd_mono.common import guard
+    from sgl_amd_mono.common.peer import PeerBuffer
+    from sgl_amd_mono.kimi_k3.gfx950.stages import ar_norm as N
+
+    for h, norm in ((3584, True), (7168, False)):
+        launch = N.build(h, norm, args.eps, nl)
+        peer = PeerBuffer(N.peer_bytes(h), cpu, rank, TP, dev, init=N.arm(h))
+        ep = torch.zeros(guard.GUARD_WORDS, dtype=torch.int32, device=dev)
+        ticks = guard.deadline_ticks(args.deadline)
+        lo = ticks & 0xFFFFFFFF
+        ep[guard.GUARD_DEADLINE] = lo - (1 << 32) if lo >= 1 << 31 else lo
+        ep[guard.GUARD_DEADLINE + 1] = ticks >> 32
+        g = torch.Generator(device=dev).manual_seed(4321 + m + h)
+        xall = (torch.randn(TP, m, h, generator=g, device=dev) * 0.3).to(BF)
+        w = (1 + 0.1 * torch.randn(h, generator=g, device=dev)).to(BF)
+        xs = xall[rank].unsqueeze(0).expand(nl, m, h).contiguous()
+        ys = torch.empty_like(xs)
+
+        def body():
+            ep[0:1].add_(1)
+            for i in range(nl):
+                launch(xs[i].data_ptr(), w.data_ptr(), ys[i].data_ptr(), m, peer.addresses.data_ptr(), rank,
+                       ep.data_ptr(), i, stream=torch.cuda.current_stream())
+
+        us = graph_time(body, args.reps, nl)
+        ar = ar_rank_order(xall)
+        snorm = stock_rmsnorm(h, args.eps, w) if norm else None
+        ref = snorm(ar.clone()) if norm else ar
+        bad = int(sum((ys[i].view(torch.int16) != ref.view(torch.int16)).sum() for i in range(nl)))
+        r64 = None
+        if norm:
+            a64 = xall.double().sum(0)
+            r64 = a64 / torch.sqrt((a64 * a64).mean(-1, keepdim=True) + args.eps) * w.double()
+        rel = rel_l2(ys[0], r64) if norm else 0.0
+        rel_s = rel_l2(ref, r64) if norm else 0.0
+        tot = torch.tensor([bad], dtype=torch.int64, device=dev)
+        dist.all_reduce(tot)
+        if rank == 0:
+            print(f"CHECK moe h={h} norm={int(norm)} m={m:3d} mismatches_vs_stock={int(tot)} rel_fused={rel:.3e} "
+                  f"rel_stock={rel_s:.3e}", flush=True)
+        out["check"].append({"moe": h, "norm": norm, "m": m, "mismatch_vs_stock_all": int(tot), "rel_fused": rel,
+                             "rel_stock": rel_s})
+        record(f"fused_moe_{h}{'_norm' if norm else ''}", m, us)
+        ins = [xall[rank].clone() for _ in range(nl)]
+
+        def stock_body():
+            for i in range(nl):
+                r = ca.custom_all_reduce(ins[i])
+                if norm:
+                    snorm(r)
+
+        stock_body()
+        torch.cuda.synchronize()
+        gr = torch.cuda.CUDAGraph()
+        with ca.capture():
+            with torch.cuda.graph(gr):
+                stock_body()
+        for _ in range(3):
+            gr.replay()
+        torch.cuda.synchronize()
+        dist.barrier()
+        e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        e0.record()
+        for _ in range(args.reps):
+            gr.replay()
+        e1.record()
+        torch.cuda.synchronize()
+        record(f"stock_moe_{h}{'_ar+norm' if norm else '_ar'}", m, e0.elapsed_time(e1) * 1000 / (args.reps * nl))
+        peer.close()
 
 
 def time_gather(args, cpu, dev, rank, record, nl):

@@ -23,7 +23,6 @@ other half, and none gets two ahead, since every launch reads every rank's data.
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.compiler.kernel_function import CompilationContext
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, T
@@ -55,8 +54,6 @@ Q8 = SL // 8  # 16 B units of a slice row
 U = H // 8  # 16 B units of a row
 NT = U  # threads a CTA: a 16 B unit of the row each
 NW = NT // 64 + (NT % 64 > 0)  # its waves
-# a CTA's waves fill 4 a SIMD: the budget of 128 VGPRs that allows (the default allows 64, and spills)
-WAVES_PER_EU = 4
 NB_MAX = 8  # banked snapshots K3 reads at most (93 layers, a block every 12)
 LOG2E = 1.4426950408889634
 # reduction slots a wave: the snapshots' dots with cw and squares (2 NB_MAX), the snapshot mix's
@@ -324,7 +321,7 @@ def build(eps_s, eps_o, launches, max_rows=MAX_ROWS, blocks=BLOCKS, emulate=Fals
     fo = 2 * half
     grid = blocks * TP if emulate else blocks
     rank_stride = max_rows * H * 2
-    name = f"k3_ar_read_r{max_rows}_b{blocks}_l{launches}_e{int(emulate)}_w{WAVES_PER_EU}"
+    name = f"k3_ar_read_r{max_rows}_b{blocks}_l{launches}_e{int(emulate)}"
 
     @fx.struct
     class Red:
@@ -411,9 +408,5 @@ def build(eps_s, eps_o, launches, max_rows=MAX_ROWS, blocks=BLOCKS, emulate=Fals
             x, res, bank, cw, w_o, pre_out, out, m, nvb, nbk, has_res, peers, rank, epoch, slot
         ).launch(grid=(grid,), block=(NT,), stream=stream)
 
-    def run(*args, **kwargs):
-        with CompilationContext.compile_hints({"waves_per_eu": WAVES_PER_EU}):
-            return launch(*args, **kwargs)
-
-    _BUILDS[key] = run
-    return run
+    _BUILDS[key] = launch
+    return launch
