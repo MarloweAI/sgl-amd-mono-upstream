@@ -400,8 +400,9 @@ def _tails(packed_layers: dict, batch, device) -> None:
     by layer position: the previous layer is covered (its K2 is this package's
     layer launch at every routed width, a KDA layer's and an MLA layer's alike:
     the MLA front is a launch of its own that ends at the core), this layer's
-    K1 is the wide form (2 to 8 requests: 12 rows today), and it is not a
-    block-write layer (whose front writes a bank row its own K2 then reads).
+    K1 is the wide form at a width the tail takes (``TAIL_MAX_ROWS``: 12
+    rows), and it is not a block-write layer (whose front writes a bank row
+    its own K2 then reads).
     Every other layer keeps the seam in its own front: layer 1 (the dense
     layer's stream), the block-write layers, the one-request form (6 rows: its
     front overlaps its in_proj stream, so the move costs more in the tail than
@@ -425,6 +426,7 @@ def _tails(packed_layers: dict, batch, device) -> None:
             or k1 is None
             or not k1_mod.is_wide(k1)
             or packed.module.is_block_write_layer
+            or prev.key.tokens > k2.tail_seam.TAIL_MAX_ROWS
         ):
             continue
         # the next layer's seam reads the blocks this K2's seam read

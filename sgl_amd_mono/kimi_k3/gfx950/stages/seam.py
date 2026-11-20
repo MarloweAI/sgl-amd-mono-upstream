@@ -604,6 +604,9 @@ def front_mix(c, task):
 # ``pack_x``'s layout, which that layer's K1 (the wide form) reads with no
 # front. Bit for bit that front: the same sums, gate (``gate_sums``) and mix.
 TAIL_ROW0 = 84  # the row CTAs, past lnorm's: no K2 work after their down
+# The widest step that takes a tail: a reduce CTA's slice round holds 16
+# tokens (THREADS // QC), and the move is measured a gain at 12 rows only.
+TAIL_MAX_ROWS = 12
 ROW_SL = THREADS // QC  # slices a row CTA's round: 32 threads a slice
 ROW_ROUNDS = (NA + ROW_SL - 1) // ROW_SL
 WOFF = 1536  # red words of the row CTA's weights, their sum and the rstd
