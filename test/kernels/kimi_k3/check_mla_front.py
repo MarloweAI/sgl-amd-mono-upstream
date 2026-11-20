@@ -170,8 +170,9 @@ class Rank:
         self.pool = torch.zeros(nrows, DQK, dtype=F8, device=device)
         prefix_rows = self.rows[: self.lr].long().to(device)
         self.pool[prefix_rows] = keys[r::DCP][: self.lr]
-        self.kv_idx = self.rows.to(device)
-        self.kv_ptr = torch.tensor([0, max(nloc, 1)], dtype=torch.int32, device=device)
+        # SGLang's ragged list: an empty span on a rank with no key of the request
+        self.kv_idx = self.rows[:nloc].to(device)
+        self.kv_ptr = torch.tensor([0, nloc], dtype=torch.int32, device=device)
         # the verify rows' slots: position q lives at rank q % 8, local row q // 8
         self.loc = torch.zeros(G, dtype=torch.int64, device=device)
         if self.own < G:
@@ -289,7 +290,7 @@ def request_view(fr, b, j):
     return out
 
 
-INV_OTHERS = (10000, 100000, 250000, 37000, 3000, 180000, 64)
+INV_OTHERS = (10000, 3, 250000, 0, 37000, 7, 180000)  # long ones and P < 8
 # a width's batch: request ids in batch order (request 0 at the context under test)
 INV_BATCHES = {12: (1, 0), 24: (2, 0, 3, 1), 48: (1, 2, 3, 4, 5, 6, 7, 0)}
 
@@ -299,9 +300,8 @@ def invariance(w, args, device, epoch):
     bit; the widest batch twice."""
     fails = []
     ctx_of = lambda i, p: p if i == 0 else INV_OTHERS[i - 1]  # noqa: E731
+    bank = make_keys(w, max([*args.ctx, *INV_OTHERS]) + 8 * 997, args.seed, device, args.temp[0])
     for p in args.ctx:
-        need = max([p, *INV_OTHERS]) + 8 * 997
-        bank = make_keys(w, need, args.seed + p, device, args.temp[0])
         reqs = {i: (ctx_of(i, p), bank[997 * i : 997 * i + ctx_of(i, p)], args.seed + 13 * i) for i in range(8)}
         for r in args.rank:
             alone = {}

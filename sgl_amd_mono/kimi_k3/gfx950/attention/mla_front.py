@@ -513,6 +513,13 @@ def request(c, r=0):
     return p, lr, own, n, uniform(_ld(a["kv_ptr"], r))
 
 
+def blocks_of(lr, own):
+    """A request's key blocks on this rank: its local keys and new token, at
+    least one (a rank with no key of the request, P < 2, runs one fully masked
+    block: an empty partial, LSE -1e30 as SGLang's)."""
+    return fx.max((lr + (own < G_ROWS).select(fx.Int32(1), fx.Int32(0)) + BK - 1) // BK, fx.Int32(1))
+
+
 def item_bases(c):
     """Each request's (first attention item, splits), its items (head group
     hg, split sp) at first + hg n + sp; and the items in all."""
@@ -793,7 +800,11 @@ def _kv_dma(c, kvp, lr, b1, blk, kvl):
     if wave == DMA_W0:
         r_kv = rsrc(a["kv"])
         kk = blk * BK + lane
-        row_l = _ld(a["kv_idx"], kvp + fx.max(fx.min(kk, lr - 1), 0))
+        # a request with no local key has no index to read (an empty range)
+        r_idx = rsrc(a["kv_idx"], (lr > 0).select(fx.Int64(0xFFFFFFFF), fx.Int64(0)))
+        row_l = fx.Int32(
+            bo.buffer_load(r_idx, kvp + fx.max(fx.min(kk, lr - 1), 0), vec_width=1, dtype=T.i32)
+        )
         live_l = (kk < lr) & (blk < b1)
         row_l = live_l.select(row_l * DQK, fx.Int32(0))
         for i in range_constexpr(DMA_N):
@@ -1017,7 +1028,7 @@ def attention(c, rq, hg, sa, sb):
     _, lr, own, n, kvp = request(c, rq)
     first_item = pick([b for b, _ in item_bases(c)[0]], rq) + hg * n
     row0 = G_ROWS * rq
-    nbl = (lr + (own < G_ROWS).select(fx.Int32(1), fx.Int32(0)) + BK - 1) // BK
+    nbl = blocks_of(lr, own)
     b0 = sa * nbl // n
     b1 = sb * nbl // n
     kvl0 = c["kvl"]
@@ -1130,7 +1141,7 @@ def cta_items(c, bid):
         nbls, rb = [], [fx.Int32(0)]
         for r in range(c["NREQ"]):
             _, lr, own, _, _ = request(c, r)
-            nbl = (lr + (own < G_ROWS).select(fx.Int32(1), fx.Int32(0)) + BK - 1) // BK
+            nbl = blocks_of(lr, own)
             nbls.append(nbl + ITEM_COST * bases[r][1])  # a head group's cost
             rb.append(rb[-1] + NHG * nbls[-1])
         x = (b * rb[-1]) // BLOCKS
