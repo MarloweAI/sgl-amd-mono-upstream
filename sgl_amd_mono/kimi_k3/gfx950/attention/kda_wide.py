@@ -5,9 +5,11 @@ core output, on the ReplaySSM ring. One launch, ``BLOCKS`` CTAs x ``THREADS``.
 
     gemv    in_proj: 131 sets of three 16-row groups x 14 K steps of 64 a
             wave (wave w streams K 896 w .. 896 (w + 1)), 1834 units in equal
-            runs of 7 or 8 over the CTAs; a set's groups share every x load.
+            runs of 7 or 8 over the CTAs, read from ``pack_w_in``'s layout (a
+            run's weights contiguous); a set's groups share every x load.
             A run's pieces are summed in wave order; a set's head CTA adds the
-            pieces of the next one or two CTAs in order -> bf16 PROJ pairs
+            pieces of the next one or two CTAs in order -> bf16 PROJ words
+            (16-B tagged words, a request's L rows of a channel)
     kda     a task a (request, head) on CTA 128 + t (at most 10 requests): its
             state, conv window, f_b rows and constants loaded first, then
             conv + SiLU of the head's q|k|v (verify windows to SGLang's
@@ -891,6 +893,7 @@ def kda_wide(
     tl=None,
 ):
     """Host launcher. ``x`` bf16 [S, 7168] (the input-normed layer input);
+    ``w_in`` in_proj as ``pack_w_in`` lays it out;
     ``conv_state`` [slot, channel, entry] by its strides (SGLang's conv cache
     [slot, CONV_W - 1, C] is its ``.mT``), read only; ``rstate`` [slots, 12, 128,
     128] fp32, read only; ``st_idx`` int32 [R]: each request's slot (< 0: none);
