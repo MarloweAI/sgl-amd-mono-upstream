@@ -18,8 +18,9 @@ its eighth and the rows are all-gathered over the peer buffer.
             bf16 -> GEMV -> bf16 partial; this rank's up columns -> SHP (plain,
             SHRDY flags), the rest -> every rank's FINAL
     ug      (|U| x 12, every CTA): the union U of the step's picks; an expert's
-            32 gate + 32 up rows against the MXFP4 latent (aiter's inline quant),
-            SiTUv2 (aiter's fp32 epilogue), MXFP4 -> INTER / ISC a pick
+            32 gate + 32 up rows against the MXFP8 latent (aiter's A8W4 inline
+            quant), SiTUv2 (aiter's fp32 epilogue), bf16, MXFP8 -> INTER / ISC a
+            pick
     down    (224 x 16 latent rows, every CTA): w2 of every expert of U against
             its picks' INTER, bf16(w acc) folded in each token's top-k order with
             a bf16 rounding an add -> every rank's LATR
@@ -44,6 +45,8 @@ from flydsl.expr.typing import Int32, Int64, T, as_ir_value
 
 from sgl_amd_mono.common.mx import (
     FP4,
+    FP8,
+    FP8_MAX,
     UNIT_SCALE,
     fp4_tile_load,
     mfma_scaled,
@@ -145,12 +148,12 @@ R_GROUPS = E // TP // ROWS  # 7 router row groups a rank
 R_PARTS = 4  # K quarters: the router is on the path to the route
 L_GROUPS = LAT // TP // ROWS  # 28 latent row groups a rank
 L_PARTS = 2  # K halves: the latent is on the path to ug
-# latq_push: the latent as 32-row groups (one MXFP4 block of columns) in K
+# latq_push: the latent as 32-row groups (one MX block of columns) in K
 # quarters, so part 0 holds whole blocks and quantizes them itself
 LQ_GROUPS = LAT // TP // 32  # 14
 LQ_PARTS = 4
 assert LQ_GROUPS * LQ_PARTS == L_GROUPS * L_PARTS
-LQ_WORDS = LAT // 8 + LAT // 32  # a token's fp4 words, then its scale codes
+LQ_WORDS = LAT // 4 + LAT // 32  # a token's fp8 words, then its scale codes
 R_TASKS = R_GROUPS * R_PARTS  # 28
 L_TASKS = L_GROUPS * L_PARTS  # 56
 G_TASKS = 2 * SI // ROWS  # 96
@@ -166,6 +169,7 @@ LN0 = 56  # lnorm's CTAs
 RED_TASKS = HIDDEN // 128  # 56
 RED0 = 200
 UG_GROUPS = RI // 32  # 12
+IW = RI // 4  # a pick's INTER words (MXFP8)
 W13_K = LAT  # 3584
 W13_STEPS = W13_K // 128  # 28
 W2_STEPS = RI // 128  # 3
@@ -198,7 +202,7 @@ def peer_pairs(s):
     return {
         "rlog": TP * s * (E // TP),
         "lat": s * LAT // 2,
-        # latq_push: every rank's MXFP4 latent words and e8m0 codes, a token a row
+        # latq_push: every rank's MXFP8 latent words and e8m0 codes, a token a row
         "latq": s * LQ_WORDS,
         "latr": TP * s * LAT // 2,
         "final": TP * s * HIDDEN // 2,
@@ -225,7 +229,7 @@ def scratch_layout(key: MoeBuild) -> dict:
         # sized for latq_push's 32-row groups in quarters (twice the halves')
         "lpart": LQ_GROUPS * LQ_PARTS * s * 2 * ROWS,
         "route": s * 2 * TOPK,
-        "inter": s * TOPK * 48,
+        "inter": s * TOPK * IW,
         "isc": s * TOPK * UG_GROUPS,
         "lmsq": LN_TASKS * s,
         "lnrdy": LN_TASKS,
@@ -250,6 +254,22 @@ def scratch_bytes(key: MoeBuild) -> int:
 
 def f32_of(w):
     return w.bitcast(fx.Float32)
+
+
+def fp8_operand(lds, row, st, kb):
+    """A lane's MXFP8 MFMA operand of K step ``st`` from a natural-order row at
+    LDS word ``row``: lane group ``kb`` takes the step's 16-byte pieces kb and
+    kb + 4 (the f8f6f4 MFMA's 8-bit operand layout; its scale is block kb)."""
+    halves = [
+        fx.Vector(
+            fx.ptr_load(
+                lds + (row + st * 32 + 4 * kb + 16 * h),
+                result_type=fx.Vector.make_type(4, fx.Int32),
+            )
+        )
+        for h in range(2)
+    ]
+    return fx.Vector.from_elements([h[d] for h in halves for d in range(4)], fx.Int32)
 
 
 def tanh_libm(x):
@@ -282,39 +302,57 @@ def situ_aiter(g, u):
 
 
 def e8m0_roundup(amax):
-    """The ``_e8m0_roundup(amax, 6)`` of aiter: ceil code of amax * f32(1/6),
-    at most 254."""
-    wi = (amax * fx.Float32(1.0 / 6.0)).bitcast(fx.Int32)
+    """The ``_e8m0_roundup(amax, 448)`` of aiter's A8W4 MoE (its MXFP8 inline
+    quant and fp8out epilogue): ceil code of amax * f32(1/448), at most 254."""
+    wi = (amax * fx.Float32(1.0 / FP8_MAX)).bitcast(fx.Int32)
     b = fx.Int32(fx.Uint32(wi + fx.Int32(0x7FFFFF)) >> fx.Uint32(23)) & 0xFF
     return fx.min(b, fx.Int32(254))
 
 
-def pk_fp4_f32(old, a, b, scale, j):
-    """Two f32 / scale -> E2M1 nibbles into byte j of ``old`` (RNE, saturating)."""
-    return fx.Int32(
-        rocdl.cvt_scalef32_pk_fp4_f32(
-            T.i32,
-            as_ir_value(fx.Int32(old)),
-            as_ir_value(fx.Float32(a)),
-            as_ir_value(fx.Float32(b)),
-            as_ir_value(fx.Float32(scale)),
-            j,
-        )
-    )
+def _pk16():
+    return fx.Vector.make_type(2, fx.Int16)
 
 
-def pk_fp4_bf16(old, word, scale, j):
-    """A packed bf16 pair word / scale -> E2M1 nibbles into byte j of ``old``."""
-    v = fx.Vector.from_elements([fx.Int32(word)], fx.Int32).bitcast(fx.BFloat16)
-    return fx.Int32(
-        rocdl.cvt_scalef32_pk_fp4_bf16(
-            T.i32,
-            as_ir_value(fx.Int32(old)),
-            as_ir_value(v),
-            as_ir_value(fx.Float32(scale)),
-            j,
+def _pk_word(pk):
+    return fx.Vector(pk).bitcast(fx.Int32)[0]
+
+
+def pk_fp8_f32(vals, scale):
+    """Four f32 / scale -> one word of four E4M3 bytes (the scaled convert)."""
+    sc = as_ir_value(fx.Float32(scale))
+    pk = fx.full(2, 0, fx.Int16)
+    for h in range(2):
+        pk = rocdl.cvt_scalef32_pk_fp8_f32(
+            _pk16(),
+            pk,
+            as_ir_value(fx.Float32(vals[2 * h])),
+            as_ir_value(fx.Float32(vals[2 * h + 1])),
+            sc,
+            h,
         )
-    )
+    return _pk_word(pk)
+
+
+def pk_fp8_bf16(words, scale):
+    """Two packed bf16 pair words / scale -> one word of four E4M3 bytes."""
+    sc = as_ir_value(fx.Float32(scale))
+    pk = fx.full(2, 0, fx.Int16)
+    for h in range(2):
+        v = fx.Vector.from_elements([fx.Int32(words[h])], fx.Int32).bitcast(fx.BFloat16)
+        pk = rocdl.cvt_scalef32_pk_fp8_bf16(_pk16(), pk, as_ir_value(v), sc, h)
+    return _pk_word(pk)
+
+
+def quant_block_bf16(ws):
+    """One 32-column block (16 packed bf16 pair words) -> (8 MXFP8 words, its
+    e8m0 code), as aiter's A8W4 inline quant: the amax of the bf16 bits."""
+    am = fx.Int32(0)
+    for w in ws:
+        am = fx.max(am, w & 0x7FFF)
+        am = fx.max(am, (w >> 16) & 0x7FFF)
+    code = e8m0_roundup((am << 16).bitcast(fx.Float32))
+    scale = (code << 23).bitcast(fx.Float32)
+    return [pk_fp8_bf16(ws[2 * q : 2 * q + 2], scale) for q in range(8)], code
 
 
 # ---------------------------------------------------------------- early
@@ -392,8 +430,8 @@ def early_out(c, kind, i, q, red):
 def early_out_lq(c, i, q, accs):
     """latq_push latent task (i, q): its two 16-row tiles' fp32 partials; part 0
     adds the parts in part order, rounds each row to bf16 (what LAT would hold),
-    and quantizes the group's 32 columns -- one MXFP4 block -- as load_latq
-    does, then pushes the block's 4 words and its code to every rank's LATQ."""
+    and quantizes the group's 32 columns -- one MX block -- as load_latq does,
+    then pushes the block's 8 words and its code to every rank's LATQ."""
     s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
     region = c["lpart"]
     for h in range_constexpr(2):
@@ -421,25 +459,17 @@ def early_out_lq(c, i, q, accs):
             ).bitcast(fx.Int32)
             for j in range(16)
         ]
-        am = fx.Int32(0)
-        for w in ws:
-            am = fx.max(am, w & 0x7FFF)
-            am = fx.max(am, (w >> 16) & 0x7FFF)
-        amax = (am << 16).bitcast(fx.Float32)
-        code = e8m0_roundup(amax)
-        scale = (code << 23).bitcast(fx.Float32)
-        pks = []
-        for q4 in range_constexpr(4):
-            pk = fx.Int32(0)
-            for j in range_constexpr(4):
-                pk = pk_fp4_bf16(pk, ws[4 * q4 + j], scale, j)
-            pks.append(pk)
+        pks, code = quant_block_bf16(ws)
         blk = c["rank"] * LQ_GROUPS + i
         for p in range_constexpr(TP):
             # two pairs a store: a buffer store moves at most 128 bits
-            c["put_words"](c["peer"]["latq"][p], t * LQ_WORDS + blk * 4, pks[:2])
-            c["put_words"](c["peer"]["latq"][p], t * LQ_WORDS + blk * 4 + 2, pks[2:])
-            c["put_words"](c["peer"]["latq"][p], t * LQ_WORDS + LAT // 8 + blk, [code])
+            for q in range_constexpr(4):
+                c["put_words"](
+                    c["peer"]["latq"][p],
+                    t * LQ_WORDS + blk * 8 + 2 * q,
+                    pks[2 * q : 2 * q + 2],
+                )
+            c["put_words"](c["peer"]["latq"][p], t * LQ_WORDS + LAT // 4 + blk, [code])
     gpu.barrier()
 
 
@@ -1009,9 +1039,9 @@ def load_route(c):
 
 @flyc.jit
 def load_latq(c):
-    """LAT (every rank's 448 columns) -> MXFP4 as aiter's inline quant: a
-    thread a (token, 32-block): amax of |bf16| bits, the ceil code of amax / 6,
-    v_cvt_scalef32_pk_fp4_bf16 -> latq words, latsc codes. Under ``latq_push``
+    """LAT (every rank's 448 columns) -> MXFP8 as aiter's A8W4 inline quant: a
+    thread a (token, 32-block): amax of |bf16| bits, the ceil code of amax /
+    448, v_cvt_scalef32_pk_fp8_bf16 -> latq words, latsc codes. Under ``latq_push``
     the producers quantized it: every rank's words and codes are polled in."""
     s, tid = c["S"], c["tid"]
     push = c.get("latq_push", False)
@@ -1030,11 +1060,11 @@ def load_latq(c):
             t = ec // LQ_WORDS
             w = ec % LQ_WORDS
             if e < n:
-                if w < LAT // 8:
-                    fx.ptr_store(got[i][0], c["latq"] + (t * (LAT // 8) + w))
+                if w < LAT // 4:
+                    fx.ptr_store(got[i][0], c["latq"] + (t * (LAT // 4) + w))
                 else:
                     fx.ptr_store(
-                        got[i][0], c["latsc"] + (t * (LAT // 32) + w - LAT // 8)
+                        got[i][0], c["latsc"] + (t * (LAT // 32) + w - LAT // 4)
                     )
         gpu.barrier()
         return
@@ -1046,19 +1076,10 @@ def load_latq(c):
         base = (t * LAT + kb * 32) // 2
         got = c["poll"]([(c["peer"]["lat_own"], base + j, 1) for j in range(16)])
         ws = [got[j][0] for j in range(16)]
-        am = fx.Int32(0)
-        for w in ws:
-            am = fx.max(am, w & 0x7FFF)
-            am = fx.max(am, (w >> 16) & 0x7FFF)
-        amax = (am << 16).bitcast(fx.Float32)
-        code = e8m0_roundup(amax)
-        scale = (code << 23).bitcast(fx.Float32)
+        pks, code = quant_block_bf16(ws)
         if tid + THREADS * i < nblk:
-            for q in range_constexpr(4):
-                pk = fx.Int32(0)
-                for j in range_constexpr(4):
-                    pk = pk_fp4_bf16(pk, ws[4 * q + j], scale, j)
-                fx.ptr_store(pk, c["latq"] + (t * (LAT // 8) + kb * 4 + q))
+            for q in range_constexpr(8):
+                fx.ptr_store(pks[q], c["latq"] + (t * (LAT // 4) + kb * 8 + q))
             fx.ptr_store(code, c["latsc"] + (t * (LAT // 32) + kb))
     gpu.barrier()
 
@@ -1120,9 +1141,9 @@ def ug_loads(c, task):
 @flyc.jit
 def stage_ug(c, task, ops):
     """Slot task / 12, 32-column group task % 12: gate rows 32 g .. and up rows
-    384 + 32 g .. of the slot's expert (``ops``: ``ug_loads``) against the MXFP4
-    latent; SiTUv2; MXFP4 a 32-column group -> INTER / ISC of each picking
-    token."""
+    384 + 32 g .. of the slot's expert (``ops``: ``ug_loads``) against the MXFP8
+    latent; SiTUv2, rounded to bf16; MXFP8 a 32-column group -> INTER / ISC of
+    each picking token."""
     s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
     rt = c["rt"]
     slot = task // UG_GROUPS
@@ -1137,16 +1158,11 @@ def stage_ug(c, task, ops):
     acc = fx.Vector.filled(4, 0.0, fx.Float32)
     for i in range_constexpr(len(steps) if c["xp"] != 2 else 0):
         st = steps[i]
-        bw = fx.Vector(
-            fx.ptr_load(
-                c["latq"] + (t * (LAT // 8) + st * 16 + kb * 4),
-                result_type=fx.Vector.make_type(4, fx.Int32),
-            )
-        )
+        bw = fp8_operand(c["latq"], t * (LAT // 4), st, kb)
         sb = fx.ptr_load(c["latsc"] + (t * (LAT // 32) + st * 4 + kb))
         # the code's byte (st % 2) 2 + rg % 2 of the word; rg % 2 is the wave's
         sa = (sw[i // 2] >> ((st % 2) * 16 + (rg % 2) * 8)) & 0xFF
-        acc = mfma_scaled(av[i], bw, acc, sa, sb, FP4, FP4, 0, 0)
+        acc = mfma_scaled(av[i], bw, acc, sa, sb, FP4, FP8, 0, 0)
     if const_expr(c["xp"] == 2):
         # loads only: keep them live
         acc = fx.Vector.from_elements(
@@ -1173,22 +1189,19 @@ def stage_ug(c, task, ops):
     uv = first.select(
         row_sum(red, r, tt, waves=(2, 6)), row_sum(red, r, tt, waves=(3, 7))
     )
-    v = situ_aiter(gv, uv)
+    # aiter's fp8out epilogue: the activation is materialized as bf16 first
+    v = bf16_round(situ_aiter(gv, uv))
     amax = butterfly(abs(v), (16, 8, 4, 2, 1), fx.max)
     code = e8m0_roundup(amax)
     gpu.barrier()
     fx.ptr_store(v, c["av"] + tid)
     gpu.barrier()
     k = fx.ptr_load(rt["kof"] + (slot * 8 + tt))
-    if live & (col < 4) & (k >= 0):
+    if live & (col < 8) & (k >= 0):
         scale = (code << 23).bitcast(fx.Float32)
-        pk = fx.Int32(0)
-        for j in range_constexpr(4):
-            x0 = fx.ptr_load(c["av"] + (tt * 32 + col * 8 + 2 * j))
-            x1 = fx.ptr_load(c["av"] + (tt * 32 + col * 8 + 2 * j + 1))
-            pk = pk_fp4_f32(pk, x0, x1, scale, j)
+        xs = [fx.ptr_load(c["av"] + (tt * 32 + col * 4 + j)) for j in range(4)]
         pick = tt * TOPK + k
-        c["put_words"](c["inter"], pick * 48 + g * 4 + col, [pk])
+        c["put_words"](c["inter"], pick * IW + g * 8 + col, [pk_fp8_f32(xs, scale)])
         if col == 0:
             c["put"](c["isc"], pick * UG_GROUPS + g, code)
     gpu.barrier()
@@ -1228,7 +1241,7 @@ def reset_queues(c):
 def load_inter(c):
     """Every pick's INTER words and ISC codes -> LDS."""
     s, tid = c["S"], c["tid"]
-    nw = s * TOPK * 48
+    nw = s * TOPK * IW
     per = (nw + THREADS - 1) // THREADS
     nc = s * TOPK * UG_GROUPS
     perc = (nc + THREADS - 1) // THREADS
@@ -1260,20 +1273,6 @@ def w2_scale(c, e, rgd, st, lane):
         bo.buffer_load(rsrc(c["args"]["w2s"]), idx // 4, vec_width=1, dtype=T.i32)
     )
     return (w >> ((idx % 4) * 8)) & 0xFF
-
-
-def poll_inter(c, pick, kb):
-    """A lane's INTER words (3 steps x 4) and ISC codes of ``pick``, polled at
-    its use: a slot whose ug tasks are done is multiplied while later slots'
-    still run (no wait for all of U)."""
-    return c["poll"](
-        [
-            (c["inter"], pick * 48 + st * 16 + kb * 4 + d, 1)
-            for st in range(W2_STEPS)
-            for d in range(4)
-        ]
-        + [(c["isc"], pick * UG_GROUPS + st * 4 + kb, 1) for st in range(W2_STEPS)]
-    )
 
 
 def down_loads(c, rgd, nu, b0):
@@ -1326,15 +1325,10 @@ def stage_down(c, rgd, nu, ops0):
             # this slot's picks' INTER, polled here (not all of U first): a slot
             # whose ug tasks are done is multiplied while later ones still run
             for st in range_constexpr(W2_STEPS):
-                bw = fx.Vector(
-                    fx.ptr_load(
-                        c["interq"] + (pick * 48 + st * 16 + kb * 4),
-                        result_type=fx.Vector.make_type(4, fx.Int32),
-                    )
-                )
+                bw = fp8_operand(c["interq"], pick * IW, st, kb)
                 scode = fx.ptr_load(c["intsc"] + (pick * UG_GROUPS + st * 4 + kb))
                 bw = fx.Vector.from_elements(
-                    [picked.select(bw[d], fx.Int32(0)) for d in range(4)], fx.Int32
+                    [picked.select(bw[d], fx.Int32(0)) for d in range(8)], fx.Int32
                 )
                 sb = picked.select(scode, fx.Int32(UNIT_SCALE))
                 acc = mfma_scaled(
@@ -1344,7 +1338,7 @@ def stage_down(c, rgd, nu, ops0):
                     ops[nbs + j * W2_STEPS + st],
                     sb,
                     FP4,
-                    FP4,
+                    FP8,
                     0,
                     0,
                 )
@@ -1708,13 +1702,13 @@ def build(key: MoeBuild):
 
     @fx.struct
     class UgLds:
-        latq: fx.Array[fx.Int32, s * LAT // 8, 16]
+        latq: fx.Array[fx.Int32, s * LAT // 4, 16]
         latsc: fx.Array[fx.Int32, s * LAT // 32, 16]
         av: fx.Array[fx.Float32, THREADS, 16]
 
     @fx.struct
     class DownLds:
-        interq: fx.Array[fx.Int32, s * TOPK * 48, 16]
+        interq: fx.Array[fx.Int32, s * TOPK * IW, 16]
         intsc: fx.Array[fx.Int32, s * TOPK * UG_GROUPS, 16]
         contrib: fx.Array[fx.Float32, s * TOPK * ROWS, 16]
 

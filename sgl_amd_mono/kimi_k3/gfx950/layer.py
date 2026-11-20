@@ -284,13 +284,13 @@ def build(key: K2Build):
 
     @fx.struct
     class UgLds:
-        latq: fx.Array[fx.Int32, s * k2b.LAT // 8, 16]
+        latq: fx.Array[fx.Int32, s * k2b.LAT // 4, 16]
         latsc: fx.Array[fx.Int32, s * k2b.LAT // 32, 16]
         av: fx.Array[fx.Float32, THREADS, 16]
 
     @fx.struct
     class DownLds:
-        interq: fx.Array[fx.Int32, s * k2b.TOPK * 48, 16]
+        interq: fx.Array[fx.Int32, s * k2b.TOPK * k2b.IW, 16]
         intsc: fx.Array[fx.Int32, s * k2b.TOPK * k2b.UG_GROUPS, 16]
         contrib: fx.Array[fx.Float32, s * k2b.TOPK * k2b.ROWS, 16]
 
@@ -408,7 +408,7 @@ def build(key: K2Build):
                 "delta": True,
                 "reset": key.reset,
                 "fold": key.fold,
-                # the top-16 by candidate rank; the latent quantized to MXFP4 by
+                # the top-16 by candidate rank; the latent quantized to MXFP8 by
                 # its producers and pushed to every rank
                 "route_v": 2,
                 "latq_push": True,
