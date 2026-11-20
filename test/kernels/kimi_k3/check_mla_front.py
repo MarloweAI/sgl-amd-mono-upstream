@@ -786,7 +786,7 @@ def time_cells(w, st, keys, p, r, scratch, epoch, layer, args):
     tl = fr["tl"]
     t0 = tl[:, 0].min()
     names = ["start", "x seen", "stage 1", "q latent", "q_b", "absorb", "attn q seen", "attn done",
-             "W_UV seen", "W_UV done", "blk start", "blk qk+sm", "blk pv", "blk stored"]
+             "W_UV seen", "W_UV done", "blk start", "blk qk", "blk pv", "blk stored", "blk sm", "blk pv start", "blk bar1", "blk dma issued", "blk dma waited"]
     pts = []
     for k, n in enumerate(names):
         col = tl[:, k]
@@ -795,6 +795,15 @@ def time_cells(w, st, keys, p, r, scratch, epoch, layer, args):
             us = ((col[live] - t0).double() / 100.0).sort().values
             pts.append(f"{n} {us[len(us) // 2].item():.1f}/{us[-1].item():.1f}")
     print(f"STAMPS P={p} rank={r} (us from launch, median/latest CTA): " + ", ".join(pts), flush=True)
+    groups = {"0-27": (0, 28), "28-55": (28, 56), "56-127": (56, 128), "128-191": (128, 192), "192-255": (192, 256)}
+    for gname, (a_, b_) in groups.items():
+        cols = []
+        for k, n in enumerate(names[:10]):
+            col = tl[a_:b_, k]
+            live = col > 0
+            if live.any():
+                cols.append(f"{n} {((col[live].max() - t0).double() / 100.0).item():.1f}")
+        print(f"  CTAs {gname} latest: " + ", ".join(cols), flush=True)
 
 
 def emulate(sends, stock_sends, gates, stock_gates, refs, tag, emus=None):

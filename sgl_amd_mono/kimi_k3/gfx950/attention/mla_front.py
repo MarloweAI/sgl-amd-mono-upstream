@@ -119,23 +119,31 @@ G_Q = QL // ROWS  # 96
 G_KV = KV // ROWS  # 32
 S1 = (LATW + GATE) // ROWS  # 228 stage-1 groups
 S1_GATE0 = G_LAT
-NCTA1 = BLOCKS - NA  # 200 stage-1 CTAs
-S1_EXTRA = S1 - NCTA1  # 28 stage-1 groups on seam CTAs
+# The CTA roles before the attention (every CTA then takes an attention item):
+#   0 .. 55      the seam, then 5 q_b groups
+#   56 .. 187    a fused_qkv_a group at launch, then 7 (to 135) or 6 q_b groups
+#   188 .. 255   g_proj, off the q path: a group each, 188 .. 215 a second one
+QKV0 = NA  # the first fused_qkv_a CTA
+GP0 = QKV0 + G_LAT  # 188: the first g_proj CTA
+GP2 = GATE // ROWS - (BLOCKS - GP0)  # 28 g_proj CTAs with a second group
+QB_SEAM, QB_HI, QB_LO = 5, 7, 6  # q_b groups a seam / early / late qkv_a CTA
 QBG = NHA * QHD // ROWS  # 1152 q_b groups
 QBG_HEAD = QHD // ROWS  # 12 a head: 8 nope, then 4 rope
-QB_ROUNDS = (QBG + BLOCKS - 1) // BLOCKS  # 5
+QB_ROUNDS = QB_HI  # q_b groups a CTA at most
+QB_HI_N = QBG - NA * QB_SEAM - G_LAT * QB_LO  # 80 qkv_a CTAs with 7
 ABS_BLK = KV // 128  # 4 absorb tasks a head
 ABS = NHA * ABS_BLK  # 384
-HT = 16  # heads an attention item
-NHG = NHA // HT  # 6 head groups
+HQ = 8  # heads an attention item (a row pair x 8 heads fill the MFMA's 16)
+NRP = 3  # row pairs (the 6 verify rows)
+NHG = NHA // HQ  # 12 head groups
 BK = 64  # keys a block
 KT = BK // 16  # 16-key QK tiles a block
 KC = BK // 32  # 32-key PV steps a block
 RWK = DQK // 4 + 4  # i32 words a key in LDS: its record + 16 bytes of pad
-PW = BK // 2 + 2  # i32 words a (row, head)'s bf16 P in LDS: its keys + pad
+PW = BK // 2 + 4  # i32 words a (row, head)'s bf16 P in LDS: its keys + pad
 ATT_CTAS = BLOCKS  # every CTA takes an attention item (at most one)
-MAX_SPLITS = 21  # the most splits whose items (at two dim ranges) fit the CTAs
-KEYS_PER_SPLIT = 256  # local keys a split aims at
+MAX_SPLITS = 21  # the most splits whose items (12 head groups) fit the CTAs
+KEYS_PER_SPLIT = 64  # local keys a split aims at (one block)
 UV_HALF = 64  # value columns a W_UV task
 UV_TASKS = NHA * (VD // UV_HALF)  # 192
 UV_CTAS = 192  # a W_UV task a CTA, on CTAs 0 .. 191
@@ -149,9 +157,9 @@ LN2 = 0.6931471805599453
 EMPTY_LSE = -1e30  # SGLang's LSE of a row with no key on this rank
 # start, x seen, stage 1, q latent normed, q_b, absorb, attention q seen,
 # attention done, W_UV partials seen, W_UV done
-TL_POINTS = 14
+TL_POINTS = 19
 
-assert S1_EXTRA <= NA - 1 and KV_CTA >= S1_EXTRA
+assert GP2 >= 0 and QB_HI_N >= 0 and NA * QB_SEAM + QB_HI_N * QB_HI + (G_LAT - QB_HI_N) * QB_LO == QBG
 
 
 def splits_of(p: int) -> int:
@@ -162,11 +170,9 @@ def splits_of(p: int) -> int:
 
 
 def dims_of(n: int) -> int:
-    """Value-dim ranges at ``n`` splits: 4 while the items (6 head groups x n x
-    d) fit the CTAs, else 2."""
-    d = 4 if NHG * n * 4 <= ATT_CTAS else 2
-    assert NHG * n * d <= ATT_CTAS, n
-    return d
+    """Value-dim ranges an item covers: one (every item all 512 dims)."""
+    assert NHG * n <= ATT_CTAS, n
+    return 1
 
 
 @dataclass(frozen=True)
@@ -384,8 +390,7 @@ def request(c):
     own = (own < G_ROWS).select(own, fx.Int32(DCP))
     lg = (p + G_ROWS + DCP - 1) >> 3
     n = fx.max(fx.Int32(1), fx.min(fx.Int32(MAX_SPLITS), (lg + KEYS_PER_SPLIT - 1) // KEYS_PER_SPLIT))
-    d = (NHG * 4 * n <= ATT_CTAS).select(fx.Int32(4), fx.Int32(2))
-    return p, lr, own, n, d
+    return p, lr, own, n, fx.Int32(1)
 
 
 # ---------------------------------------------------------------- the KV record
@@ -448,6 +453,22 @@ def stage_kv(c):
 
 
 # ---------------------------------------------------------------- stage 2: q_b
+
+
+def qb_range(bid):
+    """(first group, count) of CTA ``bid``'s q_b groups (contiguous)."""
+    seam = bid < NA
+    hi = (bid >= QKV0) & (bid < QKV0 + QB_HI_N)
+    lo = (bid >= QKV0 + QB_HI_N) & (bid < GP0)
+    first = seam.select(
+        bid * QB_SEAM,
+        hi.select(
+            NA * QB_SEAM + (bid - QKV0) * QB_HI,
+            NA * QB_SEAM + QB_HI_N * QB_HI + (bid - QKV0 - QB_HI_N) * QB_LO,
+        ),
+    )
+    count = seam.select(fx.Int32(QB_SEAM), hi.select(fx.Int32(QB_HI), lo.select(fx.Int32(QB_LO), fx.Int32(0))))
+    return first, count
 
 
 def s2_loads(c, h):
@@ -583,31 +604,6 @@ def stage3(c, task, wt):
 MAX_SPLIT_BLOCKS = 32  # a split's blocks at most (its rows' indices in LDS)
 
 
-def _kv_piece_addr(c, lr, own, b0, blk, piece):
-    """Piece ``piece`` (16 bytes) of block ``blk``'s keys: key blk 32 + piece / 36,
-    its row from the split's indices in LDS, the new token from NEWKV; a key
-    past the request's reads a valid row (and scores nothing)."""
-    a = c["args"]
-    key = piece // (DQK // 16)
-    part = piece % (DQK // 16)
-    kk = blk * BK + key
-    row = fx.Int64(fx.ptr_load(c["kil"] + ((blk - b0) * BK + key)))
-    pool = a["kv"] + row * fx.Int64(DQK) + fx.Int64(part * 16)
-    new = c["newkv"] + fx.Int64(part * 16)
-    is_new = (kk == lr) & (own < G_ROWS)
-    return is_new.select(new, pool)
-
-
-def _kv_loads(c, lr, own, b0, blk):
-    tid = c["tid"]
-    rounds = -(-(BK * DQK // 16) // THREADS)
-    out = []
-    for j in range_constexpr(rounds):
-        piece = fx.min(tid + THREADS * j, BK * DQK // 16 - 1)
-        out.append(global_load(_kv_piece_addr(c, lr, own, b0, blk, piece), 4))
-    return out
-
-
 @flyc.jit
 def _split_rows(c, kvp, lr, b0, b1):
     """The split's keys' rows (blocks b0 .. b1) from the request's indices into
@@ -624,19 +620,50 @@ def _split_rows(c, kvp, lr, b0, b1):
     gpu.barrier()
 
 
+KV_SLOTS = RWK * 4 // 16  # 37 16-byte LDS slots a key: its 36 pieces, then pad
+DMA_N = BK * KV_SLOTS // 64  # 37 wave-wide DMAs a block
+DMA_W0 = NRP  # the DMA waves: those without QK (3 .. 7)
+DMA_WAVES = WAVES - DMA_W0
+DMA_ROUNDS = -(-DMA_N // DMA_WAVES)  # 8 a wave at most
+DMA_FULL = DMA_N - (DMA_ROUNDS - 1) * DMA_WAVES  # waves with DMA_ROUNDS (the rest one fewer)
+KV_BUFS = 3  # LDS record buffers: block i in use, i + 1 landed, i + 2 in flight
+assert BK * KV_SLOTS % 64 == 0
+
+
 @flyc.jit
-def _kv_store(c, loads, kvl):
-    tid = c["tid"]
-    for j in range_constexpr(len(loads)):
-        piece = tid + THREADS * j
-        key = piece // (DQK // 16)
-        part = piece % (DQK // 16)
-        if piece < BK * DQK // 16:
-            fx.ptr_store(fx.Vector(loads[j]), kvl + (key * RWK + part * 4))
+def _kv_dma(c, b0, b1, blk, kvl):
+    """Block ``blk``'s records straight into LDS at ``kvl`` (padded rows), a
+    16-byte slot a lane: a wave's DMA fills 64 consecutive slots. The pad slots
+    and the new token's (patched after, ``_kv_patch``) take a valid dummy row."""
+    a = c["args"]
+    lane, wave = c["lane"], c["wave"]
+    r_kv = rsrc(a["kv"])
+    for r in range_constexpr(DMA_ROUNDS):
+        i = r * DMA_WAVES + wave - DMA_W0
+        q = i * 64 + lane
+        key = q // KV_SLOTS
+        part = q % KV_SLOTS
+        row = fx.ptr_load(c["kil"] + ((blk - b0) * BK + fx.min(key, BK - 1)))
+        live = (part < KV_SLOTS - 1) & (blk < b1)
+        voff = live.select(row * DQK + part * 16, fx.Int32(0))
+        if (wave >= DMA_W0) & (i < DMA_N):
+            rocdl.raw_ptr_buffer_load_lds(
+                r_kv, (kvl + i * 256).llvm_ptr, 16, voff, fx.Int32(0), 0, 0
+            )
+
+
+@flyc.jit
+def _kv_patch(c, lr, own, blk, kvl):
+    """The new token's record from NEWKV into its slot, where block ``blk``
+    holds it."""
+    e = c["tid"] - DMA_W0 * 64  # a thread of the DMA waves
+    if (own < G_ROWS) & (lr // BK == blk) & (e >= 0) & (e < DQK // 16):
+        v = _ld4(c["newkv"], 4 * e, CM_DEV)
+        fx.ptr_store(v, kvl + ((lr % BK) * RWK + 4 * e))
 
 
 QK_STEPS = -(-DQK // 128)  # 5 K = 128 e4m3 MFMAs a key tile (the last half zero)
-QK_AHEAD = 0  # QK steps whose LDS reads are in flight under a step's MFMAs
+QK_AHEAD = 1  # QK steps whose LDS reads are in flight under a step's MFMAs
 
 
 def _mfma128(a, b, c):
@@ -658,38 +685,40 @@ def _k128(lane, words8, kc):
     return fx.Vector.from_elements([live.select(words8[e], fx.Int32(0)) for e in range(8)], fx.Int32)
 
 
-def _qk(lane, kvl, ql):
-    """The block's scores against one row's 16 heads (``ql``: the row's q in
-    LDS, a head a key-sized row): KT 16-key tiles C[key][head] (element i of
-    tile kt: key 16 kt + 4 (lane / 16) + i, head lane % 16)."""
+def _qk(lane, kvl, qf):
+    """The block's scores against one row pair's 8 heads (``qf``: its e4m3 q, a
+    step of 32 bytes a lane): KT 16-key tiles C[key][rh] (element i of tile kt:
+    key 16 kt + 4 (lane / 16) + i; rh = lane % 16: row 2 rp + rh / 8, head rh % 8)."""
     g, r16 = lane // 16, lane % 16
     v4 = fx.Vector.make_type(4, fx.Int32)
     acc = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(KT)]
 
-    def row32(base, kc):
-        # past the record the reads stay in the row (its pad, then the next row)
-        w = base + fx.min(32 * kc + 8 * g, DQK // 4 - 8)
-        lo = fx.Vector(fx.ptr_load(w, result_type=v4))
-        hi = fx.Vector(fx.ptr_load(w + 4, result_type=v4))
-        return _k128(lane, fx.Vector.from_elements([lo[e] for e in range(4)] + [hi[e] for e in range(4)], fx.Int32), kc)
-
     def rd(kc):
-        return [row32(kvl + (16 * kt + r16) * RWK, kc) for kt in range(KT)] + [row32(ql + r16 * RWK, kc)]
+        # past the record the reads stay in the key's row (its pad, then the next key)
+        w = fx.min(32 * kc + 8 * g, DQK // 4 - 8)
+        ks = []
+        for kt in range_constexpr(KT):
+            base = kvl + ((16 * kt + r16) * RWK + w)
+            lo = fx.Vector(fx.ptr_load(base, result_type=v4))
+            hi = fx.Vector(fx.ptr_load(base + 4, result_type=v4))
+            ks.append(_k128(lane, fx.Vector.from_elements([lo[e] for e in range(4)] + [hi[e] for e in range(4)], fx.Int32), kc))
+        return ks
 
     ahead = [rd(kc) for kc in range(QK_AHEAD)]
     for kc in range_constexpr(QK_STEPS):
         if const_expr(kc + QK_AHEAD < QK_STEPS):
             ahead.append(rd(kc + QK_AHEAD))
-        cur = ahead.pop(0) if ahead else rd(kc)
+        ks = ahead.pop(0) if ahead else rd(kc)
         for kt in range_constexpr(KT):
-            acc[kt] = _mfma128(cur[kt], cur[KT], acc[kt])
+            acc[kt] = _mfma128(ks[kt], qf[kc], acc[kt])
         rocdl.sched_barrier(0)
     return acc
 
 
 def _softmax(lane, t, blk, kend, sacc, lr, own, m, l, qk_scale, prow):
-    """Row t's online softmax over the block: the new (max, sum, factor of the
-    earlier sums); its P (e4m3, keys the row does not see 0) to the row's LDS."""
+    """(row t, head) lane % 16's online softmax over the block: the new (max,
+    sum, factor of the earlier sums); its P (bf16, keys the row does not see 0)
+    to the (row, head)'s LDS."""
     g = lane // 16
     sv = []
     for kt in range_constexpr(KT):
@@ -715,184 +744,173 @@ def _softmax(lane, t, blk, kend, sacc, lr, own, m, l, qk_scale, prow):
     return mn, l * a + ls, a
 
 
-def _v_ops(lane, kvl, dbase, nt, kc):
-    """PV's A operands of 32-key step kc for ``nt`` 16-dim tiles: tile dt holds
-    dim dbase + nt (lane % 16) + dt at keys 32 kc + 8 (lane / 16) .. + 8 (e4m3)."""
+def _v_ops(lane, kvl, dbase, kc):
+    """PV's A operands of 32-key step kc for 4 16-dim tiles: tile dt holds dim
+    dbase + 4 (lane % 16) + dt at keys 32 kc + 8 (lane / 16) .. + 8, widened to
+    bf16 (exact)."""
     g, r16 = lane // 16, lane % 16
-    dim = dbase + nt * r16
+    dim = dbase + 4 * r16
     ws = [fx.ptr_load(kvl + ((32 * kc + 8 * g + j) * RWK + dim // 4)) for j in range(8)]
-    sh0 = (dim % 4) * 8
-    return [_pack_bytes(ws, sh0 + 8 * dt) for dt in range(nt)]
+    out = []
+    for dt in range_constexpr(4):
+        v = fx.Vector.from_elements([_pack_bytes(ws, 8 * dt)], fx.Int64).bitcast(fx.Int32)
+        out.append(fp8_to_bf16x8(v[0], v[1]))
+    return out
 
 
 def _scaled(v, a):
     return fx.Vector.from_elements([v[i] * a for i in range(4)], fx.Float32)
 
 
-def _dbase(wave, dr, nt):
-    """The first dim of this wave's share of dim range ``dr`` (16 nt dims a wave)."""
-    return dr * (128 * nt) + wave * (16 * nt)
-
-
-def _pv(lane, wave, kx, pl, al, dr, acc, nt):
-    """The block's P V onto every row's accumulators (rescaled first) for this
-    wave's ``nt`` 16-dim tiles."""
+def _pv(lane, wave, kx, pl, al, acc):
+    """The block's P V onto every row pair's accumulators (rescaled first) for
+    this wave's 64 dims (4 tiles x 3 row pairs)."""
     g, r16 = lane // 16, lane % 16
-    # V widened to bf16 (exact), P in bf16
-    vops = [
-        [
-            fp8_to_bf16x8(*[fx.Vector.from_elements([v], fx.Int64).bitcast(fx.Int32)[e] for e in range(2)])
-            for v in _v_ops(lane, kx, _dbase(wave, dr, nt), nt, kc)
-        ]
-        for kc in range(KC)
-    ]
+    vops = [_v_ops(lane, kx, 64 * wave, kc) for kc in range(KC)]
     out = list(acc)
-    for r in range_constexpr(G_ROWS):
-        alpha = fx.ptr_load(al + (r * HT + r16)).bitcast(fx.Float32)
-        for dt in range_constexpr(nt):
-            out[r * 2 + dt] = _scaled(acc[r * 2 + dt], alpha)
+    for rp in range_constexpr(NRP):
+        alpha = fx.ptr_load(al + (rp * 16 + r16)).bitcast(fx.Float32)
+        for dt in range_constexpr(4):
+            out[rp * 4 + dt] = _scaled(acc[rp * 4 + dt], alpha)
         for kc in range_constexpr(KC):
-            pw = fx.ptr_load(pl + ((r * HT + r16) * PW + 16 * kc + 4 * g), result_type=fx.Vector.make_type(4, fx.Int32))
+            pw = fx.ptr_load(pl + ((rp * 16 + r16) * PW + 16 * kc + 4 * g), result_type=fx.Vector.make_type(4, fx.Int32))
             pb = fx.Vector(pw).bitcast(fx.BFloat16)
-            for dt in range_constexpr(nt):
-                out[r * 2 + dt] = _mfma16(vops[kc][dt], pb, out[r * 2 + dt])
+            for dt in range_constexpr(4):
+                out[rp * 4 + dt] = _mfma16(vops[kc][dt], pb, out[rp * 4 + dt])
     return out
 
 
 @flyc.jit
-def _partial_out(c, lane, wave, dr, sp, head, acc, nt):
-    """Each row's partial over its own sum, f16, to PV [split][row][head][512]:
-    lane (g, head) holds dims dbase + 4 nt g + nt i + dt (i < 4, dt < nt)."""
+def _partial_out(c, lane, wave, sp, hg, acc):
+    """Each (row, head)'s partial over its own sum, f16, to PV [split][row][head][512]:
+    lane (g, rh) of row pair rp holds dims 64 wave + 16 g + 4 i + dt."""
     s = c["S"]
     g, r16 = lane // 16, lane % 16
-    dbase = _dbase(wave, dr, nt)
     mll = c["mll"]
-    for r in range_constexpr(G_ROWS):
-        ll = fx.ptr_load(mll + 2 * (r * HT + r16) + 1).bitcast(fx.Float32)
+    for rp in range_constexpr(NRP):
+        ll = fx.ptr_load(mll + 2 * (rp * 16 + r16) + 1).bitcast(fx.Float32)
         inv = (ll > fx.Float32(0.0)).select(fx.Float32(1.0) / ll, fx.Float32(0.0))
-        vals = [None] * (4 * nt)
+        vals = [None] * 16
         for i in range_constexpr(4):
-            for dt in range_constexpr(nt):
-                vals[nt * i + dt] = acc[r * 2 + dt][i] * inv
-        o0 = (((sp * s + r) * NHA + head) * KV + dbase + 4 * nt * g) // 2
-        for q in range_constexpr(max(1, nt // 2)):
-            part = vals[8 * q : 8 * q + 8] if nt >= 2 else vals
-            hv = fx.Vector.from_elements(part, fx.Float32).to(fx.Float16).bitcast(fx.Int32)
+            for dt in range_constexpr(4):
+                vals[4 * i + dt] = acc[rp * 4 + dt][i] * inv
+        r = 2 * rp + r16 // HQ
+        head = hg * HQ + r16 % HQ
+        o0 = (((sp * s + r) * NHA + head) * KV + 64 * wave + 16 * g) // 2
+        for q in range_constexpr(2):
+            hv = fx.Vector.from_elements(vals[8 * q : 8 * q + 8], fx.Float32).to(fx.Float16).bitcast(fx.Int32)
             bo.buffer_store(hv, rsrc(c["pv"]), o0 + 4 * q, cache_modifier=CM_DEV)
 
 
 @flyc.jit
-def _step(c, kx, blk, kend, m, l, acc, qf, t, lr, own, nt, dr, qk_scale):
+def _step(c, kx, blk, kend, m, l, acc, qf, t, lr, own, qk_scale):
     """Block ``blk`` (in LDS at ``kx``; past the split it scores nothing): QK and
-    the online softmax on waves 0 .. 5 (a row each), then every wave's P V."""
-    s, lane, wave = c["S"], c["lane"], c["wave"]
+    the online softmax on waves 0 .. 2 (a row pair each), then every wave's P V."""
+    lane, wave = c["lane"], c["wave"]
     g, r16 = lane // 16, lane % 16
     pl, al = c["pl"], c["al"]
-    if wave < s:
+    if wave < NRP:
         sacc = _qk(lane, kx, qf)
-        m, l, al_ = _softmax(lane, t, blk, kend, sacc, lr, own, m, l, qk_scale, pl + (wave * HT + r16) * PW)
+        if wave == 0:
+            # the scores in registers (debug stamp)
+            fx.ptr_store(sacc[KT - 1][3].bitcast(fx.Int32), c["red"] + (WAVES * 64 * 8 - 2))
+        stamp(c["on"], c["tls"], c["tid"], 11)
+        m, l, al_ = _softmax(lane, t, blk, kend, sacc, lr, own, m, l, qk_scale, pl + (wave * 16 + r16) * PW)
         if g == 0:
-            fx.ptr_store(al_.bitcast(fx.Int32), al + (wave * HT + r16))
+            fx.ptr_store(al_.bitcast(fx.Int32), al + (wave * 16 + r16))
+        stamp(c["on"], c["tls"], c["tid"], 14)
     _bar()
-    stamp(c["on"], c["tls"], c["tid"], 11)
-    if nt == 2:
-        acc = _pv(lane, wave, kx, pl, al, dr, acc, 2)
-    if nt == 1:
-        acc = _pv(lane, wave, kx, pl, al, dr, acc, 1)
+    stamp(c["on"], c["tls"], c["tid"], 15)
+    acc = _pv(lane, wave, kx, pl, al, acc)
     return m, l, acc
 
 
 @flyc.jit
-def attention(c, item):
-    """Item ``item``: (16-head group hg, key split sp, dim range dr) over the
-    split's blocks of this rank's keys; its partial, its (max, sum), ITRDY."""
+def attention(c, hg, sp):
+    """Item (8-head group hg, key split sp) over the split's blocks of this
+    rank's keys; its partial, its (max, sum), ITRDY."""
     s, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
     a = c["args"]
     g, r16 = lane // 16, lane % 16
-    _, lr, own, n, d = request(c)
-    nd = n * d
-    hg = item // nd
-    sp = (item // d) % n
-    dr = item % d
+    _, lr, own, n, _ = request(c)
+    item = hg * n + sp
     nbl = (lr + (own < G_ROWS).select(fx.Int32(1), fx.Int32(0)) + BK - 1) // BK
     b0 = sp * nbl // n
     b1 = (sp + 1) * nbl // n
     kvp = uniform(_ld(a["kv_ptr"], 0))
-    kvl0, pl, al = c["kvl"], c["pl"], c["al"]
+    kvl0 = c["kvl"]
     # the split's rows, then its first two blocks' records in flight before the
     # waits (the keys need no q)
     _split_rows(c, kvp, lr, b0, b1)
-    pend = _kv_loads(c, lr, own, b0, b0)
-    p2 = _kv_loads(c, lr, own, b0, fx.min(b0 + 1, b1 - 1))
-    # the group's q: its 16 heads' absorb tasks and rope groups; the new token
-    if tid < HT * ABS_BLK:
-        c["poll"]([(c["absrdy"], (hg * HT + tid // ABS_BLK) * ABS_BLK + tid % ABS_BLK, 1)])
-    if (tid >= HT * ABS_BLK) & (tid < 2 * HT * ABS_BLK):
-        e = tid - HT * ABS_BLK
-        c["poll"]([(c["qrdy"], (hg * HT + e // 4) * QBG_HEAD + QN // ROWS + e % 4, 1)])
+    kv1 = kvl0 + BK * RWK
+    kend = b1 * BK
+    _kv_dma(c, b0, b1, b0, kvl0)
+    _kv_dma(c, b0, b1, fx.min(b0 + 1, b1 - 1), kv1)
+    # the group's q: its 8 heads' absorb tasks and rope groups; the new token
+    if tid < HQ * ABS_BLK:
+        c["poll"]([(c["absrdy"], (hg * HQ + tid // ABS_BLK) * ABS_BLK + tid % ABS_BLK, 1)])
+    if (tid >= HQ * ABS_BLK) & (tid < 2 * HQ * ABS_BLK):
+        e = tid - HQ * ABS_BLK
+        c["poll"]([(c["qrdy"], (hg * HQ + e // 4) * QBG_HEAD + QN // ROWS + e % 4, 1)])
     has_new = (own < G_ROWS) & (b1 > lr // BK) & (b0 <= lr // BK)
-    if has_new & (tid == 2 * HT * ABS_BLK):
+    if has_new & (tid == 2 * HQ * ABS_BLK):
         c["poll"]([(c["kvrdy"], 0, 1)])
     _bar()
     stamp(c["on"], c["tls"], tid, 6)
-    t = fx.min(wave, s - 1)
-    # the group's q, every row, into LDS (a head a key-sized row)
-    qrow = DQK // 16  # 16-byte pieces a head
-    for j in range_constexpr(-(-(G_ROWS * HT * qrow) // THREADS)):
-        e = fx.min(tid + THREADS * j, G_ROWS * HT * qrow - 1)
-        tq = e // (HT * qrow)
-        hq = (e // qrow) % HT
-        pq = e % qrow
-        v = _ld4(c["q8"], (tq * (NHA * DQK) + (hg * HT + hq) * DQK) // 4 + 4 * pq, CM_DEV)
-        if tid + THREADS * j < G_ROWS * HT * qrow:
-            fx.ptr_store(v, c["qll"] + ((tq * HT + hq) * RWK + 4 * pq))
-    ql = c["qll"] + t * (HT * RWK)
+    # a QK wave's q in registers: row pair rp = wave, (row, head) lane % 16
+    rp = fx.min(wave, NRP - 1)
+    t = 2 * rp + r16 // HQ
+    qbase = (t * (NHA * DQK) + (hg * HQ + r16 % HQ) * DQK) // 4
+
+    def q_words(kc):
+        w = qbase + fx.min(32 * kc + 8 * g, DQK // 4 - 8)
+        lo = fx.Vector(bo.buffer_load(rsrc(c["q8"]), w, vec_width=4, dtype=T.i32, cache_modifier=CM_DEV))
+        hi = fx.Vector(bo.buffer_load(rsrc(c["q8"]), w + 4, vec_width=4, dtype=T.i32, cache_modifier=CM_DEV))
+        return _k128(lane, fx.Vector.from_elements([lo[e] for e in range(4)] + [hi[e] for e in range(4)], fx.Int32), kc)
+
+    qf = [q_words(kc) for kc in range(QK_STEPS)]
     qk_scale = c["scale"] * LOG2E
-    # this item's 16-dim tiles a wave: 512 / d dims over 8 waves
-    nt = (d == 4).select(fx.Int32(1), fx.Int32(2))
     m = fx.Float32(NEG)
     l = fx.Float32(0.0)
-    acc = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(G_ROWS * 2)]
-    # q and the first two blocks landed: no load from before the loop is
-    # waited on inside it (the loop's waits then count only its own loads)
+    acc = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(NRP * 4)]
+    # q and the first two blocks landed: the loop's waits count only its DMAs
     rocdl.s_waitcnt(vmcnt=0)
-    _kv_store(c, pend, kvl0)
+    _kv_patch(c, lr, own, b0, kvl0)
+    _kv_patch(c, lr, own, b0 + 1, kv1)
     _bar()
-    kend = b1 * BK
-    # two blocks a round, the load registers alternating statically: block blk
-    # in LDS, blk + 1 and blk + 2 in flight
-    for pr in range(0, (b1 - b0 + 1) // 2):
-        blk = b0 + 2 * pr
-        p3 = _kv_loads(c, lr, own, b0, fx.min(blk + 2, b1 - 1))
+    # block blk in buffer (blk - b0) % 3, blk + 1 landed in the next; the DMA
+    # waves put blk + 2 into the third under the QK
+    for blk in range(b0, b1):
+        x = (blk - b0) % KV_BUFS
+        kx = kvl0 + x * (BK * RWK)
+        ky = kvl0 + ((x + 1) % KV_BUFS) * (BK * RWK)
+        kz = kvl0 + ((x + 2) % KV_BUFS) * (BK * RWK)
         stamp(c["on"], c["tls"], tid, 10)
-        m, l, acc = _step(c, kvl0, blk, kend, m, l, acc, ql, t, lr, own, nt, dr, qk_scale)
+        _kv_dma(c, b0, b1, fx.min(blk + 2, b1 - 1), kz)
+        m, l, acc = _step(c, kx, blk, kend, m, l, acc, qf, t, lr, own, qk_scale)
         stamp(c["on"], c["tls"], tid, 12)
-        _bar()
-        _kv_store(c, p2, kvl0)
+        # block blk + 1's DMAs landed (this wave's newest, block blk + 2's, may not have)
+        if wave >= DMA_W0:
+            if wave < DMA_W0 + DMA_FULL:
+                rocdl.s_waitcnt(vmcnt=DMA_ROUNDS)
+            else:
+                rocdl.s_waitcnt(vmcnt=DMA_ROUNDS - 1)
+        _kv_patch(c, lr, own, blk + 1, ky)
         _bar()
         stamp(c["on"], c["tls"], tid, 13)
-        p2 = _kv_loads(c, lr, own, b0, fx.min(blk + 3, b1 - 1))
-        m, l, acc = _step(c, kvl0, blk + 1, kend, m, l, acc, ql, t, lr, own, nt, dr, qk_scale)
-        _bar()
-        _kv_store(c, p3, kvl0)
-        _bar()
     stamp(c["on"], c["tls"], tid, 7)
     # (max, sum) a (row, head) to LDS, then the partial over its own sum
     mll = c["mll"]
-    if (wave < s) & (g == 0):
-        fx.ptr_store(m.bitcast(fx.Int32), mll + 2 * (wave * HT + r16))
-        fx.ptr_store(l.bitcast(fx.Int32), mll + 2 * (wave * HT + r16) + 1)
+    if (wave < NRP) & (g == 0):
+        fx.ptr_store(m.bitcast(fx.Int32), mll + 2 * (wave * 16 + r16))
+        fx.ptr_store(l.bitcast(fx.Int32), mll + 2 * (wave * 16 + r16) + 1)
     gpu.barrier()
-    head = hg * HT + r16
-    if nt == 2:
-        _partial_out(c, lane, wave, dr, sp, head, acc, 2)
-    if nt == 1:
-        _partial_out(c, lane, wave, dr, sp, head, acc, 1)
-    if (wave < s) & (g == 0) & (dr == 0):
+    _partial_out(c, lane, wave, sp, hg, acc)
+    if (wave < NRP) & (g == 0):
         bo.buffer_store(
             fx.Vector.from_elements([m, l], fx.Float32),
             rsrc(c["ml"]),
-            ((sp * s + wave) * NHA + head) * 2,
+            ((sp * s + t) * NHA + hg * HQ + r16 % HQ) * 2,
             cache_modifier=CM_DEV,
         )
     rocdl.s_waitcnt(vmcnt=0)
@@ -905,34 +923,32 @@ def attention(c, item):
 # ---------------------------------------------------------------- W_UV
 
 
-def _touch(c, loads):
-    """Consume ``loads`` into one LDS word (their bytes then sit in L2)."""
-    x = fx.Int32(0)
-    for v in loads:
-        for e in range_constexpr(4):
-            x = x ^ fx.Int32(fx.Vector(v)[e])
-    fx.ptr_store(x, c["red"] + (WAVES * 64 * 8 - 1))
-
-
-def uv_loads(c, task):
-    """W_UV task ``task``'s tile W[h][k][64 half ..+64], 16 bytes a piece (8 a
-    thread, row k = piece / 8)."""
-    a = c["args"]
-    tid = c["tid"]
-    task = fx.min(task, UV_TASKS - 1)
-    h = task // 2
-    half = task % 2
-    out = []
-    for i in range_constexpr(8):
-        p = tid + THREADS * i
-        k = p // 8
-        seg = p % 8
-        out.append(_ld4(a["w_vc"], (h * (KV * VD) + k * VD + half * UV_HALF + seg * 8) // 2))
-    return out
+UV_SLOTS = UV_ROW * 2 // 16  # 9 16-byte LDS slots a tile row: its 8 pieces, then pad
+UV_DMA_N = KV * UV_SLOTS // 64  # 72 wave-wide DMAs a tile
+UV_DMA_W0 = 6  # the DMA waves (the merge runs on waves 0 .. 5)
+UV_DMA_ROUNDS = UV_DMA_N // (WAVES - UV_DMA_W0)
 
 
 @flyc.jit
-def stage_uv(c, task, wt):
+def _uv_dma(c, task):
+    """Task ``task``'s W_UV tile straight into LDS (rows padded), on the DMA waves."""
+    a = c["args"]
+    lane, wave = c["lane"], c["wave"]
+    h = task // 2
+    half = task % 2
+    r_w = rsrc(a["w_vc"])
+    for r in range_constexpr(UV_DMA_ROUNDS):
+        i = r * (WAVES - UV_DMA_W0) + wave - UV_DMA_W0
+        q = i * 64 + lane
+        k = q // UV_SLOTS
+        seg = q % UV_SLOTS
+        voff = (seg < UV_SLOTS - 1).select(((h * KV + k) * VD + half * UV_HALF + 8 * seg) * 2, fx.Int32(0))
+        if wave >= UV_DMA_W0:
+            rocdl.raw_ptr_buffer_load_lds(r_w, (c["wl"] + i * 256).llvm_ptr, 16, voff, fx.Int32(0), 0, 0)
+
+
+@flyc.jit
+def stage_uv(c, task):
     """Head task // 2's split partials (its group's items) merged in split order
     -> the bf16 latent output in LDS and the head's LSE; then W_UV for value
     columns 64 (task % 2) .. -> ``send`` (bf16), the LSE word with the first half."""
@@ -942,10 +958,13 @@ def stage_uv(c, task, wt):
     half = task % 2
     _, _, _, n, d = request(c)
     nd = n * d
-    hg = h // HT
+    hg = h // HQ
+    # the tile streams into LDS on waves 6, 7 while wave 0 polls and waves
+    # 0 .. 5 merge (a wave's loads complete in order)
+    _uv_dma(c, task)
     if tid < nd:
         c["poll"]([(c["itrdy"], hg * nd + tid, 1)])
-    gpu.barrier()
+    _bar()
     stamp(c["on"], c["tls"], tid, 8)
     xl, wl = c["xl"], c["wl"]
     owner = h // NHL
@@ -984,11 +1003,7 @@ def stage_uv(c, task, wt):
                 fx.Float32(EMPTY_LSE),
             )
             bo.buffer_store(lse, rsrc(a["send"]), ((owner * s + t) * NHL + hl) * (REC // 2) + VD // 2)
-    for i in range_constexpr(8):
-        p = tid + THREADS * i
-        k = p // 8
-        seg = p % 8
-        fx.ptr_store(wt[i], wl + (k * UV_ROW + seg * 8) // 2)
+    rocdl.s_waitcnt(vmcnt=0)
     gpu.barrier()
     vq = wave % 2
     kq = wave // 2
@@ -1045,12 +1060,11 @@ def build(key: MlaFrontBuild):
 
     @fx.struct
     class CoreLds:
-        kv: fx.Array[fx.Int32, BK * RWK, 16]
-        p: fx.Array[fx.Int32, G_ROWS * HT * PW, 16]
-        alpha: fx.Array[fx.Int32, G_ROWS * HT, 16]
-        ml: fx.Array[fx.Int32, 2 * G_ROWS * HT, 16]
+        kv: fx.Array[fx.Int32, KV_BUFS * BK * RWK, 16]
+        p: fx.Array[fx.Int32, NRP * 16 * PW, 16]
+        alpha: fx.Array[fx.Int32, NRP * 16, 16]
+        ml: fx.Array[fx.Int32, 2 * NRP * 16, 16]
         kidx: fx.Array[fx.Int32, MAX_SPLIT_BLOCKS * BK, 16]
-        q: fx.Array[fx.Int32, G_ROWS * HT * RWK, 16]
 
     @fx.struct
     class UvLds:
@@ -1109,7 +1123,7 @@ def build(key: MlaFrontBuild):
             "pv": scratch + fx.Int64(lay["pv"][0]),
             "ml": scratch + fx.Int64(lay["ml"][0]),
             "kvl": cl.kv.ptr, "pl": cl.p.ptr, "al": cl.alpha.ptr, "mll": cl.ml.ptr,
-            "kil": cl.kidx.ptr, "qll": cl.q.ptr,
+            "kil": cl.kidx.ptr,
             "args": {
                 "prefix": prefix, "delta": 0, "blocks": blocks, "blk_sm": blk_sm,
                 "blk_sr": blk_sr, "ares_nw": ares_nw, "ares_qk": ares_qk, "in_nw": in_nw,
@@ -1127,52 +1141,54 @@ def build(key: MlaFrontBuild):
         if bid < NA:
             stage_slice(c, bid)
             stage_mix(c, bid)
-            if bid < S1_EXTRA:
-                ge = bid + NCTA1
-                opse = s1_loads(c, ge)
-                load_x(c)
-                stage1(c, ge, opse)
             if bid == KV_CTA:
                 stage_kv(c)
-        if bid >= NA:
-            g0 = bid - NA
-            ops = s1_loads(c, g0)
+        if (bid >= QKV0) & (bid < GP0):
+            # fused_qkv_a: the q path's first weights, at launch
+            ops = s1_loads(c, bid - QKV0)
             load_x(c)
-            stage1(c, g0, ops)
+            stage1(c, bid - QKV0, ops)
+        if bid >= GP0:
+            # g_proj, read only after the launch
+            ops = s1_loads(c, S1_GATE0 + bid - GP0)
+            load_x(c)
+            stage1(c, S1_GATE0 + bid - GP0, ops)
+            if bid < GP0 + GP2:
+                ops2 = s1_loads(c, S1_GATE0 + BLOCKS - GP0 + bid - GP0)
+                stage1(c, S1_GATE0 + BLOCKS - GP0 + bid - GP0, ops2)
         stamp(on, tls, tid, 2)
-        # stage 2: groups bid + 256 j, each group's weights issued two groups
-        # ahead; the absorb tiles go out first, under the q latent's polls
-        ops = [s2_loads(c, bid), s2_loads(c, bid + BLOCKS)]
-        w3 = [s3_loads(c, bid), s3_loads(c, bid + BLOCKS)]
-        # this CTA's W_UV tile read once now, under the q latent's polls, so the
-        # task after the attention finds it in its XCD's L2
-        _touch(c, uv_loads(c, bid))
-        load_qlora(c)
+        # stage 2: this CTA's q_b groups, two groups of weights in flight
+        q0, qn_ = qb_range(bid)
+        # (a group index past QBG loads nothing)
+        ops = [s2_loads(c, (j < qn_).select(q0 + j, fx.Int32(QBG))) for j in range(2)]
+        if bid < GP0:
+            load_qlora(c)
         stamp(on, tls, tid, 3)
         for j in range_constexpr(QB_ROUNDS):
-            h = bid + BLOCKS * j
-            if h < QBG:
+            h = q0 + j
+            if j < qn_:
                 stage2(c, h, ops[j])
             nwait = 0
             if const_expr(j + 2 < QB_ROUNDS):
-                ops.append(s2_loads(c, h + 2 * BLOCKS))
+                ops.append(s2_loads(c, (j + 2 < qn_).select(h + 2, fx.Int32(QBG))))
                 nwait = S2_LOADS
-            if h < QBG:
+            if j < qn_:
                 stage2_flag(c, h, nwait)
             _bar()
         stamp(on, tls, tid, 4)
         # stage 3: tasks bid and bid + 256
         c["xl"], c["wl"] = abl.xl.ptr, abl.wl.ptr
+        w3 = [s3_loads(c, bid), s3_loads(c, bid + BLOCKS)]
         stage3(c, bid, w3[0])
         if bid < ABS - BLOCKS:
             stage3(c, bid + BLOCKS, w3[1])
         stamp(on, tls, tid, 5)
-        _, _, _, n, d = request(c)
-        if bid < NHG * n * d:
-            attention(c, bid)
+        _, _, _, n, _ = request(c)
+        if bid < NHG * n:
+            attention(c, bid // n, bid % n)
         c["xl"], c["wl"] = ul.xl.ptr, ul.wl.ptr
         if bid < UV_CTAS:
-            stage_uv(c, bid, uv_loads(c, bid))
+            stage_uv(c, bid)
         stamp(on, tls, tid, 9)
         stamp_flush(on, tls, tl, tid, bid, TL_POINTS)
 
