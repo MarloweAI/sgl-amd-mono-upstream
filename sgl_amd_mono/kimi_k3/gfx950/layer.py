@@ -40,7 +40,7 @@ from sgl_amd_mono.common.plan import (
     pair_layout,
 )
 from sgl_amd_mono.common.sync import Mailbox, preg, shift, sreg
-from sgl_amd_mono.kimi_k3 import MAX_ROWS
+from sgl_amd_mono.kimi_k3 import CORE, MAX_ROWS
 from sgl_amd_mono.kimi_k3.gfx950.stages import gemv as gemv
 from sgl_amd_mono.kimi_k3.gfx950.stages import moe as k2b
 from sgl_amd_mono.kimi_k3.gfx950.stages import oproj as k2a
@@ -70,7 +70,11 @@ SD0 = k2b.DOWN_TASKS  # 224: the shared down's CTAs
 # timeline points: 0 start, 1 o_proj done / AR reduced, 2 early done / slice,
 # 3 ug, 4 down/sdown, 5 lnorm, 6 up, 7 reduce, 8 gate, 9 mix (x published),
 # 10 route, 11 route table, 12 latent quant, 13 route starts
-TL_POINTS = 25  # + 20-24 router: x / LDS / GEMV / parts / pushed; + 14 route logits in, 15 INTER loaded, 16 down done, 17-19 route keys / select / rank
+TL_POINTS = 27  # + 20-24 router: x / LDS / GEMV / parts / pushed; + 14 route logits in, 15 INTER loaded, 16 down done, 17-19 route keys / select / rank
+TL_OPROJ = (
+    25  # o_proj CTAs: the last task's GEMV done, before its AR pushes (point 1: pushed)
+)
+TL_AR_WAIT = 26  # AttnRes CTAs: the AR poll starts (point 1: reduced)
 
 assert E0 + k2b.R_TASKS + k2b.L_TASKS <= BLOCKS and k2b.G_TASKS <= E0 - O0
 
@@ -106,6 +110,9 @@ _STREAM = fx.Stream(None)
 class K2Build(msgspec.Struct, frozen=True):
     tokens: int
     nblocks: int  # the MLP AttnRes block sources
+    # o_proj's input width a rank: the attention's TP-local output (KDA: 12
+    # heads x 128). The rows are bf16, row-major, ``core.stride(0)`` apart.
+    kin: int = CORE
     eps: float = 1e-5  # mlp_res_norm
     out_eps: float = 1e-5  # post_attention_layernorm
     ln_eps: float = 1e-5  # the latent RMSNorm
@@ -306,7 +313,7 @@ def build(key: K2Build):
 
     keyed = key_tuple(key, SOURCES)
     name = (
-        f"k3_mono_k2_s{s}_nb{key.nblocks}_x{int(key.reset)}_r{int(key.reduce)}"
+        f"k3_mono_k2_s{s}_k{key.kin}_nb{key.nblocks}_x{int(key.reset)}_r{int(key.reduce)}"
         f"_t{int(key.timeline)}"
         + ("_f1" if key.fold else "")
         + (f"_o{key.opt}" if key.opt else "")
@@ -315,6 +322,7 @@ def build(key: K2Build):
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def k2(
         core: Int64,
+        core_ld: Int32,
         w_o: Int64,
         prefix: Int64,
         prefix_in: Int64,
@@ -391,6 +399,7 @@ def build(key: K2Build):
                 "S": s,
                 "NS": ns,
                 "NB": key.nblocks,
+                "OK": key.kin,
                 "tid": tid,
                 "bid": bid,
                 "lane": tid % 64,
@@ -439,10 +448,12 @@ def build(key: K2Build):
                 "xflags": NA,
                 "tl_on": key.timeline,
                 "tls": lds.tls.ptr,
+                "tl_push": TL_OPROJ,
                 "ln": scratch + fx.Int64(lay["ln"][0]),
                 "shp": scratch + fx.Int64(lay["shp"][0]),
                 "args": {
                     "core": core,
+                    "core_ld": core_ld,
                     "w_o": w_o,
                     "prefix": prefix,
                     "prefix_in": prefix_in,
@@ -532,6 +543,7 @@ def build(key: K2Build):
             if bid < NA:
                 # PRELOAD: the slice's loads in flight across the o_proj poll
                 sld = slice_loads(c, bid) if key.opt & OPT_PRELOAD else None
+                stamp(on, tls, tid, TL_AR_WAIT)
                 k2a.stage_reduce(c, bid)
                 stamp(on, tls, tid, 1)
                 stage_slice(c, bid, sld)
@@ -600,6 +612,7 @@ def build(key: K2Build):
     @flyc.jit
     def launch(
         core: Int64,
+        core_ld: Int32,
         w_o: Int64,
         prefix: Int64,
         prefix_in: Int64,
@@ -632,6 +645,7 @@ def build(key: K2Build):
         _ = keyed
         k2(
             core,
+            core_ld,
             w_o,
             prefix,
             prefix_in,
@@ -702,12 +716,17 @@ def k2_launch(
     tl=None,
     prefix_in=None,
 ):
-    """Host launcher: ``core`` [S, 1536] (o_proj's input), ``prefix`` updated in
+    """Host launcher: ``core`` [S, key.kin] bf16 (o_proj's input; rows may be
+    strided, 16-B aligned), ``prefix`` updated in
     place (read from ``prefix_in`` when given), ``out`` the MoE output [S, 7168]
     (plus the updated prefix under ``key.fold``); MoE weights as ``moe``."""
     assert (
-        w_o.shape == (HIDDEN, k2a.OK)
-        and core.is_contiguous()
+        w_o.shape == (HIDDEN, key.kin)
+        and key.kin % 128 == 0
+        and core.shape == (key.tokens, key.kin)
+        and core.stride(1) == 1
+        and core.stride(0) % 8 == 0
+        and core.data_ptr() % 16 == 0
         and prefix.is_contiguous()
     )
     assert w_up.shape == (k2b.UP_N, k2b.LAT) and w_up.is_contiguous()
@@ -718,6 +737,7 @@ def k2_launch(
     f = build(key)
     f(
         core.data_ptr(),
+        core.stride(0),
         w_o.data_ptr(),
         prefix.data_ptr(),
         (prefix if prefix_in is None else prefix_in).data_ptr(),

@@ -84,8 +84,7 @@ SOURCES = kernel_sources(__name__)
 TP = 8
 OROWS = HIDDEN  # o_proj rows (full hidden, a rank's K slice)
 OTASKS = OROWS // ROWS  # 448
-OK = PROJ  # K = 1536 a rank
-OKCH = OK // 128  # 12 chunks
+OK = PROJ  # K = 1536 a rank (the KDA core)
 GEMV0 = NA  # the first gemv CTA
 GEMV_N = BLOCKS - NA  # 200
 TL_POINTS = 6  # start, gemv, pushed, reduced, slice/gate, mix
@@ -125,17 +124,26 @@ def scratch_bytes(key: AttnPostBuild) -> int:
     return max(o + n for o, n in scratch_layout(key).values())
 
 
+def o_dims(c):
+    """o_proj's K (the launch's input width) and its 128-column chunks: (K,
+    chunks, chunks a wave)."""
+    k = c.get("OK", OK)
+    n = k // 128
+    return k, n, (n + WAVES - 1) // WAVES
+
+
 def o_loads(c, rg):
-    """Rows 16 rg .. of o_proj, this wave's K chunks (wave, wave + 8 < 12): a lane
+    """Rows 16 rg .. of o_proj, this wave's K chunks (wave, wave + 8, ...): a lane
     64 B of its row a chunk."""
     lane, wave = c["lane"], c["wave"]
+    k, nch, per = o_dims(c)
     r_w = rsrc(c["args"]["w_o"])
     row = rg * ROWS + lane % ROWS
     g = lane // ROWS
     out = []
-    for i in range(2):
-        ch = fx.min(wave + WAVES * i, OKCH - 1)
-        base = (row * OK + ch * 128 + g * 8) // 2
+    for i in range(per):
+        ch = fx.min(wave + WAVES * i, nch - 1)
+        base = (row * k + ch * 128 + g * 8) // 2
         out.append(
             [
                 fx.Vector(
@@ -155,17 +163,21 @@ def o_loads(c, rg):
 
 @flyc.jit
 def load_core(c):
-    """The core rows (S x 1536 bf16) -> LDS, rows padded."""
+    """The core rows (S x K bf16, ``core_ld`` elements a row) -> LDS, rows padded."""
     s, tid = c["S"], c["tid"]
-    words = s * OK // 8
-    row = OK + LDS_PAD
+    ok, _, _ = o_dims(c)
+    ld = c["args"].get("core_ld", ok)
+    words = s * ok // 8
+    row = ok + LDS_PAD
     for i in range_constexpr((words + THREADS - 1) // THREADS):
         e = fx.min(tid + THREADS * i, words - 1)
+        t = e // (ok // 8)
+        k = e % (ok // 8) * 8
         v = fx.Vector(
-            bo.buffer_load(rsrc(c["args"]["core"]), e * 4, vec_width=4, dtype=T.i32)
+            bo.buffer_load(
+                rsrc(c["args"]["core"]), (t * ld + k) // 2, vec_width=4, dtype=T.i32
+            )
         )
-        t = e // (OK // 8)
-        k = e % (OK // 8) * 8
         if tid + THREADS * i < words:
             fx.ptr_store(v, c["xl"] + (t * row + k) // 2)
     gpu.barrier()
@@ -180,12 +192,13 @@ def stage_o(c, rg, ops):
     sent_ar = c.get("sent_ar", False)
     g = lane // ROWS
     t = fx.min(lane % ROWS, s - 1)
-    row = OK + LDS_PAD
+    ok, nch, per = o_dims(c)
+    row = ok + LDS_PAD
     acc = fx.Vector.filled(4, 0.0, fx.Float32)
-    for i in range_constexpr(2):
+    for i in range_constexpr(per):
         ch = wave + WAVES * i
-        live = ch < OKCH
-        k = fx.min(ch, OKCH - 1) * 128 + g * 8
+        live = ch < nch
+        k = fx.min(ch, nch - 1) * 128 + g * 8
         for q in range_constexpr(4):
             xb = fx.Vector(
                 fx.ptr_load(
@@ -201,6 +214,8 @@ def stage_o(c, rg, ops):
             )
     fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
     gpu.barrier()
+    # the task's GEMV done, before its pushes (the last task's stamp stays)
+    stamp(c.get("tl_on", False), c.get("tls"), tid, c.get("tl_push", 0))
     if tid < s * (ROWS // 2):
         tt = tid // (ROWS // 2)
         rp = tid % (ROWS // 2)
