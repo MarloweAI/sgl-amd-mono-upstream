@@ -222,6 +222,20 @@ def main():
     )
 
     times = {"unpack": graph_us(lambda: inproj.unpack_w_in(packed, p.plain))}
+    x48 = torch.randn(inproj.CHUNK * kc.L, kc.H, generator=gen, device=dev).to(kc.BF)
+    times["pack_chunks_r8"] = graph_us(lambda: inproj.pack_chunks(x48, p.xp, inproj.CHUNK * kc.L))
+    one = kc.Wide(w, inproj.CHUNK * kc.L, dev)
+    p8 = kc.Pools(inproj.CHUNK, gen, dev)
+    c8 = torch.zeros(inproj.CHUNK * kc.L, kc.PROJ, dtype=kc.BF, device=dev)
+    xp8 = one.packed_x(x48)
+
+    def one_launch():
+        ep.add_(1)
+        one(x48, p8, ep, c8)
+
+    one._xk = (x48.data_ptr(), x48._version)
+    one._xp = xp8
+    times["one_launch_r8"] = graph_us(one_launch)
     for R in [int(v) for v in args.time_reqs.split(",")]:
         pools = kc.Pools(R, gen, dev)
         x = torch.randn(R * kc.L, kc.H, generator=gen, device=dev).to(kc.BF)
