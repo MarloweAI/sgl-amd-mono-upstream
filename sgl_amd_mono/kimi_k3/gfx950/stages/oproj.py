@@ -236,27 +236,30 @@ def stage_o(c, rg, ops):
 @flyc.jit
 def stage_reduce(c, task):
     """Columns 128 task ..: the 8 ranks' partials, rank order, -> bf16 delta in
-    LDS (thread: token, column pair)."""
+    LDS (an item a (token, column pair), THREADS items a round)."""
     s, tid = c["S"], c["tid"]
     sent_ar = c.get("sent_ar", False)
-    if tid < s * (COLS // 2):
-        if const_expr(sent_ar):
-            # consecutive threads read consecutive words; re-armed after the mix
-            t, cp = sent_item(tid, s)
-            col = task * COLS + 2 * cp
-            lo, hi = sent_sum(c["ars_own"], col, t, s, HIDDEN, TP, rearm=False)
-        else:
-            t = tid // (COLS // 2)
-            cp = tid % (COLS // 2)
-            col = task * COLS + 2 * cp
-            lo, hi = sum_partials(
-                c["poll"],
-                c["ar_own"],
-                lambda src: ((src * s + t) * HIDDEN + col) // 2,
-                TP,
-            )
-        fx.ptr_store(bf16_round(lo), c["delta_lds"] + (t * COLS + 2 * cp))
-        fx.ptr_store(bf16_round(hi), c["delta_lds"] + (t * COLS + 2 * cp + 1))
+    n = s * (COLS // 2)
+    for i in range_constexpr((n + THREADS - 1) // THREADS):
+        idx = tid + THREADS * i
+        if idx < n:
+            if const_expr(sent_ar):
+                # consecutive threads read consecutive words; re-armed after the mix
+                t, cp = sent_item(idx, s)
+                col = task * COLS + 2 * cp
+                lo, hi = sent_sum(c["ars_own"], col, t, s, HIDDEN, TP, rearm=False)
+            else:
+                t = idx // (COLS // 2)
+                cp = idx % (COLS // 2)
+                col = task * COLS + 2 * cp
+                lo, hi = sum_partials(
+                    c["poll"],
+                    c["ar_own"],
+                    lambda src: ((src * s + t) * HIDDEN + col) // 2,
+                    TP,
+                )
+            fx.ptr_store(bf16_round(lo), c["delta_lds"] + (t * COLS + 2 * cp))
+            fx.ptr_store(bf16_round(hi), c["delta_lds"] + (t * COLS + 2 * cp + 1))
     gpu.barrier()
 
 
@@ -265,10 +268,15 @@ def rearm_ar(c, task):
     """Re-arm the sentinel words ``stage_reduce`` read for ``task``: after the
     mix, off the path to x."""
     s, tid = c["S"], c["tid"]
-    if tid < s * (COLS // 2):
-        t, cp = sent_item(tid, s)
-        col = task * COLS + 2 * cp
-        rearm_sent(c["ars_own"], [sent_ix(src, col, t, s, HIDDEN) for src in range(TP)])
+    n = s * (COLS // 2)
+    for i in range_constexpr((n + THREADS - 1) // THREADS):
+        idx = tid + THREADS * i
+        if idx < n:
+            t, cp = sent_item(idx, s)
+            col = task * COLS + 2 * cp
+            rearm_sent(
+                c["ars_own"], [sent_ix(src, col, t, s, HIDDEN) for src in range(TP)]
+            )
 
 
 _BUILDS: dict = {}
@@ -278,7 +286,7 @@ def build(key: AttnPostBuild):
     if key in _BUILDS:
         return _BUILDS[key]
     s, ns = key.tokens, key.nblocks + 1
-    assert s * (ROWS // 2) <= THREADS and s * (COLS // 2) <= THREADS
+    assert s * (ROWS // 2) <= THREADS
     lay = scratch_layout(key)
     half = ar_half_pairs(s) * 8
 

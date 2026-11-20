@@ -40,7 +40,7 @@ from sgl_amd_mono.common.plan import (
     pair_layout,
 )
 from sgl_amd_mono.common.sync import Mailbox, preg, shift, sreg
-from sgl_amd_mono.kimi_k3 import CORE, MAX_ROWS
+from sgl_amd_mono.kimi_k3 import CORE, K2_MAX_ROWS, MAX_ROWS
 from sgl_amd_mono.kimi_k3.gfx950.stages import gemv as gemv
 from sgl_amd_mono.kimi_k3.gfx950.stages import moe as k2b
 from sgl_amd_mono.kimi_k3.gfx950.stages import oproj as k2a
@@ -102,7 +102,9 @@ OPT_SENTS = OPT_SENT | OPT_SENT_LATR | OPT_SENT_FINAL
 K2_OPT = (
     OPT_SENTS | OPT_PRELOAD | OPT_TAG_X | OPT_SDOWN_FIRST | OPT_RLOG_PARTS | OPT_BATCH
 )
-NARROW_ROWS = 8  # this launch's widest step: the sentinel and tagged rows' size
+NARROW_ROWS = (
+    K2_MAX_ROWS  # this launch's widest step: the sentinel and tagged rows' size
+)
 
 _STREAM = fx.Stream(None)
 
@@ -155,7 +157,7 @@ def flags_offset() -> int:
     where the flags are. A launch reads the bytes another width wrote, takes
     live data for an error word, and stops every rank.
     """
-    return max(peer_bytes(MAX_ROWS), k2b.peer_bytes(MAX_ROWS))
+    return max(peer_bytes(K2_MAX_ROWS), k2b.peer_bytes(K2_MAX_ROWS))
 
 
 def sent_layout() -> dict:
@@ -212,7 +214,7 @@ def tag_offset() -> int:
 
     end = max(
         k2b.scratch_bytes(k2b.MoeBuild(tokens=MAX_ROWS)),
-        scratch_bytes(K2Build(tokens=MAX_ROWS, nblocks=MAX_BLOCKS)),
+        scratch_bytes(K2Build(tokens=K2_MAX_ROWS, nblocks=MAX_BLOCKS)),
         k1.scratch_bytes(MAX_ROWS),
         mla_pre.scratch_bytes(mla_pre.MlaPreBuild(tokens=MAX_ROWS, nblocks=MAX_BLOCKS)),
     )
@@ -260,7 +262,7 @@ def build(key: K2Build):
     if key in _BUILDS:
         return _BUILDS[key]
     s, ns = key.tokens, key.nblocks + 1
-    assert 1 <= s <= 8
+    assert 1 <= s <= K2_MAX_ROWS
     lay = scratch_layout(key)
     play = peer_layout(s)
     half = peer_bytes(s) // 2
@@ -269,13 +271,13 @@ def build(key: K2Build):
     class RouteLds:
         route: fx.Array[fx.Int32, s * 2 * k2b.TOPK, 16]
         flag: fx.Array[fx.Int32, k2b.E, 16]
-        expert: fx.Array[fx.Int32, k2b.MAX_U, 16]
-        kof: fx.Array[fx.Int32, k2b.MAX_U * 8, 16]
+        expert: fx.Array[fx.Int32, k2b.max_u(s), 16]
+        kof: fx.Array[fx.Int32, k2b.max_u(s) * s, 16]
         scan: fx.Array[fx.Int32, WAVES, 16]
 
     @fx.struct
     class EarlyLds:
-        xl: fx.Array[fx.Int32, s * (HIDDEN + gemv.LDS_PAD) // 2, 16]
+        xl: fx.Array[fx.Int32, k2b.xl_words(s), 16]
 
     @fx.struct
     class AttnLds:

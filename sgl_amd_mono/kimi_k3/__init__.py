@@ -24,8 +24,12 @@ HF_CONFIG = dict(
 # from is sized by them.
 LINEAR_ATTN_CONFIG = dict(head_dim=128, num_heads=96, short_conv_kernel_size=4)
 
-# One launch's token rows at most: the x rows fit one CTA's LDS.
+# One launch's token rows at most: the x rows fit one CTA's LDS. K1 and the MLA
+# front take MAX_ROWS; the layer launch (K2) takes K2_MAX_ROWS, one MFMA token
+# tile, its wider stages staged through LDS a K segment at a time.
 MAX_ROWS = 8
+K1_MAX_ROWS = MAX_ROWS
+K2_MAX_ROWS = 12
 # The attention's TP-local output per rank at TP8: 12 heads of 128. o_proj's
 # input, which is where the launch starts.
 CORE = 1536

@@ -92,6 +92,27 @@ def mfmas(lane, wave, xl, xrow, k, s, ops):
     return acc
 
 
+def mfmas_rounds(lane, wave, xl, xrow, k0, s, ops, acc, r0, r1):
+    """``mfmas``' rounds r0 .. r1 (chunks wave + 8 i) chained onto ``acc``, the
+    token rows in LDS holding columns k0 .. : the same MFMAs in the same order,
+    so a K staged a segment at a time sums bit for bit as ``mfmas``."""
+    g = lane // ROWS
+    t = fx.min(lane % ROWS, s - 1)
+    for i in range_constexpr(r0, r1):
+        kk = (wave + WAVES * i) * KCH + g * 8 - k0
+        for q in range_constexpr(4):
+            xb = fx.Vector(
+                fx.ptr_load(
+                    xl + (t * xrow + kk + 32 * q) // 2,
+                    result_type=fx.Vector.make_type(4, fx.Int32),
+                )
+            )
+            acc = mfma_bf16(
+                ops[i][q].bitcast(fx.BFloat16), xb.bitcast(fx.BFloat16), acc
+            )
+    return acc
+
+
 def const_live(per, n):
     """Whether some wave's last chunk is past K (its MFMA must add zero)."""
     return per * WAVES != n

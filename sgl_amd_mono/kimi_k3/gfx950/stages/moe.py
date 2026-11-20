@@ -175,7 +175,22 @@ W13_STEPS = W13_K // 128  # 28
 W2_STEPS = RI // 128  # 3
 DOWN_TASKS = LAT // ROWS  # 224
 DOWN_BATCH = 5  # a wave's experts whose w2 is in flight together
-MAX_U = 8 * TOPK
+# the x rows' LDS (bf16 words) and the shared gate/up's K segments, by width:
+# up to 8 rows hold a whole 7168-wide row; wider, a 3584 + pad row (the latent
+# up's input), and sgu stages its K three rounds of chunks at a time
+NARROW = 8
+SGU_SEGMENTS = ((0, 3), (3, 6), (6, 7))
+
+
+def max_u(s):
+    """The step's distinct experts at most (the route table's slots)."""
+    return min(E, s * TOPK)
+
+
+def xl_words(s):
+    return s * ((HIDDEN if s <= NARROW else LAT) + gemv.LDS_PAD) // 2
+
+
 TL_POINTS = 8  # start, early, sdown, ug, down, lnorm, up, reduce
 
 _STREAM = fx.Stream(None)
@@ -523,9 +538,26 @@ def early_compute(c, kind, i, q, ops):
         gpu.barrier()
         if const_expr(kind == 0):
             stamp(c["tl_on"], c["tls"], c["tid"], 20)  # router: x published
-        gemv.rows_to_lds(
-            tid, c["xbuf"], klen, s, c["xl"], xrow, CM_DEV, ldk=HIDDEN, k0=q * klen
-        )
+        if const_expr(kind == 2 and s > NARROW):
+            # the shared gate/up's full K does not fit: its rounds a segment at
+            # a time, the same MFMAs in the same order
+            acc = fx.Vector.filled(4, 0.0, fx.Float32)
+            for si in range_constexpr(len(SGU_SEGMENTS)):
+                r0, r1 = SGU_SEGMENTS[si]
+                k0, k1 = r0 * WAVES * gemv.KCH, r1 * WAVES * gemv.KCH
+                srow = k1 - k0 + gemv.LDS_PAD
+                gemv.rows_to_lds(
+                    tid, c["xbuf"], k1 - k0, s, c["xl"], srow, CM_DEV, ldk=HIDDEN,
+                    k0=k0,
+                )  # fmt: skip
+                acc = gemv.mfmas_rounds(
+                    lane, wave, c["xl"], srow, k0, s, ops, acc, r0, r1
+                )
+                gpu.barrier()
+        else:
+            gemv.rows_to_lds(
+                tid, c["xbuf"], klen, s, c["xl"], xrow, CM_DEV, ldk=HIDDEN, k0=q * klen
+            )
     else:
         gemv.rows_to_lds(
             tid, c["args"]["x"], klen, s, c["xl"], xrow, ldk=HIDDEN, k0=q * klen
@@ -537,7 +569,8 @@ def early_compute(c, kind, i, q, ops):
         if const_expr(kind == 0):
             gpu.barrier()
             stamp(c["tl_on"], c["tls"], c["tid"], 21)  # router: x in LDS
-        acc = gemv.mfmas(lane, wave, c["xl"], xrow, klen, s, ops)
+        if const_expr(not (kind == 2 and s > NARROW and c.get("xflags") is not None)):
+            acc = gemv.mfmas(lane, wave, c["xl"], xrow, klen, s, ops)
         fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
         gpu.barrier()
         if const_expr(kind == 0):
@@ -945,9 +978,9 @@ def load_route2(c):
     rt = c["rt"]
     n = s * 2 * TOPK
     nw = E // 32
-    for i in range_constexpr((MAX_U * 8 + THREADS - 1) // THREADS):
+    for i in range_constexpr((max_u(s) * s + THREADS - 1) // THREADS):
         j = tid + THREADS * i
-        if j < MAX_U * 8:
+        if j < max_u(s) * s:
             fx.ptr_store(fx.Int32(-1), rt["kof"] + j)
     if tid < nw:
         fx.ptr_store(fx.Int32(0), rt["flag"] + tid)
@@ -982,7 +1015,7 @@ def load_route2(c):
         below = w & ((fx.Int32(1) << (e & 31)) - 1)
         slot = fx.ptr_load(rt["flag"] + (32 + (e >> 5))) + popcount(fx.Uint32(below))
         fx.ptr_store(e, rt["expert"] + slot)
-        fx.ptr_store(k, rt["kof"] + (slot * 8 + t))
+        fx.ptr_store(k, rt["kof"] + (slot * s + t))
     tot = fx.ptr_load(rt["flag"] + (32 + nw))
     gpu.barrier()
     return uniform(tot)
@@ -1002,9 +1035,9 @@ def load_route(c):
         e = tid + THREADS * i
         if e < E:
             fx.ptr_store(fx.Int32(0), rt["flag"] + e)
-    for i in range_constexpr((MAX_U * 8 + THREADS - 1) // THREADS):
+    for i in range_constexpr((max_u(s) * s + THREADS - 1) // THREADS):
         j = tid + THREADS * i
-        if j < MAX_U * 8:
+        if j < max_u(s) * s:
             fx.ptr_store(fx.Int32(-1), rt["kof"] + j)
     gpu.barrier()
     if tid < s * TOPK:
@@ -1032,7 +1065,7 @@ def load_route(c):
         k = tid % TOPK
         e = fx.max(fx.min(fx.ptr_load(rt["route"] + (t * 2 * TOPK + k)), E - 1), 0)
         slot = fx.ptr_load(rt["flag"] + e)
-        fx.ptr_store(fx.Int32(k), rt["kof"] + (slot * 8 + t))
+        fx.ptr_store(fx.Int32(k), rt["kof"] + (slot * s + t))
     gpu.barrier()
     return uniform(tot)
 
@@ -1196,7 +1229,7 @@ def stage_ug(c, task, ops):
     gpu.barrier()
     fx.ptr_store(v, c["av"] + tid)
     gpu.barrier()
-    k = fx.ptr_load(rt["kof"] + (slot * 8 + tt))
+    k = fx.ptr_load(rt["kof"] + (slot * s + tt))
     if live & (col < 8) & (k >= 0):
         scale = (code << 23).bitcast(fx.Float32)
         xs = [fx.ptr_load(c["av"] + (tt * 32 + col * 4 + j)) for j in range(4)]
@@ -1318,7 +1351,7 @@ def stage_down(c, rgd, nu, ops0):
         slots = [fx.min(b0 + WAVES * j, nu - 1) for j in range(DOWN_BATCH)]
         for j in range_constexpr(DOWN_BATCH):
             live = (b0 + WAVES * j) < nu
-            k = fx.ptr_load(rt["kof"] + (slots[j] * 8 + t))
+            k = fx.ptr_load(rt["kof"] + (slots[j] * s + t))
             picked = (k >= 0) & (lane % 16 < s)
             pick = t * TOPK + fx.max(k, 0)
             acc = fx.Vector.filled(4, 0.0, fx.Float32)
@@ -1514,59 +1547,72 @@ def run_sdown_rest(c, bid, w_sd):
 @flyc.jit
 def stage_lnorm(c, j):
     """Columns 128 j ..: the ranks' LATR (rank order, fp32 -> bf16), every
-    task's sum of squares -> rstd -> bf16(acc rstd w) -> LN, LNRDY."""
+    task's sum of squares -> rstd -> bf16(acc rstd w) -> LN, LNRDY. A thread a
+    (token, column pair), 8 tokens a round."""
     sent_latr = c.get("sent_latr", False)
     s, tid, lane, red = c["S"], c["tid"], c["lane"], c["red"]
     a = c["args"]
-    mine = tid < s * 64
-    t = fx.min(tid // 64, s - 1)
     cp = tid % 64
     col = j * 128 + 2 * cp
-    if const_expr(sent_latr):
-        # a dead thread holds a clamped copy of a live one's words: it must not
-        # take them; re-armed once the LN rows are out
-        sidx = [sent_ix(src, col, t, s, LAT) for src in range(TP)]
-        ws = poll_sent(c["latrs_own"], sidx, [mine] * TP, rearm=False)
-        lo, hi = bf2_f32(ws[0])
-        for src in range_constexpr(1, TP):
-            l2, h2 = bf2_f32(ws[src])
-            lo, hi = lo + l2, hi + h2
-    else:
-        lo, hi = sum_partials(
-            c["poll"],
-            c["peer"]["latr_own"],
-            lambda src: ((src * s + t) * LAT + col) // 2,
-            TP,
-        )
-    lo, hi = bf16_round(lo), bf16_round(hi)
-    sq = wave_sum(lo * lo + hi * hi)
-    if mine & (lane == 0):
-        c["put"](c["lmsq"], j * s + t, sq)
+    items = []
+    for g in range_constexpr((s + 7) // 8):
+        tt = g * 8 + tid // 64
+        mine = tt < s
+        t = fx.min(tt, s - 1)
+        sidx = None
+        if const_expr(sent_latr):
+            # a dead thread holds a clamped copy of a live one's words: it must
+            # not take them; re-armed once the LN rows are out
+            sidx = [sent_ix(src, col, t, s, LAT) for src in range(TP)]
+            ws = poll_sent(c["latrs_own"], sidx, [mine] * TP, rearm=False)
+            lo, hi = bf2_f32(ws[0])
+            for src in range_constexpr(1, TP):
+                l2, h2 = bf2_f32(ws[src])
+                lo, hi = lo + l2, hi + h2
+        else:
+            lo, hi = sum_partials(
+                c["poll"],
+                c["peer"]["latr_own"],
+                lambda src: ((src * s + t) * LAT + col) // 2,
+                TP,
+            )
+        lo, hi = bf16_round(lo), bf16_round(hi)
+        sq = wave_sum(lo * lo + hi * hi)
+        if mine & (lane == 0):
+            c["put"](c["lmsq"], j * s + t, sq)
+        items.append((mine, t, lo, hi, sidx))
     gpu.barrier()
-    if mine & (lane < LN_TASKS):
-        v = c["poll"]([(c["lmsq"], lane * s + t, 1)])[0][0]
-        fx.ptr_store(f32_of(v), red + (t * 32 + lane))
+    for g in range_constexpr(len(items)):
+        mine, t = items[g][0], items[g][1]
+        if mine & (lane < LN_TASKS):
+            v = c["poll"]([(c["lmsq"], lane * s + t, 1)])[0][0]
+            fx.ptr_store(f32_of(v), red + (t * 32 + lane))
     gpu.barrier()
-    tot = fx.ptr_load(red + t * 32)
-    for q in range_constexpr(1, LN_TASKS):
-        tot = tot + fx.ptr_load(red + (t * 32 + q))
-    r = hw_rsq(tot * fx.Float32(1.0 / LAT) + fx.Float32(c["ln_eps"]))
     w0 = fx.Float32(
         fx.BFloat16(bo.buffer_load(rsrc(a["ln_w"]), col, vec_width=1, dtype=T.bf16))
     )
     w1 = fx.Float32(
         fx.BFloat16(bo.buffer_load(rsrc(a["ln_w"]), col + 1, vec_width=1, dtype=T.bf16))
     )
-    y = (
-        fx.Vector.from_elements([lo * r * w0, hi * r * w1], fx.Float32)
-        .to(fx.BFloat16)
-        .bitcast(fx.Int32)[0]
-    )
-    if mine:
-        bo.buffer_store(y, rsrc(c["ln"]), (t * LAT + col) // 2, cache_modifier=CM_DEV)
+    for g in range_constexpr(len(items)):
+        mine, t, lo, hi, _ = items[g]
+        tot = fx.ptr_load(red + t * 32)
+        for q in range_constexpr(1, LN_TASKS):
+            tot = tot + fx.ptr_load(red + (t * 32 + q))
+        r = hw_rsq(tot * fx.Float32(1.0 / LAT) + fx.Float32(c["ln_eps"]))
+        y = (
+            fx.Vector.from_elements([lo * r * w0, hi * r * w1], fx.Float32)
+            .to(fx.BFloat16)
+            .bitcast(fx.Int32)[0]
+        )
+        if mine:
+            bo.buffer_store(
+                y, rsrc(c["ln"]), (t * LAT + col) // 2, cache_modifier=CM_DEV
+            )
     publish(c["put"], c["lnrdy"], j, fx.Int32(1), tid == 0)
     if const_expr(sent_latr):
-        rearm_sent(c["latrs_own"], sidx, [mine] * TP)
+        for g in range_constexpr(len(items)):
+            rearm_sent(c["latrs_own"], items[g][4], [items[g][0]] * TP)
     gpu.barrier()
 
 
@@ -1638,40 +1684,44 @@ def stage_reduce(c, j):
     fold = c.get("fold", False)
     # the MoE launch has no prefix: only the layer launch's fold reads it
     prefix = c["args"]["prefix"] if fold else None
-    if tid < s * 64:
-        if const_expr(sent_final):
-            # consecutive threads read consecutive words
-            t, cp = sent_item(tid, s)
-        else:
-            t, cp = tid // 64, tid % 64
-        col = j * 128 + 2 * cp
-        if const_expr(sent_final):
-            lo, hi = sent_sum(c["finals_own"], col, t, s, HIDDEN, TP, rearm=False)
-        else:
-            lo, hi = sum_partials(
-                c["poll"],
-                c["peer"]["final_own"],
-                lambda src: ((src * s + t) * HIDDEN + col) // 2,
-                TP,
+    n = s * 64
+    for i in range_constexpr((n + THREADS - 1) // THREADS):
+        idx = tid + THREADS * i
+        if idx < n:
+            if const_expr(sent_final):
+                # consecutive threads read consecutive words
+                t, cp = sent_item(idx, s)
+            else:
+                t, cp = idx // 64, idx % 64
+            col = j * 128 + 2 * cp
+            if const_expr(sent_final):
+                lo, hi = sent_sum(c["finals_own"], col, t, s, HIDDEN, TP, rearm=False)
+            else:
+                lo, hi = sum_partials(
+                    c["poll"],
+                    c["peer"]["final_own"],
+                    lambda src: ((src * s + t) * HIDDEN + col) // 2,
+                    TP,
+                )
+            o_lo, o_hi = lo, hi
+            if const_expr(fold):
+                # out + the updated prefix, as torch's bf16 add: each operand
+                # rounded to bf16, the sum in fp32, rounded once more. The seam
+                # stored the prefix device-coherent, causally before FINAL.
+                pw = ld_i32(prefix, (t * HIDDEN + col) // 2, CM_DEV)
+                o_lo = bf16_round(bf16_round(lo) + bf_lo(pw))
+                o_hi = bf16_round(bf16_round(hi) + bf_hi(pw))
+            w = (
+                fx.Vector.from_elements([o_lo, o_hi], fx.Float32)
+                .to(fx.BFloat16)
+                .bitcast(fx.Int32)[0]
             )
-        o_lo, o_hi = lo, hi
-        if const_expr(fold):
-            # out + the updated prefix, as torch's bf16 add: each operand
-            # rounded to bf16, the sum in fp32, rounded once more. The seam
-            # stored the prefix device-coherent, causally before FINAL.
-            pw = ld_i32(prefix, (t * HIDDEN + col) // 2, CM_DEV)
-            o_lo = bf16_round(bf16_round(lo) + bf_lo(pw))
-            o_hi = bf16_round(bf16_round(hi) + bf_hi(pw))
-        w = (
-            fx.Vector.from_elements([o_lo, o_hi], fx.Float32)
-            .to(fx.BFloat16)
-            .bitcast(fx.Int32)[0]
-        )
-        bo.buffer_store(w, rsrc(c["args"]["out"]), (t * HIDDEN + col) // 2)
-        if const_expr(sent_final):
-            rearm_sent(
-                c["finals_own"], [sent_ix(src, col, t, s, HIDDEN) for src in range(TP)]
-            )
+            bo.buffer_store(w, rsrc(c["args"]["out"]), (t * HIDDEN + col) // 2)
+            if const_expr(sent_final):
+                rearm_sent(
+                    c["finals_own"],
+                    [sent_ix(src, col, t, s, HIDDEN) for src in range(TP)],
+                )
     gpu.barrier()
 
 
@@ -1683,7 +1733,7 @@ def build(key: MoeBuild):
     if key in _BUILDS:
         return _BUILDS[key]
     s = key.tokens
-    assert 1 <= s <= 8
+    assert 1 <= s <= NARROW
     lay = scratch_layout(key)
     play = peer_layout(s)
     half = peer_bytes(s) // 2
@@ -1692,13 +1742,13 @@ def build(key: MoeBuild):
     class RouteLds:
         route: fx.Array[fx.Int32, s * 2 * TOPK, 16]
         flag: fx.Array[fx.Int32, E, 16]
-        expert: fx.Array[fx.Int32, MAX_U, 16]
-        kof: fx.Array[fx.Int32, MAX_U * 8, 16]
+        expert: fx.Array[fx.Int32, max_u(s), 16]
+        kof: fx.Array[fx.Int32, max_u(s) * s, 16]
         scan: fx.Array[fx.Int32, WAVES, 16]
 
     @fx.struct
     class EarlyLds:
-        xl: fx.Array[fx.Int32, s * (HIDDEN + gemv.LDS_PAD) // 2, 16]
+        xl: fx.Array[fx.Int32, xl_words(s), 16]
 
     @fx.struct
     class UgLds:
@@ -1861,7 +1911,7 @@ def build(key: MoeBuild):
                 n = s * 2 * TOPK
                 if tid < n:
                     bo.buffer_store(fx.ptr_load(c["rt"]["route"] + tid), rsrc(out), tid)
-                if tid < MAX_U:
+                if tid < max_u(s):
                     bo.buffer_store(
                         fx.ptr_load(c["rt"]["expert"] + tid), rsrc(out), n + 1 + tid
                     )
