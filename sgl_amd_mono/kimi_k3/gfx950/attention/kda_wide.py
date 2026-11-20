@@ -581,38 +581,41 @@ def kda_task(c, req, h, k):
     lds_barrier()
     stamp(c["on"], c["tls"], tid, 6)
 
-    # recurrence: rows grp * rpt .., K columns k0 .. k0 + kp
-    def lds_vec(at):
-        return [
-            x
-            for q in range(kp // 4)
-            for x in fx.Vector(
-                fx.ptr_load(at + 4 * q, result_type=fx.Vector.make_type(4, fx.Float32))
-            )
-        ]
+    # recurrence: rows grp * rpt .., K columns k0 .. k0 + kp, as column pairs
+    # (packed f32 ops; a pair's lanes are SGLang's even and odd partial sums)
+    def v2(a, b):
+        return fx.Vector.from_elements([a, b], fx.Float32)
+
+    def lds_pairs(at):
+        out = []
+        for q in range_constexpr(kp // 4):
+            v = fx.Vector(fx.ptr_load(at + 4 * q, result_type=fx.Vector.make_type(4, fx.Float32)))
+            out += [v2(v[0], v[1]), v2(v[2], v[3])]
+        return out
 
     def dot2(x, y):
         """SGLang's lane sum: even and odd columns apart, then added."""
-        u0, u1 = fx.Float32(0.0), fx.Float32(0.0)
-        for e in range_constexpr(0, kp, 2):
-            u0 = fmath.fma(x[e], y[e], u0)
-            u1 = fmath.fma(x[e + 1], y[e + 1], u1)
-        return u0 + u1
+        acc = v2(fx.Float32(0.0), fx.Float32(0.0))
+        for e in range_constexpr(kp // 2):
+            acc = fmath.fma(x[e], y[e], acc)
+        return acc[0] + acc[1]
 
+    sp = [[v2(row[2 * e], row[2 * e + 1]) for e in range(kp // 2)] for row in st]
     os_ = []
     for j in range_constexpr(L):
-        qv = lds_vec(qkl + ((2 * j) * HDP + kp_(k0)))
-        kv = lds_vec(qkl + ((2 * j + 1) * HDP + kp_(k0)))
-        dk = lds_vec(decay + (j * HDP + kp_(k0)))
+        qv = lds_pairs(qkl + ((2 * j) * HDP + kp_(k0)))
+        kv = lds_pairs(qkl + ((2 * j + 1) * HDP + kp_(k0)))
+        dk = lds_pairs(decay + (j * HDP + kp_(k0)))
         bj = fx.ptr_load(beta + j)
         vs = [fx.ptr_load(vloc + (j * HD + grp * rpt + i)) for i in range(rpt)]
         for i in range_constexpr(rpt):
-            s_ = [st[i][e] * dk[e] for e in range(kp)]
+            s_ = [sp[i][e] * dk[e] for e in range(kp // 2)]
             u = group_sum(dot2(s_, kv), lpr)
             vn = (vs[i] - u) * bj
-            s_ = [fmath.fma(kv[e], vn, s_[e]) for e in range(kp)]
+            vn2 = v2(vn, vn)
+            s_ = [fmath.fma(kv[e], vn2, s_[e]) for e in range(kp // 2)]
             os_.append(live.select(bf16r(group_sum(dot2(s_, qv), lpr)), fx.Float32(0.0)))
-            st[i] = s_
+            sp[i] = s_
     if tid % lpr == 0:
         for j in range_constexpr(L):
             for i in range_constexpr(rpt):
