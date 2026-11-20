@@ -481,6 +481,45 @@ def time_case(caps, w_vc, gates, s, peers, epoch, par):
     return t_tail, t_stock
 
 
+def check_prologue(device, seed):
+    """``mla_prologue`` against SGLang's bytes at every tail width: the
+    decode's q (torch's e4m3 cast of cat(q_nope_out, q_pe)) and the KV records
+    of the rows this rank owns (cast of cat(k_nope, k_pe) at local row loc / 8),
+    every other pool row untouched."""
+    from sgl_amd_mono.kimi_k3.gfx950.attention import mla_prologue as mp
+    from sgl_amd_mono.kimi_k3.gfx950.attention import mla_tail as mt
+
+    g = torch.Generator(device=device).manual_seed(seed + 21)
+    fails = []
+    for s in range(mt.MIN_ROWS, mt.MAX_ROWS + 1, G):
+        for rank in (0, 5):
+            qn = (torch.randn(s, NHA, KV, generator=g, device=device) * 3).to(BF)
+            qb = (torch.randn(s, NHA, mp.QHD, generator=g, device=device) * 3).to(BF)
+            lat = (torch.randn(s, 2112, generator=g, device=device) * 3).to(BF)
+            kn, kp = lat[:, 1536 : 1536 + KV], lat[:, 1536 + KV :]
+            nloc = 4 * s
+            slots = torch.randperm(nloc * DCP, generator=torch.Generator().manual_seed(s + rank))[:s]
+            loc = slots.to(device=device, dtype=torch.int64)
+            pool = torch.randint(0, 255, (nloc, DQK), generator=g, device=device, dtype=torch.int32).to(torch.uint8)
+            want = pool.clone()
+            own = (loc % DCP) == rank
+            rec = torch.cat([kn, kp], -1).to(F8).view(torch.uint8)
+            want[loc[own] // DCP] = rec[own]
+            q8 = torch.empty(s, NHA, DQK, dtype=F8, device=device)
+            mp.mla_prologue_launch(
+                mp.MlaPrologueBuild(), q_nope_out=qn, q_pe=qb[..., mp.QHD - mp.ROPE :],
+                k_nope=kn, k_pe=kp, loc=loc, q8=q8, kv=pool, rank=rank,
+            )  # fmt: skip
+            torch.cuda.synchronize()
+            wq = torch.cat([qn, qb[..., mp.QHD - mp.ROPE :]], -1).to(F8)
+            ok = torch.equal(q8.view(torch.uint8), wq.view(torch.uint8)) and torch.equal(pool, want)
+            if not ok:
+                fails.append((s, rank))
+    print(f"prologue: q and KV records bit for bit at {len(range(mt.MIN_ROWS, mt.MAX_ROWS + 1, G)) * 2} (width, rank) cases"
+          + ("" if not fails else f" FAIL {fails[:4]}"))  # fmt: skip
+    return ["prologue"] if fails else []
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--reqs", type=int, nargs="+", default=[9])
@@ -497,7 +536,7 @@ def main():
     w_vc = (torch.randn(NHA, KV, VD, generator=g, device=device) * 0.045).to(BF)
     peers = TailPeers(device)
     epoch = cf.new_epoch(device)
-    fails = []
+    fails = check_prologue(device, args.seed)
     for n in args.reqs:
         ps = contexts(n, args.mode, args.ctx, args.seed)
         print(f"== {n} requests ({args.mode}): P = {ps[:8]}{' ...' if n > 8 else ''}")
