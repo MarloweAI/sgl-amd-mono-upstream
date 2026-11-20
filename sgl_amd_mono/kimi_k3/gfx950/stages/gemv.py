@@ -64,12 +64,12 @@ def loads(lane, wave, w, row0, k, nt=True, ldk=None, k0=0, nbytes=None):
     return out
 
 
-def mfmas(lane, wave, xl, xrow, k, s, ops):
-    """``loads``' operands against token rows 0 .. s - 1 of the LDS rows ``xl``
-    (``xrow`` bf16 a row) -> this wave's 16x16 accumulator."""
+def mfmas(lane, wave, xl, xrow, k, s, ops, t0=0):
+    """``loads``' operands against token rows t0 .. t0 + s - 1 (s <= 16) of the
+    LDS rows ``xl`` (``xrow`` bf16 a row) -> this wave's 16x16 accumulator."""
     per, n = chunks(k)
     g = lane // ROWS
-    t = fx.min(lane % ROWS, s - 1)
+    t = t0 + fx.min(lane % ROWS, s - 1)
     acc = fx.Vector.filled(4, 0.0, fx.Float32)
     for i in range_constexpr(per):
         ch = wave + WAVES * i
@@ -118,10 +118,15 @@ def const_live(per, n):
     return per * WAVES != n
 
 
+def tiles(s):
+    """The 16-row token tiles of an s-row step: (first row, rows) each."""
+    return [(t0, min(ROWS, s - t0)) for t0 in range(0, s, ROWS)]
+
+
 @flyc.jit
-def rows_to_lds(tid, src, k, s, xl, xrow, cm=0, ldk=None, k0=0):
-    """Columns k0 .. k0 + k of token rows 0 .. s - 1 of the bf16 [s, ldk] at
-    ``src`` -> LDS (``xrow`` a row), 16 B a lane."""
+def rows_to_lds(tid, src, k, s, xl, xrow, cm=0, ldk=None, k0=0, t0=0):
+    """Columns k0 .. k0 + k of token rows t0 .. t0 + s - 1 of the bf16 [., ldk]
+    at ``src`` -> LDS rows 0 .. s - 1 (``xrow`` a row), 16 B a lane."""
     ldk = k if ldk is None else ldk
     words = s * k // 8
     for i in range_constexpr((words + THREADS - 1) // THREADS):
@@ -131,7 +136,7 @@ def rows_to_lds(tid, src, k, s, xl, xrow, cm=0, ldk=None, k0=0):
         v = fx.Vector(
             bo.buffer_load(
                 rsrc(src),
-                (t * ldk + k0 + kk) // 2,
+                ((t0 + t) * ldk + k0 + kk) // 2,
                 vec_width=4,
                 dtype=T.i32,
                 cache_modifier=cm,
@@ -142,6 +147,6 @@ def rows_to_lds(tid, src, k, s, xl, xrow, cm=0, ldk=None, k0=0):
     gpu.barrier()
 
 
-def dev_rows_to_lds(tid, src, k, s, xl, xrow):
+def dev_rows_to_lds(tid, src, k, s, xl, xrow, t0=0):
     """``rows_to_lds`` at device scope: rows another CTA of this launch wrote."""
-    rows_to_lds(tid, src, k, s, xl, xrow, CM_DEV)
+    rows_to_lds(tid, src, k, s, xl, xrow, CM_DEV, t0=t0)

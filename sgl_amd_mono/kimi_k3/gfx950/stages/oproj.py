@@ -162,9 +162,11 @@ def o_loads(c, rg):
 
 
 @flyc.jit
-def load_core(c):
-    """The core rows (S x K bf16, ``core_ld`` elements a row) -> LDS, rows padded."""
-    s, tid = c["S"], c["tid"]
+def load_core(c, t0=0, s=None):
+    """Core rows t0 .. t0 + s - 1 (bf16, ``core_ld`` elements a row; all S
+    rows by default) -> LDS rows 0 .., padded."""
+    tid = c["tid"]
+    s = c["S"] if s is None else s
     ok, _, _ = o_dims(c)
     ld = c["args"].get("core_ld", ok)
     words = s * ok // 8
@@ -175,7 +177,10 @@ def load_core(c):
         k = e % (ok // 8) * 8
         v = fx.Vector(
             bo.buffer_load(
-                rsrc(c["args"]["core"]), (t * ld + k) // 2, vec_width=4, dtype=T.i32
+                rsrc(c["args"]["core"]),
+                ((t0 + t) * ld + k) // 2,
+                vec_width=4,
+                dtype=T.i32,
             )
         )
         if tid + THREADS * i < words:
@@ -184,14 +189,16 @@ def load_core(c):
 
 
 @flyc.jit
-def stage_o(c, rg, ops):
-    """Rows 16 rg ..: GEMV -> bf16 partials -> every rank's AR region, this
+def stage_o(c, rg, ops, t0=0, sj=None):
+    """Rows 16 rg .. against token rows t0 .. t0 + sj - 1 (LDS rows 0 ..; all S
+    rows by default): GEMV -> bf16 partials -> every rank's AR region, this
     rank's slot (thread: token, row pair; a put a peer)."""
     s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
+    sj = s if sj is None else sj
     # read before the traced branches (a dict lookup inside one is carried state)
     sent_ar = c.get("sent_ar", False)
     g = lane // ROWS
-    t = fx.min(lane % ROWS, s - 1)
+    t = fx.min(lane % ROWS, sj - 1)
     ok, nch, per = o_dims(c)
     row = ok + LDS_PAD
     acc = fx.Vector.filled(4, 0.0, fx.Float32)
@@ -216,11 +223,12 @@ def stage_o(c, rg, ops):
     gpu.barrier()
     # the task's GEMV done, before its pushes (the last task's stamp stays)
     stamp(c.get("tl_on", False), c.get("tls"), tid, c.get("tl_push", 0))
-    if tid < s * (ROWS // 2):
-        tt = tid // (ROWS // 2)
+    if tid < sj * (ROWS // 2):
+        tl = tid // (ROWS // 2)
+        tt = t0 + tl
         rp = tid % (ROWS // 2)
-        v0 = bf16_round(row_sum(red, 2 * rp, tt))
-        v1 = bf16_round(row_sum(red, 2 * rp + 1, tt))
+        v0 = bf16_round(row_sum(red, 2 * rp, tl))
+        v1 = bf16_round(row_sum(red, 2 * rp + 1, tl))
         if const_expr(sent_ar):
             si = sent_ix(c["rank"], rg * ROWS + 2 * rp, tt, s, HIDDEN)
             word = sent_word(bf16_pair(v0, v1))
@@ -236,9 +244,11 @@ def stage_o(c, rg, ops):
 @flyc.jit
 def stage_reduce(c, task):
     """Columns 128 task ..: the 8 ranks' partials, rank order, -> bf16 delta in
-    LDS (an item a (token, column pair), THREADS items a round)."""
+    LDS (an item a (token, column pair), THREADS items a round; packed bf16
+    pairs under ``vals_bf16``)."""
     s, tid = c["S"], c["tid"]
     sent_ar = c.get("sent_ar", False)
+    vals_bf16 = c.get("vals_bf16", False)
     n = s * (COLS // 2)
     for i in range_constexpr((n + THREADS - 1) // THREADS):
         idx = tid + THREADS * i
@@ -258,8 +268,16 @@ def stage_reduce(c, task):
                     lambda src: ((src * s + t) * HIDDEN + col) // 2,
                     TP,
                 )
-            fx.ptr_store(bf16_round(lo), c["delta_lds"] + (t * COLS + 2 * cp))
-            fx.ptr_store(bf16_round(hi), c["delta_lds"] + (t * COLS + 2 * cp + 1))
+            if const_expr(vals_bf16):
+                fx.ptr_store(
+                    bf16_pair(lo, hi).bitcast(fx.Int32),
+                    c["delta_lds"] + (t * COLS + 2 * cp) // 2,
+                )
+            else:
+                fx.ptr_store(bf16_round(lo), c["delta_lds"] + (t * COLS + 2 * cp))
+                fx.ptr_store(
+                    bf16_round(hi), c["delta_lds"] + (t * COLS + 2 * cp + 1)
+                )
     gpu.barrier()
 
 

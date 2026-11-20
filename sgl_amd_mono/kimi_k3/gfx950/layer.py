@@ -248,11 +248,14 @@ def stage_oproj(c, gi):
     """o_proj tasks gi, gi + 200, gi + 400 (< 448): every task's weights in
     flight at once (one memory latency, not three), then the MFMAs."""
     ops = [k2a.o_loads(c, fx.min(gi + O_N * j, OTASKS - 1)) for j in range(O_ROUNDS)]
-    k2a.load_core(c)
-    for j in range_constexpr(O_ROUNDS):
-        t = gi + O_N * j
-        if t < OTASKS:
-            k2a.stage_o(c, t, ops[j])
+    tiles = gemv.tiles(c["S"])
+    for ti in range_constexpr(len(tiles)):
+        t0, sj = tiles[ti]
+        k2a.load_core(c, t0, sj)
+        for j in range_constexpr(O_ROUNDS):
+            t = gi + O_N * j
+            if t < OTASKS:
+                k2a.stage_o(c, t, ops[j], t0, sj)
 
 
 _BUILDS: dict = {}
@@ -267,34 +270,75 @@ def build(key: K2Build):
     play = peer_layout(s)
     half = peer_bytes(s) // 2
 
-    @fx.struct
-    class RouteLds:
-        route: fx.Array[fx.Int32, s * 2 * k2b.TOPK, 16]
-        flag: fx.Array[fx.Int32, k2b.E, 16]
-        expert: fx.Array[fx.Int32, k2b.max_u(s), 16]
-        kof: fx.Array[fx.Int32, k2b.max_u(s) * s, 16]
-        scan: fx.Array[fx.Int32, WAVES, 16]
+    wide = s > gemv.ROWS  # past one MFMA token tile: ``k2b``'s wide steps
+    mu, mun = k2b.max_u(s), k2b.max_units(s)
+
+    if wide:
+
+        @fx.struct
+        class RouteLds:
+            route: fx.Array[fx.Int32, s * 2 * k2b.TOPK, 16]
+            flag: fx.Array[fx.Int32, k2b.E, 16]
+            expert: fx.Array[fx.Int32, mun, 16]  # a unit's
+            ustart: fx.Array[fx.Int32, mun, 16]
+            toks: fx.Array[fx.Int32, s * k2b.TOPK, 16]
+            scan: fx.Array[fx.Int32, WAVES, 16]
+
+        @fx.struct
+        class UgLds:
+            latq: fx.Array[fx.Int32, gemv.ROWS * k2b.LQ_WORDS, 16]
+            av: fx.Array[fx.Float32, THREADS, 16]
+
+        @fx.struct
+        class DownLds:
+            contrib: fx.Array[fx.Float32, s * k2b.TOPK * k2b.ROWS, 16]
+
+        @fx.struct
+        class TableLds:  # the route table's build
+            mask: fx.Array[fx.Int32, 2 * k2b.E, 16]
+            cnt: fx.Array[fx.Int32, mu, 16]
+            toff: fx.Array[fx.Int32, mu, 16]
+            sexp: fx.Array[fx.Int32, mu, 16]
+
+        @fx.struct
+        class AttnLds:  # packed bf16 pairs
+            vals: fx.Array[fx.Int32, s * ns * COLS // 2, 16]
+            dl: fx.Array[fx.Int32, s * COLS // 2, 16]
+
+    else:
+
+        @fx.struct
+        class RouteLds:
+            route: fx.Array[fx.Int32, s * 2 * k2b.TOPK, 16]
+            flag: fx.Array[fx.Int32, k2b.E, 16]
+            expert: fx.Array[fx.Int32, mu, 16]
+            kof: fx.Array[fx.Int32, mu * s, 16]
+            scan: fx.Array[fx.Int32, WAVES, 16]
+
+        @fx.struct
+        class UgLds:
+            latq: fx.Array[fx.Int32, s * k2b.LAT // 4, 16]
+            latsc: fx.Array[fx.Int32, s * k2b.LAT // 32, 16]
+            av: fx.Array[fx.Float32, THREADS, 16]
+
+        @fx.struct
+        class DownLds:
+            interq: fx.Array[fx.Int32, s * k2b.TOPK * k2b.IW, 16]
+            intsc: fx.Array[fx.Int32, s * k2b.TOPK * k2b.UG_GROUPS, 16]
+            contrib: fx.Array[fx.Float32, s * k2b.TOPK * k2b.ROWS, 16]
+
+        @fx.struct
+        class TableLds:
+            mask: fx.Array[fx.Int32, 16, 16]
+
+        @fx.struct
+        class AttnLds:
+            vals: fx.Array[fx.Float32, s * ns * COLS, 16]
+            dl: fx.Array[fx.Float32, s * COLS, 16]
 
     @fx.struct
     class EarlyLds:
         xl: fx.Array[fx.Int32, k2b.xl_words(s), 16]
-
-    @fx.struct
-    class AttnLds:
-        vals: fx.Array[fx.Float32, s * ns * COLS, 16]
-        dl: fx.Array[fx.Float32, s * COLS, 16]
-
-    @fx.struct
-    class UgLds:
-        latq: fx.Array[fx.Int32, s * k2b.LAT // 4, 16]
-        latsc: fx.Array[fx.Int32, s * k2b.LAT // 32, 16]
-        av: fx.Array[fx.Float32, THREADS, 16]
-
-    @fx.struct
-    class DownLds:
-        interq: fx.Array[fx.Int32, s * k2b.TOPK * k2b.IW, 16]
-        intsc: fx.Array[fx.Int32, s * k2b.TOPK * k2b.UG_GROUPS, 16]
-        contrib: fx.Array[fx.Float32, s * k2b.TOPK * k2b.ROWS, 16]
 
     @fx.struct
     class PartsLds:
@@ -307,6 +351,7 @@ def build(key: K2Build):
         ug: UgLds
         down: DownLds
         parts: PartsLds  # the route's router parts (OPT_RLOG_PARTS), after the mix
+        table: TableLds
 
     @fx.struct
     class Smem:
@@ -378,12 +423,13 @@ def build(key: K2Build):
             lds = alloc.allocate(Smem).peek()
             rl = alloc.allocate(RouteLds).peek()
             st = alloc.allocate(StageLds)
-            el, al, ul, dl, pl = (
+            el, al, ul, dl, pl, tb = (
                 st.early.peek(),
                 st.attn.peek(),
                 st.ug.peek(),
                 st.down.peek(),
                 st.parts.peek(),
+                st.table.peek(),
             )
             mb = Mailbox(step_tag(epoch, layer))
             par = uniform(ld_i32(epoch, 0)) % 2
@@ -434,17 +480,14 @@ def build(key: K2Build):
                 "vals": al.vals.ptr,
                 "delta_lds": al.dl.ptr,
                 "latq": ul.latq.ptr,
-                "latsc": ul.latsc.ptr,
                 "av": ul.av.ptr,
-                "interq": dl.interq.ptr,
-                "intsc": dl.intsc.ptr,
                 "contrib": dl.contrib.ptr,
                 "scan": rl.scan.ptr,
+                "vals_bf16": wide,
                 "rt": {
                     "route": rl.route.ptr,
                     "flag": rl.flag.ptr,
                     "expert": rl.expert.ptr,
-                    "kof": rl.kof.ptr,
                 },
                 "xbuf": scratch + fx.Int64(lay["xrow"][0]),
                 "xflags": NA,
@@ -481,6 +524,19 @@ def build(key: K2Build):
                 },
             }
             c["rlp"] = pl.rlp.ptr
+            if wide:
+                c["rt"]["ustart"] = rl.ustart.ptr
+                c["rt"]["toks"] = rl.toks.ptr
+                c["rt"]["mask"] = tb.mask.ptr
+                c["rt"]["cnt"] = tb.cnt.ptr
+                c["rt"]["toff"] = tb.toff.ptr
+                c["rt"]["sexp"] = tb.sexp.ptr
+                c["lqc"] = scratch + fx.Int64(lay["lqc"][0])
+            else:
+                c["rt"]["kof"] = rl.kof.ptr
+                c["latsc"] = ul.latsc.ptr
+                c["interq"] = dl.interq.ptr
+                c["intsc"] = dl.intsc.ptr
             c["tag_x"] = bool(key.opt & OPT_TAG_X)
             c["rlog_parts"] = bool(key.opt & OPT_RLOG_PARTS)
             c["batch"] = bool(key.opt & OPT_BATCH)
@@ -514,6 +570,8 @@ def build(key: K2Build):
                 "lmsq",
                 "lnrdy",
                 "shrdy",
+                "lqr",
+                "ugd",
             ):
                 c[region] = sreg(scratch, lay[region][0], region)
             on, tls = key.timeline, lds.tls.ptr
@@ -567,12 +625,18 @@ def build(key: K2Build):
             if bid >= NA:
                 stamp(on, tls, tid, 2)
             # ---- the routed experts
-            # the latent (ready ~10 us before the route) quantized first
-            k2b.load_latq(c)
-            stamp(on, tls, tid, 12)
-            # the route table from a bitmask's wave scan
-            nu = k2b.load_route2(c)
-            stamp(on, tls, tid, 11)
+            if const_expr(wide):
+                k2b.copy_latq(c)
+                stamp(on, tls, tid, 12)
+                nu = k2b.load_route_w(c)
+                stamp(on, tls, tid, 11)
+            else:
+                # the latent (ready ~10 us before the route) quantized first
+                k2b.load_latq(c)
+                stamp(on, tls, tid, 12)
+                # the route table from a bitmask's wave scan
+                nu = k2b.load_route2(c)
+                stamp(on, tls, tid, 11)
             total = nu * k2b.UG_GROUPS
             last = total - 1
             # reversed placement: the round's leftover tasks go to the high CTAs,
@@ -581,16 +645,32 @@ def build(key: K2Build):
             ops = k2b.ug_loads(c, fx.min(task, last))
             while task < total:
                 nxt = task + BLOCKS
-                ops_n = k2b.ug_loads(c, fx.min(nxt, last))
-                k2b.stage_ug(c, task, ops)
+                if const_expr(wide):
+                    # the unit's latent rows before the next task's weights
+                    bq = k2b.ug_b_loads(c, task)
+                    ops_n = k2b.ug_loads(c, fx.min(nxt, last))
+                    k2b.stage_ug_w(c, task, ops, bq)
+                else:
+                    ops_n = k2b.ug_loads(c, fx.min(nxt, last))
+                    k2b.stage_ug(c, task, ops)
                 task = nxt
                 ops = ops_n
+            if const_expr(wide):
+                k2b.ug_done(c)
             stamp(on, tls, tid, 3)
             if bid < k2b.DOWN_TASKS:
-                dops = k2b.down_loads(c, bid, nu, fx.min(c["wave"], nu - 1))
-                k2b.load_inter(c)
-                stamp(on, tls, tid, 15)
-                k2b.stage_down(c, bid, nu, dops)
+                if const_expr(wide):
+                    dops = k2b.down_loads(
+                        c, bid, nu, fx.min(c["wave"], nu - 1), k2b.DOWN_BATCH_W
+                    )
+                    k2b.wait_ug(c)
+                    stamp(on, tls, tid, 15)
+                    k2b.stage_down_w(c, bid, nu, dops)
+                else:
+                    dops = k2b.down_loads(c, bid, nu, fx.min(c["wave"], nu - 1))
+                    k2b.load_inter(c)
+                    stamp(on, tls, tid, 15)
+                    k2b.stage_down(c, bid, nu, dops)
                 stamp(on, tls, tid, 16)
             if const_expr(key.opt & OPT_SDOWN_FIRST):
                 k2b.run_sdown_first(c, bid, w_sd)
