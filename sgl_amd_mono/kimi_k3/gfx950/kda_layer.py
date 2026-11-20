@@ -63,11 +63,13 @@ def _up(n: int, a: int = 4096) -> int:
 def attn_offset() -> int:
     """Where the attention's scratch starts: past K2's tagged x rows and the
     MLA front's scratch, so no other launch's word sits where these keep tags."""
-    from sgl_amd_mono.kimi_k3 import MAX_BLOCKS
+    from sgl_amd_mono.kimi_k3 import K2_MAX_ROWS, MAX_BLOCKS
     from sgl_amd_mono.kimi_k3.gfx950.attention import mla_front
 
+    # the front at its widest step, as the runner sizes it
+    reqs = min(mla_front.MAX_REQS, K2_MAX_ROWS // mla_front.G_ROWS)
     front = mla_front.scratch_bytes(
-        mla_front.MlaFrontBuild(tokens=mla_front.G_ROWS, nblocks=MAX_BLOCKS, scale=1.0)
+        mla_front.MlaFrontBuild(tokens=mla_front.G_ROWS * reqs, nblocks=MAX_BLOCKS, scale=1.0)
     )
     return _up(max(k2.scratch_alloc_bytes(), front))
 
