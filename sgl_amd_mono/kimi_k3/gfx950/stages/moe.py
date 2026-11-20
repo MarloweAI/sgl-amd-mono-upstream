@@ -68,6 +68,7 @@ from sgl_amd_mono.common.ops import (
     hw_rsq,
     lanes_below,
     ld_i32,
+    lds_barrier,
     load_ptr64,
     peer_bases,
     popcount,
@@ -215,7 +216,9 @@ class MoeBuild(msgspec.Struct, frozen=True):
     eps: float = 1e-5  # the latent RMSNorm
     reduce: bool = True  # the final reduce in this launch (standalone)
     timeline: bool = False
-    xp: int = 0  # timing experiments: 1 ug without its epilogue, 2 ug loads only
+    # timing experiments: 1 ug without its epilogue, 2 ug loads only; wide steps
+    # also 3 ug weight loads only, 4 down loads only, 5 down weight loads only
+    xp: int = 0
     # debug: run phases < stop only (1 early, 2 route/sdown, 3 ug, 4 down,
     # 5 lnorm, 6 up)
     stop: int = 99
@@ -1273,7 +1276,7 @@ def stage_ug(c, task, ops):
             fx.Float32,
         )
     fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
-    gpu.barrier()
+    lds_barrier()
     if const_expr(c["xp"] != 0):
         return
     # thread (token, column): g / u summed over the K halves, SiTUv2
@@ -1293,9 +1296,9 @@ def stage_ug(c, task, ops):
     v = bf16_round(situ_aiter(gv, uv))
     amax = butterfly(abs(v), (16, 8, 4, 2, 1), fx.max)
     code = e8m0_roundup(amax)
-    gpu.barrier()
+    lds_barrier()
     fx.ptr_store(v, c["av"] + tid)
-    gpu.barrier()
+    lds_barrier()
     k = fx.ptr_load(rt["kof"] + (slot * s + tt))
     if live & (col < 8) & (k >= 0):
         scale = (code << 23).bitcast(fx.Float32)
@@ -1304,7 +1307,7 @@ def stage_ug(c, task, ops):
         c["put_words"](c["inter"], pick * IW + g * 8 + col, [pk_fp8_f32(xs, scale)])
         if col == 0:
             c["put"](c["isc"], pick * UG_GROUPS + g, code)
-    gpu.barrier()
+    lds_barrier()
 
 
 # ---------------------------------------------------------------- queues
@@ -1515,8 +1518,8 @@ COPY_CTAS = BLOCKS - (NA + G_TASKS)
 def copy_latq(c):
     """Every rank's MXFP8 latent words and codes (LATQ) -> the compact LQC, a
     (token, quarter) unit at a time on the top COPY_CTAS CTAs (their early work
-    ends before the shared gate/up's), each unit's LQR flag; then every flag
-    polled."""
+    ends before the shared gate/up's), each unit's LQR flag (``wait_latq`` polls
+    them)."""
     s, tid, bid = c["S"], c["tid"], c["bid"]
     qw = LQ_WORDS // 4
     v = BLOCKS - 1 - bid
@@ -1528,9 +1531,14 @@ def copy_latq(c):
             if tid < qw:
                 bo.buffer_store(got, rsrc(c["lqc"]), w, cache_modifier=CM_DEV)
             publish(c["put"], c["lqr"], u, fx.Int32(1), tid == 0)
-    if tid < 4 * s:
-        c["poll"]([(c["lqr"], tid, 1)])
-    gpu.barrier()
+
+
+@flyc.jit
+def wait_latq(c):
+    """Every LQR flag: the compact latent copy is complete."""
+    if c["tid"] < 4 * c["S"]:
+        c["poll"]([(c["lqr"], c["tid"], 1)])
+    lds_barrier()
 
 
 @flyc.jit
@@ -1653,7 +1661,7 @@ def ug_b_loads(c, task):
     nb = s * LQ_WORDS * 4
     r = rsrc(c["lqc"], nb)
     out = []
-    for i in range(UG_BQ):
+    for i in range(UG_BQ if c["xp"] != 3 else 0):
         qd = tid + THREADS * i
         j = qd // qw
         ok = (qd < ROWS * qw) & (j < n)
@@ -1677,10 +1685,18 @@ def stage_ug_w(c, task, ops, bq):
     g = task % UG_GROUPS
     st0, n = unit_of(c, task // UG_GROUPS)
     qw = LQ_WORDS // 4
+    if const_expr(c["xp"] in (2, 3)):
+        # loads only: keep them live
+        z = fx.Int32(0)
+        for v in list(ops) + list(bq):
+            for w in [v[d] for d in range(4)] if isinstance(v, fx.Vector) else [v]:
+                z = z ^ w
+        fx.ptr_store(z.bitcast(fx.Float32), red + tid)
+        return
     for i in range_constexpr(len(bq)):
         if tid + THREADS * i < ROWS * qw:
             fx.ptr_store(bq[i], c["latq"] + (tid + THREADS * i) * 4)
-    gpu.barrier()
+    lds_barrier()
     half = wave // 4
     rg = ug_row_group(c, g, wave)
     steps = [half * (W13_STEPS // 2) + i for i in range(W13_STEPS // 2)]
@@ -1696,7 +1712,7 @@ def stage_ug_w(c, task, ops, bq):
         sa = (sw[i // 2] >> ((st % 2) * 16 + (rg % 2) * 8)) & 0xFF
         acc = mfma_scaled(av[i], bw, acc, sa, sb, FP4, FP8, 0, 0)
     fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
-    gpu.barrier()
+    lds_barrier()
     tt = tid // 32
     col = tid % 32
     live = tt < n
@@ -1711,9 +1727,9 @@ def stage_ug_w(c, task, ops, bq):
     v = bf16_round(situ_aiter(gv, uv))
     amax = butterfly(abs(v), (16, 8, 4, 2, 1), fx.max)
     code = e8m0_roundup(amax)
-    gpu.barrier()
+    lds_barrier()
     fx.ptr_store(v, c["av"] + tid)
-    gpu.barrier()
+    lds_barrier()
     if live & (col < 8):
         p = fx.ptr_load(rt["toks"] + (st0 + fx.min(tt, n - 1)))
         scale = (code << 23).bitcast(fx.Float32)
@@ -1731,7 +1747,7 @@ def stage_ug_w(c, task, ops, bq):
                 p * UG_GROUPS + g,
                 cache_modifier=CM_DEV,
             )
-    gpu.barrier()
+    lds_barrier()
 
 
 @flyc.jit
@@ -1774,6 +1790,8 @@ def down_b_loads(c, b0, nu):
     ri = rsrc(c["inter"].value, nbi)
     rc = rsrc(c["isc"].value, nbc)
     words, codes = [], []
+    if c["xp"] == 5:
+        return []
     units, lives = down_units(b0, nu)
     for j in range(DOWN_BATCH_W):
         ok, p = down_pick(c, units[j], lives[j])
@@ -1816,7 +1834,14 @@ def stage_down_w(c, rgd, nu, ops0):
         ops_n = down_loads(c, rgd, nu, fx.min(nb, nu - 1), DOWN_BATCH_W)
         bl_n = down_b_loads(c, fx.min(nb, nu - 1), nu)
         units, lives = down_units(b0, nu)
-        for j in range_constexpr(DOWN_BATCH_W):
+        if const_expr(c["xp"] in (4, 5)):
+            # loads only: keep them live
+            z = fx.Int32(0)
+            for v in list(ops) + list(bl):
+                for w in [v[d] for d in range(4)] if isinstance(v, fx.Vector) else [v]:
+                    z = z ^ w
+            fx.ptr_store(z.bitcast(fx.Float32), c["red"] + c["tid"])
+        for j in range_constexpr(DOWN_BATCH_W if c["xp"] not in (4, 5) else 0):
             ok, p = down_pick(c, units[j], lives[j])
             acc = fx.Vector.filled(4, 0.0, fx.Float32)
             for st in range_constexpr(W2_STEPS):
@@ -1893,9 +1918,11 @@ def load_h(c):
 
 
 @flyc.jit
-def stage_sdown(c, j, ops):
+def stage_sdown(c, j, ops, flag=True):
     """Shared down rows 16 j .. (K 768) against h in LDS (``load_h``): bf16
-    partial -> SHP (this rank's up columns) or every rank's FINAL."""
+    partial -> SHP (this rank's up columns) or every rank's FINAL. ``flag``
+    False: a task never in this rank's up columns (no SHRDY flag, its stores
+    left in flight)."""
     sent_final = c.get("sent_final", False)
     s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
     hrow = SI + gemv.LDS_PAD
@@ -1906,7 +1933,7 @@ def stage_sdown(c, j, ops):
         t0, sj = tiles[ti]
         acc = gemv.mfmas(lane, wave, c["xl"], hrow, SI, sj, ops, t0)
         fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
-        gpu.barrier()
+        lds_barrier()
         if tid < (ROWS // 2) * sj:
             rp = tid % (ROWS // 2)
             tl = tid // (ROWS // 2)
@@ -1928,15 +1955,16 @@ def stage_sdown(c, j, ops):
             else:
                 put_final(c, j * ROWS + 2 * rp, tt, v0, v1, sent_final)
         if const_expr(ti + 1 < len(tiles)):
-            gpu.barrier()
-    publish(
-        c["put"],
-        c["shrdy"],
-        fx.max(fx.min(j - lo, UP_TASKS - 1), 0),
-        fx.Int32(1),
-        (tid == 0) & mine,
-    )
-    gpu.barrier()
+            lds_barrier()
+    if const_expr(flag):
+        publish(
+            c["put"],
+            c["shrdy"],
+            fx.max(fx.min(j - lo, UP_TASKS - 1), 0),
+            fx.Int32(1),
+            (tid == 0) & mine,
+        )
+    lds_barrier()
 
 
 @flyc.jit
@@ -1972,6 +2000,37 @@ def run_sdown_first(c, bid, w_sd):
         stage_sdown(c, j0, ops0)
         if k0 + nsd < UP_TASKS:
             stage_sdown(c, j1, ops1)
+
+
+SDOWN_AHEAD = 6  # run_sdown_late's tasks in flight (12 VGPRs a task)
+
+
+@flyc.jit
+def run_sdown_late(c, bid, w_sd):
+    """Every shared-down task on the CTAs past the down tasks, during down: CTA
+    224 + k0 takes tasks k0 + 32 i (up's 56 first, at i < 2), weights
+    SDOWN_AHEAD tasks ahead. The same tasks and arithmetic as ``run_sdown`` and
+    ``run_sdown_rest``: placement only."""
+    nsd = BLOCKS - DOWN_TASKS  # 32
+    n = SD_TASKS // nsd  # 14
+    assert n * nsd == SD_TASKS and UP_TASKS <= 2 * nsd
+    if bid >= DOWN_TASKS:
+        k0 = bid - DOWN_TASKS
+        lo = c["rank"] * UP_TASKS
+        js = [(k0 + nsd * i + lo) % SD_TASKS for i in range(n)]
+        ops = [
+            gemv.loads(c["lane"], c["wave"], w_sd, js[i] * ROWS, SI)
+            for i in range(SDOWN_AHEAD)
+        ]
+        load_h(c)
+        for i in range_constexpr(n):
+            if const_expr(i + SDOWN_AHEAD < n):
+                ops.append(
+                    gemv.loads(
+                        c["lane"], c["wave"], w_sd, js[i + SDOWN_AHEAD] * ROWS, SI
+                    )
+                )
+            stage_sdown(c, js[i], ops[i], i < 2)
 
 
 @flyc.jit

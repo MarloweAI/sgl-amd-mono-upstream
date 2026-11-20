@@ -129,7 +129,7 @@ class K2Build(msgspec.Struct, frozen=True):
     # to let through first. Compile-time, so a serving build pays nothing.
     fault_site: int = 0
     fault_after: int = 0
-    xp: int = 0  # timing experiments (7: route without its selection)
+    xp: int = 0  # timing experiments (7: route without its selection; 2-5 stages.moe)
     guint: bool = False  # w13's AITER layout; see stages.moe.MoeBuild
     opt: int = 0  # the OPT_* bits
 
@@ -627,7 +627,6 @@ def build(key: K2Build):
             # ---- the routed experts
             if const_expr(wide):
                 k2b.copy_latq(c)
-                stamp(on, tls, tid, 12)
                 nu = k2b.load_route_w(c)
                 stamp(on, tls, tid, 11)
             else:
@@ -641,10 +640,13 @@ def build(key: K2Build):
             last = total - 1
             # reversed placement: the round's leftover tasks go to the high CTAs,
             # whose early work ends first (the AttnRes / route CTAs start ug last)
-            task = BLOCKS - 1 - bid
-            ops = k2b.ug_loads(c, fx.min(task, last))
             if const_expr(wide):
+                task = BLOCKS - 1 - bid
+                # the first task's weights in flight while the latent copy lands;
                 # a task's latent rows are issued with its weights, a task ahead
+                ops = k2b.ug_loads(c, fx.min(task, last))
+                k2b.wait_latq(c)
+                stamp(on, tls, tid, 12)
                 bq = k2b.ug_b_loads(c, fx.min(task, last))
                 while task < total:
                     nxt = task + BLOCKS
@@ -655,6 +657,8 @@ def build(key: K2Build):
                     ops = ops_n
                     bq = bq_n
             else:
+                task = BLOCKS - 1 - bid
+                ops = k2b.ug_loads(c, fx.min(task, last))
                 while task < total:
                     nxt = task + BLOCKS
                     ops_n = k2b.ug_loads(c, fx.min(nxt, last))
@@ -678,12 +682,16 @@ def build(key: K2Build):
                     stamp(on, tls, tid, 15)
                     k2b.stage_down(c, bid, nu, dops)
                 stamp(on, tls, tid, 16)
-            if const_expr(key.opt & OPT_SDOWN_FIRST):
-                k2b.run_sdown_first(c, bid, w_sd)
-                k2b.run_sdown_rest(c, bid, w_sd)
+            if const_expr(wide):
+                # the shared down on the CTAs with no down task, during down
+                k2b.run_sdown_late(c, bid, w_sd)
             else:
-                k2b.run_sdown_rest(c, bid, w_sd)
-                k2b.run_sdown(c, bid, w_sd)
+                if const_expr(key.opt & OPT_SDOWN_FIRST):
+                    k2b.run_sdown_first(c, bid, w_sd)
+                    k2b.run_sdown_rest(c, bid, w_sd)
+                else:
+                    k2b.run_sdown_rest(c, bid, w_sd)
+                    k2b.run_sdown(c, bid, w_sd)
             stamp(on, tls, tid, 4)
             if (bid >= k2b.LN0) & (bid < k2b.LN0 + k2b.LN_TASKS):
                 k2b.stage_lnorm(c, bid - k2b.LN0)

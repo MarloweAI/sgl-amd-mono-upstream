@@ -32,6 +32,7 @@ from sgl_amd_mono.common.ops import (
     bf16_pair,
     bf16_round,
     ld_i32,
+    lds_barrier,
     mfma_bf16,
     peer_bases,
     row_sum,
@@ -185,7 +186,7 @@ def load_core(c, t0=0, s=None):
         )
         if tid + THREADS * i < words:
             fx.ptr_store(v, c["xl"] + (t * row + k) // 2)
-    gpu.barrier()
+    lds_barrier()
 
 
 @flyc.jit
@@ -220,7 +221,7 @@ def stage_o(c, rg, ops, t0=0, sj=None):
                 ops[i][q].bitcast(fx.BFloat16), xb.bitcast(fx.BFloat16), acc
             )
     fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
-    gpu.barrier()
+    lds_barrier()
     # the task's GEMV done, before its pushes (the last task's stamp stays)
     stamp(c.get("tl_on", False), c.get("tls"), tid, c.get("tl_push", 0))
     if tid < sj * (ROWS // 2):
@@ -238,7 +239,7 @@ def stage_o(c, rg, ops, t0=0, sj=None):
             at = (c["rank"] * s + tt) * HIDDEN + rg * ROWS + 2 * rp
             for p in range_constexpr(TP):
                 c["put_bf"](c["ar_peer"][p], at, [v0, v1])
-    gpu.barrier()
+    lds_barrier()
 
 
 @flyc.jit
