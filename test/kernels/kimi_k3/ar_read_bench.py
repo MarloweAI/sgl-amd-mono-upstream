@@ -393,62 +393,19 @@ def tp8_main(args):
                 e1.record()
                 torch.cuda.synchronize()
                 record(name, m, e0.elapsed_time(e1) * 1000 / (args.reps * nl))
-            # the MoE's [latent | shared] all-reduce at this width
-            moe_in = [torch.randn(m, 10752, device=dev).to(BF) for _ in range(nl)]
-
-            def moe_body():
-                for i in range(nl):
-                    ca.custom_all_reduce(moe_in[i])
-
-            moe_body()
-            torch.cuda.synchronize()
-            g = torch.cuda.CUDAGraph()
-            with ca.capture():
-                with torch.cuda.graph(g):
-                    moe_body()
-            for _ in range(3):
-                g.replay()
-            torch.cuda.synchronize()
-            dist.barrier()
-            e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-            e0.record()
-            for _ in range(args.reps):
-                g.replay()
-            e1.record()
-            torch.cuda.synchronize()
-            record("stock_moe_ar_10752", m, e0.elapsed_time(e1) * 1000 / (args.reps * nl))
-            # kimi_k31 coll.py's standalone two-shot AR
-            from sgl_amd_mono.kimi_k31.gfx950.stages import coll
-
-            for h in (7168, 10752):
-                for fmt in ("tag", "flag"):
-                    cl = coll.standalone(m, h, "ar", fmt, False, nl, "launch")
-                    cp = PeerBuffer(coll.peer_bytes(m, h, fmt), cpu, rank, TP, dev)
-                    cp.bytes.zero_()
-                    ep = torch.zeros(guard.GUARD_WORDS, dtype=torch.int32, device=dev)
-                    ep[1:3].copy_(epoch[1:3])
-                    cx = torch.randn(nl, m, h, device=dev).to(BF)
-                    cy = torch.empty_like(cx)
-                    dl = torch.zeros(nl, 2 * 256, dtype=torch.int32, device=dev)
-
-                    def cbody():
-                        ep[0:1].add_(1)
-                        for i in range(nl):
-                            cl(cx[i].data_ptr(), cy[i].data_ptr(), cp.addresses.data_ptr(), rank,
-                               ep.data_ptr(), dl[i].data_ptr(), i, stream=torch.cuda.current_stream())
-
-                    record(f"coll_ar_{fmt}_{h}", m, graph_time(cbody, args.reps, nl))
-                    cp.close()
-        for m in args.rows:
-            try:
-                moe_halves(args, cpu, dev, rank, record, nl, m, ca, out)
-            except Exception as e:  # noqa: BLE001  a bench section's failure leaves the others' numbers
-                print(f"MOE m={m} rank {rank} failed: {type(e).__name__}: {e}", flush=True)
+        # in order of need, each section on its own: a failure leaves the others' numbers
+        sections = []
         if args.gather_rows:
+            sections.append(("gather", lambda: time_gather(args, cpu, dev, rank, record, nl)))
+        for m in args.rows:
+            sections.append((f"moe m={m}", lambda m=m: moe_halves(args, cpu, dev, rank, record, nl, m, ca, out)))
+        for m in args.rows:
+            sections.append((f"coll m={m}", lambda m=m: moe_and_coll(args, cpu, dev, rank, record, nl, m, ca, epoch)))
+        for name, run in sections:
             try:
-                time_gather(args, cpu, dev, rank, record, nl)
+                run()
             except Exception as e:  # noqa: BLE001
-                print(f"GATHER rank {rank} failed: {type(e).__name__}: {e}", flush=True)
+                print(f"SECTION {name} rank {rank} failed: {type(e).__name__}: {e}", flush=True)
     every = [None] * TP
     dist.all_gather_object(every, out, group=cpu)
     if rank == 0 and args.json:
@@ -462,6 +419,59 @@ def tp8_main(args):
         print("TP8", "PASS" if not bad.item() else "FAIL", flush=True)
     dist.destroy_process_group()
     return not bad.item()
+
+
+def moe_and_coll(args, cpu, dev, rank, record, nl, m, ca, epoch):
+    """aiter's flat MoE all-reduce and kimi_k31 coll.py's standalone ARs at this width."""
+    from sgl_amd_mono.common import guard
+    from sgl_amd_mono.common.peer import PeerBuffer
+
+    # the MoE's [latent | shared] all-reduce at this width
+    moe_in = [torch.randn(m, 10752, device=dev).to(BF) for _ in range(nl)]
+
+    def moe_body():
+        for i in range(nl):
+            ca.custom_all_reduce(moe_in[i])
+
+    moe_body()
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with ca.capture():
+        with torch.cuda.graph(g):
+            moe_body()
+    for _ in range(3):
+        g.replay()
+    torch.cuda.synchronize()
+    dist.barrier()
+    e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    e0.record()
+    for _ in range(args.reps):
+        g.replay()
+    e1.record()
+    torch.cuda.synchronize()
+    record("stock_moe_ar_10752", m, e0.elapsed_time(e1) * 1000 / (args.reps * nl))
+    # kimi_k31 coll.py's standalone two-shot AR
+    from sgl_amd_mono.kimi_k31.gfx950.stages import coll
+
+    for h in (7168, 10752):
+        for fmt in ("tag", "flag"):
+            cl = coll.standalone(m, h, "ar", fmt, False, nl, "launch")
+            cp = PeerBuffer(coll.peer_bytes(m, h, fmt), cpu, rank, TP, dev)
+            cp.bytes.zero_()
+            ep = torch.zeros(guard.GUARD_WORDS, dtype=torch.int32, device=dev)
+            ep[1:3].copy_(epoch[1:3])
+            cx = torch.randn(nl, m, h, device=dev).to(BF)
+            cy = torch.empty_like(cx)
+            dl = torch.zeros(nl, 2 * 256, dtype=torch.int32, device=dev)
+
+            def cbody():
+                ep[0:1].add_(1)
+                for i in range(nl):
+                    cl(cx[i].data_ptr(), cy[i].data_ptr(), cp.addresses.data_ptr(), rank,
+                       ep.data_ptr(), dl[i].data_ptr(), i, stream=torch.cuda.current_stream())
+
+            record(f"coll_ar_{fmt}_{h}", m, graph_time(cbody, args.reps, nl))
+            cp.close()
 
 
 def stock_rmsnorm(h, eps, w):
