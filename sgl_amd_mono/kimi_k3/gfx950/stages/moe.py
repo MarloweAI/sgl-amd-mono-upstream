@@ -11,7 +11,7 @@ its eighth and the rows are all-gathered over the peer buffer.
       router  (7 x 16 rows of this rank's 112 experts): fp32 logits -> every
               rank's RLOG
       latent  (28 x 16 rows of this rank's 448): bf16 -> every rank's LAT
-      sgu     (96 x 16 rows of the shared gate | up): bf16 -> SGU
+      sgu     (96 x 16 rows of the shared gate | up): fp32 -> SGU
     route   (S, CTAs 131 ..): sigmoid (v_rcp), + bias, top-16, the pre-bias
             sigmoids renormalized (IEEE 1 / sum) -> ROUTE (every rank alike)
     sdown   (448 x 16 rows, K 768, CTAs 131 ..): SiTU of SGU (vLLM's kernel) ->
@@ -255,7 +255,7 @@ def peer_bytes(s):
 def scratch_layout(key: MoeBuild) -> dict:
     s = key.tokens
     pairs = {
-        "sgu": s * SI,
+        "sgu": s * 2 * SI,
         "h": s * SI // 2,
         "rpart": R_GROUPS * R_PARTS * s * ROWS,
         # sized for latq_push's 32-row groups in quarters (twice the halves')
@@ -424,9 +424,10 @@ def early_out(c, kind, i, q, red, t0=0, sj=None):
             rp = tid % (ROWS // 2)
             tl = tid // (ROWS // 2)
             t = t0 + tl
-            v0 = bf16_round(row_sum(red, 2 * rp, tl))
-            v1 = bf16_round(row_sum(red, 2 * rp + 1, tl))
-            c["put_bf"](c["sgu"], t * 2 * SI + i * ROWS + 2 * rp, [v0, v1])
+            # fp32, as SGLang's shared gate/up output: SiTU rounds once, to bf16 h
+            at = t * 2 * SI + i * ROWS + 2 * rp
+            c["put"](c["sgu"], at, row_sum(red, 2 * rp, tl))
+            c["put"](c["sgu"], at + 1, row_sum(red, 2 * rp + 1, tl))
     else:
         parts = R_PARTS if kind == 0 else L_PARTS
         region = c["rpart"] if kind == 0 else c["lpart"]
@@ -1883,19 +1884,19 @@ def stage_down_w(c, rgd, nu, ops0):
 # ---------------------------------------------------------------- shared down
 @flyc.jit
 def stage_h(c, t):
-    """Token t's shared h = SiTU(g, u) (vLLM's situ_and_mul, bf16) of SGU, once
+    """Token t's shared h = SiTU(g, u) (vLLM's situ_and_mul on fp32 g, u) of SGU, once
     -> H; a thread a column pair, its polls in one batch."""
     tid = c["tid"]
     n = SI // 2
     if tid < n:
         got = c["poll"](
             [
-                (c["sgu"], (t * 2 * SI) // 2 + tid, 1),
-                (c["sgu"], (t * 2 * SI + SI) // 2 + tid, 1),
+                (c["sgu"], t * 2 * SI + 2 * tid, 2),
+                (c["sgu"], t * 2 * SI + SI + 2 * tid, 2),
             ]
         )
-        g0, g1 = bf_lo(got[0][0]), bf_hi(got[0][0])
-        u0, u1 = bf_lo(got[1][0]), bf_hi(got[1][0])
+        g0, g1 = f32_of(got[0][0]), f32_of(got[0][1])
+        u0, u1 = f32_of(got[1][0]), f32_of(got[1][1])
         c["put_bf"](c["h"], t * SI + 2 * tid, [situ_vllm(g0, u0), situ_vllm(g1, u1)])
     gpu.barrier()
 
