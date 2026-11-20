@@ -153,15 +153,25 @@ def _soff(c, hs):
     return uniform((c["wave"] * HSTEPS + hs) * KSTEP * 2)
 
 
-def _loads(c, p, hs, live):
-    """One step of this wave: rows 16 (2 p + g) .. of both groups and every token
-    tile's x, 2 x 16 B a lane each (zeros, with no memory read, unless ``live``;
-    the rows past in_proj's last are zeros too)."""
+def _loads(c, u, hs, live):
+    """One step (unit ``u``, K step ``hs``) of this wave: 2 x 16 B a lane of each
+    group's weights (``pack_w_in``: a unit's bytes are contiguous, 1 KB an
+    instruction) and of every token tile's x (zeros, with no memory read,
+    unless ``live``)."""
     lane, s = c["lane"], c["S"]
     soff = _soff(c, hs)
     wr = rsrc(c["args"]["w_in"], live.select(fx.Int64(NPROJ * HIDDEN * 2), fx.Int64(0)))
     xr = rsrc(c["args"]["x"], live.select(fx.Int64(s * HIDDEN * 2), fx.Int64(0)))
     k8 = (lane // ROWS) * 8
+    wo = uniform((u * WAVES + c["wave"]) * (G * 2 * 1024))
+
+    def wld(g, q):
+        return fx.Vector(
+            bo.buffer_load(
+                wr, lane * 4, vec_width=4, dtype=T.i32, cache_modifier=CM_NT,
+                soffset_bytes=wo + (g * 2 + q) * 1024,
+            )
+        )  # fmt: skip
 
     def ld(r, row, cm):
         base = (row * HIDDEN + k8) // 2
@@ -175,9 +185,17 @@ def _loads(c, p, hs, live):
             for q in range(KSTEP // 32)
         ]  # fmt: skip
 
-    ws = [ld(wr, (G * p + g) * ROWS + lane % ROWS, CM_NT) for g in range(G)]
+    ws = [[wld(g, q) for q in range(KSTEP // 32)] for g in range(G)]
     xs = [ld(xr, fx.min(tt * 16 + lane % 16, s - 1), 0) for tt in range(c["T"])]
     return ws, xs
+
+
+def pack_w_in(w_in):
+    """in_proj [NPROJ, HIDDEN] in the launch's stream order: unit (set, K step),
+    wave, group, K half, lane (K group, row), 8 K a lane."""
+    assert w_in.shape == (NPROJ, HIDDEN)
+    v = w_in.view(SETS, G, ROWS, WAVES, HSTEPS, KSTEP // 32, 4, 8)
+    return v.permute(0, 4, 3, 1, 5, 6, 2, 7).contiguous().view(NPROJ, HIDDEN)
 
 
 def _slot_w(c):
@@ -195,7 +213,7 @@ def gemv_loop(c):
 
     def unit(i):
         u = u0 + i
-        return u // HSTEPS, u % HSTEPS, u < u1
+        return u, u % HSTEPS, u < u1
 
     acc = [[fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(nt)] for _ in range(G)]
 
@@ -222,7 +240,7 @@ def gemv_loop(c):
         ws, xs = pend.pop(i)
         if const_expr(i > 0):
             # the run crosses into the next set here: the first piece is done
-            p, hs, live = unit(i)
+            _, hs, live = unit(i)
             cross = (hs == 0) & live
             if cross:
                 spill(0)

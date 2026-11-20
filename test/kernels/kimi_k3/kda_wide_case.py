@@ -183,6 +183,7 @@ class Wide:
 
         self.kw = kw
         self.w = w
+        self.w_in = kw.pack_w_in(w["w_in"])
         self.key = kw.KdaWideBuild(
             tokens=S, qlen=L, onorm_eps=EPS, lower_bound=LB, debug=debug, depth=depth, timeline=timeline
         )
@@ -202,7 +203,7 @@ class Wide:
         self.kw.kda_wide(
             self.key,
             x=x,
-            w_in=self.w["w_in"],
+            w_in=self.w_in,
             w_fb=self.w["w_fb"],
             conv_w=self.w["conv_w"],
             conv_state=pools.conv.mT,
