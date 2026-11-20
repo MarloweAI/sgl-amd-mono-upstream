@@ -94,6 +94,7 @@ def main():
     ap.add_argument("--warmup", type=int, default=10)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--tl-dir", help="each rank's stamped launch, every CTA's points (us from its first): <cell>-r<rank>.pt")
     args = ap.parse_args()
     args.copy, args.layer = None, 3
     rank = int(os.environ["RANK"])
@@ -177,6 +178,11 @@ def main():
             mf.mla_front_launch(tkey, tl=tl, **{**common, "scratch": scratch_for(tkey, device)})
             torch.cuda.synchronize()
         t0 = tl[:, 0][tl[:, 0] > 0].min()
+
+        if args.tl_dir:
+            os.makedirs(args.tl_dir, exist_ok=True)
+            us = torch.where(tl > 0, (tl - t0).double() / 100.0, torch.full_like(tl, float("nan"), dtype=torch.double))
+            torch.save(us.cpu(), os.path.join(args.tl_dir, f"{name}-r{rank}.pt"))
 
         def lat(k, tl=tl, t0=t0):  # a point no CTA stamped: nan
             v = tl[:, k][tl[:, k] > 0]
