@@ -39,6 +39,7 @@ launch once on real weights, not through FlyDSL's compile-only mode
 
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
 import logging
 import os
@@ -341,6 +342,11 @@ def _build(model, hf_config, ctx):
                 backbone.layers[i], i, rows, runner, mla_off is None, dcp
             )
             layers.setdefault(rows, {})[i] = packed
+        # consecutive DCP fronts take alternate QG copies (mla_front.peer_end)
+        fronts = [p for _, p in sorted(layers[rows].items()) if p.front is not None]
+        for n, p in enumerate(fronts):
+            key, w = p.front
+            p.front = (dataclasses.replace(key, qg_par=n % 2), w)
         # FlyDSL compiles a launcher on its first call, and the first real call
         # is inside a CUDA graph capture, where compiling aborts the process.
         # A compile-only call cannot stand in: with zero arguments the buffer

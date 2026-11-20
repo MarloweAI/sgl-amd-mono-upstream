@@ -225,12 +225,16 @@ def batch_stream(ids, seed, device):
     return {k: torch.cat([x[k] for x in sts]).contiguous() for k in sts[0]}
 
 
+# the QG copy every launch here takes (--qg-par)
+QG_PAR = [0]
+
+
 def front_key(w, s, timeline=False):
     from sgl_amd_mono.kimi_k3.gfx950.attention import mla_front as mf
 
     return mf.MlaFrontBuild(
         tokens=s, nblocks=NVB, scale=w["scale"], eps=w["eps"], out_eps=w["out_eps"],
-        q_eps=w["q_eps"], kv_eps=w["kv_eps"], timeline=timeline,
+        q_eps=w["q_eps"], kv_eps=w["kv_eps"], qg_par=QG_PAR[0], timeline=timeline,
     )  # fmt: skip
 
 
@@ -264,7 +268,7 @@ class Peers:
         )
 
     def _copy(self, o):
-        off = o * self.stride + self.mf.qg_offset()
+        off = o * self.stride + self.mf.qg_offset() + QG_PAR[0] * self.mf.QG_COPY
         return self.buf.bytes[off : off + self.mf.QG_COPY]
 
     def q_of(self, o, s):
@@ -819,7 +823,9 @@ def main():
     ap.add_argument("--invariance", action="store_true", help="the batch-invariance suite")
     ap.add_argument("--time-wide", action="store_true", help="time the front at 4 and 8 requests")
     ap.add_argument("--max-reqs", type=int, default=8)
+    ap.add_argument("--qg-par", type=int, default=0, choices=(0, 1), help="the QG copy the launches take")
     args = ap.parse_args()
+    QG_PAR[0] = args.qg_par
     device = torch.device("cuda", 0)
     torch.cuda.set_device(device)
     from sgl_amd_mono.common.peer import PeerBuffer

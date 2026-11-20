@@ -14,6 +14,7 @@ of every request's keys. Results as JSON (``--out``), from rank 0.
 """
 
 import argparse
+import dataclasses
 import faulthandler
 import inspect
 import json
@@ -135,6 +136,8 @@ def main():
         st = batch_stream(range(len(ctxs)), args.seed, device)
         s = b.s
         key = front_key(w, s)
+        # consecutive fronts (MLA layers) take alternate QG copies, where the tree has them
+        keys = [dataclasses.replace(key, qg_par=q) for q in (0, 1)] if hasattr(key, "qg_par") else [key]
         scratch = scratch_for(key, device)
         gate = torch.zeros(s, NHL * VD, dtype=BF, device=device)
         send = torch.zeros(DCP, s, NHL, mf.REC, dtype=BF, device=device)
@@ -146,21 +149,22 @@ def main():
             scratch=scratch, rank=rank, layer=args.layer, epoch=epoch, **extra,
         )  # fmt: skip
 
-        def step(key=key, common=common, send=send, recv=recv, gate=gate, core=core):
+        nth = [0]
+
+        def front(keys=keys, common=common, nth=nth):
+            mf.mla_front_launch(keys[nth[0] % len(keys)], **common)
+            nth[0] += 1
+
+        def step(front=front, send=send, recv=recv, gate=gate, core=core):
             epoch[0].add_(1)
-            mf.mla_front_launch(key, **common)
+            front()
             dist.all_to_all_single(recv.view(-1).view(torch.uint8), send.view(-1).view(torch.uint8))
             comb, _ = dcp_lse_combine_triton(recv[..., :VD], recv.view(torch.float32)[..., VD // 2], is_lse_base_on_e=True)
             core.copy_(mla_output_gate.kimi_k3_mla_output_gate(comb.flatten(1, 2), gate))
 
-        # back to back with no a2a between, a rank may start the next front while a peer
-        # still reads this one's q: consecutive fronts take alternate QG copies
-        par = [0]
-
-        def front_only(key=key, common=common, par=par):
+        def front_only(front=front):
             epoch[0].add_(1)
-            mf.mla_front_launch(key, **common, **({"qg_par": par[0]} if gathered else {}))
-            par[0] ^= 1
+            front()
 
         dist.barrier(cpu)
         phase(rank, f"{name} step")

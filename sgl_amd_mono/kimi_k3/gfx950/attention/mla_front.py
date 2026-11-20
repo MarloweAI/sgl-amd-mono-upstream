@@ -214,7 +214,13 @@ def qg_offset() -> int:
 
 
 def peer_end() -> int:
-    """A rank's peer buffer with the QG region's two copies."""
+    """A rank's peer buffer with the QG region's two copies.
+
+    Consecutive fronts take alternate copies, so a rank writes a copy again two
+    fronts later. By then every peer has finished the front that read it: a
+    front ends only once every source's flags of its own launch came (CTA
+    ``QG_FLAG_CTA``), so each peer had started that front, after the one before.
+    That needs an even number of fronts a step (K3: 24 MLA layers)."""
     return qg_offset() + 2 * QG_COPY
 
 
@@ -252,6 +258,8 @@ class MlaFrontBuild:
     q_eps: float = 1e-6  # q_a_layernorm
     kv_eps: float = 1e-6  # kv_a_layernorm
     write_idx: int = -1  # a block-write layer's block: the updated prefix stored there
+    # the QG copy: the parity of the layer's ordinal among the step's MLA fronts
+    qg_par: int = 0
     timeline: bool = False
 
 
@@ -853,6 +861,9 @@ def qg_flags(c):
         for p in range_constexpr(DCP):
             c["put"](flags[p], c["rank"] * MAX_REQS + tid, fx.Int32(1))
     rocdl.s_waitcnt(vmcnt=0)
+    # every source's flags of this launch, whichever heads this rank's items read
+    if (tid < DCP * MAX_REQS) & (tid % MAX_REQS < c["NREQ"]):
+        c["poll"]([(QgCopies(c, flags=True)[c["rank"]], tid, 1)])
     gpu.barrier()
 
 
@@ -1854,7 +1865,7 @@ def build(key: MlaFrontBuild):
         ares_qk: Int64, in_nw: Int64, w_qkv: Int64, w_g: Int64, q_nw: Int64,
         kv_nw: Int64, w_qb: Int64, w_kc: Int64, w_vc: Int64, kv: Int64, kv_idx: Int64,
         kv_ptr: Int64, g_kv_ptr: Int64, loc: Int64, gate: Int64, send: Int64,
-        scratch: Int64, peers: Int64, qg_par: Int32, rank: Int32, layer: Int32, epoch: Int64, tl: Int64,
+        scratch: Int64, peers: Int64, rank: Int32, layer: Int32, epoch: Int64, tl: Int64,
     ):  # fmt: skip
         _ = keyed
         tid = fx.thread_idx.x
@@ -1875,7 +1886,7 @@ def build(key: MlaFrontBuild):
             # every role but the attention's starts with the same red (offset 0)
             "red": al.red.ptr, "vals": al.vals.ptr, "xl": gl.xl.ptr,
             "scale": key.scale, "rank": rank, "loc_words": 2,
-            "qg_off": fx.Int64(qg_offset()) + fx.Int64(qg_par) * fx.Int64(QG_COPY),
+            "qg_off": fx.Int64(qg_offset() + key.qg_par * QG_COPY),
             "xbuf": scratch + fx.Int64(lay["x"][0]),
             "lat": scratch + fx.Int64(lay["lat"][0]),
             "qb": scratch + fx.Int64(lay["qb"][0]),
@@ -1991,14 +2002,14 @@ def build(key: MlaFrontBuild):
         ares_qk: Int64, in_nw: Int64, w_qkv: Int64, w_g: Int64, q_nw: Int64,
         kv_nw: Int64, w_qb: Int64, w_kc: Int64, w_vc: Int64, kv: Int64, kv_idx: Int64,
         kv_ptr: Int64, g_kv_ptr: Int64, loc: Int64, gate: Int64, send: Int64,
-        scratch: Int64, peers: Int64, qg_par: Int32, rank: Int32, layer: Int32, epoch: Int64, tl: Int64,
+        scratch: Int64, peers: Int64, rank: Int32, layer: Int32, epoch: Int64, tl: Int64,
         stream: fx.Stream = _STREAM,
     ):  # fmt: skip
         _ = keyed
         mla_front(
             prefix, blocks, blk_sm, blk_sr, ares_nw, ares_qk, in_nw, w_qkv, w_g, q_nw,
             kv_nw, w_qb, w_kc, w_vc, kv, kv_idx, kv_ptr, g_kv_ptr, loc, gate, send,
-            scratch, peers, qg_par, rank, layer, epoch, tl,
+            scratch, peers, rank, layer, epoch, tl,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)  # fmt: skip
 
     _BUILDS[key] = launch
@@ -2028,7 +2039,7 @@ def weight_ok(name, t) -> bool:
 
 def mla_front_launch(
     key: MlaFrontBuild, *, prefix, blocks, w, kv, kv_idx, kv_ptr, g_kv_ptr, loc,
-    gate, send, scratch, peers, rank, layer, epoch, qg_par=0, tl=None,
+    gate, send, scratch, peers, rank, layer, epoch, tl=None,
 ):  # fmt: skip
     """Host launcher. ``w``: ares_nw, ares_qk, in_nw, q_nw, kv_nw and the
     ``WEIGHT_SHAPES`` weights (bf16, contiguous); ``kv``: this rank's e4m3 KV
@@ -2038,7 +2049,7 @@ def mla_front_launch(
     ``loc``: the rows' KV slots (int64);
     ``gate`` [S, 1536] bf16 out; ``send`` [8, S, 12, 130] bf16 out; ``peers``:
     the DCP ranks' peer buffers (int64 [8], ``peer_end`` bytes each: the q
-    all-gather's QG copies, ``qg_par`` the one this launch uses); ``w_qb`` /
+    all-gather's QG copies, ``key.qg_par`` the one this launch uses); ``w_qb`` /
     ``w_kc`` this rank's 12 heads' shards."""
     assert key.write_idx < blocks.shape[1]
     for n, shp in WEIGHT_SHAPES.items():
@@ -2046,7 +2057,7 @@ def mla_front_launch(
     assert kv.dtype in (torch.float8_e4m3fn, torch.uint8) and kv.stride(-2) == DQK
     assert kv_idx.dtype == torch.int32 and kv_ptr.dtype == torch.int32
     assert loc.dtype == torch.int64 and g_kv_ptr.dtype == torch.int32
-    assert peers.dtype == torch.int64 and peers.numel() == DCP and qg_par in (0, 1)
+    assert peers.dtype == torch.int64 and peers.numel() == DCP and key.qg_par in (0, 1)
     nreq = reqs_of(key.tokens)
     assert kv_ptr.numel() >= nreq + 1 and g_kv_ptr.numel() >= nreq + 1 and loc.numel() >= key.tokens
     assert tuple(send.shape) == (DCP, key.tokens, NHL, REC) and send.dtype == torch.bfloat16
@@ -2059,7 +2070,7 @@ def mla_front_launch(
         w["kv_nw"].data_ptr(), w["w_qb"].data_ptr(), w["w_kc"].data_ptr(),
         w["w_vc"].data_ptr(), kv.data_ptr(), kv_idx.data_ptr(), kv_ptr.data_ptr(),
         g_kv_ptr.data_ptr(), loc.data_ptr(), gate.data_ptr(), send.data_ptr(),
-        scratch.data_ptr(), peers.data_ptr(), qg_par, rank, layer, epoch.data_ptr(), ptr(tl),
+        scratch.data_ptr(), peers.data_ptr(), rank, layer, epoch.data_ptr(), ptr(tl),
         stream=torch.cuda.current_stream(),
     )  # fmt: skip
 
