@@ -388,6 +388,8 @@ class InProj:
                     continue
                 _WARM.add(key)
                 nt = kw.tiles(key)
+                # a step a launch: one layer's widths share its slot
+                self.epochs[:, 0].add_(1)
                 kw.kda_wide(
                     key,
                     x=z(16 * nt, HIDDEN),

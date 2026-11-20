@@ -493,6 +493,14 @@ def _warmup(runner, packed_layers: dict, rows: int) -> None:
             )
         return banks[nb]
 
+    # A served step bumps the epoch once, so its launches' tags differ by slot
+    # and the steps' by epoch (gfx950/tag.py). The warmup is one step a width,
+    # and K2's slot runs twice a one-launch layer (inside it, then alone), so
+    # each of those launches gets its own epoch too. Under one epoch a width's
+    # polls pass on the pairs an earlier width left at the same address in
+    # another region: its x, routes and output are garbage, NaN at 42 rows
+    # (check_k2_loopback --same-epoch).
+    runner.step_begin()
     for packed in packed_layers.values():
         # K1 first: on a served step it runs before this layer's K2, so the
         # waits pair up in the same order here as there.
@@ -520,6 +528,8 @@ def _warmup(runner, packed_layers: dict, rows: int) -> None:
                 scratch=scratch_region(runner.scratch, "mla_pre"),
                 layer=packed.i, epoch=runner.epoch,
             )  # fmt: skip
+        if packed.k1 is not None and packed.k1.one_launch:
+            runner.step_begin()
         _k2_launch(
             runner, packed, core, runner.prefix[:rows], bank(packed.key.nblocks), out
         )

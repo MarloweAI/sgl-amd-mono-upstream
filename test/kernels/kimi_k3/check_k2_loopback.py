@@ -220,6 +220,9 @@ def main():
     # or required bit for bit equal to an earlier tree's --save (--against)
     ap.add_argument("--save")
     ap.add_argument("--against")
+    # every width under one epoch, the warmup's order before it bumped the epoch:
+    # a launch's polls can then pass on the pairs an earlier width left
+    ap.add_argument("--same-epoch", action="store_true")
     args = ap.parse_args()
     assert os.environ.get("AITER_SITUV2_A8W4") == "1", "the stock A8W4 numerics"
     load_tree(args.tree)
@@ -266,7 +269,8 @@ def main():
             fold=False, guint=True, opt=k2.K2_OPT,
         )  # fmt: skip
         prefix, out = prefix_in.clone(), torch.empty_like(prefix_in)
-        epoch[0].add_(1)
+        if not args.same_epoch or rows == args.widths[0]:
+            epoch[0].add_(1)
         k2.k2_launch(
             key, core=core, w_o=w["w_o"], prefix=prefix, blocks=blocks,
             ares_nw=w["ares_nw"], ares_qk=w["ares_qk"], in_nw=w["in_nw"],
