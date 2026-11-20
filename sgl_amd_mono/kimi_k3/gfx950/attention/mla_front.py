@@ -78,6 +78,7 @@ from sgl_amd_mono.common.ops import (
     sfresh64,
     sload64,
     uniform,
+    wave_max,
     xred,
 )
 from sgl_amd_mono.common.plan import (
@@ -298,6 +299,7 @@ def scratch_layout(key: MlaFrontBuild) -> dict:
     }
     if wide(s):
         pairs["olrdy"] = BLOCKS
+        pairs["deal"] = DEAL_WORDS + 2
     lay = pair_layout(pairs.items())
     end = max(o + n for o, n in lay.values())
 
@@ -1628,49 +1630,219 @@ def attention1(c, rq, hg, sa, sb):
 
 
 ITEM_COST = 2  # an item's cost past its blocks, in blocks (its run's start, its partial)
+NHG_W = NHA // 16  # 6 head groups a request past one request
 
 
-def cta_items(c, bid):
-    """CTA bid's attention items [k0, k1): item bid when the items fit the
-    CTAs, else a contiguous range from the item boundary nearest bid / 256 of
-    all the items' cost (an item's blocks + ``ITEM_COST``; items in order)."""
-    HQ, NCT, NHG = c["HQ"], c["NCT"], c["NHG"]
-    bases, total = item_bases(c)
+def dealt_places(c):
+    """Every request's items in decreasing cost (blocks + ITEM_COST a split;
+    ties by request), dealt to the CTAs as cards: round q gives item q B + i
+    to CTA i, every other round in reverse, so a CTA's few large items sit
+    beside the smallest. Each request's (splits, place in the deal) and the
+    items in all; a function of the batch alone."""
+    reqs, tot = [], fx.Int32(0)
+    for r in range(c["NREQ"]):
+        _, lr, own, n, _ = request(c, r)
+        reqs.append((blocks_of(lr, own) + ITEM_COST * n, n))
+        tot = tot + NHG_W * n
+    out = []
+    for r, (w, n) in enumerate(reqs):
+        place = fx.Int32(0)
+        for q, (wq, nq) in enumerate(reqs):
+            if q == r:
+                continue
+            # request q's items deal before r's: costlier, or as costly and earlier
+            ahead = (wq * n > w * nq) | (wq * n == w * nq) if q < r else (wq * n > w * nq)
+            place = place + ahead.select(NHG_W * nq, fx.Int32(0))
+        out.append((n, place))
+    return out, tot
 
-    def start(b):
-        nbls, rb = [], [fx.Int32(0)]
-        for r in range(c["NREQ"]):
+
+RQT = 6  # LDS words a request: splits, deal place, blocks, first item, blocks before it, cost before it
+RQT_TOT = RQT * MAX_REQS  # then the items in all, the cost in all
+
+
+@flyc.jit
+def deal_table(c):
+    """Every request's (splits, deal place, blocks) and the items in all into
+    LDS (``rqt``), once a launch: the deal's lookups read them there."""
+    if c["tid"] == 0:
+        reqs, tot = dealt_places(c)
+        first = fx.Int32(0)
+        before = fx.Int32(0)
+        cost = fx.Int32(0)
+        for r in range_constexpr(c["NREQ"]):
             _, lr, own, _, _ = request(c, r)
             nbl = blocks_of(lr, own)
-            nbls.append(nbl + ITEM_COST * bases[r][1])  # a head group's cost
-            rb.append(rb[-1] + NHG * nbls[-1])
-        x = (b * rb[-1]) // BLOCKS
-        # the last request whose blocks start before x
-        r = fx.Int32(0)
-        for j in range(1, c["NREQ"]):
-            r = r + (rb[j] < x).select(fx.Int32(1), fx.Int32(0))
-        n = pick([nn for _, nn in bases], r)
-        w = pick(nbls, r)
-        xr = x - pick(rb[:-1], r)
-        hg = xr // w
-        rem = xr % w
-        sp = (rem * n + w // 2) // w  # the nearest item boundary
-        k = pick([f for f, _ in bases], r) + hg * n + sp
-        k = (x == 0).select(fx.Int32(0), fx.min(k, total))
-        return (b >= BLOCKS).select(total, k)
-
-    few = total <= BLOCKS
-    k0 = few.select(fx.min(bid, total), start(bid))
-    k1 = few.select(fx.min(bid + 1, total), start(bid + 1))
-    return k0, k1, bases
+            for f, v in enumerate((reqs[r][0], reqs[r][1], nbl, first, before, cost)):
+                fx.ptr_store(v, c["rqt"] + (RQT * r + f))
+            first = first + NHG_W * reqs[r][0]
+            before = before + NHG_W * nbl
+            cost = cost + NHG_W * (nbl + ITEM_COST * reqs[r][0])
+        fx.ptr_store(tot, c["rqt"] + RQT_TOT)
+        fx.ptr_store(cost, c["rqt"] + (RQT_TOT + 1))
+    gpu.barrier()
 
 
-def group_of(bases, k, NHG):
-    """Item k's (request, head group) as one index 12 r + hg."""
+def rqt(c, r, f):
+    return fx.ptr_load(c["rqt"] + (RQT * r + f))
+
+
+def dealt_item(c, j):
+    """Deal place j's (request, head group, split)."""
     r = fx.Int32(0)
-    for j in range(1, len(bases)):
-        r = r + (k >= bases[j][0]).select(fx.Int32(1), fx.Int32(0))
-    return NHG * r + (k - pick([f for f, _ in bases], r)) // pick([n for _, n in bases], r)
+    k = fx.Int32(0)
+    for q in range(c["NREQ"]):
+        n, place = rqt(c, q, 0), rqt(c, q, 1)
+        hit = (j >= place) & (j < place + NHG_W * n)
+        r = hit.select(fx.Int32(q), r)
+        k = hit.select(j - place, k)
+    n = rqt(c, r, 0)
+    return r, k // n, k % n
+
+
+# The balance model (us, doubled): a block, an item (its partial), a run (its
+# pipeline's start). Each CTA works out its load under both assignments; the
+# one with the smaller busiest CTA runs (ties: contiguous ranges).
+LOAD_BLOCK, LOAD_ITEM, LOAD_RUN = 9, 18, 24
+
+
+def contig_runs(c, bid):
+    """CTA bid's contiguous range: (k0, k1, first group, runs), from the LDS table."""
+    k0, k1 = table_start(c, bid), table_start(c, bid + 1)
+    g0 = table_group(c, k0)
+    nruns = (k1 > k0).select(table_group(c, k1 - 1) - g0 + 1, fx.Int32(0))
+    return k0, k1, g0, nruns
+
+
+def contig_run(c, rng, gi):
+    """Run gi of the range: (request, head group, first split, end split)."""
+    k0, k1, g0, _ = rng
+    grp = g0 + gi
+    rq = grp // NHG_W
+    hg = grp % NHG_W
+    n = rqt(c, rq, 0)
+    gfirst = rqt(c, rq, 3) + hg * n
+    return rq, hg, fx.max(k0 - gfirst, fx.Int32(0)), fx.min(k1 - gfirst, n)
+
+
+def dealt_count(tot, bid):
+    """How many deal places (bid, 2 B - 1 - bid, 2 B + bid, ...) fall below tot."""
+    ev = fx.max(tot - bid, fx.Int32(0))
+    od = fx.max(tot - (2 * BLOCKS - 1 - bid), fx.Int32(0))
+    return (ev + 2 * BLOCKS - 1) // (2 * BLOCKS) + (od + 2 * BLOCKS - 1) // (2 * BLOCKS)
+
+
+def dealt_place(bid, i):
+    """CTA bid's i-th deal place."""
+    if isinstance(i, int):
+        return (i // 2) * (2 * BLOCKS) + (bid if i % 2 == 0 else 2 * BLOCKS - 1 - bid)
+    return (i // 2) * (2 * BLOCKS) + (i % 2 == 0).select(fx.Int32(0) + bid, 2 * BLOCKS - 1 - bid)
+
+
+def table_start(c, b):
+    """CTA b's first item under contiguous ranges, from the LDS table: item b
+    when the items fit the CTAs, else the item boundary nearest b / 256 of all
+    the items' cost (an item's blocks + ``ITEM_COST``; items in order)."""
+    nreq = c["NREQ"]
+    total = fx.ptr_load(c["rqt"] + RQT_TOT)
+    ctot = fx.ptr_load(c["rqt"] + (RQT_TOT + 1))
+    x = (b * ctot) // BLOCKS
+    r = fx.Int32(0)
+    for q in range(1, nreq):
+        r = r + (rqt(c, q, 5) < x).select(fx.Int32(1), fx.Int32(0))
+    n, nbl = rqt(c, r, 0), rqt(c, r, 2)
+    w = nbl + ITEM_COST * n
+    xr = x - rqt(c, r, 5)
+    sp = ((xr % w) * n + w // 2) // w
+    k = rqt(c, r, 3) + (xr // w) * n + sp
+    k = (x == 0).select(fx.Int32(0), fx.min(k, total))
+    k = (b >= BLOCKS).select(total, k)
+    return (total <= BLOCKS).select(fx.min(fx.Int32(0) + b, total), k)
+
+
+def table_group(c, k):
+    """Item k's (request, head group) as one index 6 r + hg, from the LDS table."""
+    r = fx.Int32(0)
+    for q in range(1, c["NREQ"]):
+        r = r + (k >= rqt(c, q, 3)).select(fx.Int32(1), fx.Int32(0))
+    return NHG_W * r + (k - rqt(c, r, 3)) // rqt(c, r, 0)
+
+
+def blocks_before(c, k):
+    """The blocks of items 0 .. k - 1 (items in (request, head group, split) order)."""
+    r = fx.Int32(0)
+    for q in range(1, c["NREQ"]):
+        r = r + (k >= rqt(c, q, 3)).select(fx.Int32(1), fx.Int32(0))
+    n, nbl = rqt(c, r, 0), rqt(c, r, 2)
+    e = k - rqt(c, r, 3)
+    return rqt(c, r, 4) + (e // n) * nbl + ((e % n) * nbl) // n
+
+
+def busiest(c):
+    """The modelled busiest CTA under contiguous ranges and under the deal (in
+    LDS ``balw``): thread t models CTA t % 256 under assignment t // 256."""
+    tid = c["tid"]
+    b = tid % BLOCKS
+    k0, k1 = table_start(c, b), table_start(c, b + 1)
+    runs = (k1 > k0).select(table_group(c, k1 - 1) - table_group(c, k0) + 1, fx.Int32(0))
+    lc = LOAD_ITEM * (k1 - k0) + LOAD_RUN * runs + LOAD_BLOCK * (blocks_before(c, k1) - blocks_before(c, k0))
+    tot = fx.ptr_load(c["rqt"] + RQT_TOT)
+    mine = dealt_count(tot, b)
+    ld = (LOAD_ITEM + LOAD_RUN) * mine
+    for i in range(DEALT_MAX):
+        rq, _, sp = dealt_item(c, fx.min(dealt_place(b, i), tot - 1))
+        ld = ld + (i < mine).select(LOAD_BLOCK * split_blocks(c, rq, sp, sp + 1), fx.Int32(0))
+    # every lane of a wave stores the wave's max (one value, one word)
+    fx.ptr_store(wave_max((tid < BLOCKS).select(lc, ld)), c["balw"] + tid // 64)
+    gpu.barrier()
+    mc = fx.ptr_load(c["balw"] + 0)
+    md = fx.ptr_load(c["balw"] + WAVES // 2)
+    for w_ in range(1, WAVES // 2):
+        mc = fx.max(mc, fx.ptr_load(c["balw"] + w_))
+        md = fx.max(md, fx.ptr_load(c["balw"] + WAVES // 2 + w_))
+    return uniform(mc), uniform(md)
+
+
+DEALT_MAX = -(-NHG_W * MAX_SPLITS * MAX_REQS // BLOCKS) + 1  # items a CTA in the deal, at most
+DEAL_CTA = KV_CTA - 1  # 253: the choice at launch, then one g_proj group (idle until the q flags)
+DEAL_WORDS = RQT_TOT + 3  # the table, the items and the cost in all, the choice
+DEAL_LOADS = DEAL_WORDS  # then the two busiest loads (for the checks)
+
+
+@flyc.jit
+def deal_choose(c):
+    """The deal's table and the choice of assignment, into DEAL for every CTA."""
+    tid = c["tid"]
+    deal_table(c)
+    mc, md = busiest(c)
+    if tid < DEAL_WORDS - 1:
+        c["put"](c["deal"], tid, fx.ptr_load(c["rqt"] + tid))
+    if tid == DEAL_WORDS - 1:
+        c["put"](c["deal"], tid, (md < mc).select(fx.Int32(1), fx.Int32(0)))
+    if tid == DEAL_LOADS:
+        c["put"](c["deal"], tid, mc)
+    if tid == DEAL_LOADS + 1:
+        c["put"](c["deal"], tid, md)
+    gpu.barrier()
+
+
+@flyc.jit
+def deal_read(c):
+    """DEAL's table into this CTA's LDS; whether the items are dealt."""
+    tid = c["tid"]
+    v = c["poll"]([(c["deal"], fx.min(tid, DEAL_WORDS - 1), 1)])[0][0]
+    if tid < DEAL_WORDS - 1:
+        fx.ptr_store(v, c["rqt"] + tid)
+    if tid == DEAL_WORDS - 1:
+        fx.ptr_store(v, c["balw"] + 0)
+    gpu.barrier()
+    return uniform(fx.ptr_load(c["balw"] + 0)) != 0
+
+
+def split_blocks(c, rq, sa, sb):
+    """Request rq's blocks in splits sa .. sb."""
+    n, nbl = rqt(c, rq, 0), rqt(c, rq, 2)
+    return (sb * nbl) // n - (sa * nbl) // n
 
 
 # ---------------------------------------------------------------- W_UV
@@ -2061,6 +2233,8 @@ def build(key: MlaFrontBuild):
     @fx.struct
     class Smem:
         tls: fx.Array[fx.Int64, TL_POINTS, 16]
+        balw: fx.Array[fx.Int32, WAVES, 16]
+        rqt: fx.Array[fx.Int32, RQT * MAX_REQS + 4, 16]
 
     keyed = key_tuple(key, SOURCES)
     name = (
@@ -2133,9 +2307,17 @@ def build(key: MlaFrontBuild):
                 c["olrdy"] = sreg(scratch, lay["olrdy"][0], "olrdy")
                 c["ol"] = scratch + fx.Int64(lay["ol"][0])
                 c["olse"] = scratch + fx.Int64(lay["olse"][0])
+                c["balw"] = lds.balw.ptr
+                c["deal"] = sreg(scratch, lay["deal"][0], "deal")
+                c["rqt"] = lds.rqt.ptr
             on, tls = key.timeline, lds.tls.ptr
             c["on"], c["tls"] = on, tls
             stamp_begin(on, tls, tid, TL_POINTS)
+            if const_expr(wd and nreq > 1):
+                # the attention's assignment, worked out at launch on a CTA whose
+                # only role (a g_proj group) is off the q path
+                if bid == DEAL_CTA:
+                    deal_choose(c)
             if const_expr(not key.x_in):
                 if bid < NA:
                     stage_slice(c, bid)
@@ -2206,17 +2388,29 @@ def build(key: MlaFrontBuild):
                 if bid < nhg * n:
                     attention1(c, 0, bid // n, bid % n, bid % n + 1)
             else:
-                # runs of one (request, head group)'s consecutive splits
-                k0, k1, bases = cta_items(c, bid)
-                g0 = group_of(bases, k0, nhg)
-                nruns = (k1 > k0).select(group_of(bases, k1 - 1, nhg) - g0 + 1, fx.Int32(0))
-                for gi in range(nruns):
-                    grp = g0 + gi
-                    rq = grp // nhg
-                    hg = grp % nhg
-                    gfirst = pick([f for f, _ in bases], rq) + hg * pick([n for _, n in bases], rq)
-                    sa = fx.max(k0 - gfirst, fx.Int32(0))
-                    sb = fx.min(k1 - gfirst, pick([n for _, n in bases], rq))
+                # the assignment with the smaller modelled busiest CTA (DEAL_CTA's
+                # choice; a function of the batch alone)
+                assert nhg == NHG_W
+                dealt = deal_read(c)
+                # contiguous ranges a run at a time, or the dealt items one at a
+                # time; the range kept in LDS, so nothing more stays live across
+                # the attention than the loop's count
+                rng = contig_runs(c, bid)
+                tot = fx.ptr_load(c["rqt"] + RQT_TOT)
+                count = dealt.select(dealt_count(tot, bid), rng[3])
+                if tid == 0:
+                    for f in range_constexpr(3):
+                        fx.ptr_store(rng[f], c["balw"] + (1 + f))
+                gpu.barrier()
+                for i in range(count):
+                    dealt = fx.ptr_load(c["balw"] + 0) != 0
+                    rng = tuple(fx.ptr_load(c["balw"] + (1 + f)) for f in range(3)) + (count,)
+                    rc, hc, sac, sbc = contig_run(c, rng, i)
+                    rd, hd, spd = dealt_item(c, dealt_place(bid, i))
+                    rq = dealt.select(rd, rc)
+                    hg = dealt.select(hd, hc)
+                    sa = dealt.select(spd, sac)
+                    sb = dealt.select(spd + 1, sbc)
                     if sb > sa:
                         attention(c, rq, hg, sa, sb)
             c["xl"], c["wl"] = ul.xl.ptr, ul.wl.ptr
