@@ -89,7 +89,7 @@ from sgl_amd_mono.common.plan import (
     pair_layout,
 )
 from sgl_amd_mono.common import guard
-from sgl_amd_mono.common.sync import Addr, Mailbox, Space, sreg
+from sgl_amd_mono.common.sync import Addr, Mailbox, Space, publish, sreg
 from sgl_amd_mono.kimi_k3.gfx950.attention import mla_combine as mc
 from sgl_amd_mono.kimi_k3.gfx950.attention.mla_pre import load_qlora, load_x
 from sgl_amd_mono.kimi_k3.gfx950.stages import gemv
@@ -178,7 +178,7 @@ MAX_SPLITS = 21  # the most splits of a request (its 12 head groups' items fit t
 KEYS_PER_SPLIT = 64  # local keys a split aims at (one block)
 UV_HALF = 64  # value columns a W_UV task
 UV_TASKS = NHA * (VD // UV_HALF)  # 192
-UV_CTAS = 192  # a W_UV task a CTA, on CTAs 0 .. 191
+UV_CTAS = 192  # a W_UV task a CTA, on CTAs 0 .. 191, after every CTA's share of the merge
 UV_ROW = UV_HALF + 8  # bf16 a W_UV tile row in LDS
 ABS_ROW = 128 + 8  # bf16 an absorb tile row in LDS
 OL_ROW = KV + 8  # bf16 a latent output row in LDS
@@ -295,6 +295,7 @@ def scratch_layout(key: MlaFrontBuild) -> dict:
         "absrdy": ABS,
         "kvrdy": nreq,
         "itrdy": (NHA // heads_of(s)) * MAX_SPLITS * nreq,
+        "olrdy": BLOCKS,
     }
     lay = pair_layout(pairs.items())
     end = max(o + n for o, n in lay.values())
@@ -313,6 +314,8 @@ def scratch_layout(key: MlaFrontBuild) -> dict:
     add("ml", MAX_SPLITS * s * NHA * 2 * 4)
     add("g", s * GATE * 2)
     add("grdy", mc.GATE_GROUPS * 8)
+    add("ol", s * NHA * KV * 2)
+    add("olse", s * NHA * 4)
     return lay
 
 
@@ -1695,11 +1698,36 @@ def _uv_dma(c, task):
             rocdl.raw_ptr_buffer_load_lds(r_w, (c["wl"] + i * 256).llvm_ptr, 16, voff, fx.Int32(0), 0, 0)
 
 
-MERGE_THREADS = UV_DMA_W0 * 64  # the merge's threads (a row's 64 x 8 dims a round)
+def _split_loads(c, t, h, o, n):
+    """Row t, head h, dims 8 o ..: every split's (max, sum) and values, all in flight at once."""
+    s = c["S"]
+    mws, pvs = [], []
+    for sp in range_constexpr(MAX_SPLITS):
+        spc = fx.min(fx.Int32(sp), n - 1)
+        mws.append(
+            fx.Vector(
+                bo.buffer_load(rsrc(c["ml"]), ((spc * s + t) * NHA + h) * 2, vec_width=2, dtype=T.f32, cache_modifier=CM_DEV)
+            )
+        )
+        pvs.append(_ld4(c["pv"], (((spc * s + t) * NHA + h) * KV + 8 * o) // 2, CM_DEV))
+    return mws, pvs
+
+
+def _split_max(mws, n):
+    """The live splits' (max, sum), past n (NEG, 0), and their max."""
+    mx = fx.Float32(NEG)
+    mls = []
+    for sp in range_constexpr(MAX_SPLITS):
+        live = sp < n
+        mm = live.select(mws[sp][0], fx.Float32(NEG))
+        ll = live.select(mws[sp][1], fx.Float32(0.0))
+        mls.append((mm, ll))
+        mx = fx.max(mx, mm)
+    return mx, mls
 
 
 @flyc.jit
-def _merge(c, e, h, half, n):
+def _merge_task(c, e, h, half, n):
     """Merge item e (row e / 64, 8 dims at 8 (e % 64)) of head h: its n split
     partials in split order -> the bf16 latent output in LDS; the row's LSE
     beside it, pushed with the first value half."""
@@ -1709,26 +1737,15 @@ def _merge(c, e, h, half, n):
     o = e % (KV // 8)
     owner = h // NHL
     hl = h % NHL
-    mx = fx.Float32(NEG)
-    mls = []
-    for sp in range_constexpr(MAX_SPLITS):
-        live = sp < n
-        spc = fx.min(fx.Int32(sp), n - 1)
-        mw = fx.Vector(
-            bo.buffer_load(rsrc(c["ml"]), ((spc * s + t) * NHA + h) * 2, vec_width=2, dtype=T.f32, cache_modifier=CM_DEV)
-        )
-        mm = live.select(mw[0], fx.Float32(NEG))
-        ll = live.select(mw[1], fx.Float32(0.0))
-        mls.append((mm, ll, spc))
-        mx = fx.max(mx, mm)
+    mws, pvs = _split_loads(c, t, h, o, n)
+    mx, mls = _split_max(mws, n)
     lsum = fx.Float32(0.0)
     tot = [fx.Float32(0.0)] * 8
     for sp in range_constexpr(MAX_SPLITS):
-        mm, ll, spc = mls[sp]
+        mm, ll = mls[sp]
         wgt = hw_exp2(mm - mx) * ll
         lsum = lsum + wgt
-        pv = _ld4(c["pv"], (((spc * s + t) * NHA + h) * KV + 8 * o) // 2, CM_DEV)
-        vals = fx.Vector(pv).bitcast(fx.Float16).to(fx.Float32)
+        vals = fx.Vector(pvs[sp]).bitcast(fx.Float16).to(fx.Float32)
         tot = [tot[e_] + wgt * vals[e_] for e_ in range(8)]
     inv = (lsum > fx.Float32(0.0)).select(fx.Float32(1.0) / lsum, fx.Float32(0.0))
     ob = fx.Vector.from_elements([tot[e_] * inv for e_ in range(8)], fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)
@@ -1775,13 +1792,13 @@ def stage_uv(c, task):
     rounds = -(-s * (KV // 8) // MERGE_THREADS)
     if const_expr(rounds == 1):
         if tid < s * (KV // 8):
-            _merge(c, tid, h, half, bases[0][1])
+            _merge_task(c, tid, h, half, bases[0][1])
     else:
         ns_ = [n for _, n in bases]
         if tid < MERGE_THREADS:
             for rd in range(rounds):
                 e = tid + MERGE_THREADS * rd
-                _merge(c, e, h, half, pick(ns_, e // (G_ROWS * (KV // 8))))
+                _merge_task(c, e, h, half, pick(ns_, e // (G_ROWS * (KV // 8))))
     rocdl.s_waitcnt(vmcnt=0)
     gpu.barrier()
     vq = wave % 2
@@ -1807,6 +1824,139 @@ def stage_uv(c, task):
             mc.push_values(c, owner, hl, t0 + r16, col, vals)
             if (wave == 0) & (g == 0) & (half == 0):
                 lse = fx.Int32(fx.ptr_load(xl + ((t0 + r16) * OL_ROW + KV) // 2)).bitcast(fx.Float32)
+                mc.push_lse(c, owner, hl, t0 + r16, lse)
+                if const_expr(c["records"]):
+                    bo.buffer_store(lse, rsrc(a["send"]), ((owner * s + t0 + r16) * NHL + hl) * (REC // 2) + VD // 2)
+            if const_expr(c["records"]):
+                ob = fx.Vector.from_elements(vals, fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)
+                bo.buffer_store(ob, rsrc(a["send"]), (((owner * s + t0 + r16) * NHL + hl) * REC + col) // 2)
+        gpu.barrier()
+
+
+
+def merge_units(s):
+    """The merge's (head, row) units a CTA (head-major: unit h s + t), every CTA's share."""
+    return -(-NHA * s // BLOCKS)
+
+
+@flyc.jit
+def _merge(c, u, o, n):
+    """Unit u (head u // S, row u % S), 8 dims at 8 o: its n split partials in
+    split order -> the bf16 latent output row (``ol``); the row's LSE into
+    ``send`` once (o == 0)."""
+    s = c["S"]
+    a = c["args"]
+    h = u // s
+    t = u % s
+    owner = h // NHL
+    hl = h % NHL
+    mws, pvs = _split_loads(c, t, h, o, n)
+    mx, mls = _split_max(mws, n)
+    lsum = fx.Float32(0.0)
+    tot = [fx.Float32(0.0)] * 8
+    for sp in range_constexpr(MAX_SPLITS):
+        mm, ll = mls[sp]
+        wgt = hw_exp2(mm - mx) * ll
+        lsum = lsum + wgt
+        vals = fx.Vector(pvs[sp]).bitcast(fx.Float16).to(fx.Float32)
+        tot = [tot[e_] + wgt * vals[e_] for e_ in range(8)]
+    inv = (lsum > fx.Float32(0.0)).select(fx.Float32(1.0) / lsum, fx.Float32(0.0))
+    ob = fx.Vector.from_elements([tot[e_] * inv for e_ in range(8)], fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)
+    bo.buffer_store(ob, rsrc(c["ol"]), ((t * NHA + h) * KV + 8 * o) // 2, cache_modifier=CM_DEV)
+    if o == 0:
+        lse = (lsum > fx.Float32(0.0)).select(
+            (mx + fx.Float32(fmath.log2(lsum))) * fx.Float32(LN2),
+            fx.Float32(EMPTY_LSE),
+        )
+        # for the W_UV task's push with its first value half
+        bo.buffer_store(lse, rsrc(c["olse"]), t * NHA + h, cache_modifier=CM_DEV)
+
+
+MERGE_THREADS = UV_DMA_W0 * 64  # the merge's threads (64 a unit: its 8-dim pieces)
+
+
+@flyc.jit
+def stage_merge(c, bid):
+    """CTA bid's merge units, MERGE_THREADS // 64 at a time, each once its
+    request's head group's split items are in; then OLRDY. A W_UV CTA's tile
+    streams into LDS meanwhile (waves 6, 7)."""
+    HQ = c["HQ"]
+    s, tid = c["S"], c["tid"]
+    per = merge_units(s)
+    nu = MERGE_THREADS // 64
+    bases, _ = item_bases(c)
+    if bid < UV_CTAS:
+        _uv_dma(c, bid)
+    for rd in range_constexpr(-(-per // nu)):
+        k = tid // 64
+        j = tid % 64
+        u = bid * per + rd * nu + k
+        live = (tid < MERGE_THREADS) & (rd * nu + k < per) & (u < NHA * s)
+        uc = fx.min(u, NHA * s - 1)
+        r = (uc % s) // G_ROWS
+        hg = (uc // s) // HQ
+        n = pick([nn for _, nn in bases], r)
+        first = pick([f for f, _ in bases], r)
+        if live & (j < n):
+            c["poll"]([(c["itrdy"], first + hg * n + j, 1)])
+        _bar()
+        if live:
+            _merge(c, uc, j, n)
+    stamp(c["on"], c["tls"], tid, 8)
+    publish(c["put"], c["olrdy"], bid, fx.Int32(1), tid == 0)
+
+
+@flyc.jit
+def stage_wuv(c, task):
+    """W_UV for head task // 2, value columns 64 (task % 2) ..: its merged
+    rows (the merge CTAs' OLRDY) into LDS, the tile already there -> ``send``
+    (bf16)."""
+    s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
+    a = c["args"]
+    h = task // 2
+    half = task % 2
+    per = merge_units(s)
+    b0 = (h * s) // per
+    nb = ((h + 1) * s - 1) // per - b0 + 1
+    if tid < nb:
+        c["poll"]([(c["olrdy"], b0 + tid, 1)])
+    _bar()
+    xl, wl = c["xl"], c["wl"]
+    words = s * (KV // 8)
+    for i in range_constexpr(-(-words // THREADS)):
+        e = fx.min(tid + THREADS * i, words - 1)
+        t = e // (KV // 8)
+        o = e % (KV // 8)
+        v = _ld4(c["ol"], ((t * NHA + h) * KV + 8 * o) // 2, CM_DEV)
+        if tid + THREADS * i < words:
+            fx.ptr_store(v, xl + (t * OL_ROW + 8 * o) // 2)
+    rocdl.s_waitcnt(vmcnt=0)
+    gpu.barrier()
+    owner = h // NHL
+    hl = h % NHL
+    vq = wave % 2
+    kq = wave // 2
+    g, r16 = lane // 16, lane % 16
+    tiles = gemv.tiles(s)
+    for ti in range_constexpr(len(tiles)):
+        t0, sj = tiles[ti]
+        acc = _tgemv(lane, wl, UV_ROW, 32 * vq, 128 * kq, 4, xl + t0 * (OL_ROW // 2), OL_ROW, sj)
+        rb = red + (wave * 64 + lane) * 8
+        for dt in range_constexpr(2):
+            fx.ptr_store(acc[dt], rb + 4 * dt)
+        gpu.barrier()
+        if (wave < 2) & (r16 < sj):
+            vals = [None] * 8
+            for dt in range_constexpr(2):
+                for i in range_constexpr(4):
+                    tot = fx.Float32(0.0)
+                    for q in range_constexpr(4):
+                        tot = tot + fx.ptr_load(red + (((2 * q + wave) * 64 + lane) * 8 + 4 * dt + i))
+                    vals[2 * i + dt] = tot
+            col = half * UV_HALF + 32 * wave + 8 * g
+            mc.push_values(c, owner, hl, t0 + r16, col, vals)
+            if (wave == 0) & (g == 0) & (half == 0):
+                lse = fx.Int32(_ld(c["olse"], (t0 + r16) * NHA + h, CM_DEV)).bitcast(fx.Float32)
                 mc.push_lse(c, owner, hl, t0 + r16, lse)
                 if const_expr(c["records"]):
                     bo.buffer_store(lse, rsrc(a["send"]), ((owner * s + t0 + r16) * NHL + hl) * (REC // 2) + VD // 2)
@@ -1948,6 +2098,8 @@ def build(key: MlaFrontBuild):
                 "newkv": scratch + fx.Int64(lay["newkv"][0]),
                 "pv": scratch + fx.Int64(lay["pv"][0]),
                 "ml": scratch + fx.Int64(lay["ml"][0]),
+                "ol": scratch + fx.Int64(lay["ol"][0]),
+                "olse": scratch + fx.Int64(lay["olse"][0]),
                 "kvl": cl.kv.ptr, "pl": cl.p.ptr, "al": cl.alpha.ptr, "mll": cl.ml.ptr,
                 "qll": cl.q.ptr if nreq == 1 else None, "vt": cl.vt.ptr if nreq > 1 else None,
                 "records": key.records, "gate0": S1_GATE0, "gbuf": gate,
@@ -1961,7 +2113,7 @@ def build(key: MlaFrontBuild):
                     "send": send, "core": core, "q_lora": 0, "peers": peers,
                 },
             }  # fmt: skip
-            for region in ("part", "wgt", "msq", "xrdy", "ss", "qrdy", "absrdy", "kvrdy", "itrdy", "grdy"):
+            for region in ("part", "wgt", "msq", "xrdy", "ss", "qrdy", "absrdy", "kvrdy", "itrdy", "grdy", "olrdy"):
                 c[region] = sreg(scratch, lay[region][0], region)
             on, tls = key.timeline, lds.tls.ptr
             c["on"], c["tls"] = on, tls
@@ -2050,8 +2202,15 @@ def build(key: MlaFrontBuild):
                     if sb > sa:
                         attention(c, rq, hg, sa, sb)
             c["xl"], c["wl"] = ul.xl.ptr, ul.wl.ptr
-            if bid < UV_CTAS:
-                stage_uv(c, bid)
+            if const_expr(wd):
+                # every CTA's share of the (head, row) merges, then W_UV a (head, half)
+                stage_merge(c, bid)
+                if bid < UV_CTAS:
+                    stage_wuv(c, bid)
+            else:
+                # one request: a (head, half) task merges its head's rows itself
+                if bid < UV_CTAS:
+                    stage_uv(c, bid)
             stamp(on, tls, tid, 9)
             # the owner's combine and output gate, a (request, local head) a
             # task on the last CTAs
