@@ -140,7 +140,8 @@ def graph_time(fn, group, sets, reps, warmup):
     torch.cuda.current_stream().wait_stream(s)
     torch.cuda.synchronize()
     g = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(g):
+    # thread-local: the NCCL watchdog's event queries run beside the capture
+    with torch.cuda.graph(g, capture_error_mode="thread_local"):
         for _ in range(reps):
             fn()
     dist.barrier(group)
