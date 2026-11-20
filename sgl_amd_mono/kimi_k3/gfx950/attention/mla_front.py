@@ -319,13 +319,29 @@ def qg_base(c, p):
     return sload64(sfresh64(c["args"]["peers"]) + fx.Int64(p) * fx.Int64(8)) + c["qg_off"]
 
 
+class QgCopies:
+    """Every rank's QG copy by rank (``[p]``: its base), the records', or with
+    ``flags`` its flag pairs' (an ``Addr``)."""
+
+    def __init__(self, c, flags=False):
+        self.c, self.flags = c, flags
+
+    def __getitem__(self, p):
+        base = qg_base(self.c, p)
+        return Addr("qgf", Space.PEER, base + fx.Int64(QG_DATA)) if self.flags else base
+
+
+def put_q(base, w, words):
+    bo.buffer_store(words, rsrc(base), w, cache_modifier=CM_SYS)
+
+
 def push_q(c, t, head, byte, words):
     """One piece of row t's q of (global) head ``head`` -- ``words`` (i32) at
-    ``byte`` of its 576 -- into every rank's QG copy, system scope."""
-    src = c["rank"]
-    w = qg_word(src, t // G_ROWS, head - NHL * src, t % G_ROWS, byte)
+    ``byte`` of its 576 -- into every rank's QG copy, system scope, at this
+    rank's (source) slot."""
+    peer = QgCopies(c)
     for p in range_constexpr(DCP):
-        bo.buffer_store(words, rsrc(qg_base(c, p)), w, cache_modifier=CM_SYS)
+        put_q(peer[p], qg_word(c["rank"], t // G_ROWS, head % NHL, t % G_ROWS, byte), words)
 
 
 def _st_bf(ptr, i, v, cm=0):
@@ -819,8 +835,9 @@ def qg_flags(c):
         c["poll"]([(c["qrdy"], (NHL * src + e // 4) * QBG_HEAD + QN // ROWS + e % 4, 1)])
     gpu.barrier()
     if tid < c["NREQ"]:
+        flags = QgCopies(c, flags=True)
         for p in range_constexpr(DCP):
-            c["put"](Addr("qgf", Space.PEER, qg_base(c, p) + fx.Int64(QG_DATA)), src * MAX_REQS + tid, fx.Int32(1))
+            c["put"](flags[p], c["rank"] * MAX_REQS + tid, fx.Int32(1))
     rocdl.s_waitcnt(vmcnt=0)
     gpu.barrier()
 
