@@ -396,6 +396,91 @@ def case(ps, args, device, peers, epoch, w_vc):
     return fails, caps, gates, p3
 
 
+def graph_us(fn, reps=20):
+    """Mean us of ``fn`` replayed in a CUDA graph of ``reps`` calls."""
+    torch.cuda.synchronize()
+    fn()
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        for _ in range(reps):
+            fn()
+    for _ in range(3):
+        g.replay()
+    torch.cuda.synchronize()
+    a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    a.record()
+    for _ in range(5):
+        g.replay()
+    b.record()
+    torch.cuda.synchronize()
+    return a.elapsed_time(b) * 1000 / (5 * reps)
+
+
+def time_case(caps, w_vc, gates, s, peers, epoch, par):
+    """Rank 0's tail (the other ranks' records stood in as zero words before
+    each launch, that store's time taken off) against SGLang's chain past the
+    decode on the same outputs: reduce, fills, pack, the all-to-all as a copy,
+    LSE combine, W_UV, gate."""
+    from sglang.kernels.ops.attention.dcp_kernels import dcp_lse_combine_triton, dcp_pack_a2a_send
+    from sglang.kernels.ops.elementwise import mla_output_gate
+    from sgl_amd_mono.common.peer import PeerBuffer
+    from sgl_amd_mono.kimi_k3.gfx950.attention import mla_tail as mt
+    import aiter.mla as am
+
+    cap, dev = caps[0], w_vc.device
+    key = mt.MlaTailBuild(par=par)
+    scratch = PeerBuffer(mt.scratch_bytes(key), None, 0, 1, dev).bytes
+    scratch.zero_()
+    o, lse = cap["o"].clone(), cap["lse"].clone().view(s, NHA)
+    core = torch.zeros(s, GATE, dtype=BF, device=dev)
+    own = peers.a2a(0, s, par)
+
+    def stand_in():
+        own[1:, ..., : peers.mc.LSE_CELL + 1, :].zero_()
+
+    def tail():
+        stand_in()
+        epoch[0].add_(1)
+        mt.mla_tail_launch(
+            key, s=s, logits=cap["logits"], plse=cap["plse"], indptr=cap["indptr"],
+            fmap=cap["fmap"], pmap=cap["pmap"], o=o, lse=lse, empty=cap["empty"], w_vc=w_vc,
+            gate=gates[0], core=core, scratch=scratch, peers=peers.table, rank=0, layer=3,
+            epoch=epoch,
+        )  # fmt: skip
+
+    def base():
+        stand_in()
+        epoch[0].add_(1)
+
+    t_tail = graph_us(tail) - graph_us(base)
+    peers.rearm()
+    reduce = _CAPTURE["orig"]
+    so, sl = cap["o"].clone(), cap["lse"].clone()
+    send = torch.empty(DCP, s, NHL, KV + 2, dtype=BF, device=dev)
+    recv = torch.empty_like(send)
+    em = cap["empty"]
+    proj = torch.empty(s, NHL, VD, dtype=BF, device=dev)
+
+    def stock():
+        reduce(cap["logits"], cap["plse"], cap["indptr"], cap["fmap"], cap["pmap"], G, 32, so, sl)
+        ov, lv = so.view(s, NHA, KV), sl.view(s, NHA)
+        ov.masked_fill_(em[:, None, None], 0.0)
+        lv.masked_fill_(em[:, None], -1e30)
+        dcp_pack_a2a_send(ov, lv, send[..., :KV], send.view(torch.float32)[..., KV // 2])
+        recv.copy_(send)
+        comb, _ = dcp_lse_combine_triton(recv[..., :KV], recv.view(torch.float32)[..., KV // 2], is_lse_base_on_e=True)
+        torch.bmm(comb.view(s, NHL, KV).transpose(0, 1), w_vc[:NHL], out=proj.transpose(0, 1))
+        mla_output_gate.kimi_k3_mla_output_gate(proj.view(s, GATE), gates[0])
+
+    def stock_reduce():
+        reduce(cap["logits"], cap["plse"], cap["indptr"], cap["fmap"], cap["pmap"], G, 32, so, sl)
+
+    t_stock, t_red = graph_us(stock), graph_us(stock_reduce)
+    print(f"time {s // G} requests: tail {t_tail:.1f} us, stock chain {t_stock:.1f} us (its reduce {t_red:.1f})")
+    return t_tail, t_stock
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--reqs", type=int, nargs="+", default=[9])
@@ -404,6 +489,7 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--par", type=int, default=0, choices=(0, 1))
     ap.add_argument("--diag", action="store_true")
+    ap.add_argument("--time", action="store_true", help="time rank 0's tail against SGLang's chain")
     args = ap.parse_args()
     device = torch.device("cuda", 0)
     torch.cuda.set_device(device)
@@ -415,8 +501,10 @@ def main():
     for n in args.reqs:
         ps = contexts(n, args.mode, args.ctx, args.seed)
         print(f"== {n} requests ({args.mode}): P = {ps[:8]}{' ...' if n > 8 else ''}")
-        f, _, _, _ = case(ps, args, device, peers, epoch, w_vc)
+        f, caps, gates, _ = case(ps, args, device, peers, epoch, w_vc)
         fails += [f"{n}:{x}" for x in f]
+        if args.time:
+            time_case(caps, w_vc, gates, G * n, peers, epoch, args.par)
     print("FAILS " + " ".join(fails) if fails else "ALL OK")
     sys.exit(1 if fails else 0)
 

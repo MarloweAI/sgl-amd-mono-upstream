@@ -13,15 +13,18 @@ The decode leaves, for every rank, all 96 heads over its own share of the keys:
     o, lse    bf16 [S, 96, 512] and fp32 [S, 96]: the rows no reduce tile
               covers, finished by the decode itself
 
-    reduce, every CTA
-              a (reduce tile, head) unit, tile-major, every 256th unit a CTA:
-              each row of the tile from its split partials, as aiter's
-              ``kn_mla_reduce_v1_ps`` computes it -> o, lse; then TRDY a CTA
+    reduce, every wave
+              a (reduce tile, head) unit, tile-major, every 2048th unit a
+              wave, up to the first tile at the CSR sentinel: each row of the
+              tile from its split partials (8 values a lane, a split's LSE
+              and weight a lane), as aiter's ``kn_mla_reduce_v1_ps`` computes
+              it -> o, lse; then TRDY a CTA
     W_UV, CTAs 0 .. 191
               a (head, 64 value columns) task, once every CTA's units are in:
-              the head's rows 16 at a time (a row with no key on this rank:
-              zeros and LSE -1e30, SGLang's fills), W_UV -> the head's owner
-              rank (``mla_combine``), the first half with the LSE
+              the head's rows 32 at a time (a row with no key on this rank:
+              zeros and LSE -1e30, SGLang's fills), the next 32's loads in
+              flight, W_UV -> the head's owner rank (``mla_combine``), the
+              first half with the LSE
     combine, every CTA
               a (request, local head) task: ``mla_combine``'s LSE combine and
               output gate of the 8 ranks' records -> ``core`` [S, 1536] bf16
@@ -29,8 +32,8 @@ The decode leaves, for every rank, all 96 heads over its own share of the keys:
 The reduce is aiter's: below ``MASSIVE`` splits an online max and sum in
 split order, the sum's division; from ``MASSIVE`` on one wave's LSE max and
 sum (a butterfly), each split's weight exp(lse - LSE), and the weighted sum in
-split order. A row's bits depend on its tile's partials only, and a tile's
-splits on its request alone, so no row's output depends on the batch.
+split order. A row's bits depend on its tile's partials only, as aiter's
+do; W_UV, the combine and the gate are a row's own.
 
 Unlike SGLang (combine, then W_UV on the 12 local heads), W_UV is applied to
 each head's partial before the exchange: 128-dim records, a quarter of the
@@ -48,7 +51,7 @@ from flydsl.expr import math as fmath
 from flydsl.expr.typing import Int32, Int64, T
 
 from sgl_amd_mono.common import guard
-from sgl_amd_mono.common.ops import CM_DEV, load_ptr64, rsrc, uniform, wave_max
+from sgl_amd_mono.common.ops import CM_DEV, load_ptr64, read_lane_i32, rsrc, uniform
 from sgl_amd_mono.common.plan import BLOCKS, THREADS, WAVES, kernel_sources, key_tuple, pair_layout
 from sgl_amd_mono.common.sync import Mailbox, publish, sreg
 from sgl_amd_mono.kimi_k3.gfx950.attention import mla_combine as mc
@@ -67,14 +70,11 @@ GATE = mc.GATE
 G_ROWS = mf.G_ROWS
 MIN_ROWS = 36  # 6 requests: past the front's widths (FRONT_MAX_ROWS)
 MAX_ROWS = 180
-RT = 128  # threads a reduced row (aiter's: 2 waves, 4 values a thread)
-RV = KV // RT  # 4
-RSLOT = THREADS // RT  # 4 rows a CTA at a time
+RV = 4  # values a thread of aiter's reduce (2 waves a row)
 MASSIVE = 4  # aiter's kMassiveThreshold
 LANE_SPLITS = 64  # splits a massive tile at most (one LSE a lane of a wave)
-CHUNK = 16  # a massive row's partials in flight at once
+CHUNK = 8  # a massive row's partials in flight at once
 UV_TASKS = 2 * NHA  # 192: a (head, value half) a CTA
-SEARCH_ROUNDS = 3  # the live-tile search: up to 64^3 tiles
 EMPTY_LSE = mf.EMPTY_LSE
 INF = float("inf")
 NEG_INF = float("-inf")
@@ -163,22 +163,39 @@ def _lse_bad(sm):
     return (sm == fx.Float32(0.0)) | (sm != sm)
 
 
-def _store_row(c, seq, h, j, acc):
+def _store_row(c, seq, h, lane, acc):
     ob = fx.Vector.from_elements(acc, fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)
-    bo.buffer_store(ob, rsrc(c["args"]["o"]), ((seq * NHA + h) * KV + RV * j) // 2, cache_modifier=CM_DEV)
+    bo.buffer_store(ob, rsrc(c["args"]["o"]), ((seq * NHA + h) * KV + RV * lane) // 2, cache_modifier=CM_DEV)
 
 
 def _store_lse(c, seq, h, v):
     bo.buffer_store(fx.Float32(v), rsrc(c["args"]["lse"]), seq * NHA + h, cache_modifier=CM_DEV)
 
 
+def _lane_f32(v, i):
+    return read_lane_i32(fx.Float32(v).bitcast(fx.Int32), i).bitcast(fx.Float32)
+
+
+def _row_vals(c, pm, ls, h, lane):
+    """A split partial row's 8 values of this lane (values 8 lane ..): two
+    aiter threads' four each."""
+    base = _row_base(c, pm, ls)
+    return _ld4f(base, h * KV + RV * (2 * lane)) + _ld4f(base, h * KV + RV * (2 * lane + 1))
+
+
+def _quad(e):
+    """A value's place among an aiter thread's four."""
+    return e % RV
+
+
 @flyc.jit
-def _simple(c, h, t0, n, ls, seq, on, j):
-    """A row of a tile of n < MASSIVE splits: aiter's online max and sum."""
-    a = c["args"]
-    pm = [uniform(_ld(a["pmap"], t0 + fx.min(fx.Int32(sp), n - 1))) for sp in range(MASSIVE - 1)]
-    vals = [_ld4f(_row_base(c, pm[sp], ls), h * KV + RV * j) for sp in range(MASSIVE - 1)]
-    lses = [_ldf(a["plse"], (pm[sp] + ls) * NHA + h) for sp in range(MASSIVE - 1)]
+def _simple(c, h, n, ls, seq, pm_l, lse_l):
+    """A row of a tile of n < MASSIVE splits: aiter's online max and sum.
+    Lane k holds split k's partial row slot and LSE."""
+    lane = c["lane"]
+    pm = [read_lane_i32(pm_l, fx.min(fx.Int32(sp), n - 1)) for sp in range(MASSIVE - 1)]
+    lses = [_lane_f32(lse_l, fx.min(fx.Int32(sp), n - 1)) for sp in range(MASSIVE - 1)]
+    vals = [_row_vals(c, pm[sp], ls, h, lane) for sp in range(MASSIVE - 1)]
     acc = vals[0]
     m = lses[0]
     sm = fx.Float32(1.0)
@@ -189,99 +206,74 @@ def _simple(c, h, t0, n, ls, seq, on, j):
         new = fmath.exp(lses[sp] - nm)
         # aiter's build fuses values 0, 1 of a thread's four (a packed FMA)
         # and rounds the two products of values 2, 3
-        upd = [fmath.fma(acc[e], old, new * vals[sp][e]) for e in range(2)]
-        upd += [acc[e] * old + vals[sp][e] * new for e in range(2, RV)]
-        acc = [live.select(upd[e], acc[e]) for e in range(RV)]
+        upd = [
+            fmath.fma(acc[e], old, new * vals[sp][e]) if _quad(e) < 2
+            else acc[e] * old + vals[sp][e] * new
+            for e in range(2 * RV)
+        ]  # fmt: skip
+        acc = [live.select(upd[e], acc[e]) for e in range(2 * RV)]
         sm = live.select(fmath.fma(sm, old, new), sm)
         m = live.select(nm, m)
-    if on:
-        _store_row(c, seq, h, j, [acc[e] / sm for e in range(RV)])
-        if j == 0:
-            _store_lse(c, seq, h, _lse_bad(sm).select(fx.Float32(INF), _logf(sm) + m))
+    _store_row(c, seq, h, 2 * lane, [acc[e] / sm for e in range(RV)])
+    _store_row(c, seq, h, 2 * lane + 1, [acc[e] / sm for e in range(RV, 2 * RV)])
+    if lane == 0:
+        _store_lse(c, seq, h, _lse_bad(sm).select(fx.Float32(INF), _logf(sm) + m))
 
 
 @flyc.jit
-def _massive(c, h, t0, t1, n, ls, seq, on, g, j):
-    """A row of a tile of n >= MASSIVE splits (t0 .. t1): the group's first
-    wave takes the LSE (a split a lane) and each split's weight into LDS, then
-    the weighted sum in split order."""
-    a = c["args"]
-    lane, wave = c["lane"], c["wave"]
-    sc = c["sc"] + g * LANE_SPLITS
-    if (wave % 2 == 0) & on:
-        lin = lane < n
-        pm = _ld(a["pmap"], t0 + fx.min(lane, n - 1))
-        lse = lin.select(_ldf(a["plse"], (pm + ls) * NHA + h), fx.Float32(NEG_INF))
-        mx = _bfly(lse, lambda x, y: fx.max(x, y))
-        sm = _bfly(fmath.exp(lse - mx), lambda x, y: x + y)
-        glse = _lse_bad(sm).select(fx.Float32(INF), _logf(sm) + mx)
-        if lane == 0:
-            _store_lse(c, seq, h, glse)
-        fx.ptr_store(fmath.exp(lse - glse), sc + lane)
-    mf._bar()
+def _massive(c, h, t0, t1, n, ls, seq, pm_l, lse_l):
+    """A row of a tile of n >= MASSIVE splits (t0 .. t1) on one wave: the LSE
+    (a split a lane), each split's weight on its lane, then the weighted sum in
+    split order."""
+    lane = c["lane"]
+    mx = _bfly(lse_l, lambda x, y: fx.max(x, y))
+    sm = _bfly(fmath.exp(lse_l - mx), lambda x, y: x + y)
+    glse = _lse_bad(sm).select(fx.Float32(INF), _logf(sm) + mx)
+    if lane == 0:
+        _store_lse(c, seq, h, glse)
+    sc = fmath.exp(lse_l - glse)
     # the splits aiter's two-split loop takes: pairs from t0 while below
     # t1 - t1 % 2 - 2 (absolute split indices)
     n_pair = fx.max(fx.Int32(0), (t1 - t1 % 2 - 2 - t0 + 1) // 2) * 2
     zero = fx.Float32(0.0)
-    init = [zero] * RV
+    init = [zero] * (2 * RV)
     for ck, acc in range(fx.Int32(0), (n + CHUNK - 1) // CHUNK, fx.Int32(1), init=init):
         s0 = fx.Int32(ck) * CHUNK
         sps = [fx.min(s0 + sp, n - 1) for sp in range(CHUNK)]
-        pm = [uniform(_ld(a["pmap"], t0 + sps[sp])) for sp in range(CHUNK)]
-        vals = [_ld4f(_row_base(c, pm[sp], ls), h * KV + RV * j) for sp in range(CHUNK)]
+        pm = [read_lane_i32(pm_l, sps[sp]) for sp in range(CHUNK)]
+        vals = [_row_vals(c, pm[sp], ls, h, lane) for sp in range(CHUNK)]
         acc = [fx.Float32(x) for x in acc]
         for sp in range_constexpr(CHUNK):
             live = s0 + sp < n
-            wt = fx.ptr_load(sc + sps[sp])
+            wt = _lane_f32(sc, sps[sp])
             # aiter's build: values 0, 1 fused; 2, 3 with the product rounded
             # in its two-split loop, fused in the splits after it
             paired = s0 + sp < n_pair
-            upd = [fmath.fma(wt, vals[sp][e], acc[e]) for e in range(2)]
-            upd += [paired.select(acc[e] + wt * vals[sp][e], fmath.fma(wt, vals[sp][e], acc[e])) for e in range(2, RV)]
-            acc = [live.select(upd[e], acc[e]) for e in range(RV)]
+            upd = [
+                fmath.fma(wt, vals[sp][e], acc[e]) if _quad(e) < 2
+                else paired.select(acc[e] + wt * vals[sp][e], fmath.fma(wt, vals[sp][e], acc[e]))
+                for e in range(2 * RV)
+            ]  # fmt: skip
+            acc = [live.select(upd[e], acc[e]) for e in range(2 * RV)]
         acc = yield acc
-    if on:
-        _store_row(c, seq, h, j, [fx.Float32(x) for x in acc])
-    mf._bar()
-
-
-@flyc.jit
-def live_tiles(c):
-    """The reduce tiles before the first one at the CSR sentinel (aiter's
-    planner packs the live ones first): a 64-way search on wave 0, then to
-    every wave through LDS."""
-    a = c["args"]
-    nt, lane, wave = c["NT"], c["lane"], c["wave"]
-    last = uniform(_ld(a["indptr"], nt))
-    if wave == 0:
-        lo = fx.Int32(0)
-        hi = nt  # the answer lies in [lo, hi]: indptr[hi] is the sentinel
-        span = nt
-        for _ in range_constexpr(SEARCH_ROUNDS):
-            step = (span + 63) // 64
-            p = fx.min(lo + lane * step, hi)
-            dead = _ld(a["indptr"], p) == last
-            first = -wave_max(dead.select(-p, -hi))
-            lo = fx.max(lo, first - step + 1)
-            hi = first
-            span = hi - lo
-        if lane == 0:
-            fx.ptr_store(hi, c["ntl"])
-    gpu.barrier()
-    return fx.ptr_load(c["ntl"])
+    acc = [fx.Float32(x) for x in acc]
+    _store_row(c, seq, h, 2 * lane, acc[:RV])
+    _store_row(c, seq, h, 2 * lane + 1, acc[RV:])
 
 
 @flyc.jit
 def stage_reduce(c, bid):
-    """CTA bid's (tile, head) units bid, bid + 256 .. (unit 96 i + h), a row a
-    128-thread group, RSLOT rows at a time; then TRDY."""
+    """The (tile, head) units of CTA bid's waves (unit 96 i + h; wave w of
+    the launch's 2048 takes w, w + 2048 .. up to the first tile at the CSR
+    sentinel), a row at a time on one wave (8 values a lane); then TRDY."""
     a = c["args"]
-    tid = c["tid"]
-    g = tid // RT
-    j = tid % RT
-    ntl = live_tiles(c)
-    for k in range((NHA * ntl - bid + BLOCKS - 1) // BLOCKS):
-        u = bid + BLOCKS * k
+    tid, lane = c["tid"], c["lane"]
+    nt = c["NT"]
+    last = uniform(_ld(a["indptr"], nt))
+    nw = BLOCKS * WAVES
+    lim = NHA * nt
+    u = bid * WAVES + c["wave"]
+    while u < lim:
         i = u // NHA
         h = u % NHA
         t0 = uniform(_ld(a["indptr"], i))
@@ -289,16 +281,20 @@ def stage_reduce(c, bid):
         q0 = uniform(_ld(a["fmap"], 2 * i))
         q1 = uniform(_ld(a["fmap"], 2 * i + 1))
         n = t1 - t0
-        live = n > 0
-        rows = live.select(q1 - q0, fx.Int32(0))
-        for rr in range((rows + RSLOT - 1) // RSLOT):
-            seq = q0 + RSLOT * rr + g
-            on = seq < q1
-            ls = seq - q0
+        # aiter's planner packs the live tiles first: the first at the
+        # sentinel ends the wave's units
+        dead = t0 == last
+        rows = ((n > 0) & ~dead).select(q1 - q0, fx.Int32(0))
+        # lane k: split k's partial row slot (n <= 64)
+        pm_l = _ld(a["pmap"], t0 + fx.min(lane, fx.max(n - 1, 0)))
+        for rr in range(rows):
+            seq = q0 + rr
+            lse_l = (lane < n).select(_ldf(a["plse"], (pm_l + rr) * NHA + h), fx.Float32(NEG_INF))
             if n >= MASSIVE:
-                _massive(c, h, t0, t1, n, ls, seq, on, g, j)
+                _massive(c, h, t0, t1, n, rr, seq, pm_l, lse_l)
             else:
-                _simple(c, h, t0, n, ls, seq, on, j)
+                _simple(c, h, n, rr, seq, pm_l, lse_l)
+        u = dead.select(lim, u + nw)
     publish(c["put"], c["trdy"], bid, fx.Int32(1), tid == 0)
 
 
@@ -308,10 +304,32 @@ def _empty(c, t):
     return ((w >> ((t % 4) * 8)) & 0xFF) != 0
 
 
+UV_ROWS = 2 * gemv.ROWS  # rows a W_UV round: two 16-row GEMV tiles
+PIECES = UV_ROWS * (KV // 8) // THREADS  # 16-byte pieces of a round a thread: 4
+
+
+def _round_loads(c, h, t0):
+    """A thread's pieces of rows t0 .. t0 + 31 (clamped to the step) and their
+    rows' empty flags, and the LSE and flag of the row its lane pushes (wave
+    2 b + w, lane r: row t0 + 16 b + r): all in flight."""
+    s, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
+    a = c["args"]
+    out = []
+    for i in range_constexpr(PIECES):
+        e = tid + THREADS * i
+        t = fx.min(t0 + e // (KV // 8), s - 1)
+        v = mf._ld4(a["o"], ((t * NHA + h) * KV + 8 * (e % (KV // 8))) // 2, CM_DEV)
+        out += [v[q] for q in range(4)] + [_empty(c, t).select(fx.Int32(1), fx.Int32(0))]
+    t = fx.min(t0 + (wave // 2 % 2) * gemv.ROWS + lane % 16, s - 1)
+    out += [_ld(a["lse"], t * NHA + h, CM_DEV), _empty(c, t).select(fx.Int32(1), fx.Int32(0))]
+    return out
+
+
 @flyc.jit
 def stage_wuv(c, task):
     """W_UV for head task // 2, value columns 64 (task % 2) ..: the head's
-    reduced rows (every CTA's TRDY) 16 at a time into LDS, the tile already
+    reduced rows (every CTA's TRDY) 32 at a time through LDS (two GEMV tiles a
+    round), the next round's loads in flight under each, the W_UV tile already
     there -> the head's owner (``mla_combine``), and ``send`` (records)."""
     s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
     a = c["args"]
@@ -326,46 +344,51 @@ def stage_wuv(c, task):
     vq = wave % 2
     kq = wave // 2
     g, r16 = lane // 16, lane % 16
-    for ti in range((s + gemv.ROWS - 1) // gemv.ROWS):
-        t0 = fx.Int32(ti) * gemv.ROWS
-        sj = fx.min(fx.Int32(gemv.ROWS), s - t0)
-        words = sj * (KV // 8)
-        for i in range_constexpr(gemv.ROWS * (KV // 8) // THREADS):
-            e = fx.min(tid + THREADS * i, words - 1)
-            t = t0 + e // (KV // 8)
-            o = e % (KV // 8)
-            v = mf._ld4(a["o"], ((t * NHA + h) * KV + 8 * o) // 2, CM_DEV)
-            em = _empty(c, t)
-            v = fx.Vector.from_elements([em.select(fx.Int32(0), v[q]) for q in range(4)], fx.Int32)
-            if tid + THREADS * i < words:
-                fx.ptr_store(v, xl + ((t - t0) * mf.OL_ROW + 8 * o) // 2)
-        rocdl.s_waitcnt(vmcnt=0)
-        gpu.barrier()
-        acc = mf._tgemv(lane, wl, mf.UV_ROW, 32 * vq, 128 * kq, 4, xl, mf.OL_ROW, sj)
-        rb = red + (wave * 64 + lane) * 8
-        for dt in range_constexpr(2):
-            fx.ptr_store(acc[dt], rb + 4 * dt)
-        gpu.barrier()
-        if (wave < 2) & (r16 < sj):
+    # the push: waves 0, 1 the round's first tile, waves 2, 3 its second
+    pt, pw = wave // 2, wave % 2
+    first = _round_loads(c, h, fx.Int32(0))
+    for ri, cur in range(fx.Int32(0), (s + UV_ROWS - 1) // UV_ROWS, fx.Int32(1), init=first):
+        r0 = fx.Int32(ri) * UV_ROWS
+        cur = [fx.Int32(x) for x in cur]
+        nxt = _round_loads(c, h, r0 + UV_ROWS)
+        for i in range_constexpr(PIECES):
+            e = tid + THREADS * i
+            em = cur[5 * i + 4] != 0
+            v = fx.Vector.from_elements([em.select(fx.Int32(0), cur[5 * i + q]) for q in range(4)], fx.Int32)
+            fx.ptr_store(v, xl + ((e // (KV // 8)) * mf.OL_ROW + 8 * (e % (KV // 8))) // 2)
+        mf._bar()
+        for b in range_constexpr(2):
+            sj = fx.min(fx.Int32(gemv.ROWS), s - r0 - b * gemv.ROWS)
+            acc = mf._tgemv(
+                lane, wl, mf.UV_ROW, 32 * vq, 128 * kq, 4,
+                xl + b * gemv.ROWS * (mf.OL_ROW // 2), mf.OL_ROW, fx.max(sj, 1),
+            )  # fmt: skip
+            rb = red + ((b * WAVES + wave) * 64 + lane) * 8
+            for dt in range_constexpr(2):
+                fx.ptr_store(acc[dt], rb + 4 * dt)
+        mf._bar()
+        t = r0 + pt * gemv.ROWS + r16
+        if (wave < 4) & (t < s):
             vals = [None] * 8
             for dt in range_constexpr(2):
                 for i in range_constexpr(4):
                     tot = fx.Float32(0.0)
                     for q in range_constexpr(4):
-                        tot = tot + fx.ptr_load(red + (((2 * q + wave) * 64 + lane) * 8 + 4 * dt + i))
+                        tot = tot + fx.ptr_load(red + (((pt * WAVES + 2 * q + pw) * 64 + lane) * 8 + 4 * dt + i))
                     vals[2 * i + dt] = tot
-            col = half * mf.UV_HALF + 32 * wave + 8 * g
-            t = t0 + r16
+            col = half * mf.UV_HALF + 32 * pw + 8 * g
             mc.push_values(c, owner, hl, t, col, vals)
-            if (wave == 0) & (g == 0) & (half == 0):
-                lse = _empty(c, t).select(fx.Float32(EMPTY_LSE), _ldf(a["lse"], t * NHA + h, CM_DEV))
+            if (pw == 0) & (g == 0) & (half == 0):
+                lse_w = cur[5 * PIECES]
+                em_w = cur[5 * PIECES + 1]
+                lse = (em_w != 0).select(fx.Float32(EMPTY_LSE), lse_w.bitcast(fx.Float32))
                 mc.push_lse(c, owner, hl, t, lse)
                 if const_expr(c["records"]):
                     bo.buffer_store(lse, rsrc(a["send"]), ((owner * s + t) * NHL + hl) * (mf.REC // 2) + VD // 2)
             if const_expr(c["records"]):
                 ob = fx.Vector.from_elements(vals, fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)
                 bo.buffer_store(ob, rsrc(a["send"]), (((owner * s + t) * NHL + hl) * mf.REC + col) // 2)
-        gpu.barrier()
+        _ = yield nxt
 
 
 ARGS = ("logits", "plse", "indptr", "fmap", "pmap", "o", "lse", "empty", "w_vc", "gate", "core", "send")
@@ -378,10 +401,8 @@ def build(key: MlaTailBuild):
 
     @fx.struct
     class Smem:
-        red: fx.Array[fx.Float32, WAVES * 64 * 8, 16]
-        sc: fx.Array[fx.Float32, RSLOT * LANE_SPLITS, 16]
-        ntl: fx.Array[fx.Int32, 4, 16]
-        xl: fx.Array[fx.Int32, gemv.ROWS * mf.OL_ROW // 2, 16]
+        red: fx.Array[fx.Float32, 2 * WAVES * 64 * 8, 16]
+        xl: fx.Array[fx.Int32, UV_ROWS * mf.OL_ROW // 2, 16]
         wl: fx.Array[fx.Int32, KV * mf.UV_ROW // 2, 16]
 
     keyed = key_tuple(key, SOURCES)
@@ -410,8 +431,7 @@ def build(key: MlaTailBuild):
                 "S": s, "NT": nt, "tid": tid, "bid": bid,
                 "lane": tid % 64, "wave": tid // 64, "rank": rank,
                 "put": mb.put, "poll": mb.poll, "records": key.records,
-                "red": lds.red.ptr, "sc": lds.sc.ptr, "xl": lds.xl.ptr, "wl": lds.wl.ptr,
-                "ntl": lds.ntl.ptr,
+                "red": lds.red.ptr, "xl": lds.xl.ptr, "wl": lds.wl.ptr,
                 "trdy": sreg(scratch, lay["trdy"][0], "trdy"),
                 "gbuf": gate, "on": False, "tls": None,
                 "a2a_peer": mc.PeerRegions(peers, key.par, peer_offset(), a2a_copy_bytes()),
@@ -476,7 +496,6 @@ def mla_tail_launch(
     assert plse.dtype == f32 and plse.is_contiguous() and plse.numel() * KV == logits.numel()
     nt = indptr.numel() - 1
     assert indptr.dtype == i32 and fmap.dtype == i32 and fmap.numel() >= 2 * nt and pmap.dtype == i32
-    assert nt < 64**SEARCH_ROUNDS, nt
     assert o.dtype == bf and o.is_contiguous() and tuple(o.shape) == (s, NHA, KV)
     assert lse.dtype == f32 and lse.is_contiguous() and lse.numel() == s * NHA
     assert empty.dtype == torch.bool and empty.is_contiguous() and empty.numel() >= s
