@@ -81,6 +81,7 @@ from sgl_amd_mono.kimi_k3.gfx950.attention.kda import (
 )
 from sgl_amd_mono.kimi_k3.gfx950.stages.dims import COLS, HD, HIDDEN, LOG2E, NA, NH, PROJ, ROWS
 from sgl_amd_mono.kimi_k3.gfx950.stages.seam import (
+    AUX_ROW,
     bf16r,
     f32_of,
     front_gate,
@@ -134,6 +135,9 @@ class KdaWideBuild:
     eps: float = 1e-5  # AttnRes norm
     out_eps: float = 1e-5  # input_layernorm
     write_idx: int = -1
+    # the drafter's aux slot j (0 .. 4) at a DSpark capture layer's next one: the
+    # seam's pre-norm mixture also into aux[row, j * 7168 ..] (bf16)
+    aux_slot: int = -1
 
 
 def tiles(key):
@@ -1155,7 +1159,7 @@ KDA_ARGS = (
     "core_out", "proj_dbg", "o_dbg", "cs_seq", "cs_dim", "cs_tok", "rs_seq",
     "cw_seq", "cw_tok", "cw_q", "rk_seq", "rv_seq", "rg_seq", "rb_seq", "ring_len",
     "layer", "epoch", "tl", "prefix", "blocks", "blk_sm", "blk_sr", "ares_nw",
-    "ares_qk", "in_nw", "reqs",
+    "ares_qk", "in_nw", "reqs", "aux",
 )  # kda_body's ``args``: the kernel's parameters but its scratch
 
 
@@ -1192,6 +1196,7 @@ def kda_body(key: KdaWideBuild, smem, role, scratch, args: dict) -> None:
     ring_len, layer, epoch, tl = a_["ring_len"], a_["layer"], a_["epoch"], a_["tl"]
     prefix, blocks, blk_sm, blk_sr = a_["prefix"], a_["blocks"], a_["blk_sm"], a_["blk_sr"]
     ares_nw, ares_qk, in_nw, reqs = a_["ares_nw"], a_["ares_qk"], a_["in_nw"], a_["reqs"]
+    aux = a_["aux"]
     core_box = args.get("core_box")
     assert core_box is None or not is_gemm(key), "a core box: the first form"
     tid = fx.thread_idx.x
@@ -1293,6 +1298,8 @@ def kda_body(key: KdaWideBuild, smem, role, scratch, args: dict) -> None:
         }
         for region in ("part", "wgt", "xrdy"):
             fc[region] = sreg(scratch, lay["f" + region][0], "f" + region)
+        if const_expr(key.aux_slot >= 0):
+            fc["aux"] = (aux, key.aux_slot)
         c["fc"] = fc
     if const_expr(core_box is not None):
         c["core_box"] = core_box
@@ -1347,6 +1354,7 @@ def build(key: KdaWideBuild):
         name += "_gemm"
     if key.front:
         name += f"_f{key.nblocks}" + (f"w{key.write_idx}" if key.write_idx >= 0 else "")
+        name += f"a{key.aux_slot}" if key.aux_slot >= 0 else ""
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def kda_wide(
@@ -1393,6 +1401,7 @@ def build(key: KdaWideBuild):
         ares_qk: Int64,
         in_nw: Int64,
         reqs: Int32,
+        aux: Int64,
     ):
         _ = keyed
         alloc = fx.SharedAllocator()
@@ -1403,7 +1412,7 @@ def build(key: KdaWideBuild):
             win_row, conv_win, ring_k, ring_v, ring_g, ring_b, core_out, proj_dbg,
             o_dbg, cs_seq, cs_dim, cs_tok, rs_seq, cw_seq, cw_tok, cw_q, rk_seq,
             rv_seq, rg_seq, rb_seq, ring_len, layer, epoch, tl, prefix, blocks,
-            blk_sm, blk_sr, ares_nw, ares_qk, in_nw, reqs,
+            blk_sm, blk_sr, ares_nw, ares_qk, in_nw, reqs, aux,
         )  # fmt: skip
         kda_body(key, smem, role, scratch, dict(zip(KDA_ARGS, params)))
 
@@ -1452,6 +1461,7 @@ def build(key: KdaWideBuild):
         ares_qk: Int64,
         in_nw: Int64,
         reqs: Int32,
+        aux: Int64,
         stream: fx.Stream = _STREAM,
     ):
         _ = keyed
@@ -1460,7 +1470,7 @@ def build(key: KdaWideBuild):
             win_row, conv_win, ring_k, ring_v, ring_g, ring_b, core_out, proj_dbg,
             o_dbg, cs_seq, cs_dim, cs_tok, rs_seq, cw_seq, cw_tok, cw_q, rk_seq,
             rv_seq, rg_seq, rb_seq, ring_len, scratch, layer, epoch, tl, prefix,
-            blocks, blk_sm, blk_sr, ares_nw, ares_qk, in_nw, reqs,
+            blocks, blk_sm, blk_sr, ares_nw, ares_qk, in_nw, reqs, aux,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)  # fmt: skip
 
     _BUILDS[key] = launch
@@ -1504,6 +1514,7 @@ def launch_values(
     ares_nw=None,
     ares_qk=None,
     in_nw=None,
+    aux=None,
 ):
     """The launch's kernel arguments (``KDA_ARGS`` with the scratch, in the
     kernel's order), checked. ``x`` the input-normed layer input [S, 7168] bf16 as
@@ -1519,7 +1530,8 @@ def launch_values(
     ``conv_win`` [row, >= L, CONV_W - 1, C] gets request r's verify windows at
     ``win_row[r]`` (int32 [R], < 0: none); ``ring`` = (k, v, g, beta) [slots, 12,
     ring_len, (128)]; ``scratch`` (``scratch_bytes``) zeroed once; ``epoch`` a
-    device int32 bumped once a step, ``layer`` this launch's slot."""
+    device int32 bumped once a step, ``layer`` this launch's slot; ``aux`` the
+    drafter's aux_hidden_states_buffer [>= S, 5 x 7168] bf16 (``aux_slot``)."""
     s, L = key.tokens, key.qlen
     R = st_idx.numel()
     assert R <= gemm_reqs(key) and (is_gemm(key) or R == s // L)
@@ -1552,6 +1564,10 @@ def launch_values(
         blk_sm, blk_sr = blocks.stride(0), blocks.stride(1)
     else:
         assert prefix is None and blocks is None
+    assert (key.aux_slot >= 0) == (aux is not None) and (aux is None or key.front)
+    if aux is not None:
+        assert aux.dtype == torch.bfloat16 and aux.is_contiguous()
+        assert aux.shape[0] >= s and aux.shape[1] == AUX_ROW
     return (
         x.data_ptr(),
         w_in.data_ptr(),
@@ -1596,4 +1612,5 @@ def launch_values(
         ptr(ares_qk),
         ptr(in_nw),
         R,
+        ptr(aux),
     )

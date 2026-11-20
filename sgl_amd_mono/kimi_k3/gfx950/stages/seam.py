@@ -517,6 +517,10 @@ def front_gate(c, t):
     gpu.barrier()
 
 
+AUX_SLOTS = 5  # DSpark's captured target layers
+AUX_ROW = AUX_SLOTS * HIDDEN  # bf16 a row of aux_hidden_states_buffer
+
+
 @flyc.jit
 def front_mix(c, task):
     """Columns 128 task ..: every token's softmax mix of ``vals`` (4 columns a
@@ -525,6 +529,8 @@ def front_mix(c, task):
     s, ns, tid, red = c["S"], c["NS"], c["tid"], c["red"]
     a = c["args"]
     tiles = c["x_tiles"]
+    # read before the traced branches (a dict lookup inside one is carried state)
+    aux = c.get("aux")
     c0 = task * COLS
     cc = (tid % QC) * 4
     nw = s * (ns + 2)
@@ -555,5 +561,11 @@ def front_mix(c, task):
         xw = bf4_words([mixed[j] * r * wn[j] for j in range(4)])
         if mine:
             bo.buffer_store(xw, rsrc(c["xbuf"]), x_packed_word(t, c0 + cc, tiles), cache_modifier=CM_DEV)
+            if const_expr(aux is not None):
+                # the drafter's aux hidden: the pre-norm mixture, row t's slot
+                ptr, slot = aux
+                bo.buffer_store(
+                    bf4_words(mixed), rsrc(ptr), (t * AUX_ROW + slot * HIDDEN + c0 + cc) // 2
+                )
     publish(c["put"], c["xrdy"], task, fx.Int32(1), tid == 0)
     gpu.barrier()

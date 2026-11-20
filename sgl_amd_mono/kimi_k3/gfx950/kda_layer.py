@@ -141,7 +141,9 @@ def build(key: KdaLayerBuild):
 
     keyed = key_tuple(key, SOURCES)
     name = (
-        f"k3_mono_kda_layer_s{s}_f{akey.nblocks}_k{kkey.nblocks}"
+        f"k3_mono_kda_layer_s{s}_f{akey.nblocks}"
+        + (f"a{akey.aux_slot}" if akey.aux_slot >= 0 else "")
+        + f"_k{kkey.nblocks}"
         f"_t{int(akey.timeline)}{int(kkey.timeline)}_o{kkey.opt}"
     )
 
@@ -155,7 +157,7 @@ def build(key: KdaLayerBuild):
         rg_seq: Int32, rb_seq: Int32, ring_len: Int32, scratch: Int64,
         layer: Int32, epoch: Int64, tl: Int64, prefix: Int64, blocks: Int64,
         blk_sm: Int32, blk_sr: Int32, ares_nw: Int64, ares_qk: Int64,
-        in_nw: Int64, reqs: Int32,
+        in_nw: Int64, reqs: Int32, aux: Int64,
         k_core: Int64, k_core_ld: Int32, k_w_o: Int64, k_prefix: Int64,
         k_prefix_in: Int64, k_blocks: Int64, k_blk_sm: Int32, k_blk_sr: Int32,
         k_ares_nw: Int64, k_ares_qk: Int64, k_in_nw: Int64, k_w_gate: Int64,
@@ -172,7 +174,7 @@ def build(key: KdaLayerBuild):
             win_row, conv_win, ring_k, ring_v, ring_g, ring_b, core_out, proj_dbg,
             o_dbg, cs_seq, cs_dim, cs_tok, rs_seq, cw_seq, cw_tok, cw_q, rk_seq,
             rv_seq, rg_seq, rb_seq, ring_len, layer, epoch, tl, prefix, blocks,
-            blk_sm, blk_sr, ares_nw, ares_qk, in_nw, reqs,
+            blk_sm, blk_sr, ares_nw, ares_qk, in_nw, reqs, aux,
         )  # fmt: skip
         args = dict(zip(kw.KDA_ARGS, params))
         # each task's box holds K2's tag once its core rows are stored
@@ -206,7 +208,7 @@ def build(key: KdaLayerBuild):
         rg_seq: Int32, rb_seq: Int32, ring_len: Int32, scratch: Int64,
         layer: Int32, epoch: Int64, tl: Int64, prefix: Int64, blocks: Int64,
         blk_sm: Int32, blk_sr: Int32, ares_nw: Int64, ares_qk: Int64,
-        in_nw: Int64, reqs: Int32,
+        in_nw: Int64, reqs: Int32, aux: Int64,
         k_core: Int64, k_core_ld: Int32, k_w_o: Int64, k_prefix: Int64,
         k_prefix_in: Int64, k_blocks: Int64, k_blk_sm: Int32, k_blk_sr: Int32,
         k_ares_nw: Int64, k_ares_qk: Int64, k_in_nw: Int64, k_w_gate: Int64,
@@ -221,7 +223,7 @@ def build(key: KdaLayerBuild):
             win_row, conv_win, ring_k, ring_v, ring_g, ring_b, core_out, proj_dbg,
             o_dbg, cs_seq, cs_dim, cs_tok, rs_seq, cw_seq, cw_tok, cw_q, rk_seq,
             rv_seq, rg_seq, rb_seq, ring_len, scratch, layer, epoch, tl, prefix,
-            blocks, blk_sm, blk_sr, ares_nw, ares_qk, in_nw, reqs,
+            blocks, blk_sm, blk_sr, ares_nw, ares_qk, in_nw, reqs, aux,
             k_core, k_core_ld, k_w_o, k_prefix, k_prefix_in, k_blocks, k_blk_sm,
             k_blk_sr, k_ares_nw, k_ares_qk, k_in_nw, k_w_gate, k_bias, k_w_ld,
             k_w_sgu, k_w_sd, k_w13, k_w13s, k_w2, k_w2s, k_ln_w, k_w_up, k_out,
