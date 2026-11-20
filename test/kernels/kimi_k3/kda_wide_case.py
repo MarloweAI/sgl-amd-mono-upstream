@@ -202,10 +202,17 @@ class Wide:
             else (None, None)
         )
 
+    def packed_x(self, x):
+        """``pack_x`` of x, made once per x (as the producer writes it)."""
+        k = (x.data_ptr(), x._version)
+        if getattr(self, "_xk", None) != k:
+            self._xk, self._xp = k, self.kw.pack_x(x, self.kw.tiles(self.key))
+        return self._xp
+
     def __call__(self, x, pools, epoch, core):
         self.kw.kda_wide(
             self.key,
-            x=x,
+            x=self.packed_x(x),
             w_in=self.w_in,
             w_fb=self.w["w_fb"],
             conv_w=self.w["conv_w"],

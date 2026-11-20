@@ -6,8 +6,8 @@ core output, on the ReplaySSM ring. One launch, ``BLOCKS`` CTAs x ``THREADS``.
     gemv    in_proj: 131 sets of three 16-row groups x 14 K steps of 64 a
             wave (wave w streams K 896 w .. 896 (w + 1)), 1834 units in equal
             runs of 7 or 8 over the CTAs, read from ``pack_w_in``'s layout (a
-            run's weights contiguous); a set's groups share every x load.
-            A run's pieces are summed in wave order; a set's head CTA adds the
+            run's weights contiguous); a set's groups share every x load, x
+            read from ``pack_x``'s layout (1 KB an instruction). A run's pieces are summed in wave order; a set's head CTA adds the
             pieces of the next one or two CTAs in order -> bf16 PROJ words
             (16-B tagged words, a request's L rows of a channel)
     kda     a task a (request, head) on CTA 128 + t (at most 10 requests): its
@@ -213,13 +213,13 @@ def _soff(c, hs):
 def _loads(c, u, hs, live):
     """One step (unit ``u``, K step ``hs``) of this wave: 2 x 16 B a lane of each
     group's weights (``pack_w_in``: a unit's bytes are contiguous, 1 KB an
-    instruction) and of every token tile's x (zeros, with no memory read,
-    unless ``live``)."""
-    lane, s = c["lane"], c["S"]
+    instruction) and of every token tile's x (``pack_x``: 1 KB an instruction)
+    (zeros, with no memory read, unless ``live``)."""
+    lane = c["lane"]
     soff = _soff(c, hs)
+    nt = c["T"]
     wr = rsrc(c["args"]["w_in"], live.select(fx.Int64(NPROJ * HIDDEN * 2), fx.Int64(0)))
-    xr = rsrc(c["args"]["x"], live.select(fx.Int64(s * HIDDEN * 2), fx.Int64(0)))
-    k8 = (lane // ROWS) * 8
+    xr = rsrc(c["args"]["x"], live.select(fx.Int64(nt * 16 * HIDDEN * 2), fx.Int64(0)))
     wo = uniform((u * WAVES + c["wave"]) * (G * 2 * 1024))
 
     def wld(g, q):
@@ -230,20 +230,16 @@ def _loads(c, u, hs, live):
             )
         )  # fmt: skip
 
-    def ld(r, row, cm):
-        base = (row * HIDDEN + k8) // 2
-        return [
-            fx.Vector(
-                bo.buffer_load(
-                    r, base + 16 * q, vec_width=4, dtype=T.i32, cache_modifier=cm,
-                    soffset_bytes=soff,
-                )
+    def xld(tt, q):
+        return fx.Vector(
+            bo.buffer_load(
+                xr, lane * 4 + (tt * 2 + q) * 256, vec_width=4, dtype=T.i32,
+                soffset_bytes=uniform(soff * (nt * 16)),
             )
-            for q in range(KSTEP // 32)
-        ]  # fmt: skip
+        )  # fmt: skip
 
     ws = [[wld(g, q) for q in range(KSTEP // 32)] for g in range(G)]
-    xs = [ld(xr, fx.min(tt * 16 + lane % 16, s - 1), 0) for tt in range(c["T"])]
+    xs = [[xld(tt, q) for q in range(KSTEP // 32)] for tt in range(nt)]
     return ws, xs
 
 
@@ -253,6 +249,18 @@ def pack_w_in(w_in):
     assert w_in.shape == (NPROJ, HIDDEN)
     v = w_in.view(SETS, G, ROWS, WAVES, HSTEPS, KSTEP // 32, 4, 8)
     return v.permute(0, 4, 3, 1, 5, 6, 2, 7).contiguous().view(NPROJ, HIDDEN)
+
+
+def pack_x(x, nt):
+    """x [S, HIDDEN] in the launch's stream order, its rows padded to ``nt``
+    token tiles: K step (wave, step), token tile, K half, lane (K group, row),
+    8 K a lane; [16 nt, HIDDEN]."""
+    s = x.shape[0]
+    assert x.shape == (s, HIDDEN) and s <= 16 * nt
+    xp = torch.zeros(16 * nt, HIDDEN, dtype=x.dtype, device=x.device)
+    xp[:s] = x
+    v = xp.view(nt, 16, HIDDEN // KSTEP, KSTEP // 32, 4, 8)
+    return v.permute(2, 0, 3, 4, 1, 5).contiguous().view(16 * nt, HIDDEN)
 
 
 def _slot_w(c):
@@ -892,7 +900,8 @@ def kda_wide(
     o_dbg=None,
     tl=None,
 ):
-    """Host launcher. ``x`` bf16 [S, 7168] (the input-normed layer input);
+    """Host launcher. ``x`` the input-normed layer input [S, 7168] bf16 as
+    ``pack_x`` lays it out;
     ``w_in`` in_proj as ``pack_w_in`` lays it out;
     ``conv_state`` [slot, channel, entry] by its strides (SGLang's conv cache
     [slot, CONV_W - 1, C] is its ``.mT``), read only; ``rstate`` [slots, 12, 128,
@@ -903,7 +912,7 @@ def kda_wide(
     device int32 bumped once a step, ``layer`` this launch's slot."""
     s, L = key.tokens, key.qlen
     R = s // L
-    assert x.shape == (s, HIDDEN) and x.dtype == torch.bfloat16 and x.is_contiguous()
+    assert x.shape == (16 * tiles(key), HIDDEN) and x.dtype == torch.bfloat16 and x.is_contiguous()
     assert w_in.shape == (NPROJ, HIDDEN) and w_in.is_contiguous()
     assert rstate.dtype == torch.float32 and rstate[0].numel() == NH * HD * HD
     assert rstate[0].is_contiguous()
