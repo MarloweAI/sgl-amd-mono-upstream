@@ -13,7 +13,14 @@ except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
     from sglang.srt.monokernels import spec as registry
 
 import sgl_amd_mono
-from sgl_amd_mono.kimi_k3 import HF_CONFIG, LINEAR_ATTN_CONFIG, MAX_BLOCKS, MAX_ROWS
+from sgl_amd_mono.kimi_k3 import (
+    FRONT_MAX_ROWS,
+    HF_CONFIG,
+    K2_MAX_ROWS,
+    LINEAR_ATTN_CONFIG,
+    MAX_BLOCKS,
+    MAX_ROWS,
+)
 from sgl_amd_mono.kimi_k3 import spec as k3
 
 # Kimi-K3's layer structure (its config.json): 93 layers, a dense layer 0, then
@@ -195,6 +202,58 @@ def test_the_guard_flags_sit_past_every_width(monkeypatch):
         assert moe.peer_bytes(width) <= off, width
     # the widest launch ends exactly there: a larger offset wastes a peer page
     assert off == max(layer.peer_bytes(MAX_ROWS), moe.peer_bytes(MAX_ROWS))
+
+
+@pytest.mark.parametrize(
+    "rows,front_rows",
+    [(K2_MAX_ROWS, max(K2_MAX_ROWS, FRONT_MAX_ROWS)), (12, 30), (18, 18), (18, 30), (24, 30)],
+)
+def test_the_scratch_regions_are_disjoint_at_every_width(rows, front_rows):
+    """No launch family's scratch overlaps another's at any built width.
+
+    The DCP front's pv rows once covered K2's tagged x rows: a front word left
+    there could pass for a pair of K2's tag. Each region holds its family's
+    layout at every width and bank depth it is built for, the front's ``x_in``
+    builds (SGLang's attention, no blocks) among them.
+    """
+    from sgl_amd_mono.kimi_k3 import MAX_BLOCKS
+    from sgl_amd_mono.kimi_k3.gfx950 import k1, layer
+    from sgl_amd_mono.kimi_k3.gfx950.attention import mla_front as mf
+    from sgl_amd_mono.kimi_k3.gfx950.stages.dims import HIDDEN
+
+    reg = layer.scratch_regions(rows, front_rows)
+    spans = sorted(reg.values())
+    assert all(o % 4096 == 0 for o, _ in spans)
+    for (o0, n0), (o1, _) in zip(spans, spans[1:]):
+        assert o0 + n0 <= o1, reg
+    blocks = range(0, MAX_BLOCKS + 1)
+    k2_end = max(
+        layer.scratch_bytes(layer.K2Build(tokens=s, nblocks=nb))
+        for s in range(1, rows + 1) for nb in blocks
+    )  # fmt: skip
+    assert k2_end <= reg["k2"][1]
+    assert reg["xt"][1] == rows * HIDDEN // 2 * 8
+    assert k1.scratch_bytes(rows) <= reg["k1"][1]
+    fronts = [s for s in range(mf.G_ROWS, front_rows + 1, mf.G_ROWS) if s // mf.G_ROWS <= mf.MAX_REQS]
+    for s in fronts:
+        for nb in blocks:
+            for x_in in (False, True):
+                key = mf.MlaFrontBuild(tokens=s, nblocks=nb, scale=1.0, x_in=x_in)
+                assert mf.scratch_bytes(key) <= reg["front"][1], (s, nb, x_in)
+
+
+def test_every_launch_takes_its_region_from_the_one_layout():
+    """The offsets the kernels and the runner read are the layout's, and the
+    front's region holds the served ``x_in`` widths up to FRONT_MAX_ROWS."""
+    from sgl_amd_mono.kimi_k3.gfx950 import layer
+    from sgl_amd_mono.kimi_k3.gfx950.attention import mla_front as mf
+
+    reg = layer.scratch_regions()
+    assert layer.tag_offset() == reg["xt"][0]
+    assert layer.scratch_alloc_bytes() >= max(o + n for o, n in reg.values())
+    for s in range(mf.G_ROWS, FRONT_MAX_ROWS + 1, mf.G_ROWS):
+        key = mf.MlaFrontBuild(tokens=s, nblocks=0, scale=1.0, x_in=True)
+        assert mf.scratch_bytes(key) <= reg["front"][1], s
 
 
 # A TP8 + DCP8 DSpark server, as SGLang's feature probes read it.

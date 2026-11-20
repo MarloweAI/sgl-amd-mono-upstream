@@ -386,6 +386,7 @@ def _build(model, hf_config, ctx):
 def _warmup(runner, packed_layers: dict, rows: int) -> None:
     """Launch every layer once at this width, before any graph capture."""
     from sgl_amd_mono.kimi_k3.gfx950 import k1 as k1_mod
+    from sgl_amd_mono.kimi_k3.gfx950.layer import scratch_region
     from sgl_amd_mono.kimi_k3.gfx950.stages.dims import HIDDEN
 
     device = runner.device
@@ -422,7 +423,8 @@ def _warmup(runner, packed_layers: dict, rows: int) -> None:
             key, w = packed.mla
             mp.mla_pre_launch(
                 key, prefix=runner.prefix[:rows], blocks=bank(key.nblocks), w=w,
-                out=_mla_outputs(rows, device), scratch=runner.scratch,
+                out=_mla_outputs(rows, device),
+                scratch=scratch_region(runner.scratch, "mla_pre"),
                 layer=packed.i, epoch=runner.epoch,
             )  # fmt: skip
         _k2_launch(
@@ -816,6 +818,7 @@ def _front_core_buffer(rows: int, device) -> torch.Tensor:
 def _front_warmup(runner, packed, rows: int, blocks) -> None:
     """The DCP front once, on throwaway KV and every request at P = 0."""
     from sgl_amd_mono.kimi_k3.gfx950.attention import mla_front as mf
+    from sgl_amd_mono.kimi_k3.gfx950.layer import scratch_region
 
     dev = runner.device
     key, w = packed.front
@@ -827,7 +830,8 @@ def _front_warmup(runner, packed, rows: int, blocks) -> None:
         kv_ptr=torch.tensor([0] + [1] * nreq, dtype=torch.int32, device=dev),
         g_kv_ptr=torch.arange(nreq + 1, dtype=torch.int32, device=dev) * mf.G_ROWS,
         loc=torch.zeros(rows, dtype=torch.int64, device=dev),
-        core=_front_core_buffer(rows, dev), scratch=runner.scratch,
+        core=_front_core_buffer(rows, dev),
+        scratch=scratch_region(runner.scratch, "front"),
         peers=runner.peer.addresses, rank=runner.dcp_rank, layer=packed.i,
         epoch=runner.epoch,
     )  # fmt: skip
@@ -895,6 +899,7 @@ class _SglFronts:
         """Both QG copies' builds at this width once, on two layers' weights,
         throwaway KV and every request at P = 0, in an epoch of their own."""
         from sgl_amd_mono.kimi_k3.gfx950.attention import mla_front as mf
+        from sgl_amd_mono.kimi_k3.gfx950.layer import scratch_region
 
         dev, nreq = self.runner.device, rows // mf.G_ROWS
         self.runner.step_begin()
@@ -908,7 +913,8 @@ class _SglFronts:
                 kv_ptr=torch.tensor([0] + [1] * nreq, dtype=torch.int32, device=dev),
                 g_kv_ptr=torch.arange(nreq + 1, dtype=torch.int32, device=dev) * mf.G_ROWS,
                 loc=torch.zeros(rows, dtype=torch.int64, device=dev),
-                core=self.core[rows], scratch=self.runner.scratch,
+                core=self.core[rows],
+                scratch=scratch_region(self.runner.scratch, "front"),
                 peers=self.runner.peer.addresses, rank=self.runner.dcp_rank,
                 layer=e.i, epoch=self.runner.epoch,
             )  # fmt: skip
@@ -926,6 +932,7 @@ class _SglFronts:
         from sglang.srt.model_executor.forward_context import get_attn_backend
 
         from sgl_amd_mono.kimi_k3.gfx950.attention import mla_front as mf
+        from sgl_amd_mono.kimi_k3.gfx950.layer import scratch_region
 
         if e.first:
             # once a forward, before its first front: the steps' mailbox tags
@@ -941,7 +948,8 @@ class _SglFronts:
             kv=kv.view(-1, mf.DQK), kv_idx=fm.cprr_kv_indices,
             kv_ptr=fm.cprr_kv_indptr, g_kv_ptr=fm.global_kv_indptr,
             loc=forward_batch.out_cache_loc, core=core,
-            scratch=self.runner.scratch, peers=self.runner.peer.addresses,
+            scratch=scratch_region(self.runner.scratch, "front"),
+            peers=self.runner.peer.addresses,
             rank=self.runner.dcp_rank, layer=e.i, epoch=self.runner.epoch,
         )  # fmt: skip
         # the gate is in the core: o_proj's wrapper has no gate input to apply
@@ -1298,6 +1306,7 @@ class _Built:
         from sglang.srt.model_executor.forward_context import get_attn_backend
 
         from sgl_amd_mono.kimi_k3.gfx950.attention import mla_front as mf
+        from sgl_amd_mono.kimi_k3.gfx950.layer import scratch_region
 
         key, w = packed.front
         rows = hidden.shape[0]
@@ -1316,7 +1325,8 @@ class _Built:
             kv=kv.view(-1, mf.DQK), kv_idx=fm.cprr_kv_indices,
             kv_ptr=fm.cprr_kv_indptr, g_kv_ptr=fm.global_kv_indptr,
             loc=forward_batch.out_cache_loc, core=core,
-            scratch=self.runner.scratch, peers=self.runner.peer.addresses,
+            scratch=scratch_region(self.runner.scratch, "front"),
+            peers=self.runner.peer.addresses,
             rank=self.runner.dcp_rank, layer=packed.i, epoch=self.runner.epoch,
         )  # fmt: skip
         if key.write_idx >= 0:
@@ -1330,6 +1340,7 @@ class _Built:
         from sglang.srt.layers.layer_boundary.residual.batch import set_written
 
         from sgl_amd_mono.kimi_k3.gfx950.attention import mla_pre as mp
+        from sgl_amd_mono.kimi_k3.gfx950.layer import scratch_region
         from sgl_amd_mono.kimi_k3.gfx950.stages.dims import HIDDEN
 
         key, w = packed.mla
@@ -1339,13 +1350,14 @@ class _Built:
         set_written(hidden, forward_batch)
         mp.mla_pre_launch(
             key, prefix=hidden, blocks=bank.block_residual, w=w, out=out,
-            scratch=self.runner.scratch, layer=packed.i, epoch=self.runner.epoch,
+            scratch=scratch_region(self.runner.scratch, "mla_pre"),
+            layer=packed.i, epoch=self.runner.epoch,
         )  # fmt: skip
         if key.write_idx >= 0:
             bank._count_write(None)  # the launch wrote the bank row
         off, nbytes = mp.scratch_layout(key)["x"]
         x = (
-            self.runner.scratch[off : off + nbytes]
+            scratch_region(self.runner.scratch, "mla_pre")[off : off + nbytes]
             .view(torch.bfloat16)
             .view(rows, HIDDEN)
         )

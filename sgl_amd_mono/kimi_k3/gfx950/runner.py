@@ -13,7 +13,7 @@ import torch
 
 from sgl_amd_mono.common import guard
 from sgl_amd_mono.common.peer import PeerBuffer
-from sgl_amd_mono.kimi_k3 import FRONT_MAX_ROWS, K2_MAX_ROWS
+from sgl_amd_mono.kimi_k3 import K2_MAX_ROWS
 
 
 class K3MonoRunner:
@@ -24,7 +24,6 @@ class K3MonoRunner:
     """
 
     def __init__(self, tp: int, rank: int, group, device) -> None:
-        from sgl_amd_mono.kimi_k3 import MAX_BLOCKS
         from sgl_amd_mono.kimi_k3.gfx950 import layer
         from sgl_amd_mono.kimi_k3.gfx950.attention import mla_combine, mla_front
         from sgl_amd_mono.kimi_k3.gfx950.stages import moe
@@ -33,17 +32,8 @@ class K3MonoRunner:
         # tests only: the wait to stall and how many launches to let
         # through first, compiled into this rank's build key
         self.fault_site, self.fault_after = guard.fault_injection(rank) or (0, 0)
-        # The launches run one after another, so one buffer the widest of them
-        # fits, then K2's tagged x rows, then the DCP front's regions.
-        front = mla_front.scratch_bytes(
-            mla_front.MlaFrontBuild(
-                tokens=mla_front.G_ROWS
-                * min(mla_front.MAX_REQS, max(K2_MAX_ROWS, FRONT_MAX_ROWS) // mla_front.G_ROWS),
-                nblocks=MAX_BLOCKS,
-                scale=1.0,
-            )
-        )
-        self.scratch_bytes = (max(layer.scratch_alloc_bytes(), front) + 255) // 256 * 256
+        # one region a launch family (layer.scratch_regions)
+        self.scratch_bytes = layer.scratch_alloc_bytes()
         # this rank's decode-context-parallel rank (the DCP front's key share)
         self.dcp_rank = 0
         # The hand-off mailboxes uncached, as GLM-5.3-Flash's: a consumer reads a

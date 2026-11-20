@@ -283,15 +283,6 @@ class MlaFrontBuild:
     x_in: bool = False
 
 
-def scratch_base() -> int:
-    """Where the front's scratch starts: past K2's tagged x rows
-    (``layer.scratch_alloc_bytes``), so none of the front's plain words sits
-    where K2's polls read tags."""
-    from sgl_amd_mono.kimi_k3.gfx950 import layer
-
-    return -(-layer.scratch_alloc_bytes() // 4096) * 4096
-
-
 def scratch_layout(key: MlaFrontBuild) -> dict:
     s, ns = key.tokens, key.nblocks + 1
     nreq = reqs_of(s)
@@ -309,7 +300,7 @@ def scratch_layout(key: MlaFrontBuild) -> dict:
     if wide(s):
         pairs["olrdy"] = BLOCKS
         pairs["deal"] = DEAL_WORDS + 2
-    lay = pair_layout(pairs.items(), start=scratch_base())
+    lay = pair_layout(pairs.items())
     end = max(o + n for o, n in lay.values())
 
     def add(name, nbytes):

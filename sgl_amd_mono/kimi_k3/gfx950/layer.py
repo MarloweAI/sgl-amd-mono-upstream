@@ -19,6 +19,7 @@ shared gate/up GEMVs issue their weights before they first wait.
                      lnorm (56 .. 83), up (0 .. 55), reduce (200 .. 255)
 """
 
+import functools
 from typing import Any, NamedTuple
 
 import flydsl.compiler as flyc
@@ -44,7 +45,7 @@ from sgl_amd_mono.common.plan import (
     pair_layout,
 )
 from sgl_amd_mono.common.sync import Mailbox, preg, shift, sreg
-from sgl_amd_mono.kimi_k3 import CORE, K2_MAX_ROWS, MAX_ROWS
+from sgl_amd_mono.kimi_k3 import CORE, FRONT_MAX_ROWS, K2_MAX_ROWS, MAX_BLOCKS, MAX_ROWS
 from sgl_amd_mono.kimi_k3.gfx950.stages import gemv as gemv
 from sgl_amd_mono.kimi_k3.gfx950.stages import moe as k2b
 from sgl_amd_mono.kimi_k3.gfx950.stages import oproj as k2a
@@ -212,26 +213,68 @@ def init_peer(buf: torch.Tensor) -> None:
     SENT_READY = True
 
 
-def tag_offset() -> int:
-    """Where the tagged x rows (OPT_TAG_X) start in the scratch: past every
-    launch's layout at its widest, so no other launch's plain word sits where
-    these keep tags."""
-    from sgl_amd_mono.kimi_k3 import MAX_BLOCKS
+@functools.cache
+def scratch_regions(
+    rows: int = K2_MAX_ROWS, front_rows: int = max(K2_MAX_ROWS, FRONT_MAX_ROWS)
+) -> dict:
+    """The runner's scratch, one region a launch family, back to back:
+    name -> (byte offset, bytes), K2 and K1 built to ``rows`` rows, the DCP
+    front to ``front_rows``.
+
+    No region overlaps another at any built width. A launch's polls take a pair
+    whose second word equals its tag, so a word another launch left where they
+    poll could pass for one.
+
+    - ``k2``: K2 (``scratch_layout``) at every width, and the MoE alone (the
+      kernel checks');
+    - ``xt``: K2's tagged x rows (OPT_TAG_X);
+    - ``k1``: K1's own launches (``k1.scratch_bytes``);
+    - ``mla_pre``: the MLA projection front;
+    - ``front``: the DCP MLA front (``mla_front.scratch_layout`` inside it),
+      the spec's builds and the ``x_in`` ones inside SGLang's attention.
+
+    Every launch takes its offset from here, and the end sizes the runner's
+    allocation (``scratch_alloc_bytes``)."""
     from sgl_amd_mono.kimi_k3.gfx950 import k1
+    from sgl_amd_mono.kimi_k3.gfx950.attention import mla_front as mf
     from sgl_amd_mono.kimi_k3.gfx950.attention import mla_pre
 
-    end = max(
-        k2b.scratch_bytes(k2b.MoeBuild(tokens=MAX_ROWS)),
-        scratch_bytes(K2Build(tokens=K2_MAX_ROWS, nblocks=MAX_BLOCKS)),
-        k1.scratch_bytes(MAX_ROWS),
-        mla_pre.scratch_bytes(mla_pre.MlaPreBuild(tokens=MAX_ROWS, nblocks=MAX_BLOCKS)),
-    )
-    return -(-end // 4096) * 4096
+    widths = range(1, rows + 1)
+    sizes = {
+        "k2": max(
+            k2b.scratch_bytes(k2b.MoeBuild(tokens=MAX_ROWS)),
+            *(scratch_bytes(K2Build(tokens=s, nblocks=MAX_BLOCKS)) for s in widths),
+        ),
+        "xt": rows * HIDDEN // 2 * 8,
+        "k1": k1.scratch_bytes(rows),
+        "mla_pre": mla_pre.scratch_bytes(mla_pre.MlaPreBuild(tokens=MAX_ROWS, nblocks=MAX_BLOCKS)),
+        "front": max(
+            mf.scratch_bytes(mf.MlaFrontBuild(tokens=s, nblocks=nb, scale=1.0, x_in=x_in))
+            for s in range(mf.G_ROWS, min(front_rows, mf.G_ROWS * mf.MAX_REQS) + 1, mf.G_ROWS)
+            for nb, x_in in ((MAX_BLOCKS, False), (0, True))
+        ),
+    }
+    out, off = {}, 0
+    for name, n in sizes.items():
+        out[name] = (off, n)
+        off = -(-(off + n) // 4096) * 4096
+    return out
+
+
+def scratch_region(scratch, name: str):
+    """Region ``name`` (``scratch_regions``) of the runner's uint8 ``scratch``."""
+    off, n = scratch_regions()[name]
+    return scratch[off : off + n]
+
+
+def tag_offset() -> int:
+    """Where the tagged x rows (OPT_TAG_X) start in the scratch."""
+    return scratch_regions()["xt"][0]
 
 
 def scratch_alloc_bytes() -> int:
-    """The scratch every Kimi-K3 launch on a rank shares, tagged x rows included."""
-    return tag_offset() + NARROW_ROWS * HIDDEN // 2 * 8
+    """The scratch every Kimi-K3 launch on a rank shares: every region."""
+    return -(-max(o + n for o, n in scratch_regions().values()) // 4096) * 4096
 
 
 def scratch_layout(key: K2Build) -> dict:

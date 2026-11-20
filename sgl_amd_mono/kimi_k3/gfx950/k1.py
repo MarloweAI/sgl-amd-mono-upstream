@@ -351,12 +351,12 @@ def warmup(runner, packed: K1Layer, prefix, blocks) -> None:
     state tensors are not available yet at build, so they are stand-ins of the
     right shape; only the build key reaches the compiler.
     """
+    from sgl_amd_mono.kimi_k3.gfx950 import layer
     from sgl_amd_mono.kimi_k3.gfx950.attention import kda
 
-    need = kda.scratch_bytes(packed.key)
-    assert need <= runner.scratch.numel(), (
-        f"K1 layer {packed.i} needs {need} B of scratch, the runner has "
-        f"{runner.scratch.numel()}"
+    need, have = kda.scratch_bytes(packed.key), layer.scratch_regions()["k1"][1]
+    assert need <= have, (
+        f"K1 layer {packed.i} needs {need} B of scratch, its region has {have}"
     )
     # A block-write layer stores its bank row at block write_idx: the bank must
     # hold that block, or the last token's row lands past the allocation.
@@ -407,7 +407,7 @@ def warmup(runner, packed: K1Layer, prefix, blocks) -> None:
             else None
         ),
         core_out=torch.empty(rows, kda.PROJ, dtype=torch.bfloat16, device=device),
-        scratch=runner.scratch,
+        scratch=layer.scratch_region(runner.scratch, "k1"),
         epoch=runner.epoch,
         layer=packed.i,
     )
@@ -738,6 +738,7 @@ def launch(runner, packed: K1Layer, prefix, attn_res, state) -> torch.Tensor:
     host sync, which a CUDA graph capture rejects, and this runs inside a
     captured decode graph.
     """
+    from sgl_amd_mono.kimi_k3.gfx950 import layer
     from sgl_amd_mono.kimi_k3.gfx950.attention import kda
 
     qlen = packed.key.qlen
@@ -777,7 +778,7 @@ def launch(runner, packed: K1Layer, prefix, attn_res, state) -> torch.Tensor:
         ),
         init_slot=state["slot_i32"] if packed.key.init_committed else None,
         core_out=core,
-        scratch=runner.scratch,
+        scratch=layer.scratch_region(runner.scratch, "k1"),
         epoch=runner.epoch,
         # K2 takes slot 128 + i. The slots below it are free for exactly one
         # more launch a layer. A tag only has to tell apart the pairs live at
