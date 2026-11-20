@@ -183,6 +183,8 @@ class K1Layer(msgspec.Struct):
     conv: Any  # a row of K1Batch.conv, not an allocation of its own
     mamba_idx: int  # this layer's index into the KDA state pools
     w_in: Any = None  # in_proj, packed in place (``inproj.InProj.pack``)
+    # the wide form inside the layer's K2 launch (``gfx950/kda_layer.py``)
+    one_launch: bool = False
 
 
 class K1Batch(msgspec.Struct):
@@ -257,6 +259,15 @@ def _unsupported_reasons(layer) -> list[str]:
 # rows the one-request form is the faster on tier 0 (35.2 against 38.3 us).
 WIDE_FROM_REQS = 2
 WIDE_MAX_REQS = 8
+
+
+def one_launch_takes(layer, qlen: int) -> bool:
+    """Whether a wide-form layer runs inside its K2 launch: not a block-write
+    layer (its K2 would read the bank row the front writes cached), and a
+    request's verify rows are a core box's."""
+    from sgl_amd_mono.kimi_k3.gfx950.stages import oproj
+
+    return not layer.is_block_write_layer and qlen == oproj.CORE_REQ_ROWS
 
 
 def is_wide(packed) -> bool:
@@ -414,6 +425,7 @@ def _build_wide(layer, i: int, rows: int, qlen: int) -> Optional[K1Layer]:
         conv=None,
         mamba_idx=-1,  # prepare's first call
         w_in=_packed_w_in(layer, i),
+        one_launch=one_launch_takes(layer, qlen),
     )
 
 
@@ -502,7 +514,7 @@ def _weight_args(packed: K1Layer) -> dict:
     }
 
 
-def warmup(runner, packed: K1Layer, prefix, blocks) -> None:
+def warmup(runner, packed: K1Layer, prefix, blocks, k2=None) -> None:
     """Launch K1 once on this layer's real weights and throwaway activations.
 
     FlyDSL compiles a launcher on its first call, and the first real call is
@@ -513,7 +525,7 @@ def warmup(runner, packed: K1Layer, prefix, blocks) -> None:
     from sgl_amd_mono.kimi_k3.gfx950.attention import kda
 
     if is_wide(packed):
-        _warmup_wide(runner, packed, prefix, blocks)
+        _warmup_wide(runner, packed, prefix, blocks, k2)
         return
     need = kda.scratch_bytes(packed.key)
     assert need <= runner.scratch.numel(), (
@@ -592,9 +604,10 @@ def _wide_args(packed: K1Layer) -> dict:
     }
 
 
-def _warmup_wide(runner, packed: K1Layer, prefix, blocks) -> None:
+def _warmup_wide(runner, packed: K1Layer, prefix, blocks, k2=None) -> None:
     """The wide form's warmup launch: stand-in state of one slot (every request
-    reads and writes slot 0), throwaway outputs."""
+    reads and writes slot 0), throwaway outputs; a one-launch layer's inside
+    ``k2`` (as ``launch`` takes it)."""
     from sgl_amd_mono.kimi_k3.gfx950.attention import kda, kda_wide as kw
 
     key, device = packed.key, runner.device
@@ -612,8 +625,10 @@ def _warmup_wide(runner, packed: K1Layer, prefix, blocks) -> None:
     def z(*shape, dt=bf16):
         return torch.zeros(*shape, dtype=dt, device=device)
 
-    kw.kda_wide(
-        key,
+    _run_wide(
+        runner,
+        packed,
+        k2,
         x=z(16 * kw.tiles(key), HIDDEN),
         **_wide_args(packed),
         conv_state=z(1, kda.CONV_W - 1, chans).mT,
@@ -627,8 +642,6 @@ def _warmup_wide(runner, packed: K1Layer, prefix, blocks) -> None:
             z(1, kda.NH, L, kda.HD, dt=f32),
             z(1, kda.NH, L, dt=f32),
         ),
-        core_out=z(rows, kda.PROJ),
-        scratch=runner.scratch,
         layer=packed.i,
         epoch=runner.epoch,
         prefix=prefix,
@@ -968,8 +981,10 @@ def covered(packed: K1Layer, prefix, attn_res, state) -> bool:
     return True
 
 
-def launch(runner, packed: K1Layer, prefix, attn_res, state) -> torch.Tensor:
-    """Run K1 and return this layer's gated core output.
+def launch(runner, packed: K1Layer, prefix, attn_res, state, k2=None) -> torch.Tensor:
+    """Run K1 and return this layer's gated core output. A one-launch layer
+    runs inside ``k2(core, attn)``, the layer's K2 launch given the core
+    buffer and the attention part (``kda_layer.Attn``).
 
     Every index below stays on the device. Reading one out with ``int()`` is a
     host sync, which a CUDA graph capture rejects, and this runs inside a
@@ -978,7 +993,7 @@ def launch(runner, packed: K1Layer, prefix, attn_res, state) -> torch.Tensor:
     from sgl_amd_mono.kimi_k3.gfx950.attention import kda
 
     if is_wide(packed):
-        return _launch_wide(runner, packed, prefix, attn_res, state)
+        return _launch_wide(runner, packed, prefix, attn_res, state, k2)
     qlen = packed.key.qlen
     device = prefix.device
     # prepare() filled the conv window for every layer, and the SSM scratch
@@ -1034,16 +1049,13 @@ def launch(runner, packed: K1Layer, prefix, attn_res, state) -> torch.Tensor:
     return core
 
 
-def _launch_wide(runner, packed: K1Layer, prefix, attn_res, state) -> torch.Tensor:
+def _launch_wide(runner, packed: K1Layer, prefix, attn_res, state, k2=None) -> torch.Tensor:
     """The wide form on this layer's state; returns the gated core output."""
-    from sgl_amd_mono.kimi_k3.gfx950.attention import kda, kda_wide as kw
-
     mi = packed.mamba_idx
-    core = torch.empty(
-        packed.key.tokens, kda.PROJ, dtype=torch.bfloat16, device=prefix.device
-    )
-    kw.kda_wide(
-        packed.key,
+    core = _run_wide(
+        runner,
+        packed,
+        k2,
         x=state["wide_x"],
         **_wide_args(packed),
         conv_state=state["committed_conv"][mi].mT,
@@ -1052,8 +1064,6 @@ def _launch_wide(runner, packed: K1Layer, prefix, attn_res, state) -> torch.Tens
         conv_win=state["inter_window"][mi],
         win_row=state["wide_rows"],
         ring=tuple(t[mi] for t in state["ring"]),
-        core_out=core,
-        scratch=runner.scratch,
         # K2 takes slot 128 + i (see launch())
         layer=packed.i,
         epoch=runner.epoch,
@@ -1062,4 +1072,25 @@ def _launch_wide(runner, packed: K1Layer, prefix, attn_res, state) -> torch.Tens
     )
     if packed.key.write_idx >= 0:
         attn_res._count_write(None)  # the front wrote the bank row
+    return core
+
+
+def _run_wide(runner, packed: K1Layer, k2, **kw_args) -> torch.Tensor:
+    """The wide form's launch (``kda_wide.launch_values``' arguments but its
+    core and scratch); returns the core. A one-launch layer's runs in ``k2``,
+    its core in the runner's scratch."""
+    from sgl_amd_mono.kimi_k3.gfx950 import kda_layer
+    from sgl_amd_mono.kimi_k3.gfx950.attention import kda, kda_wide as kw
+
+    key = packed.key
+    if packed.one_launch:
+        assert k2 is not None, "a one-launch layer runs in its K2 launch"
+        core = kda_layer.core_view(key, runner.scratch)
+        vals = kw.launch_values(
+            key, core_out=core, scratch=kda_layer.attn_scratch(key, runner.scratch), **kw_args
+        )
+        k2(core, kda_layer.Attn(key=key, vals=vals))
+        return core
+    core = torch.empty(key.tokens, kda.PROJ, dtype=torch.bfloat16, device=runner.device)
+    kw.kda_wide(key, core_out=core, scratch=runner.scratch, **kw_args)
     return core

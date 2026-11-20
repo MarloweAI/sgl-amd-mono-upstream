@@ -182,7 +182,8 @@ def core_ready(c, box, t, k):
 def load_core(c, t0=0, s=None):
     """Core rows t0 .. t0 + s - 1 (bf16, ``core_ld`` elements a row; all S
     rows by default) -> LDS rows 0 .., padded. With ``core_box`` (core from
-    the same launch), each chunk after its box, device scope."""
+    the same launch), after the rows' boxes (one a thread, all at once),
+    device scope."""
     tid = c["tid"]
     s = c["S"] if s is None else s
     # read before the traced branches (a dict lookup inside one is carried state)
@@ -191,12 +192,15 @@ def load_core(c, t0=0, s=None):
     ld = c["args"].get("core_ld", ok)
     words = s * ok // 8
     row = ok + LDS_PAD
+    if const_expr(box is not None):
+        r0, r1 = t0 // CORE_REQ_ROWS, (t0 + s - 1) // CORE_REQ_ROWS
+        if tid < (r1 - r0 + 1) * (OK // 128):
+            core_ready(c, box, r0 * CORE_REQ_ROWS, tid * 128)
+        lds_barrier()
     for i in range_constexpr((words + THREADS - 1) // THREADS):
         e = fx.min(tid + THREADS * i, words - 1)
         t = e // (ok // 8)
         k = e % (ok // 8) * 8
-        if const_expr(box is not None):
-            core_ready(c, box, t0 + t, k)
         v = fx.Vector(
             bo.buffer_load(
                 rsrc(c["args"]["core"]),

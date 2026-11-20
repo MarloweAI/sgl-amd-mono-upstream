@@ -957,11 +957,14 @@ def k2_launch(
     layer,
     tl=None,
     prefix_in=None,
+    attn=None,
 ):
     """Host launcher: ``core`` [S, key.kin] bf16 (o_proj's input; rows may be
     strided, 16-B aligned), ``prefix`` updated in
     place (read from ``prefix_in`` when given), ``out`` the MoE output [S, 7168]
-    (plus the updated prefix under ``key.fold``); MoE weights as ``moe``."""
+    (plus the updated prefix under ``key.fold``); MoE weights as ``moe``.
+    ``attn`` (``kda_layer.Attn``): the layer's KDA attention in the same launch,
+    its core into ``core`` (``kda_layer.core_view``; ``key.core_box``)."""
     assert (
         w_o.shape == (HIDDEN, key.kin)
         and key.kin % 128 == 0
@@ -976,8 +979,7 @@ def k2_launch(
     assert not key.opt & OPT_TAG_X or scratch.numel() >= scratch_alloc_bytes(), (
         "OPT_TAG_X without scratch_alloc_bytes of scratch"
     )
-    f = build(key)
-    f(
+    vals = (
         core.data_ptr(),
         core.stride(0),
         w_o.data_ptr(),
@@ -1007,5 +1009,10 @@ def k2_launch(
         epoch.data_ptr(),
         layer,
         ptr(tl),
-        stream=torch.cuda.current_stream(),
     )
+    if attn is not None:
+        from sgl_amd_mono.kimi_k3.gfx950 import kda_layer
+
+        kda_layer.run_layer(attn, key, vals)
+    else:
+        build(key)(*vals, stream=torch.cuda.current_stream())

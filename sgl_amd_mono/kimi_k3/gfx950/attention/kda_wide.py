@@ -39,6 +39,7 @@ request's outputs and ring rows are the same bits in any batch.
 """
 
 from dataclasses import dataclass
+from typing import Any, NamedTuple
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -50,6 +51,7 @@ from flydsl.expr import math as fmath
 from flydsl.expr.typing import Int32, Int64, T
 
 from sgl_amd_mono.common.ops import (
+    CM_DEV,
     CM_NT,
     bf2_f32,
     bf16_pair,
@@ -879,6 +881,8 @@ def kda_task(c, task, req, h, hf, k):
     L, tid, kp = c["L"], c["tid"], c["KPT"]
     lane, wave = tid % 64, tid // 64
     a = c["args"]
+    # read before the traced branches (a dict lookup inside one is carried state)
+    box = c.get("core_box")
     fa_l, qkl, decay, vloc, ol, beta = (
         c["fa"], c["qkl"], c["decay"], c["vloc"], c["ol"], c["beta"],
     )  # fmt: skip
@@ -1069,14 +1073,27 @@ def kda_task(c, task, req, h, hf, k):
         fmath.sqrt(ss * fx.Float32(1.0 / HD) + fx.Float32(c["onorm_eps"]))
     )
     for u, x in ((0, x0), (1, x1)):
-        own = (hf == u) if c["SPLIT"] else (wave >= 0)
+        if const_expr(box is None):
+            own = (hf == u) if c["SPLIT"] else (wave >= 0)
+        else:
+            # half 0 stores both halves' channels (the same values), so one
+            # CTA's stores precede the box
+            own = hf == 0
         if (wave < L) & own:
             e = lane + 64 * u
             y = x * rr * on_w[u] * sigmoid(fx.ptr_load(c["g2l"] + (jn * HD + e)))
             bo.buffer_store(
-                y.to(fx.BFloat16), rsrc(a["core_out"]), (req * L + jn) * PROJ + h * HD + e
+                y.to(fx.BFloat16),
+                rsrc(a["core_out"]),
+                (req * L + jn) * PROJ + h * HD + e,
+                cache_modifier=0 if box is None else CM_DEV,
             )
     lds_barrier()
+    if const_expr(box is not None):
+        # every wave's core stores acknowledged, then the task's box
+        gpu.barrier()
+        if (tid == 0) & (hf == 0):
+            Mailbox(box[1]).put(box[0], task, fx.Int32(1))
     stamp(c["on"], c["tls"], tid, 8)
 
 
@@ -1085,21 +1102,18 @@ _BUILDS: dict = {}
 
 
 
-def build(key: KdaWideBuild):
-    if key in _BUILDS:
-        return _BUILDS[key]
+class KdaLdsTypes(NamedTuple):
+    smem: Any
+    role: Any
+
+
+def lds_types(key: KdaWideBuild) -> KdaLdsTypes:
+    """The LDS structs ``kda_body`` takes at this build: allocate each from the
+    enclosing kernel's allocator (``role`` may sit in a wider union)."""
     s, L = key.tokens, key.qlen
-    assert s % L == 0 and 1 <= L <= WT, (s, L)
-    ntasks = s // L * NH
     gemm = is_gemm(key)
     nt = tiles(key)
-    if gemm:
-        assert not key.front and (16 * CHUNK_T) % L == 0, "the GEMM form: no front, whole requests a fold"
-    else:
-        assert 2 * 8 * ((ntasks + 7) // 8) <= BLOCKS - TASK0, "a KDA task half a CTA"
-    lay = scratch_layout(key)
     ns = key.nblocks + 1
-    assert not key.front or (key.nblocks >= 1 and s <= NA), "the front's gate runs token t on CTA t"
 
     @fx.struct
     class GemvLds:
@@ -1131,6 +1145,201 @@ def build(key: KdaWideBuild):
     @fx.struct
     class Smem:
         tls: fx.Array[fx.Int64, TL_POINTS, 16]
+
+    return KdaLdsTypes(smem=Smem, role=RoleLds)
+
+
+KDA_ARGS = (
+    "x", "w_in", "w_fb", "conv_w", "conv_st", "a_log", "dt_bias", "on_w", "rstate",
+    "st_idx", "win_row", "conv_win", "ring_k", "ring_v", "ring_g", "ring_b",
+    "core_out", "proj_dbg", "o_dbg", "cs_seq", "cs_dim", "cs_tok", "rs_seq",
+    "cw_seq", "cw_tok", "cw_q", "rk_seq", "rv_seq", "rg_seq", "rb_seq", "ring_len",
+    "layer", "epoch", "tl", "prefix", "blocks", "blk_sm", "blk_sr", "ares_nw",
+    "ares_qk", "in_nw", "reqs",
+)  # kda_body's ``args``: the kernel's parameters but its scratch
+
+
+@flyc.jit
+def kda_body(key: KdaWideBuild, smem, role, scratch, args: dict) -> None:
+    """The launch's whole body, traced into the calling kernel: LDS from the
+    ``lds_types`` structs (``smem`` peeked, ``role`` as allocated), the scratch
+    layout (``scratch_layout``) from ``scratch``; ``args`` the kernel
+    parameters by ``KDA_ARGS`` name. With ``args["core_box"]`` = (box region,
+    tag) the core is stored device scope and each (request, head) task's box
+    then holds the tag (a consumer in the same launch)."""
+    s, L = key.tokens, key.qlen
+    assert s % L == 0 and 1 <= L <= WT, (s, L)
+    ntasks = s // L * NH
+    gemm = is_gemm(key)
+    nt = tiles(key)
+    if gemm:
+        assert not key.front and (16 * CHUNK_T) % L == 0, "the GEMM form: no front, whole requests a fold"
+    else:
+        assert 2 * 8 * ((ntasks + 7) // 8) <= BLOCKS - TASK0, "a KDA task half a CTA"
+    lay = scratch_layout(key)
+    ns = key.nblocks + 1
+    assert not key.front or (key.nblocks >= 1 and s <= NA), "the front's gate runs token t on CTA t"
+
+    a_ = args
+    x, w_in, w_fb, conv_w, conv_st = a_["x"], a_["w_in"], a_["w_fb"], a_["conv_w"], a_["conv_st"]
+    a_log, dt_bias, on_w, rstate = a_["a_log"], a_["dt_bias"], a_["on_w"], a_["rstate"]
+    st_idx, win_row, conv_win = a_["st_idx"], a_["win_row"], a_["conv_win"]
+    ring_k, ring_v, ring_g, ring_b = a_["ring_k"], a_["ring_v"], a_["ring_g"], a_["ring_b"]
+    core_out, proj_dbg, o_dbg = a_["core_out"], a_["proj_dbg"], a_["o_dbg"]
+    cs_seq, cs_dim, cs_tok, rs_seq = a_["cs_seq"], a_["cs_dim"], a_["cs_tok"], a_["rs_seq"]
+    cw_seq, cw_tok, cw_q = a_["cw_seq"], a_["cw_tok"], a_["cw_q"]
+    rk_seq, rv_seq, rg_seq, rb_seq = a_["rk_seq"], a_["rv_seq"], a_["rg_seq"], a_["rb_seq"]
+    ring_len, layer, epoch, tl = a_["ring_len"], a_["layer"], a_["epoch"], a_["tl"]
+    prefix, blocks, blk_sm, blk_sr = a_["prefix"], a_["blocks"], a_["blk_sm"], a_["blk_sr"]
+    ares_nw, ares_qk, in_nw, reqs = a_["ares_nw"], a_["ares_qk"], a_["in_nw"], a_["reqs"]
+    core_box = args.get("core_box")
+    assert core_box is None or not is_gemm(key), "a core box: the first form"
+    tid = fx.thread_idx.x
+    bid = fx.block_idx.x
+    gl, kl, fl = role.gemv.peek(), role.kda.peek(), role.front.peek()
+    mb = Mailbox(step_tag(epoch, layer) - 1)
+    c = {
+        "S": s,
+        "L": L,
+        "T": nt,
+        "D": depth(key),
+        "KPT": KPT,
+        "tid": tid,
+        "bid": bid,
+        "lane": tid % 64,
+        "wave": uniform(tid // 64),
+        "debug": key.debug,
+        "front": key.front,
+        "lb": key.lower_bound,
+        "onorm_eps": key.onorm_eps,
+        "tag": mb.tag,
+        "SPLIT": True,
+        "red": gl.red.ptr,
+        "fa": kl.fa.ptr,
+        "qkl": kl.qkl.ptr,
+        "decay": kl.decay.ptr,
+        "vloc": kl.vloc.ptr,
+        "ol": kl.ol.ptr,
+        "g2l": kl.g2l.ptr,
+        "beta": kl.beta.ptr,
+        "on": key.timeline,
+        "tls": smem.tls.ptr,
+        "proj": sreg(scratch, lay["proj"][0], "proj"),
+        "part": sreg(scratch, lay["part"][0], "part"),
+        "ox": sreg(scratch, lay["ox"][0], "ox"),
+        "args": {
+            "x": x,
+            "w_in": w_in,
+            "w_fb": w_fb,
+            "conv_w": conv_w,
+            "conv_st": conv_st,
+            "a_log": a_log,
+            "dt_bias": dt_bias,
+            "on_w": on_w,
+            "rstate": rstate,
+            "st_idx": st_idx,
+            "win_row": win_row,
+            "conv_win": conv_win,
+            "ring_k": ring_k,
+            "ring_v": ring_v,
+            "ring_g": ring_g,
+            "ring_b": ring_b,
+            "core_out": core_out,
+            "proj_dbg": proj_dbg,
+            "o_dbg": o_dbg,
+            "cs_seq": cs_seq,
+            "cs_dim": cs_dim,
+            "cs_tok": cs_tok,
+            "rs_seq": rs_seq,
+            "cw_seq": cw_seq,
+            "cw_tok": cw_tok,
+            "cw_q": cw_q,
+            "rk_seq": rk_seq,
+            "rv_seq": rv_seq,
+            "rg_seq": rg_seq,
+            "rb_seq": rb_seq,
+            "ring_len": ring_len,
+        },
+    }
+    if const_expr(key.front):
+        # the seam's state, as K1 builds it (attention side: no delta)
+        fc = {
+            "S": s,
+            "NS": ns,
+            "NB": key.nblocks,
+            "tid": tid,
+            "lane": tid % 64,
+            "wave": tid // 64,
+            "delta": False,
+            "debug": False,
+            "eps": key.eps,
+            "out_eps": key.out_eps,
+            "write_idx": key.write_idx,
+            "x_tiles": nt,
+            "put": mb.put,
+            "poll": mb.poll,
+            "red": fl.red.ptr,
+            "vals": fl.vals.ptr,
+            "xbuf": x,
+            "args": {
+                "prefix": prefix,
+                "blocks": blocks,
+                "blk_sm": blk_sm,
+                "blk_sr": blk_sr,
+                "ares_nw": ares_nw,
+                "ares_qk": ares_qk,
+                "in_nw": in_nw,
+            },
+        }
+        for region in ("part", "wgt", "xrdy"):
+            fc[region] = sreg(scratch, lay["f" + region][0], "f" + region)
+        c["fc"] = fc
+    if const_expr(core_box is not None):
+        c["core_box"] = core_box
+    stamp_begin(key.timeline, smem.tls.ptr, tid, TL_POINTS)
+    if const_expr(gemm):
+        c["R"] = reqs
+        c["RMAX"] = gemm_reqs(key)
+        # whole tasks, BLOCKS a round, once halves need more than one round
+        c["SPLIT"] = gemm_reqs(key) * NH <= TASK_SLOTS
+        c["NPASS"] = (nt + PASS_T - 1) // PASS_T
+        c["task_pre"] = task_pre(c)
+        for p in range_constexpr(c["NPASS"]):
+            gemm_pass(c, p)
+        gemm_tasks(c)
+    if const_expr(key.front):
+        if bid < NA:
+            front_slice(fc, bid)
+            stamp(key.timeline, smem.tls.ptr, tid, 10)
+            if bid < s:
+                front_gate(fc, bid)
+            stamp(key.timeline, smem.tls.ptr, tid, 11)
+            front_mix(fc, bid)
+            stamp(key.timeline, smem.tls.ptr, tid, 12)
+    if const_expr(not gemm):
+        # task t = (request, head), half hf on CTA TASK0 + 16 (t // 8) + 8 hf + t % 8,
+        # its inputs in flight under the emit
+        o = fx.max(bid - TASK0, 0)
+        hf = (o % 16) // 8
+        t = o // 16 * 8 + o % 8
+        has = (bid >= TASK0) & (t < ntasks)
+        tc = uniform(fx.min(t, ntasks - 1))
+        c["req"] = tc // NH
+        gemv_loop(c)
+        c["pre"] = lambda: kda_pre(c, tc // NH, tc % NH, hf, has, c["slot0"], c["w_row"])
+        gemv_emit(c)
+        if has:
+            kda_task(c, tc, tc // NH, tc % NH, hf, c["k"])
+    stamp_flush(key.timeline, smem.tls.ptr, tl, tid, bid, TL_POINTS)
+
+
+
+def build(key: KdaWideBuild):
+    if key in _BUILDS:
+        return _BUILDS[key]
+    types = lds_types(key)
+    s, L = key.tokens, key.qlen
+    gemm = is_gemm(key)
 
     keyed = key_tuple(key, SOURCES)
     name = f"k3_mono_kda_wide_s{s}_l{L}_d{depth(key)}_g{int(key.debug)}_t{int(key.timeline)}"
@@ -1186,144 +1395,17 @@ def build(key: KdaWideBuild):
         reqs: Int32,
     ):
         _ = keyed
-        tid = fx.thread_idx.x
-        bid = fx.block_idx.x
         alloc = fx.SharedAllocator()
-        lds = alloc.allocate(Smem).peek()
-        role = alloc.allocate(RoleLds)
-        gl, kl, fl = role.gemv.peek(), role.kda.peek(), role.front.peek()
-        mb = Mailbox(step_tag(epoch, layer) - 1)
-        c = {
-            "S": s,
-            "L": L,
-            "T": nt,
-            "D": depth(key),
-            "KPT": KPT,
-            "tid": tid,
-            "bid": bid,
-            "lane": tid % 64,
-            "wave": uniform(tid // 64),
-            "debug": key.debug,
-            "front": key.front,
-            "lb": key.lower_bound,
-            "onorm_eps": key.onorm_eps,
-            "tag": mb.tag,
-            "SPLIT": True,
-            "red": gl.red.ptr,
-            "fa": kl.fa.ptr,
-            "qkl": kl.qkl.ptr,
-            "decay": kl.decay.ptr,
-            "vloc": kl.vloc.ptr,
-            "ol": kl.ol.ptr,
-            "g2l": kl.g2l.ptr,
-            "beta": kl.beta.ptr,
-            "on": key.timeline,
-            "tls": lds.tls.ptr,
-            "proj": sreg(scratch, lay["proj"][0], "proj"),
-            "part": sreg(scratch, lay["part"][0], "part"),
-            "ox": sreg(scratch, lay["ox"][0], "ox"),
-            "args": {
-                "x": x,
-                "w_in": w_in,
-                "w_fb": w_fb,
-                "conv_w": conv_w,
-                "conv_st": conv_st,
-                "a_log": a_log,
-                "dt_bias": dt_bias,
-                "on_w": on_w,
-                "rstate": rstate,
-                "st_idx": st_idx,
-                "win_row": win_row,
-                "conv_win": conv_win,
-                "ring_k": ring_k,
-                "ring_v": ring_v,
-                "ring_g": ring_g,
-                "ring_b": ring_b,
-                "core_out": core_out,
-                "proj_dbg": proj_dbg,
-                "o_dbg": o_dbg,
-                "cs_seq": cs_seq,
-                "cs_dim": cs_dim,
-                "cs_tok": cs_tok,
-                "rs_seq": rs_seq,
-                "cw_seq": cw_seq,
-                "cw_tok": cw_tok,
-                "cw_q": cw_q,
-                "rk_seq": rk_seq,
-                "rv_seq": rv_seq,
-                "rg_seq": rg_seq,
-                "rb_seq": rb_seq,
-                "ring_len": ring_len,
-            },
-        }
-        if const_expr(key.front):
-            # the seam's state, as K1 builds it (attention side: no delta)
-            fc = {
-                "S": s,
-                "NS": ns,
-                "NB": key.nblocks,
-                "tid": tid,
-                "lane": tid % 64,
-                "wave": tid // 64,
-                "delta": False,
-                "debug": False,
-                "eps": key.eps,
-                "out_eps": key.out_eps,
-                "write_idx": key.write_idx,
-                "x_tiles": nt,
-                "put": mb.put,
-                "poll": mb.poll,
-                "red": fl.red.ptr,
-                "vals": fl.vals.ptr,
-                "xbuf": x,
-                "args": {
-                    "prefix": prefix,
-                    "blocks": blocks,
-                    "blk_sm": blk_sm,
-                    "blk_sr": blk_sr,
-                    "ares_nw": ares_nw,
-                    "ares_qk": ares_qk,
-                    "in_nw": in_nw,
-                },
-            }
-            for region in ("part", "wgt", "xrdy"):
-                fc[region] = sreg(scratch, lay["f" + region][0], "f" + region)
-            c["fc"] = fc
-        stamp_begin(key.timeline, lds.tls.ptr, tid, TL_POINTS)
-        if const_expr(gemm):
-            c["R"] = reqs
-            c["RMAX"] = gemm_reqs(key)
-            # whole tasks, BLOCKS a round, once halves need more than one round
-            c["SPLIT"] = gemm_reqs(key) * NH <= TASK_SLOTS
-            c["NPASS"] = (nt + PASS_T - 1) // PASS_T
-            c["task_pre"] = task_pre(c)
-            for p in range_constexpr(c["NPASS"]):
-                gemm_pass(c, p)
-            gemm_tasks(c)
-        if const_expr(key.front):
-            if bid < NA:
-                front_slice(fc, bid)
-                stamp(key.timeline, lds.tls.ptr, tid, 10)
-                if bid < s:
-                    front_gate(fc, bid)
-                stamp(key.timeline, lds.tls.ptr, tid, 11)
-                front_mix(fc, bid)
-                stamp(key.timeline, lds.tls.ptr, tid, 12)
-        if const_expr(not gemm):
-            # task t = (request, head), half hf on CTA TASK0 + 16 (t // 8) + 8 hf + t % 8,
-            # its inputs in flight under the emit
-            o = fx.max(bid - TASK0, 0)
-            hf = (o % 16) // 8
-            t = o // 16 * 8 + o % 8
-            has = (bid >= TASK0) & (t < ntasks)
-            tc = uniform(fx.min(t, ntasks - 1))
-            c["req"] = tc // NH
-            gemv_loop(c)
-            c["pre"] = lambda: kda_pre(c, tc // NH, tc % NH, hf, has, c["slot0"], c["w_row"])
-            gemv_emit(c)
-            if has:
-                kda_task(c, tc, tc // NH, tc % NH, hf, c["k"])
-        stamp_flush(key.timeline, lds.tls.ptr, tl, tid, bid, TL_POINTS)
+        smem = alloc.allocate(types.smem).peek()
+        role = alloc.allocate(types.role)
+        params = (
+            x, w_in, w_fb, conv_w, conv_st, a_log, dt_bias, on_w, rstate, st_idx,
+            win_row, conv_win, ring_k, ring_v, ring_g, ring_b, core_out, proj_dbg,
+            o_dbg, cs_seq, cs_dim, cs_tok, rs_seq, cw_seq, cw_tok, cw_q, rk_seq,
+            rv_seq, rg_seq, rb_seq, ring_len, layer, epoch, tl, prefix, blocks,
+            blk_sm, blk_sr, ares_nw, ares_qk, in_nw, reqs,
+        )  # fmt: skip
+        kda_body(key, smem, role, scratch, dict(zip(KDA_ARGS, params)))
 
     @flyc.jit
     def launch(
@@ -1389,7 +1471,12 @@ def ptr(t):
     return 0 if t is None else t.data_ptr()
 
 
-def kda_wide(
+def kda_wide(key: KdaWideBuild, **kw):
+    """Host launcher; the arguments as ``launch_values`` takes them."""
+    build(key)(*launch_values(key, **kw), stream=torch.cuda.current_stream())
+
+
+def launch_values(
     key: KdaWideBuild,
     *,
     x,
@@ -1418,7 +1505,8 @@ def kda_wide(
     ares_qk=None,
     in_nw=None,
 ):
-    """Host launcher. ``x`` the input-normed layer input [S, 7168] bf16 as
+    """The launch's kernel arguments (``KDA_ARGS`` with the scratch, in the
+    kernel's order), checked. ``x`` the input-normed layer input [S, 7168] bf16 as
     ``pack_x`` lays it out (a ``front`` build writes it: [16 tiles, 7168], its
     rows past S zero or anything; then ``prefix`` [S, 7168] bf16 is the stream,
     ``blocks`` the AttnRes bank [S, >= nblocks (+ 1 for a write), 7168] bf16 and
@@ -1464,8 +1552,7 @@ def kda_wide(
         blk_sm, blk_sr = blocks.stride(0), blocks.stride(1)
     else:
         assert prefix is None and blocks is None
-    f = build(key)
-    f(
+    return (
         x.data_ptr(),
         w_in.data_ptr(),
         w_fb.data_ptr(),
@@ -1509,5 +1596,4 @@ def kda_wide(
         ptr(ares_qk),
         ptr(in_nw),
         R,
-        stream=torch.cuda.current_stream(),
     )

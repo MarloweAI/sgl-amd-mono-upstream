@@ -407,9 +407,17 @@ def _warmup(runner, packed_layers: dict, rows: int) -> None:
         # K1 first: on a served step it runs before this layer's K2, so the
         # waits pair up in the same order here as there.
         if packed.k1 is not None:
+
+            def k2(core_, attn, packed=packed):
+                _k2_launch(
+                    runner, packed, core_, runner.prefix[:rows], bank(packed.key.nblocks),
+                    out, attn=attn,
+                )  # fmt: skip
+
             k1_mod.warmup(
-                runner, packed.k1, runner.prefix[:rows], bank(packed.k1.key.nblocks)
-            )
+                runner, packed.k1, runner.prefix[:rows], bank(packed.k1.key.nblocks),
+                k2 if packed.k1.one_launch else None,
+            )  # fmt: skip
         if packed.front is not None:
             _front_warmup(runner, packed, rows, bank(packed.front[0].nblocks))
         if packed.mla is not None:
@@ -785,10 +793,11 @@ def _up_shard(moe, rank: int):
 
 
 def _k2_launch(
-    runner, packed: _Layer, core, prefix, blocks, out, prefix_in=None
+    runner, packed: _Layer, core, prefix, blocks, out, prefix_in=None, attn=None
 ) -> None:
     """The launch itself: this layer's weights read in place, the activations
-    the caller owns."""
+    the caller owns; with ``attn`` (``kda_layer.Attn``) the layer's KDA
+    attention runs in it too."""
     from sgl_amd_mono.kimi_k3.gfx950 import layer as k2
     from sgl_amd_mono.kimi_k3.gfx950.stages.dims import HIDDEN
 
@@ -816,16 +825,21 @@ def _k2_launch(
         w_up=_up_shard(moe, runner.rank),
         out=out,
         prefix_in=prefix_in,
+        attn=attn,
         **runner.launch_args(),
         # One tag a layer: a layer takes at most one launch in a step.
         layer=128 + packed.i,
     )
 
 
-def _launch(runner, packed: _Layer, attn_res, core, forward_batch):
-    """One layer, from the attention's TP-local core to the layer's output."""
+def _launch(runner, packed: _Layer, attn_res, core, forward_batch, out=None):
+    """One layer, from the attention's TP-local core to the layer's output;
+    ``out`` where the layer's launch ran with its attention (K1's one-launch
+    form)."""
     from sglang.srt.layers.layer_boundary.residual.batch import written_residual
 
+    if out is not None:
+        return out
     module = packed.module
     rows = core.shape[0]
     core = core.contiguous()
@@ -933,6 +947,8 @@ class _Built:
         # This step's shared K1 state and the layers that took it, set by
         # _backbone before the first layer and read by _core and finish().
         self._k1_state, self._k1_engaged = None, []
+        # {layer id: its output}, where the layer ran as one launch in _core
+        self._one_out = {}
         # Read once: _core asks this for every layer of every step, and a
         # served step must not pay for a check that is off.
         self._check = os.environ.get("SGLANG_AMD_MONO_CHECK") == "1"
@@ -1045,7 +1061,9 @@ class _Built:
             )
         bank = self.backbone.attn_bank.current
         core = self._core(layer, packed, hidden, bank, forward_batch, zero_allocator)
-        out = _launch(self.runner, packed, bank, core, forward_batch)
+        out = _launch(
+            self.runner, packed, bank, core, forward_batch, out=self._one_out.pop(i, None)
+        )
         # The launch folded the residual in, so the stream is written rather
         # than finished through ffn_boundary.
         return set_written(out, forward_batch)
@@ -1089,6 +1107,8 @@ class _Built:
                 )
             set_written(hidden, forward_batch)
             self._k1_engaged.append(packed.i)
+            if packed.k1.one_launch:
+                return self._one_launch(packed, hidden, bank, forward_batch, state)
             core = k1_mod.launch(self.runner, packed.k1, hidden, bank, state)
             if check:
                 from sgl_amd_mono.kimi_k3 import check as check_mod
@@ -1097,6 +1117,28 @@ class _Built:
             return core
         x = layer.attn_boundary.prepare(hidden, forward_batch, capture_gathered=None)
         return self._pre_o_proj(layer, x, forward_batch, zero_allocator)
+
+    def _one_launch(self, packed, hidden, bank, forward_batch, state):
+        """A KDA layer as one launch, K1's wide form inside its K2 launch:
+        returns the core it left; the layer's output waits in ``_one_out``."""
+        from sglang.srt.layers.layer_boundary.residual.batch import written_residual
+
+        from sgl_amd_mono.kimi_k3.gfx950 import k1 as k1_mod
+
+        rows = hidden.shape[0]
+        prefix_sum = written_residual(forward_batch)
+        prefix = self.runner.prefix[:rows]
+        out = torch.empty_like(prefix)
+
+        def k2(core, attn):
+            _check(packed, core, prefix_sum, bank, rows)
+            _k2_launch(
+                self.runner, packed, core, prefix, bank.block_residual, out, prefix_sum, attn=attn
+            )
+
+        core = k1_mod.launch(self.runner, packed.k1, hidden, bank, state, k2=k2)
+        self._one_out[packed.i] = out
+        return core
 
     def _front_core(self, layer, packed, hidden, bank, forward_batch):
         """An MLA layer under DCP8: the front launch, through its all-to-all,
