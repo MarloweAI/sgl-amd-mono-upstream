@@ -221,6 +221,10 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
     ):
         # CONTEXT_PARALLEL is accepted for DCP; attention CP reshapes the decode rows
         reasons.append("attention context parallel is on; only --dcp-size is accepted")
+    if (getattr(cfg, "kda_dwdp_size", None) or 1) > 1:
+        # DWDP shards the KDA in-projection, o_proj and shared experts per rank
+        # and gathers them in layer hooks; the launches read them whole
+        reasons.append("--kda-dwdp-size is on; the launches read unsharded weights")
     return reasons
 
 

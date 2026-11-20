@@ -247,6 +247,11 @@ def test_other_context_parallel_shapes_are_refused(monkeypatch):
     assert any("attention context" in r for r in _config_reasons(monkeypatch, cp))
 
 
+def test_kda_dwdp_is_refused(monkeypatch):
+    dwdp = SimpleNamespace(**{**vars(TP8_DCP8), "kda_dwdp_size": 8})
+    assert any("--kda-dwdp-size" in r for r in _config_reasons(monkeypatch, dwdp))
+
+
 def test_the_mla_front_is_off_under_dcp():
     # the front computes only this rank's 12 heads' q; SGLang's DCP MLA forward
     # needs all 96, so those layers keep SGLang's MLA attention
