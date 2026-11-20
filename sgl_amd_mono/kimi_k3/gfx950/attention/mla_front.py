@@ -404,7 +404,17 @@ def _tgemv_ops(lane, wl, wrow, col, k0, step):
     return a.bitcast(fx.BFloat16), b.bitcast(fx.BFloat16)
 
 
-def _tgemv(lane, wl, wrow, col0, k0, steps, xl, xrow, s):
+def _tgemv_cols(lane, wl, wrow, col, k0, step):
+    """``_tgemv_ops`` of a tile held column major (column c a row of ``wrow``
+    bf16 at ``wl``, K contiguous): the same operands, a 16-byte read each."""
+    g = lane // 16
+    kb = k0 + 32 * step + 8 * g
+    a = _lds16(wl + (col * wrow + kb) // 2)
+    b = _lds16(wl + ((col + 1) * wrow + kb) // 2)
+    return a.bitcast(fx.BFloat16), b.bitcast(fx.BFloat16)
+
+
+def _tgemv(lane, wl, wrow, col0, k0, steps, xl, xrow, s, cols_major=False):
     """Columns col0 + 2 (lane % 16) + dt (dt = 0, 1) of X W over K = k0 ..
     k0 + 32 steps, X the token rows in LDS (``xrow`` bf16 a row): two 16x16
     accumulators C[col][token] (lane: columns col0 + 2 (4 (lane / 16) + i) + dt,
@@ -413,7 +423,10 @@ def _tgemv(lane, wl, wrow, col0, k0, steps, xl, xrow, s):
     t = fx.min(r16, s - 1)
     acc = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(2)]
     for st in range_constexpr(steps):
-        a0, a1 = _tgemv_ops(lane, wl, wrow, col0 + 2 * r16, k0, st)
+        if const_expr(cols_major):
+            a0, a1 = _tgemv_cols(lane, wl, wrow, col0 + 2 * r16, k0, st)
+        else:
+            a0, a1 = _tgemv_ops(lane, wl, wrow, col0 + 2 * r16, k0, st)
         xb = fx.Vector(
             fx.ptr_load(
                 xl + (t * xrow + k0 + 32 * st + 8 * g) // 2,
@@ -744,8 +757,9 @@ def stage2_flag(c, h, nwait):
 
 
 def s3_loads(c, task):
-    """Absorb task ``task``'s W_UK tile, W[h][n][128 b ..+128], 16 bytes a piece
-    (4 pieces a thread, row n = piece / 16)."""
+    """Absorb task ``task``'s W_UK tile, W[h][n][128 b ..+128] of the local shard
+    as SGLang holds it (``W_KC_STRIDES``: n innermost), 16 bytes (8 n) a piece
+    (4 pieces a thread, column k = piece / 16)."""
     a = c["args"]
     tid = c["tid"]
     task = fx.min(task, ABS - 1)
@@ -755,9 +769,9 @@ def s3_loads(c, task):
     out = []
     for i in range_constexpr(4):
         p = tid + THREADS * i
-        n = p // 16
+        k = p // 16
         seg = p % 16
-        out.append(_ld4(a["w_kc"], (h * (QN * KV) + n * KV + b * 128 + seg * 8) // 2))
+        out.append(_ld4(a["w_kc"], (h * (QN * KV) + (b * 128 + k) * QN + seg * 8) // 2))
     return out
 
 
@@ -784,9 +798,9 @@ def stage3(c, task, wt):
             fx.ptr_store(v, xl + (t * xrow + k) // 2)
     for i in range_constexpr(4):
         p = tid + THREADS * i
-        n = p // 16
+        kr = p // 16
         seg = p % 16
-        fx.ptr_store(wt[i], wl + (n * ABS_ROW + seg * 8) // 2)
+        fx.ptr_store(wt[i], wl + (kr * ABS_ROW + seg * 8) // 2)  # tile row k, n 8 seg ..
     gpu.barrier()
     cq = wave % 4
     kh = wave // 4
@@ -794,7 +808,7 @@ def stage3(c, task, wt):
     tiles = gemv.tiles(s)
     for ti in range_constexpr(len(tiles)):
         t0, sj = tiles[ti]
-        acc = _tgemv(lane, wl, ABS_ROW, 32 * cq, 64 * kh, 2, xl + t0 * (xrow // 2), xrow, sj)
+        acc = _tgemv(lane, wl, ABS_ROW, 32 * cq, 64 * kh, 2, xl + t0 * (xrow // 2), xrow, sj, cols_major=True)
         # the two K halves summed in order: wave w + 4 adds onto wave w's
         rb = red + (wave * 64 + lane) * 8
         for dt in range_constexpr(2):
@@ -1995,10 +2009,21 @@ def ptr(t):
     return 0 if t is None else t.data_ptr()
 
 
+# W_UK's local shard as SGLang holds it: [12, 128 n, 512 k], n innermost
+W_KC_STRIDES = (QN * KV, 1, QN)
+
 WEIGHT_SHAPES = {
     "w_qkv": (LATW, HIDDEN), "w_g": (GATE, HIDDEN), "w_qb": (NHL * QHD, QL),
     "w_kc": (NHL, QN, KV), "w_vc": (NHA, KV, VD),
 }  # fmt: skip
+
+
+def weight_ok(name, t) -> bool:
+    """Whether ``t`` is weight ``name`` as the launch reads it: bf16 of its
+    shape, contiguous (W_UK: ``W_KC_STRIDES``)."""
+    if not isinstance(t, torch.Tensor) or t.dtype != torch.bfloat16 or tuple(t.shape) != WEIGHT_SHAPES[name]:
+        return False
+    return tuple(t.stride()) == W_KC_STRIDES if name == "w_kc" else t.is_contiguous()
 
 
 def mla_front_launch(
@@ -2017,10 +2042,7 @@ def mla_front_launch(
     ``w_kc`` this rank's 12 heads' shards."""
     assert key.write_idx < blocks.shape[1]
     for n, shp in WEIGHT_SHAPES.items():
-        t = w[n]
-        assert tuple(t.shape) == shp and t.is_contiguous() and t.dtype == torch.bfloat16, (
-            n, tuple(t.shape), t.dtype,
-        )  # fmt: skip
+        assert weight_ok(n, w[n]), (n, tuple(w[n].shape), w[n].stride(), w[n].dtype)
     assert kv.dtype in (torch.float8_e4m3fn, torch.uint8) and kv.stride(-2) == DQK
     assert kv_idx.dtype == torch.int32 and kv_ptr.dtype == torch.int32
     assert loc.dtype == torch.int64 and g_kv_ptr.dtype == torch.int32

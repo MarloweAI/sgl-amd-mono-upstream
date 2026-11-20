@@ -307,7 +307,9 @@ def rank_weights(w, o):
     key = (id(w), o)
     if key not in _WRANK:
         h0, h1 = NHL * o, NHL * (o + 1)
-        _WRANK[key] = dict(w, w_qb=w["w_qb"][h0 * QHD : h1 * QHD].contiguous(), w_kc=w["w_kc"][h0:h1].contiguous())
+        # W_UK as SGLang holds its shard: [12, 128, 512], n innermost
+        w_kc = w["w_kc"][h0:h1].transpose(1, 2).contiguous().transpose(1, 2)
+        _WRANK[key] = dict(w, w_qb=w["w_qb"][h0 * QHD : h1 * QHD].contiguous(), w_kc=w_kc)
     return _WRANK[key]
 
 

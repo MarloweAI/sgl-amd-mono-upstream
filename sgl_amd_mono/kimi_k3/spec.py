@@ -669,14 +669,9 @@ def _front_build(layer, rows: int):
         "w_kc": getattr(attn, "w_kc", None),
         "w_vc": getattr(attn, "w_vc_qrep", None),
     }
-    for n, shp in mf.WEIGHT_SHAPES.items():
+    for n in mf.WEIGHT_SHAPES:
         t = w[n]
-        if (
-            not isinstance(t, torch.Tensor)
-            or t.dtype != torch.bfloat16
-            or tuple(t.shape) != shp
-            or not t.is_contiguous()
-        ):
+        if not mf.weight_ok(n, t):
             logger.info("monokernel: no DCP front for layer %d: %s is %s", layer.layer_id if hasattr(layer, "layer_id") else -1, n, None if t is None else (t.dtype, tuple(t.shape)))  # fmt: skip
             return None
     if mqa is None or getattr(attn, "rotary_emb", None) is not None:
