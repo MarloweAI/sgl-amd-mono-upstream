@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """``kda_layer``: one Kimi-K3 KDA layer of 1 to 8 requests as one launch. The
-KDA attention (``attention/kda_wide``'s body, its seam front included) runs
-first, then K2 (``layer.k2_body``: o_proj, its all-reduce, the MLP seam and the
+KDA attention (``attention/kda_wide``'s body, with its seam front, or reading
+the x the previous layer's K2 tail left) runs first, then K2 (``layer.k2_body``: o_proj, its all-reduce, the MLP seam and the
 MoE), whose o_proj reads the core the attention's tasks wrote, chunk by chunk
 behind each (request, local head) box (``K2Build.core_box``). A CTA runs its
 attention role, then its K2 role: the CTAs with no KDA task start K2, and so its
@@ -43,7 +43,7 @@ SOURCES = kernel_sources(__name__)
 
 @dataclass(frozen=True)
 class KdaLayerBuild:
-    attn: kw.KdaWideBuild  # the wide form with its front
+    attn: kw.KdaWideBuild  # the wide form: its seam front, or (front off) x given
     k2: k2.K2Build  # the layer's K2 key, core_box on
 
 
@@ -116,7 +116,7 @@ def build(key: KdaLayerBuild):
         return _BUILDS[key]
     akey, kkey = key.attn, key.k2
     s = akey.tokens
-    assert akey.front and not kw.is_gemm(akey) and kkey.core_box and kkey.tokens == s
+    assert not kw.is_gemm(akey) and kkey.core_box and kkey.tokens == s
     # a core box is a request's verify rows of a local head
     assert akey.qlen == oproj.CORE_REQ_ROWS and s // akey.qlen <= kw.WIDE_REQS
     cbox_off, cbox_n = k2.scratch_layout(kkey)["cbox"]
@@ -141,10 +141,11 @@ def build(key: KdaLayerBuild):
 
     keyed = key_tuple(key, SOURCES)
     name = (
-        f"k3_mono_kda_layer_s{s}_f{akey.nblocks}"
+        f"k3_mono_kda_layer_s{s}_" + (f"f{akey.nblocks}" if akey.front else "x")
         + (f"a{akey.aux_slot}" if akey.aux_slot >= 0 else "")
         + f"_k{kkey.nblocks}"
         f"_t{int(akey.timeline)}{int(kkey.timeline)}_o{kkey.opt}"
+        + (f"_tl{kkey.tail.tiles}" if kkey.tail is not None else "")
     )
 
     def layer_body(
@@ -164,7 +165,7 @@ def build(key: KdaLayerBuild):
         k_bias: Int64, k_w_ld: Int64, k_w_sgu: Int64, k_w_sd: Int64, k_w13: Int64,
         k_w13s: Int64, k_w2: Int64, k_w2s: Int64, k_ln_w: Int64, k_w_up: Int64,
         k_out: Int64, k_scratch: Int64, k_peers: Int64, k_rank: Int32,
-        k_epoch: Int64, k_layer: Int32, k_tl: Int64,
+        k_epoch: Int64, k_layer: Int32, k_tl: Int64, k_tail: Int64,
     ):  # fmt: skip
         _ = keyed
         alloc = fx.SharedAllocator()
@@ -215,7 +216,8 @@ def build(key: KdaLayerBuild):
         k_bias: Int64, k_w_ld: Int64, k_w_sgu: Int64, k_w_sd: Int64, k_w13: Int64,
         k_w13s: Int64, k_w2: Int64, k_w2s: Int64, k_ln_w: Int64, k_w_up: Int64,
         k_out: Int64, k_scratch: Int64, k_peers: Int64, k_rank: Int32,
-        k_epoch: Int64, k_layer: Int32, k_tl: Int64, stream: fx.Stream = _STREAM,
+        k_epoch: Int64, k_layer: Int32, k_tl: Int64, k_tail: Int64,
+        stream: fx.Stream = _STREAM,
     ):  # fmt: skip
         _ = keyed
         kda_layer(
@@ -227,7 +229,7 @@ def build(key: KdaLayerBuild):
             k_core, k_core_ld, k_w_o, k_prefix, k_prefix_in, k_blocks, k_blk_sm,
             k_blk_sr, k_ares_nw, k_ares_qk, k_in_nw, k_w_gate, k_bias, k_w_ld,
             k_w_sgu, k_w_sd, k_w13, k_w13s, k_w2, k_w2s, k_ln_w, k_w_up, k_out,
-            k_scratch, k_peers, k_rank, k_epoch, k_layer, k_tl,
+            k_scratch, k_peers, k_rank, k_epoch, k_layer, k_tl, k_tail,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)  # fmt: skip
 
     _BUILDS[key] = run

@@ -22,6 +22,7 @@ from sgl_amd_mono.common.ops import (
     butterfly,
     hw_exp2,
     hw_rsq,
+    load_ptr64,
     rsrc,
     wave_max,
 )
@@ -32,6 +33,7 @@ from sgl_amd_mono.kimi_k3.gfx950.stages.dims import (
     GSL,
     HIDDEN,
     LOG2E,
+    NA,
     QC,
 )
 
@@ -319,6 +321,7 @@ def stage_mix(c, task):
     # read before the traced branches (a dict lookup inside one is carried state)
     tag_x = c.get("tag_x", False)
     vals_bf16 = c.get("vals_bf16", False)
+    aux = c.get("aux")
     c0 = task * COLS
     nw = s * (ns + 1)
     if const_expr(c.get("gate_local", False)):
@@ -385,6 +388,12 @@ def stage_mix(c, task):
             bo.buffer_store(xw, rsrc(c["xbuf"]), at, cache_modifier=CM_DEV)
             if const_expr(c["debug"]):
                 bo.buffer_store(xw, rsrc(a["x_dbg"]), at)
+            if const_expr(aux is not None):
+                # the drafter's aux hidden: the pre-norm mixture, row t's slot
+                ptr, slot = aux
+                bo.buffer_store(
+                    bf4_words(mixed), rsrc(ptr), (t * AUX_ROW + slot * HIDDEN + c0 + cc) // 2
+                )
     publish(c["put"], c["xrdy"], task, fx.Int32(1), tid == 0)
     gpu.barrier()
 
@@ -471,13 +480,24 @@ EX_OFF = 1024  # red words of front_gate's source weights
 def front_gate(c, t):
     """Token t: the 56 slices' partials -> source weights e_s, their sum, and
     the input_layernorm rstd of the mix -> WGT (ns + 2 values)."""
+    ns = c["NS"]
+    wgt = c["wgt"]
+    gate_sums(c, c["part"], t, front_nq(ns), True, lambda i, v: c["put"](wgt, t * (ns + 2) + i, v))
+
+
+@flyc.jit
+def gate_sums(c, part, t, nq, gram, emit):
+    """Token t's gate from the 56 slices' partials in region ``part`` (``nq`` a
+    (slice, token): each source's sum of squares and qk dot, then under
+    ``gram`` the sources' Gram terms): ``emit(i, v)`` the source weights e_s
+    (i < ns), their sum (i = ns) and, under ``gram``, the input_layernorm rstd
+    of the mix (i = ns + 1)."""
     s, ns, tid, lane, wave, red = c["S"], c["NS"], c["tid"], c["lane"], c["wave"], c["red"]
-    nq = front_nq(ns)
     pairs = front_pairs(ns)
     if tid < 8 * nq:
         g = tid // nq
         q = tid % nq
-        vals = c["poll"]([(c["part"], ((g * GSL + k) * s + t) * nq + q, 1) for k in range(GSL)])
+        vals = c["poll"]([(part, ((g * GSL + k) * s + t) * nq + q, 1) for k in range(GSL)])
         fx.ptr_store(sum_polled(vals), red + (g * nq + q))
     gpu.barrier()
     if wave == 0:
@@ -493,27 +513,29 @@ def front_gate(c, t):
         m = wave_max(logit)
         ex = (lane < ns).select(hw_exp2(logit - m), fx.Float32(0.0))
         den = butterfly(ex, (32, 16, 8, 4, 2, 1))
+        if const_expr(gram):
+            if lane < ns:
+                fx.ptr_store(ex, red + (EX_OFF + lane))
+            # lane p: Gram entry p (the diagonal, then the pairs), weighted by its sources
+            diag = [(x, x, 2 * x, 1.0) for x in range(ns)]
+            cross = [(x, y, 2 * ns + k, 2.0) for k, (x, y) in enumerate(pairs)]
+            sa, sb, gi, mult = fx.Int32(0), fx.Int32(0), fx.Int32(0), fx.Float32(0.0)
+            for p, (x, y, k, f) in enumerate(diag + cross):
+                hit = lane == p
+                sa, sb = hit.select(fx.Int32(x), sa), hit.select(fx.Int32(y), sb)
+                gi, mult = hit.select(fx.Int32(k), gi), hit.select(fx.Float32(f), mult)
+            gsum = fx.ptr_load(red + gi)
+            for g in range_constexpr(1, 8):
+                gsum = gsum + fx.ptr_load(red + (g * nq + gi))
+            term = mult * fx.ptr_load(red + (EX_OFF + sa)) * fx.ptr_load(red + (EX_OFF + sb)) * gsum
+            tot = butterfly(term, (32, 16, 8, 4, 2, 1))
+            r = hw_rsq(tot / (den * den) * fx.Float32(1.0 / HIDDEN) + fx.Float32(c["out_eps"]))
         if lane < ns:
-            fx.ptr_store(ex, red + (EX_OFF + lane))
-        # lane p: Gram entry p (the diagonal, then the pairs), weighted by its sources
-        diag = [(x, x, 2 * x, 1.0) for x in range(ns)]
-        cross = [(x, y, 2 * ns + k, 2.0) for k, (x, y) in enumerate(pairs)]
-        sa, sb, gi, mult = fx.Int32(0), fx.Int32(0), fx.Int32(0), fx.Float32(0.0)
-        for p, (x, y, k, f) in enumerate(diag + cross):
-            hit = lane == p
-            sa, sb = hit.select(fx.Int32(x), sa), hit.select(fx.Int32(y), sb)
-            gi, mult = hit.select(fx.Int32(k), gi), hit.select(fx.Float32(f), mult)
-        gsum = fx.ptr_load(red + gi)
-        for g in range_constexpr(1, 8):
-            gsum = gsum + fx.ptr_load(red + (g * nq + gi))
-        term = mult * fx.ptr_load(red + (EX_OFF + sa)) * fx.ptr_load(red + (EX_OFF + sb)) * gsum
-        tot = butterfly(term, (32, 16, 8, 4, 2, 1))
-        r = hw_rsq(tot / (den * den) * fx.Float32(1.0 / HIDDEN) + fx.Float32(c["out_eps"]))
-        if lane < ns:
-            c["put"](c["wgt"], t * (ns + 2) + lane, ex)
+            emit(lane, ex)
         if lane == 0:
-            c["put"](c["wgt"], t * (ns + 2) + ns, den)
-            c["put"](c["wgt"], t * (ns + 2) + ns + 1, r)
+            emit(ns, den)
+            if const_expr(gram):
+                emit(ns + 1, r)
     gpu.barrier()
 
 
@@ -569,3 +591,129 @@ def front_mix(c, task):
                 )
     publish(c["put"], c["xrdy"], task, fx.Int32(1), tid == 0)
     gpu.barrier()
+
+
+# ------------------------------- the next layer's attention seam, in K2's tail
+# The previous layer's K2 holds the stream (its final reduce writes it) and the
+# bank, so a KDA layer's attention-side seam and input_layernorm can run there,
+# one hand-off after the reduce instead of four in the layer's own front: the
+# reduce CTAs (task j: columns 128 j ..) slice the stream they just reduced
+# (``front_slice``'s sums, the stream from LDS) -> TPART, and push the stream
+# as tagged pairs; a row CTA a token gathers its 56 slices' partials and its
+# stream row, mixes the whole row and norms it -> the next layer's x in
+# ``pack_x``'s layout, which that layer's K1 (the wide form) reads with no
+# front. Bit for bit that front: the same sums, gate (``gate_sums``) and mix.
+TAIL_ROW0 = 84  # the row CTAs, past lnorm's: no K2 work after their down
+ROW_SL = THREADS // QC  # slices a row CTA's round: 32 threads a slice
+ROW_ROUNDS = (NA + ROW_SL - 1) // ROW_SL
+WOFF = 1536  # red words of the row CTA's weights, their sum and the rstd
+
+# the tail's device table (K2's ``tail`` argument): the next layer's AttnRes norm
+# and qk, its input_layernorm and its x, int64 addresses in this order
+TAIL_ARGS = ("ares_nw", "ares_qk", "in_nw", "x")
+
+
+def tail_arg(c, name):
+    """An address of the tail's device table, loaded where it is used."""
+    return load_ptr64(c["tail_tab"], TAIL_ARGS.index(name))
+
+
+def tail_loads(c, task):
+    """A reduce CTA's loads for its slice that wait on nothing in this launch:
+    its tokens' bank blocks and the next layer's AttnRes norm / qk words,
+    issued before the final reduce's poll."""
+    s, nb, tid = c["S"], c["NB"], c["tid"]
+    a = c["args"]
+    assert s <= THREADS // QC, "a slice's tokens in one round"
+    col = task * COLS + (tid % QC) * 4
+    t = fx.min(tid // QC, s - 1)
+    return {
+        "blk": [_raw4(a["blocks"], t * a["blk_sm"] + src * a["blk_sr"] + col) for src in range(nb)],
+        "w": _raw4(tail_arg(c, "ares_nw"), col),
+        "q": _raw4(tail_arg(c, "ares_qk"), col),
+    }
+
+
+@flyc.jit
+def tail_slice(c, task, ld):
+    """Columns 128 task ..: ``front_slice``'s per-(token, source) sums of squares
+    and qk dots and per-(token, source pair) dots of the bank blocks and the
+    stream the reduce left in LDS ``tpre`` -> TPART."""
+    s, ns, tid, lane = c["S"], c["NS"], c["tid"], c["lane"]
+    nq = front_nq(ns)
+    gpu.barrier()  # the stream's LDS copy
+    cc = (tid % QC) * 4
+    tt = tid // QC
+    live = tt < s
+    t = fx.min(tt, s - 1)
+    w, q = _f4(ld["w"]), _f4(ld["q"])
+    wq = [w[j] * q[j] for j in range(4)]
+    raw = ld["blk"] + [lds_words2(c["tpre"], (t * COLS + cc) // 2)]
+    vs = [_f4(r) for r in raw]
+    sums = []
+    for src in range_constexpr(ns):
+        v = vs[src]
+        sums.append(v[0] * v[0] + v[1] * v[1] + v[2] * v[2] + v[3] * v[3])
+        sums.append(v[0] * wq[0] + v[1] * wq[1] + v[2] * wq[2] + v[3] * wq[3])
+    for x, y in front_pairs(ns):
+        u, v = vs[x], vs[y]
+        sums.append(u[0] * v[0] + u[1] * v[1] + u[2] * v[2] + u[3] * v[3])
+    sums = [butterfly(x, (16, 8, 4, 2, 1)) for x in sums]
+    if live & (lane % 32 == 0):
+        at = (task * s + t) * nq
+        for k in range_constexpr(nq):
+            c["put"](c["tpart"], at + k, sums[k])
+
+
+def _row_col(c, r):
+    """Round r of a row CTA's thread: (live, column)."""
+    sl = r * ROW_SL + c["tid"] // QC
+    return sl < NA, fx.min(sl, NA - 1) * COLS + (c["tid"] % QC) * 4
+
+
+def row_loads(c, t):
+    """A row CTA's loads that wait on nothing in this launch: token t's bank
+    blocks and the next layer's input_layernorm words, every round."""
+    nb = c["NB"]
+    a = c["args"]
+    in_nw = tail_arg(c, "in_nw")
+    blk, wn = [], []
+    for r in range(ROW_ROUNDS):
+        col = _row_col(c, r)[1]
+        blk.append(
+            [_raw4(a["blocks"], t * a["blk_sm"] + src * a["blk_sr"] + col) for src in range(nb)]
+        )
+        wn.append(_raw4(in_nw, col))
+    return {"blk": blk, "wn": wn}
+
+
+@flyc.jit
+def tail_row(c, t, ld, mark):
+    """Token t of the next layer: its 56 slices' TPART -> the source weights,
+    their sum and the rstd (``gate_sums``, as ``front_gate``); the stream row
+    the reduce CTAs pushed; the softmax mix of every column (``front_mix``'s
+    sums); bf16 x = mixed rstd w -> the next layer's x, ``pack_x``'s layout over
+    ``tail.tiles`` tiles."""
+    ns, red = c["NS"], c["red"]
+    tiles = c["tail"].tiles
+    xbuf = tail_arg(c, "x")
+    # the stream row (the reduce CTAs' tagged pairs) in flight under TPART's poll
+    specs = [(c["tstream"], (t * HIDDEN + _row_col(c, r)[1]) // 2, 2) for r in range(ROW_ROUNDS)]
+    first = c["poll_issue"](specs)
+    gate_sums(c, c["tpart"], t, front_nq(ns), True, lambda i, v: fx.ptr_store(v, red + (WOFF + i)))
+    mark()
+    pre = c["poll_wait"](specs, first)  # a spec's two words: _f4 reads [0], [1]
+    rs = fx.ptr_load(red + (WOFF + ns + 1))
+    for r in range_constexpr(ROW_ROUNDS):
+        live, col = _row_col(c, r)
+        vs = [_f4(b) for b in ld["blk"][r]] + [_f4(pre[r])]
+        wn = _f4(ld["wn"][r])
+        mixed = []
+        for j in range_constexpr(4):
+            acc = fx.Float32(0.0)
+            for src in range_constexpr(ns):
+                acc = acc + fx.ptr_load(red + (WOFF + src)) * vs[src][j]
+            mixed.append(acc / fx.ptr_load(red + (WOFF + ns)))
+        xw = bf4_words([mixed[j] * rs * wn[j] for j in range(4)])
+        if live:
+            bo.buffer_store(xw, rsrc(xbuf), x_packed_word(t, col, tiles), cache_modifier=CM_DEV)

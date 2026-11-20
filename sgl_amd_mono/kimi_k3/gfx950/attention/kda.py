@@ -134,6 +134,9 @@ class KdaPreBuild:
     # state, read and never written; each token's conv k / v, gate and beta go
     # to the ring rows SGLang's commit replays, instead of a state a token.
     ring: bool = False
+    # the drafter's aux slot j (0 .. 4) at a DSpark capture layer's next one: the
+    # front's pre-norm mixture also into aux[row, j * 7168 ..] (bf16)
+    aux_slot: int = -1
 
 
 def scratch_layout(key: KdaPreBuild) -> dict:
@@ -619,6 +622,7 @@ def build(key: KdaPreBuild):
         f"k3_mono_kda_pre_s{s}_l{L}_nb{key.nblocks}_d{int(key.delta)}"
         f"_g{int(key.debug)}_t{int(key.timeline)}_r{int(key.ring)}"
         + ("_ic" if key.init_committed else "")
+        + (f"_a{key.aux_slot}" if key.aux_slot >= 0 else "")
     )
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
@@ -665,6 +669,7 @@ def build(key: KdaPreBuild):
         layer: Int32,
         epoch: Int64,
         tl: Int64,
+        aux: Int64,
     ):
         _ = keyed
         tid = fx.thread_idx.x
@@ -751,6 +756,8 @@ def build(key: KdaPreBuild):
         }
         for region in ("part", "wgt", "msq", "xrdy", "proj", "qk", "onrm"):
             c[region] = sreg(scratch, lay[region][0], region)
+        if const_expr(key.aux_slot >= 0):
+            c["aux"] = (aux, key.aux_slot)
         on, tls = key.timeline, lds.tls.ptr
         c["on"], c["tls"] = on, tls
         stamp_begin(on, tls, tid, TL_POINTS)
@@ -823,6 +830,7 @@ def build(key: KdaPreBuild):
         layer: Int32,
         epoch: Int64,
         tl: Int64,
+        aux: Int64,
         stream: fx.Stream = _STREAM,
     ):
         _ = keyed
@@ -869,6 +877,7 @@ def build(key: KdaPreBuild):
             layer,
             epoch,
             tl,
+            aux,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 
     _BUILDS[key] = launch
@@ -908,19 +917,27 @@ def kda_pre(
     ring=None,
     rstate0=None,
     init_slot=None,
+    aux=None,
 ):
     """Host launcher. ``w_in`` in_proj as ``kda_wide.pack_w_in`` lays it out;
     ``conv_state`` [slots, dim, state_len] or a transposed view
     of [slots, state_len, dim] (strides read); ``rstate`` [slots, 12, 128, 128]
     fp32; ``st_idx`` [R, >= L] int32; ``scratch`` zeroed before the step's first
     layer (tags are a layer's); ``epoch`` a device int32 bumped once a step and
-    ``layer`` this launch's slot below ``TAG_SLOTS``."""
+    ``layer`` this launch's slot below ``TAG_SLOTS``; ``aux`` (``aux_slot``) the
+    drafter's aux_hidden_states_buffer [>= S, 5 x 7168] bf16."""
     assert w_in.shape == (NPROJ, HIDDEN) and w_in.is_contiguous()
     assert rstate.dtype == torch.float32 and rstate[0].numel() == NH * HD * HD
     assert rstate[0].is_contiguous(), (
         "a slot's state must be dense; slots may be strided"
     )
     assert conv_state.dtype == torch.bfloat16
+    assert (key.aux_slot >= 0) == (aux is not None)
+    if aux is not None:
+        from sgl_amd_mono.kimi_k3.gfx950.stages.seam import AUX_ROW
+
+        assert aux.dtype == torch.bfloat16 and aux.is_contiguous()
+        assert aux.shape[0] >= key.tokens and aux.shape[1] == AUX_ROW
     assert (ring is not None) == key.ring, (
         "a ring build takes the ring rows, and only it"
     )
@@ -981,5 +998,6 @@ def kda_pre(
         layer,
         epoch.data_ptr(),
         ptr(tl),
+        ptr(aux),
         stream=torch.cuda.current_stream(),
     )
