@@ -295,8 +295,9 @@ def scratch_layout(key: MlaFrontBuild) -> dict:
         "absrdy": ABS,
         "kvrdy": nreq,
         "itrdy": (NHA // heads_of(s)) * MAX_SPLITS * nreq,
-        "olrdy": BLOCKS,
     }
+    if wide(s):
+        pairs["olrdy"] = BLOCKS
     lay = pair_layout(pairs.items())
     end = max(o + n for o, n in lay.values())
 
@@ -314,8 +315,9 @@ def scratch_layout(key: MlaFrontBuild) -> dict:
     add("ml", MAX_SPLITS * s * NHA * 2 * 4)
     add("g", s * GATE * 2)
     add("grdy", mc.GATE_GROUPS * 8)
-    add("ol", s * NHA * KV * 2)
-    add("olse", s * NHA * 4)
+    if wide(s):
+        add("ol", s * NHA * KV * 2)
+        add("olse", s * NHA * 4)
     return lay
 
 
@@ -1737,15 +1739,28 @@ def _merge_task(c, e, h, half, n):
     o = e % (KV // 8)
     owner = h // NHL
     hl = h % NHL
-    mws, pvs = _split_loads(c, t, h, o, n)
-    mx, mls = _split_max(mws, n)
+    # one request: a split's values loaded as its weight is known (fewer
+    # registers live than ``_split_loads``)
+    mx = fx.Float32(NEG)
+    mls = []
+    for sp in range_constexpr(MAX_SPLITS):
+        live = sp < n
+        spc = fx.min(fx.Int32(sp), n - 1)
+        mw = fx.Vector(
+            bo.buffer_load(rsrc(c["ml"]), ((spc * s + t) * NHA + h) * 2, vec_width=2, dtype=T.f32, cache_modifier=CM_DEV)
+        )
+        mm = live.select(mw[0], fx.Float32(NEG))
+        ll = live.select(mw[1], fx.Float32(0.0))
+        mls.append((mm, ll, spc))
+        mx = fx.max(mx, mm)
     lsum = fx.Float32(0.0)
     tot = [fx.Float32(0.0)] * 8
     for sp in range_constexpr(MAX_SPLITS):
-        mm, ll = mls[sp]
+        mm, ll, spc = mls[sp]
         wgt = hw_exp2(mm - mx) * ll
         lsum = lsum + wgt
-        vals = fx.Vector(pvs[sp]).bitcast(fx.Float16).to(fx.Float32)
+        pv = _ld4(c["pv"], (((spc * s + t) * NHA + h) * KV + 8 * o) // 2, CM_DEV)
+        vals = fx.Vector(pv).bitcast(fx.Float16).to(fx.Float32)
         tot = [tot[e_] + wgt * vals[e_] for e_ in range(8)]
     inv = (lsum > fx.Float32(0.0)).select(fx.Float32(1.0) / lsum, fx.Float32(0.0))
     ob = fx.Vector.from_elements([tot[e_] * inv for e_ in range(8)], fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)
@@ -2098,8 +2113,6 @@ def build(key: MlaFrontBuild):
                 "newkv": scratch + fx.Int64(lay["newkv"][0]),
                 "pv": scratch + fx.Int64(lay["pv"][0]),
                 "ml": scratch + fx.Int64(lay["ml"][0]),
-                "ol": scratch + fx.Int64(lay["ol"][0]),
-                "olse": scratch + fx.Int64(lay["olse"][0]),
                 "kvl": cl.kv.ptr, "pl": cl.p.ptr, "al": cl.alpha.ptr, "mll": cl.ml.ptr,
                 "qll": cl.q.ptr if nreq == 1 else None, "vt": cl.vt.ptr if nreq > 1 else None,
                 "records": key.records, "gate0": S1_GATE0, "gbuf": gate,
@@ -2113,8 +2126,13 @@ def build(key: MlaFrontBuild):
                     "send": send, "core": core, "q_lora": 0, "peers": peers,
                 },
             }  # fmt: skip
-            for region in ("part", "wgt", "msq", "xrdy", "ss", "qrdy", "absrdy", "kvrdy", "itrdy", "grdy", "olrdy"):
+            for region in ("part", "wgt", "msq", "xrdy", "ss", "qrdy", "absrdy", "kvrdy", "itrdy", "grdy"):
                 c[region] = sreg(scratch, lay[region][0], region)
+            if const_expr(wd):
+                # the wide merge's latent rows, their LSEs and its CTAs' flags
+                c["olrdy"] = sreg(scratch, lay["olrdy"][0], "olrdy")
+                c["ol"] = scratch + fx.Int64(lay["ol"][0])
+                c["olse"] = scratch + fx.Int64(lay["olse"][0])
             on, tls = key.timeline, lds.tls.ptr
             c["on"], c["tls"] = on, tls
             stamp_begin(on, tls, tid, TL_POINTS)
