@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 import kda_wide_case as kc  # noqa: E402
 
 POINTS = ("start", "mfma", "emit", "issued", "polled", "conv", "gates", "recur", "norm", "pub",
-          "f.slice", "f.gate", "f.mix", "xready")
+          "f.slice", "f.gate", "f.mix", "xready", "g.parked", "g.stored", "g.wsum")
 
 
 def main():
@@ -79,7 +79,7 @@ def main():
             # the GEMM form's points 10 .. 13 (no front)
             for p, g in zip(POINTS[10:], ("g.sums", "g.pub", "g.hpoll", "t.round1")):
                 rows[g] = rows.pop(p)
-            names = POINTS[:10] + ("g.sums", "g.pub", "g.hpoll", "t.round1")
+            names = POINTS[:10] + ("g.sums", "g.pub", "g.hpoll", "t.round1") + POINTS[14:]
         else:
             names = POINTS
         for p in names:

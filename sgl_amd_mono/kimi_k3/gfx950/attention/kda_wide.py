@@ -110,8 +110,9 @@ SCALE = HD**-0.5
 # conv inputs polled, conv done, gates + l2norm done, recurrence done, norm done, the run's
 # non-head piece published (thread 0); the front's slice, gate and mix done, x ready
 # (the GEMM form, which has no front: the last fold's sums in LDS, its pieces
-# published, the head's poll returned, the first task round done)
-TL_POINTS = 14
+# published, the head's poll returned, the first task round done; the parked
+# piece folded, the last fold's partials in LDS, its wave sums loaded)
+TL_POINTS = 17
 
 # a set spans at most 3 CTAs; a run at most 2 sets
 assert GROUPS * ROWS == NPROJ and SETS * G == GROUPS
@@ -617,6 +618,7 @@ def gemm_pass(c, p):
     if const_expr(park):
         if (u1 - 1) // HSTEPS != u0 // HSTEPS:
             gemm_fold(c, None, p, False)
+        stamp(c["on"], c["tls"], c["tid"], 14)
     gemm_fold(c, acc, p, True)
     stamp(c["on"], c["tls"], c["tid"], 2)
 
@@ -665,6 +667,8 @@ def gemm_fold(c, acc, p, last):
                 # the first task round's inputs, in flight under the fold
                 c["nxt"] = c["task_pre"](0)
         lds_barrier()
+        if const_expr(last and t0 + ntc == npt):
+            stamp(c["on"], c["tls"], tid, 15)
         n1 = G * ntc * 64
         s1 = []
         for it in range_constexpr((n1 + THREADS - 1) // THREADS):
@@ -680,6 +684,8 @@ def gemm_fold(c, acc, p, last):
                     )
                 )
             s1.append((tot, blk, ln, tid + THREADS * it < n1))
+        if const_expr(last and t0 + ntc == npt):
+            stamp(c["on"], c["tls"], tid, 16)
         lds_barrier()
         for tot, blk, ln, live in s1:
             if live:
