@@ -32,6 +32,7 @@ from sgl_amd_mono.common.ops import (
     bf16_pair,
     bf16_round,
     ld_i32,
+    lds_barrier,
     mfma_bf16,
     peer_bases,
     row_sum,
@@ -134,16 +135,17 @@ def o_dims(c):
 
 def o_loads(c, rg):
     """Rows 16 rg .. of o_proj, this wave's K chunks (wave, wave + 8, ...): a lane
-    64 B of its row a chunk."""
+    64 B of its row a chunk. A chunk past the last reads no memory (zeros)."""
     lane, wave = c["lane"], c["wave"]
     k, nch, per = o_dims(c)
-    r_w = rsrc(c["args"]["w_o"])
     row = rg * ROWS + lane % ROWS
     g = lane // ROWS
     out = []
     for i in range(per):
-        ch = fx.min(wave + WAVES * i, nch - 1)
-        base = (row * k + ch * 128 + g * 8) // 2
+        ch = wave + WAVES * i
+        live = ch < nch
+        r_w = rsrc(c["args"]["w_o"], live.select(fx.Int64(OROWS * k * 2), fx.Int64(0)))
+        base = (row * k + fx.min(ch, nch - 1) * 128 + g * 8) // 2
         out.append(
             [
                 fx.Vector(
@@ -185,7 +187,7 @@ def load_core(c, t0=0, s=None):
         )
         if tid + THREADS * i < words:
             fx.ptr_store(v, c["xl"] + (t * row + k) // 2)
-    gpu.barrier()
+    lds_barrier()
 
 
 @flyc.jit
@@ -220,7 +222,7 @@ def stage_o(c, rg, ops, t0=0, sj=None):
                 ops[i][q].bitcast(fx.BFloat16), xb.bitcast(fx.BFloat16), acc
             )
     fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
-    gpu.barrier()
+    lds_barrier()
     # the task's GEMV done, before its pushes (the last task's stamp stays)
     stamp(c.get("tl_on", False), c.get("tls"), tid, c.get("tl_push", 0))
     if tid < sj * (ROWS // 2):
@@ -238,7 +240,7 @@ def stage_o(c, rg, ops, t0=0, sj=None):
             at = (c["rank"] * s + tt) * HIDDEN + rg * ROWS + 2 * rp
             for p in range_constexpr(TP):
                 c["put_bf"](c["ar_peer"][p], at, [v0, v1])
-    gpu.barrier()
+    lds_barrier()
 
 
 @flyc.jit
@@ -275,9 +277,7 @@ def stage_reduce(c, task):
                 )
             else:
                 fx.ptr_store(bf16_round(lo), c["delta_lds"] + (t * COLS + 2 * cp))
-                fx.ptr_store(
-                    bf16_round(hi), c["delta_lds"] + (t * COLS + 2 * cp + 1)
-                )
+                fx.ptr_store(bf16_round(hi), c["delta_lds"] + (t * COLS + 2 * cp + 1))
     gpu.barrier()
 
 

@@ -216,6 +216,10 @@ def main():
     ap.add_argument("--layer", type=int, default=4)
     ap.add_argument("--widths", type=int, nargs="+", default=[6])
     ap.add_argument("--json")
+    # every width's output, the latent norm and the x rows: written to --save,
+    # or required bit for bit equal to an earlier tree's --save (--against)
+    ap.add_argument("--save")
+    ap.add_argument("--against")
     args = ap.parse_args()
     assert os.environ.get("AITER_SITUV2_A8W4") == "1", "the stock A8W4 numerics"
     load_tree(args.tree)
@@ -252,7 +256,7 @@ def main():
         "prefix": rnd(top, HIDDEN, scale=0.3),
         "blocks": rnd(top, MAX_BLOCKS, HIDDEN, scale=0.3),
     }
-    results, fails, outs = {}, [], {}
+    results, fails, outs, bits = {}, [], {}, {}
     for rows in args.widths:
         core = draw["core"][:rows].contiguous()
         prefix_in = draw["prefix"][:rows].contiguous()
@@ -322,6 +326,7 @@ def main():
             "finite": bool(torch.isfinite(out.float()).all()),
         }
         outs[rows] = out.clone()
+        bits[rows] = {"out": out.cpu(), "ln": k_ln.cpu().clone(), "x": xrow.cpu()}
         print(f"rows={rows}: {json.dumps(res)}", flush=True)
         results[rows] = res
         if not res["finite"] or res["out_vs_stock_on_kernel_routes"]["rel"] > 0.02:
@@ -334,6 +339,16 @@ def main():
         results[rows]["batch_invariant"] = same
         if not same:
             fails.append(f"invariance {rows}")
+    if args.save:
+        torch.save(bits, args.save)
+    if args.against:
+        ref_bits = torch.load(args.against, weights_only=True)
+        for rows in args.widths:
+            same = {n: torch.equal(bits[rows][n], ref_bits[rows][n]) for n in bits[rows]}
+            print(f"against {args.against} rows={rows}: {same}", flush=True)
+            results[rows]["against"] = same
+            if not all(same.values()):
+                fails.append(f"against {rows}")
     if args.json:
         with open(args.json, "w") as fh:
             json.dump(results, fh, indent=1)
