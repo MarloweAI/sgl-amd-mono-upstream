@@ -783,6 +783,8 @@ def main():
                 rk = Rank(keys, p, r, device, args.seed + p)
                 fr = run_front(w, st, rk, scratch, epoch, args.layer)
                 sk = stock_rank(w, fr["x"], rk, args.page_size)
+                # the send records in SGLang's a2a layout
+                assert fr["send"].shape == sk["send"].shape, (fr["send"].shape, sk["send"].shape)
                 tag = f"P={p} temp={temp} rank={r} splits={fr['splits']}"
                 # the seam
                 rx = rel(fr["x"], xr)

@@ -121,7 +121,9 @@ GATE = 1536  # g_proj's rows a rank (12 heads x 128)
 NHA = 96  # heads every rank attends
 NHL = NHA // DCP  # 12: heads a rank owns after the all-to-all
 QHD, QN, VD = 192, 128, 128  # a head's q_b rows, its nope part, v_head_dim
-REC = NHL * VD + 2  # 130: bf16 a send record (128 values, the fp32 LSE)
+# a send record, as SGLang's dcp_pack_a2a_send lays out [8, S, 12, REC]: a
+# (row, head)'s 128 bf16 values, then its fp32 LSE
+REC = VD + 2
 G_LAT = LATW // ROWS  # 132
 G_Q = QL // ROWS  # 96
 G_KV = KV // ROWS  # 32
