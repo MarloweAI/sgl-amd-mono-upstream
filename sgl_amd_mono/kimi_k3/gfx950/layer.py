@@ -44,7 +44,7 @@ from sgl_amd_mono.common.plan import (
     pair_layout,
 )
 from sgl_amd_mono.common.sync import Mailbox, preg, shift, sreg
-from sgl_amd_mono.kimi_k3 import CORE, K2_MAX_ROWS, MAX_BLOCKS, MAX_ROWS
+from sgl_amd_mono.kimi_k3 import CORE, FRONT_MAX_ROWS, K2_MAX_ROWS, MAX_BLOCKS, MAX_ROWS
 from sgl_amd_mono.kimi_k3.gfx950.stages import gemv as gemv
 from sgl_amd_mono.kimi_k3.gfx950.stages import moe as k2b
 from sgl_amd_mono.kimi_k3.gfx950.stages import oproj as k2a
@@ -243,7 +243,9 @@ def init_peer(buf: torch.Tensor) -> None:
 
 
 @functools.cache
-def scratch_regions(rows: int = K2_MAX_ROWS, front_rows: int = K2_MAX_ROWS) -> dict:
+def scratch_regions(
+    rows: int = K2_MAX_ROWS, front_rows: int = max(K2_MAX_ROWS, FRONT_MAX_ROWS)
+) -> dict:
     """The runner's scratch, one region a launch family, back to back:
     name -> (byte offset, bytes), K2 and K1 built to ``rows`` rows, the DCP
     front to ``front_rows``.
@@ -258,7 +260,8 @@ def scratch_regions(rows: int = K2_MAX_ROWS, front_rows: int = K2_MAX_ROWS) -> d
     - ``xt``: K2's tagged x rows (OPT_TAG_X);
     - ``k1``: K1's own launches (``k1.scratch_bytes``);
     - ``mla_pre``: the MLA projection front;
-    - ``front``: the DCP MLA front (``mla_front.scratch_layout`` inside it);
+    - ``front``: the DCP MLA front (``mla_front.scratch_layout`` inside it),
+      the spec's builds and the ``x_in`` ones inside SGLang's attention;
     - ``attn``: the one-launch KDA layer's attention, then its core;
     - ``tpart``, ``tstream``: K2's tail seam, its slices' partials and the
       stream rows it pushes (``tail_part_bytes``, ``tail_stream_bytes``).
@@ -280,8 +283,9 @@ def scratch_regions(rows: int = K2_MAX_ROWS, front_rows: int = K2_MAX_ROWS) -> d
         "k1": k1.scratch_bytes(rows),
         "mla_pre": mla_pre.scratch_bytes(mla_pre.MlaPreBuild(tokens=MAX_ROWS, nblocks=MAX_BLOCKS)),
         "front": max(
-            mf.scratch_bytes(mf.MlaFrontBuild(tokens=s, nblocks=MAX_BLOCKS, scale=1.0))
+            mf.scratch_bytes(mf.MlaFrontBuild(tokens=s, nblocks=nb, scale=1.0, x_in=x_in))
             for s in range(mf.G_ROWS, min(front_rows, mf.G_ROWS * mf.MAX_REQS) + 1, mf.G_ROWS)
+            for nb, x_in in ((MAX_BLOCKS, False), (0, True))
         ),
         "attn": max(
             kda_layer.region_bytes(kw.KdaWideBuild(tokens=s, qlen=kw.WT, front=True, nblocks=MAX_BLOCKS))

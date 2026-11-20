@@ -78,6 +78,7 @@ from sgl_amd_mono.common.ops import (
     sfresh64,
     sload64,
     uniform,
+    wave_max,
     xred,
 )
 from sgl_amd_mono.common.plan import (
@@ -89,7 +90,7 @@ from sgl_amd_mono.common.plan import (
     pair_layout,
 )
 from sgl_amd_mono.common import guard
-from sgl_amd_mono.common.sync import Addr, Mailbox, Space, sreg
+from sgl_amd_mono.common.sync import Addr, Mailbox, Space, publish, sreg
 from sgl_amd_mono.kimi_k3.gfx950.attention import mla_combine as mc
 from sgl_amd_mono.kimi_k3.gfx950.attention.mla_pre import load_qlora, load_x
 from sgl_amd_mono.kimi_k3.gfx950.stages import gemv
@@ -178,7 +179,7 @@ MAX_SPLITS = 21  # the most splits of a request (its 12 head groups' items fit t
 KEYS_PER_SPLIT = 64  # local keys a split aims at (one block)
 UV_HALF = 64  # value columns a W_UV task
 UV_TASKS = NHA * (VD // UV_HALF)  # 192
-UV_CTAS = 192  # a W_UV task a CTA, on CTAs 0 .. 191
+UV_CTAS = 192  # a W_UV task a CTA, on CTAs 0 .. 191, after every CTA's share of the merge
 UV_ROW = UV_HALF + 8  # bf16 a W_UV tile row in LDS
 ABS_ROW = 128 + 8  # bf16 an absorb tile row in LDS
 OL_ROW = KV + 8  # bf16 a latent output row in LDS
@@ -277,6 +278,9 @@ class MlaFrontBuild:
     # checks only: the W_UV records also to ``send`` in SGLang's all-to-all
     # layout [8, S, 12, 130]
     records: bool = False
+    # the x rows given (``prefix``: SGLang's input_layernorm output, its own
+    # seam done): no seam roles, stage 1 reads them in place
+    x_in: bool = False
 
 
 def scratch_layout(key: MlaFrontBuild) -> dict:
@@ -293,6 +297,9 @@ def scratch_layout(key: MlaFrontBuild) -> dict:
         "kvrdy": nreq,
         "itrdy": (NHA // heads_of(s)) * MAX_SPLITS * nreq,
     }
+    if wide(s):
+        pairs["olrdy"] = BLOCKS
+        pairs["deal"] = DEAL_WORDS + 2
     lay = pair_layout(pairs.items())
     end = max(o + n for o, n in lay.values())
 
@@ -310,6 +317,9 @@ def scratch_layout(key: MlaFrontBuild) -> dict:
     add("ml", MAX_SPLITS * s * NHA * 2 * 4)
     add("g", s * GATE * 2)
     add("grdy", mc.GATE_GROUPS * 8)
+    if wide(s):
+        add("ol", s * NHA * KV * 2)
+        add("olse", s * NHA * 4)
     return lay
 
 
@@ -551,11 +561,13 @@ def s1_out(c, g, acc, t0, sj):
 
 @flyc.jit
 def x_seen(c):
-    """Every slice's x ready (the wide stage 1 stages it itself)."""
+    """Every slice's x ready (the wide stage 1 stages it itself); given x
+    rows are ready at launch."""
     tid = c["tid"]
-    if tid < NA:
-        c["poll"]([(c["xrdy"], tid, 1)])
-    gpu.barrier()
+    if const_expr(not c["x_in"]):
+        if tid < NA:
+            c["poll"]([(c["xrdy"], tid, 1)])
+        gpu.barrier()
     stamp(c["on"], c["tls"], tid, 1)
 
 
@@ -1618,49 +1630,219 @@ def attention1(c, rq, hg, sa, sb):
 
 
 ITEM_COST = 2  # an item's cost past its blocks, in blocks (its run's start, its partial)
+NHG_W = NHA // 16  # 6 head groups a request past one request
 
 
-def cta_items(c, bid):
-    """CTA bid's attention items [k0, k1): item bid when the items fit the
-    CTAs, else a contiguous range from the item boundary nearest bid / 256 of
-    all the items' cost (an item's blocks + ``ITEM_COST``; items in order)."""
-    HQ, NCT, NHG = c["HQ"], c["NCT"], c["NHG"]
-    bases, total = item_bases(c)
+def dealt_places(c):
+    """Every request's items in decreasing cost (blocks + ITEM_COST a split;
+    ties by request), dealt to the CTAs as cards: round q gives item q B + i
+    to CTA i, every other round in reverse, so a CTA's few large items sit
+    beside the smallest. Each request's (splits, place in the deal) and the
+    items in all; a function of the batch alone."""
+    reqs, tot = [], fx.Int32(0)
+    for r in range(c["NREQ"]):
+        _, lr, own, n, _ = request(c, r)
+        reqs.append((blocks_of(lr, own) + ITEM_COST * n, n))
+        tot = tot + NHG_W * n
+    out = []
+    for r, (w, n) in enumerate(reqs):
+        place = fx.Int32(0)
+        for q, (wq, nq) in enumerate(reqs):
+            if q == r:
+                continue
+            # request q's items deal before r's: costlier, or as costly and earlier
+            ahead = (wq * n > w * nq) | (wq * n == w * nq) if q < r else (wq * n > w * nq)
+            place = place + ahead.select(NHG_W * nq, fx.Int32(0))
+        out.append((n, place))
+    return out, tot
 
-    def start(b):
-        nbls, rb = [], [fx.Int32(0)]
-        for r in range(c["NREQ"]):
+
+RQT = 6  # LDS words a request: splits, deal place, blocks, first item, blocks before it, cost before it
+RQT_TOT = RQT * MAX_REQS  # then the items in all, the cost in all
+
+
+@flyc.jit
+def deal_table(c):
+    """Every request's (splits, deal place, blocks) and the items in all into
+    LDS (``rqt``), once a launch: the deal's lookups read them there."""
+    if c["tid"] == 0:
+        reqs, tot = dealt_places(c)
+        first = fx.Int32(0)
+        before = fx.Int32(0)
+        cost = fx.Int32(0)
+        for r in range_constexpr(c["NREQ"]):
             _, lr, own, _, _ = request(c, r)
             nbl = blocks_of(lr, own)
-            nbls.append(nbl + ITEM_COST * bases[r][1])  # a head group's cost
-            rb.append(rb[-1] + NHG * nbls[-1])
-        x = (b * rb[-1]) // BLOCKS
-        # the last request whose blocks start before x
-        r = fx.Int32(0)
-        for j in range(1, c["NREQ"]):
-            r = r + (rb[j] < x).select(fx.Int32(1), fx.Int32(0))
-        n = pick([nn for _, nn in bases], r)
-        w = pick(nbls, r)
-        xr = x - pick(rb[:-1], r)
-        hg = xr // w
-        rem = xr % w
-        sp = (rem * n + w // 2) // w  # the nearest item boundary
-        k = pick([f for f, _ in bases], r) + hg * n + sp
-        k = (x == 0).select(fx.Int32(0), fx.min(k, total))
-        return (b >= BLOCKS).select(total, k)
-
-    few = total <= BLOCKS
-    k0 = few.select(fx.min(bid, total), start(bid))
-    k1 = few.select(fx.min(bid + 1, total), start(bid + 1))
-    return k0, k1, bases
+            for f, v in enumerate((reqs[r][0], reqs[r][1], nbl, first, before, cost)):
+                fx.ptr_store(v, c["rqt"] + (RQT * r + f))
+            first = first + NHG_W * reqs[r][0]
+            before = before + NHG_W * nbl
+            cost = cost + NHG_W * (nbl + ITEM_COST * reqs[r][0])
+        fx.ptr_store(tot, c["rqt"] + RQT_TOT)
+        fx.ptr_store(cost, c["rqt"] + (RQT_TOT + 1))
+    gpu.barrier()
 
 
-def group_of(bases, k, NHG):
-    """Item k's (request, head group) as one index 12 r + hg."""
+def rqt(c, r, f):
+    return fx.ptr_load(c["rqt"] + (RQT * r + f))
+
+
+def dealt_item(c, j):
+    """Deal place j's (request, head group, split)."""
     r = fx.Int32(0)
-    for j in range(1, len(bases)):
-        r = r + (k >= bases[j][0]).select(fx.Int32(1), fx.Int32(0))
-    return NHG * r + (k - pick([f for f, _ in bases], r)) // pick([n for _, n in bases], r)
+    k = fx.Int32(0)
+    for q in range(c["NREQ"]):
+        n, place = rqt(c, q, 0), rqt(c, q, 1)
+        hit = (j >= place) & (j < place + NHG_W * n)
+        r = hit.select(fx.Int32(q), r)
+        k = hit.select(j - place, k)
+    n = rqt(c, r, 0)
+    return r, k // n, k % n
+
+
+# The balance model (us, doubled): a block, an item (its partial), a run (its
+# pipeline's start). Each CTA works out its load under both assignments; the
+# one with the smaller busiest CTA runs (ties: contiguous ranges).
+LOAD_BLOCK, LOAD_ITEM, LOAD_RUN = 9, 18, 24
+
+
+def contig_runs(c, bid):
+    """CTA bid's contiguous range: (k0, k1, first group, runs), from the LDS table."""
+    k0, k1 = table_start(c, bid), table_start(c, bid + 1)
+    g0 = table_group(c, k0)
+    nruns = (k1 > k0).select(table_group(c, k1 - 1) - g0 + 1, fx.Int32(0))
+    return k0, k1, g0, nruns
+
+
+def contig_run(c, rng, gi):
+    """Run gi of the range: (request, head group, first split, end split)."""
+    k0, k1, g0, _ = rng
+    grp = g0 + gi
+    rq = grp // NHG_W
+    hg = grp % NHG_W
+    n = rqt(c, rq, 0)
+    gfirst = rqt(c, rq, 3) + hg * n
+    return rq, hg, fx.max(k0 - gfirst, fx.Int32(0)), fx.min(k1 - gfirst, n)
+
+
+def dealt_count(tot, bid):
+    """How many deal places (bid, 2 B - 1 - bid, 2 B + bid, ...) fall below tot."""
+    ev = fx.max(tot - bid, fx.Int32(0))
+    od = fx.max(tot - (2 * BLOCKS - 1 - bid), fx.Int32(0))
+    return (ev + 2 * BLOCKS - 1) // (2 * BLOCKS) + (od + 2 * BLOCKS - 1) // (2 * BLOCKS)
+
+
+def dealt_place(bid, i):
+    """CTA bid's i-th deal place."""
+    if isinstance(i, int):
+        return (i // 2) * (2 * BLOCKS) + (bid if i % 2 == 0 else 2 * BLOCKS - 1 - bid)
+    return (i // 2) * (2 * BLOCKS) + (i % 2 == 0).select(fx.Int32(0) + bid, 2 * BLOCKS - 1 - bid)
+
+
+def table_start(c, b):
+    """CTA b's first item under contiguous ranges, from the LDS table: item b
+    when the items fit the CTAs, else the item boundary nearest b / 256 of all
+    the items' cost (an item's blocks + ``ITEM_COST``; items in order)."""
+    nreq = c["NREQ"]
+    total = fx.ptr_load(c["rqt"] + RQT_TOT)
+    ctot = fx.ptr_load(c["rqt"] + (RQT_TOT + 1))
+    x = (b * ctot) // BLOCKS
+    r = fx.Int32(0)
+    for q in range(1, nreq):
+        r = r + (rqt(c, q, 5) < x).select(fx.Int32(1), fx.Int32(0))
+    n, nbl = rqt(c, r, 0), rqt(c, r, 2)
+    w = nbl + ITEM_COST * n
+    xr = x - rqt(c, r, 5)
+    sp = ((xr % w) * n + w // 2) // w
+    k = rqt(c, r, 3) + (xr // w) * n + sp
+    k = (x == 0).select(fx.Int32(0), fx.min(k, total))
+    k = (b >= BLOCKS).select(total, k)
+    return (total <= BLOCKS).select(fx.min(fx.Int32(0) + b, total), k)
+
+
+def table_group(c, k):
+    """Item k's (request, head group) as one index 6 r + hg, from the LDS table."""
+    r = fx.Int32(0)
+    for q in range(1, c["NREQ"]):
+        r = r + (k >= rqt(c, q, 3)).select(fx.Int32(1), fx.Int32(0))
+    return NHG_W * r + (k - rqt(c, r, 3)) // rqt(c, r, 0)
+
+
+def blocks_before(c, k):
+    """The blocks of items 0 .. k - 1 (items in (request, head group, split) order)."""
+    r = fx.Int32(0)
+    for q in range(1, c["NREQ"]):
+        r = r + (k >= rqt(c, q, 3)).select(fx.Int32(1), fx.Int32(0))
+    n, nbl = rqt(c, r, 0), rqt(c, r, 2)
+    e = k - rqt(c, r, 3)
+    return rqt(c, r, 4) + (e // n) * nbl + ((e % n) * nbl) // n
+
+
+def busiest(c):
+    """The modelled busiest CTA under contiguous ranges and under the deal (in
+    LDS ``balw``): thread t models CTA t % 256 under assignment t // 256."""
+    tid = c["tid"]
+    b = tid % BLOCKS
+    k0, k1 = table_start(c, b), table_start(c, b + 1)
+    runs = (k1 > k0).select(table_group(c, k1 - 1) - table_group(c, k0) + 1, fx.Int32(0))
+    lc = LOAD_ITEM * (k1 - k0) + LOAD_RUN * runs + LOAD_BLOCK * (blocks_before(c, k1) - blocks_before(c, k0))
+    tot = fx.ptr_load(c["rqt"] + RQT_TOT)
+    mine = dealt_count(tot, b)
+    ld = (LOAD_ITEM + LOAD_RUN) * mine
+    for i in range(DEALT_MAX):
+        rq, _, sp = dealt_item(c, fx.min(dealt_place(b, i), tot - 1))
+        ld = ld + (i < mine).select(LOAD_BLOCK * split_blocks(c, rq, sp, sp + 1), fx.Int32(0))
+    # every lane of a wave stores the wave's max (one value, one word)
+    fx.ptr_store(wave_max((tid < BLOCKS).select(lc, ld)), c["balw"] + tid // 64)
+    gpu.barrier()
+    mc = fx.ptr_load(c["balw"] + 0)
+    md = fx.ptr_load(c["balw"] + WAVES // 2)
+    for w_ in range(1, WAVES // 2):
+        mc = fx.max(mc, fx.ptr_load(c["balw"] + w_))
+        md = fx.max(md, fx.ptr_load(c["balw"] + WAVES // 2 + w_))
+    return uniform(mc), uniform(md)
+
+
+DEALT_MAX = -(-NHG_W * MAX_SPLITS * MAX_REQS // BLOCKS) + 1  # items a CTA in the deal, at most
+DEAL_CTA = KV_CTA - 1  # 253: the choice at launch, then one g_proj group (idle until the q flags)
+DEAL_WORDS = RQT_TOT + 3  # the table, the items and the cost in all, the choice
+DEAL_LOADS = DEAL_WORDS  # then the two busiest loads (for the checks)
+
+
+@flyc.jit
+def deal_choose(c):
+    """The deal's table and the choice of assignment, into DEAL for every CTA."""
+    tid = c["tid"]
+    deal_table(c)
+    mc, md = busiest(c)
+    if tid < DEAL_WORDS - 1:
+        c["put"](c["deal"], tid, fx.ptr_load(c["rqt"] + tid))
+    if tid == DEAL_WORDS - 1:
+        c["put"](c["deal"], tid, (md < mc).select(fx.Int32(1), fx.Int32(0)))
+    if tid == DEAL_LOADS:
+        c["put"](c["deal"], tid, mc)
+    if tid == DEAL_LOADS + 1:
+        c["put"](c["deal"], tid, md)
+    gpu.barrier()
+
+
+@flyc.jit
+def deal_read(c):
+    """DEAL's table into this CTA's LDS; whether the items are dealt."""
+    tid = c["tid"]
+    v = c["poll"]([(c["deal"], fx.min(tid, DEAL_WORDS - 1), 1)])[0][0]
+    if tid < DEAL_WORDS - 1:
+        fx.ptr_store(v, c["rqt"] + tid)
+    if tid == DEAL_WORDS - 1:
+        fx.ptr_store(v, c["balw"] + 0)
+    gpu.barrier()
+    return uniform(fx.ptr_load(c["balw"] + 0)) != 0
+
+
+def split_blocks(c, rq, sa, sb):
+    """Request rq's blocks in splits sa .. sb."""
+    n, nbl = rqt(c, rq, 0), rqt(c, rq, 2)
+    return (sb * nbl) // n - (sa * nbl) // n
 
 
 # ---------------------------------------------------------------- W_UV
@@ -1690,11 +1872,36 @@ def _uv_dma(c, task):
             rocdl.raw_ptr_buffer_load_lds(r_w, (c["wl"] + i * 256).llvm_ptr, 16, voff, fx.Int32(0), 0, 0)
 
 
-MERGE_THREADS = UV_DMA_W0 * 64  # the merge's threads (a row's 64 x 8 dims a round)
+def _split_loads(c, t, h, o, n):
+    """Row t, head h, dims 8 o ..: every split's (max, sum) and values, all in flight at once."""
+    s = c["S"]
+    mws, pvs = [], []
+    for sp in range_constexpr(MAX_SPLITS):
+        spc = fx.min(fx.Int32(sp), n - 1)
+        mws.append(
+            fx.Vector(
+                bo.buffer_load(rsrc(c["ml"]), ((spc * s + t) * NHA + h) * 2, vec_width=2, dtype=T.f32, cache_modifier=CM_DEV)
+            )
+        )
+        pvs.append(_ld4(c["pv"], (((spc * s + t) * NHA + h) * KV + 8 * o) // 2, CM_DEV))
+    return mws, pvs
+
+
+def _split_max(mws, n):
+    """The live splits' (max, sum), past n (NEG, 0), and their max."""
+    mx = fx.Float32(NEG)
+    mls = []
+    for sp in range_constexpr(MAX_SPLITS):
+        live = sp < n
+        mm = live.select(mws[sp][0], fx.Float32(NEG))
+        ll = live.select(mws[sp][1], fx.Float32(0.0))
+        mls.append((mm, ll))
+        mx = fx.max(mx, mm)
+    return mx, mls
 
 
 @flyc.jit
-def _merge(c, e, h, half, n):
+def _merge_task(c, e, h, half, n):
     """Merge item e (row e / 64, 8 dims at 8 (e % 64)) of head h: its n split
     partials in split order -> the bf16 latent output in LDS; the row's LSE
     beside it, pushed with the first value half."""
@@ -1704,6 +1911,8 @@ def _merge(c, e, h, half, n):
     o = e % (KV // 8)
     owner = h // NHL
     hl = h % NHL
+    # one request: a split's values loaded as its weight is known (fewer
+    # registers live than ``_split_loads``)
     mx = fx.Float32(NEG)
     mls = []
     for sp in range_constexpr(MAX_SPLITS):
@@ -1770,13 +1979,13 @@ def stage_uv(c, task):
     rounds = -(-s * (KV // 8) // MERGE_THREADS)
     if const_expr(rounds == 1):
         if tid < s * (KV // 8):
-            _merge(c, tid, h, half, bases[0][1])
+            _merge_task(c, tid, h, half, bases[0][1])
     else:
         ns_ = [n for _, n in bases]
         if tid < MERGE_THREADS:
             for rd in range(rounds):
                 e = tid + MERGE_THREADS * rd
-                _merge(c, e, h, half, pick(ns_, e // (G_ROWS * (KV // 8))))
+                _merge_task(c, e, h, half, pick(ns_, e // (G_ROWS * (KV // 8))))
     rocdl.s_waitcnt(vmcnt=0)
     gpu.barrier()
     vq = wave % 2
@@ -1802,6 +2011,139 @@ def stage_uv(c, task):
             mc.push_values(c, owner, hl, t0 + r16, col, vals)
             if (wave == 0) & (g == 0) & (half == 0):
                 lse = fx.Int32(fx.ptr_load(xl + ((t0 + r16) * OL_ROW + KV) // 2)).bitcast(fx.Float32)
+                mc.push_lse(c, owner, hl, t0 + r16, lse)
+                if const_expr(c["records"]):
+                    bo.buffer_store(lse, rsrc(a["send"]), ((owner * s + t0 + r16) * NHL + hl) * (REC // 2) + VD // 2)
+            if const_expr(c["records"]):
+                ob = fx.Vector.from_elements(vals, fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)
+                bo.buffer_store(ob, rsrc(a["send"]), (((owner * s + t0 + r16) * NHL + hl) * REC + col) // 2)
+        gpu.barrier()
+
+
+
+def merge_units(s):
+    """The merge's (head, row) units a CTA (head-major: unit h s + t), every CTA's share."""
+    return -(-NHA * s // BLOCKS)
+
+
+@flyc.jit
+def _merge(c, u, o, n):
+    """Unit u (head u // S, row u % S), 8 dims at 8 o: its n split partials in
+    split order -> the bf16 latent output row (``ol``); the row's LSE into
+    ``send`` once (o == 0)."""
+    s = c["S"]
+    a = c["args"]
+    h = u // s
+    t = u % s
+    owner = h // NHL
+    hl = h % NHL
+    mws, pvs = _split_loads(c, t, h, o, n)
+    mx, mls = _split_max(mws, n)
+    lsum = fx.Float32(0.0)
+    tot = [fx.Float32(0.0)] * 8
+    for sp in range_constexpr(MAX_SPLITS):
+        mm, ll = mls[sp]
+        wgt = hw_exp2(mm - mx) * ll
+        lsum = lsum + wgt
+        vals = fx.Vector(pvs[sp]).bitcast(fx.Float16).to(fx.Float32)
+        tot = [tot[e_] + wgt * vals[e_] for e_ in range(8)]
+    inv = (lsum > fx.Float32(0.0)).select(fx.Float32(1.0) / lsum, fx.Float32(0.0))
+    ob = fx.Vector.from_elements([tot[e_] * inv for e_ in range(8)], fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)
+    bo.buffer_store(ob, rsrc(c["ol"]), ((t * NHA + h) * KV + 8 * o) // 2, cache_modifier=CM_DEV)
+    if o == 0:
+        lse = (lsum > fx.Float32(0.0)).select(
+            (mx + fx.Float32(fmath.log2(lsum))) * fx.Float32(LN2),
+            fx.Float32(EMPTY_LSE),
+        )
+        # for the W_UV task's push with its first value half
+        bo.buffer_store(lse, rsrc(c["olse"]), t * NHA + h, cache_modifier=CM_DEV)
+
+
+MERGE_THREADS = UV_DMA_W0 * 64  # the merge's threads (64 a unit: its 8-dim pieces)
+
+
+@flyc.jit
+def stage_merge(c, bid):
+    """CTA bid's merge units, MERGE_THREADS // 64 at a time, each once its
+    request's head group's split items are in; then OLRDY. A W_UV CTA's tile
+    streams into LDS meanwhile (waves 6, 7)."""
+    HQ = c["HQ"]
+    s, tid = c["S"], c["tid"]
+    per = merge_units(s)
+    nu = MERGE_THREADS // 64
+    bases, _ = item_bases(c)
+    if bid < UV_CTAS:
+        _uv_dma(c, bid)
+    for rd in range_constexpr(-(-per // nu)):
+        k = tid // 64
+        j = tid % 64
+        u = bid * per + rd * nu + k
+        live = (tid < MERGE_THREADS) & (rd * nu + k < per) & (u < NHA * s)
+        uc = fx.min(u, NHA * s - 1)
+        r = (uc % s) // G_ROWS
+        hg = (uc // s) // HQ
+        n = pick([nn for _, nn in bases], r)
+        first = pick([f for f, _ in bases], r)
+        if live & (j < n):
+            c["poll"]([(c["itrdy"], first + hg * n + j, 1)])
+        _bar()
+        if live:
+            _merge(c, uc, j, n)
+    stamp(c["on"], c["tls"], tid, 8)
+    publish(c["put"], c["olrdy"], bid, fx.Int32(1), tid == 0)
+
+
+@flyc.jit
+def stage_wuv(c, task):
+    """W_UV for head task // 2, value columns 64 (task % 2) ..: its merged
+    rows (the merge CTAs' OLRDY) into LDS, the tile already there -> ``send``
+    (bf16)."""
+    s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
+    a = c["args"]
+    h = task // 2
+    half = task % 2
+    per = merge_units(s)
+    b0 = (h * s) // per
+    nb = ((h + 1) * s - 1) // per - b0 + 1
+    if tid < nb:
+        c["poll"]([(c["olrdy"], b0 + tid, 1)])
+    _bar()
+    xl, wl = c["xl"], c["wl"]
+    words = s * (KV // 8)
+    for i in range_constexpr(-(-words // THREADS)):
+        e = fx.min(tid + THREADS * i, words - 1)
+        t = e // (KV // 8)
+        o = e % (KV // 8)
+        v = _ld4(c["ol"], ((t * NHA + h) * KV + 8 * o) // 2, CM_DEV)
+        if tid + THREADS * i < words:
+            fx.ptr_store(v, xl + (t * OL_ROW + 8 * o) // 2)
+    rocdl.s_waitcnt(vmcnt=0)
+    gpu.barrier()
+    owner = h // NHL
+    hl = h % NHL
+    vq = wave % 2
+    kq = wave // 2
+    g, r16 = lane // 16, lane % 16
+    tiles = gemv.tiles(s)
+    for ti in range_constexpr(len(tiles)):
+        t0, sj = tiles[ti]
+        acc = _tgemv(lane, wl, UV_ROW, 32 * vq, 128 * kq, 4, xl + t0 * (OL_ROW // 2), OL_ROW, sj)
+        rb = red + (wave * 64 + lane) * 8
+        for dt in range_constexpr(2):
+            fx.ptr_store(acc[dt], rb + 4 * dt)
+        gpu.barrier()
+        if (wave < 2) & (r16 < sj):
+            vals = [None] * 8
+            for dt in range_constexpr(2):
+                for i in range_constexpr(4):
+                    tot = fx.Float32(0.0)
+                    for q in range_constexpr(4):
+                        tot = tot + fx.ptr_load(red + (((2 * q + wave) * 64 + lane) * 8 + 4 * dt + i))
+                    vals[2 * i + dt] = tot
+            col = half * UV_HALF + 32 * wave + 8 * g
+            mc.push_values(c, owner, hl, t0 + r16, col, vals)
+            if (wave == 0) & (g == 0) & (half == 0):
+                lse = fx.Int32(_ld(c["olse"], (t0 + r16) * NHA + h, CM_DEV)).bitcast(fx.Float32)
                 mc.push_lse(c, owner, hl, t0 + r16, lse)
                 if const_expr(c["records"]):
                     bo.buffer_store(lse, rsrc(a["send"]), ((owner * s + t0 + r16) * NHL + hl) * (REC // 2) + VD // 2)
@@ -1891,11 +2233,13 @@ def build(key: MlaFrontBuild):
     @fx.struct
     class Smem:
         tls: fx.Array[fx.Int64, TL_POINTS, 16]
+        balw: fx.Array[fx.Int32, WAVES, 16]
+        rqt: fx.Array[fx.Int32, RQT * MAX_REQS + 4, 16]
 
     keyed = key_tuple(key, SOURCES)
     name = (
         f"k3_mono_mla_front_s{s}_nb{key.nblocks}_w{int(key.write_idx >= 0)}"
-        f"_t{int(key.timeline)}_r{int(key.records)}"
+        f"_t{int(key.timeline)}_r{int(key.records)}_x{int(key.x_in)}"
     )
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
@@ -1935,7 +2279,8 @@ def build(key: MlaFrontBuild):
                 "red": al.red.ptr, "vals": al.vals.ptr, "xl": gl.xl.ptr,
                 "scale": key.scale, "rank": rank, "loc_words": 2,
                 "qg_off": fx.Int64(qg_offset() + key.qg_par * QG_COPY),
-                "xbuf": scratch + fx.Int64(lay["x"][0]),
+                "xbuf": prefix if key.x_in else scratch + fx.Int64(lay["x"][0]),
+                "x_in": key.x_in,
                 "lat": scratch + fx.Int64(lay["lat"][0]),
                 "qb": scratch + fx.Int64(lay["qb"][0]),
                 "q8": scratch + fx.Int64(lay["q8"][0]),
@@ -1957,15 +2302,29 @@ def build(key: MlaFrontBuild):
             }  # fmt: skip
             for region in ("part", "wgt", "msq", "xrdy", "ss", "qrdy", "absrdy", "kvrdy", "itrdy", "grdy"):
                 c[region] = sreg(scratch, lay[region][0], region)
+            if const_expr(wd):
+                # the wide merge's latent rows, their LSEs and its CTAs' flags
+                c["olrdy"] = sreg(scratch, lay["olrdy"][0], "olrdy")
+                c["ol"] = scratch + fx.Int64(lay["ol"][0])
+                c["olse"] = scratch + fx.Int64(lay["olse"][0])
+                c["balw"] = lds.balw.ptr
+                c["deal"] = sreg(scratch, lay["deal"][0], "deal")
+                c["rqt"] = lds.rqt.ptr
             on, tls = key.timeline, lds.tls.ptr
             c["on"], c["tls"] = on, tls
             stamp_begin(on, tls, tid, TL_POINTS)
-            if bid < NA:
-                stage_slice(c, bid)
-                if const_expr(wd):
-                    if bid < s:
-                        stage_gate(c, bid)
-                stage_mix(c, bid)
+            if const_expr(wd and nreq > 1):
+                # the attention's assignment, worked out at launch on a CTA whose
+                # only role (a g_proj group) is off the q path
+                if bid == DEAL_CTA:
+                    deal_choose(c)
+            if const_expr(not key.x_in):
+                if bid < NA:
+                    stage_slice(c, bid)
+                    if const_expr(wd):
+                        if bid < s:
+                            stage_gate(c, bid)
+                    stage_mix(c, bid)
             if (bid >= QKV0) & (bid < GP0):
                 # fused_qkv_a: the q path's first weights, at launch
                 ops = s1_loads(c, bid - QKV0)
@@ -2029,22 +2388,41 @@ def build(key: MlaFrontBuild):
                 if bid < nhg * n:
                     attention1(c, 0, bid // n, bid % n, bid % n + 1)
             else:
-                # runs of one (request, head group)'s consecutive splits
-                k0, k1, bases = cta_items(c, bid)
-                g0 = group_of(bases, k0, nhg)
-                nruns = (k1 > k0).select(group_of(bases, k1 - 1, nhg) - g0 + 1, fx.Int32(0))
-                for gi in range(nruns):
-                    grp = g0 + gi
-                    rq = grp // nhg
-                    hg = grp % nhg
-                    gfirst = pick([f for f, _ in bases], rq) + hg * pick([n for _, n in bases], rq)
-                    sa = fx.max(k0 - gfirst, fx.Int32(0))
-                    sb = fx.min(k1 - gfirst, pick([n for _, n in bases], rq))
+                # the assignment with the smaller modelled busiest CTA (DEAL_CTA's
+                # choice; a function of the batch alone)
+                assert nhg == NHG_W
+                dealt = deal_read(c)
+                # contiguous ranges a run at a time, or the dealt items one at a
+                # time; the range kept in LDS, so nothing more stays live across
+                # the attention than the loop's count
+                rng = contig_runs(c, bid)
+                tot = fx.ptr_load(c["rqt"] + RQT_TOT)
+                count = dealt.select(dealt_count(tot, bid), rng[3])
+                if tid == 0:
+                    for f in range_constexpr(3):
+                        fx.ptr_store(rng[f], c["balw"] + (1 + f))
+                gpu.barrier()
+                for i in range(count):
+                    dealt = fx.ptr_load(c["balw"] + 0) != 0
+                    rng = tuple(fx.ptr_load(c["balw"] + (1 + f)) for f in range(3)) + (count,)
+                    rc, hc, sac, sbc = contig_run(c, rng, i)
+                    rd, hd, spd = dealt_item(c, dealt_place(bid, i))
+                    rq = dealt.select(rd, rc)
+                    hg = dealt.select(hd, hc)
+                    sa = dealt.select(spd, sac)
+                    sb = dealt.select(spd + 1, sbc)
                     if sb > sa:
                         attention(c, rq, hg, sa, sb)
             c["xl"], c["wl"] = ul.xl.ptr, ul.wl.ptr
-            if bid < UV_CTAS:
-                stage_uv(c, bid)
+            if const_expr(wd):
+                # every CTA's share of the (head, row) merges, then W_UV a (head, half)
+                stage_merge(c, bid)
+                if bid < UV_CTAS:
+                    stage_wuv(c, bid)
+            else:
+                # one request: a (head, half) task merges its head's rows itself
+                if bid < UV_CTAS:
+                    stage_uv(c, bid)
             stamp(on, tls, tid, 9)
             # the owner's combine and output gate, a (request, local head) a
             # task on the last CTAs
@@ -2108,8 +2486,15 @@ def mla_front_launch(
     peer buffers (int64 [8], ``peer_end`` bytes each: the q all-gather's QG
     copies and the all-to-all's A2A copies, ``key.qg_par`` the one this launch
     uses); ``send`` [8, S, 12, 130] bf16 out, a ``records`` build only;
-    ``w_qb`` / ``w_kc`` this rank's 12 heads' shards."""
-    assert key.write_idx < blocks.shape[1]
+    ``w_qb`` / ``w_kc`` this rank's 12 heads' shards. An ``x_in`` build takes
+    the x rows [S, 7168] bf16 as ``prefix`` and no ``blocks`` (None)."""
+    if key.x_in:
+        assert blocks is None and key.write_idx < 0
+        assert prefix.is_contiguous() and tuple(prefix.shape) == (key.tokens, HIDDEN)
+        blk = (0, 0, 0)
+    else:
+        assert key.write_idx < blocks.shape[1]
+        blk = (blocks.data_ptr(), blocks.stride(0), blocks.stride(1))
     for n, shp in WEIGHT_SHAPES.items():
         assert weight_ok(n, w[n]), (n, tuple(w[n].shape), w[n].stride(), w[n].dtype)
     assert kv.dtype in (torch.float8_e4m3fn, torch.uint8) and kv.stride(-2) == DQK
@@ -2124,7 +2509,7 @@ def mla_front_launch(
     assert tuple(core.shape) == (key.tokens, GATE) and core.dtype == torch.bfloat16 and core.is_contiguous()
     f = build(key)
     f(
-        prefix.data_ptr(), blocks.data_ptr(), blocks.stride(0), blocks.stride(1),
+        prefix.data_ptr(), *blk,
         w["ares_nw"].data_ptr(), w["ares_qk"].data_ptr(), w["in_nw"].data_ptr(),
         w["w_qkv"].data_ptr(), w["w_g"].data_ptr(), w["q_nw"].data_ptr(),
         w["kv_nw"].data_ptr(), w["w_qb"].data_ptr(), w["w_kc"].data_ptr(),

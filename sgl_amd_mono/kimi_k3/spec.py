@@ -40,9 +40,11 @@ launch once on real weights, not through FlyDSL's compile-only mode
 from __future__ import annotations
 
 import dataclasses
+import functools
 import importlib.util
 import logging
 import os
+from types import SimpleNamespace
 from typing import Any
 
 import msgspec
@@ -70,6 +72,7 @@ except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
 from sgl_amd_mono.common.plan import BLOCKS
 from sgl_amd_mono.kimi_k3 import (
     CORE,
+    FRONT_MAX_ROWS,
     HF_CONFIG,
     K2_MAX_ROWS,
     LINEAR_ATTN_CONFIG,
@@ -140,9 +143,10 @@ SGLANG_READS = {
         "global_kv_indptr",
         # the verify plan the front makes for itself (_skip_verify_plan)
         "AiterAttnBackend",
-        "def make_mla_meta_data(",
-        "is_cp_round_robin",
-        "nhead_override",
+        "AiterAttnBackend.make_mla_meta_data(qo_indptr)",
+        "AiterAttnBackend.make_mla_meta_data(max_q_len)",
+        "AiterAttnBackend.make_mla_meta_data(is_cp_round_robin)",
+        "AiterAttnBackend.make_mla_meta_data(nhead_override)",
         "cprr_kernel_heads",
     ),
     # the attention stops here and the launch runs o_proj; both attention
@@ -165,6 +169,13 @@ SGLANG_READS = {
         "o_proj",
         "layers",
         "language_model",
+        # _SglFronts: the MLA attention's forward it stands in for, and the
+        # gated o_proj wrapper's gate input it leaves unset
+        "KimiK3MLAAttention",
+        "_gate_hidden_states",
+    ),
+    "srt/model_executor/forward_mode.py": (
+        "is_target_verify",
     ),
 }
 
@@ -390,6 +401,12 @@ def _build(model, hf_config, ctx):
         _warmup(runner, layers[rows], rows)
     # SGLang's attention on the packed layers (inproj.py): its verify launches
     inproj.for_device(device).warmup(k1_mod._draft_tokens())
+    sgl = _SglFronts.install(backbone, runner, vcs, layers, ctx.widths) if dcp else None
+    global _FRONT_ROWS
+    _FRONT_ROWS = frozenset(
+        rows for rows, packed in layers.items()
+        if _every_mla_layer_fronted(backbone, packed)
+    ) | (sgl.rows if sgl is not None else frozenset())  # fmt: skip
     built = _Built(model, runner, layers, batches)
     _follow_captures(model, built)
     return built
@@ -864,25 +881,22 @@ def _front_build(layer, rows: int, vc):
     return (key, w)
 
 
-# The step widths at which every MLA layer runs the DCP front, and the target's
-# MLA backends the front has run on: there SGLang's verify attention plan
-# (make_mla_meta_data, aiter's get_mla_metadata_v1) has no reader. Set with
-# the plan's skip at the front's first launch (_front_plan_skip).
+# The step widths at which every MLA layer runs the DCP front (the spec's
+# layer launches and _SglFronts), set by _build, and the target's MLA backends
+# the front has run on: there SGLang's verify attention plan
+# (make_mla_meta_data, aiter's get_mla_metadata_v1) has no reader. The plan's
+# skip is installed at the front's first launch (_front_plan_skip).
 _FRONT_ROWS: frozenset = frozenset()
 _FRONT_BACKENDS = None
 
 
-def _front_plan_skip(built, backend) -> None:
-    """This module's skip of SGLang's verify plan, from the widths ``built``
-    fronts every MLA layer at; ``backend`` among the backends it applies to."""
+def _front_plan_skip(backend) -> None:
+    """This module's skip of SGLang's verify plan at ``_FRONT_ROWS``;
+    ``backend`` among the backends it applies to."""
     import weakref
 
-    global _FRONT_ROWS, _FRONT_BACKENDS
+    global _FRONT_BACKENDS
     if _FRONT_BACKENDS is None:
-        _FRONT_ROWS = frozenset(
-            rows for rows, packed in built._by_width.items()
-            if _every_mla_layer_fronted(built.backbone, packed)
-        )  # fmt: skip
         _FRONT_BACKENDS = weakref.WeakSet()
         _skip_verify_plan()
     _FRONT_BACKENDS.add(backend)
@@ -961,6 +975,126 @@ def _front_warmup(runner, packed, rows: int, blocks) -> None:
         peers=runner.peer.addresses, rank=runner.dcp_rank, layer=packed.i,
         epoch=runner.epoch,
     )  # fmt: skip
+
+
+class _SglFronts:
+    """The DCP front inside SGLang's own MLA attention, at the verify widths the
+    spec builds no layer launch for, up to ``FRONT_MAX_ROWS``. There SGLang
+    runs the whole layer: its seam and input_layernorm, then this front on
+    their x rows (an ``x_in`` build: the q path, the attention, the
+    all-to-all, LSE combine and output gate, and this rank's KV record), then
+    SGLang's o_proj on the gated core, its all-reduce and MoE. Every other
+    step of these layers (other widths, decode, extend) is SGLang's own
+    forward. One static rule a width: no step chooses."""
+
+    def __init__(self, runner, entries: list, rows: frozenset) -> None:
+        self.runner, self.entries, self.rows = runner, entries, rows
+        self.core = {r: _front_core_buffer(r, runner.device) for r in rows}
+
+    @classmethod
+    def install(cls, backbone, runner, vcs: dict, by_width: dict, widths):
+        """Every MLA layer's ``x_in`` front at the verify widths past the spec's
+        own, built and run once (every rank the same launches in the same
+        order, so the peer waits pair up), then each layer's attention routed
+        through it. None where no width or no layer qualifies."""
+        from sgl_amd_mono.kimi_k3.gfx950.attention import mla_front as mf
+
+        rows = frozenset(
+            r for r in range(mf.G_ROWS, FRONT_MAX_ROWS + 1, mf.G_ROWS)
+            if r not in widths and r // mf.G_ROWS <= mf.MAX_REQS
+        )  # fmt: skip
+        if not rows:
+            return None
+        mla = [
+            i for i, layer in enumerate(backbone.layers)
+            if hasattr(layer, "self_attn") and not hasattr(layer.self_attn, "qkv_conv1d")
+        ]  # fmt: skip
+        entries = []
+        for n, i in enumerate(mla):
+            layer = backbone.layers[i]
+            keys, w = {}, None
+            for r in sorted(rows):
+                built = _front_build(layer, r, vcs.get(i))
+                if built is None:
+                    return None  # a layer the front does not take: none of them
+                key, w = built
+                # consecutive fronts take alternate QG copies (mla_front.peer_end)
+                keys[r] = dataclasses.replace(
+                    key, nblocks=0, write_idx=-1, x_in=True, qg_par=n % 2
+                )
+            entries.append(SimpleNamespace(i=i, attn=layer.self_attn, keys=keys, w=w))
+        self = cls(runner, entries, rows)
+        for r in sorted(rows):
+            self._warmup(r)
+        for n, e in enumerate(entries):
+            e.first = n == 0
+            e.attn.forward = functools.partial(self.forward, e)
+        logger.info(
+            "monokernel: DCP front in SGLang's MLA attention at %s rows (%d layers)",
+            sorted(rows), len(entries),
+        )  # fmt: skip
+        return self
+
+    def _warmup(self, rows: int) -> None:
+        """Both QG copies' builds at this width once, on two layers' weights,
+        throwaway KV and every request at P = 0, in an epoch of their own."""
+        from sgl_amd_mono.kimi_k3.gfx950.attention import mla_front as mf
+        from sgl_amd_mono.kimi_k3.gfx950.layer import scratch_region
+
+        dev, nreq = self.runner.device, rows // mf.G_ROWS
+        self.runner.step_begin()
+        for e in self.entries[:2]:
+            mf.mla_front_launch(
+                e.keys[rows],
+                prefix=torch.zeros(rows, mf.HIDDEN, dtype=torch.bfloat16, device=dev),
+                blocks=None, w=e.w,
+                kv=torch.zeros(64, mf.DQK, dtype=torch.uint8, device=dev),
+                kv_idx=torch.zeros(8, dtype=torch.int32, device=dev),
+                kv_ptr=torch.tensor([0] + [1] * nreq, dtype=torch.int32, device=dev),
+                g_kv_ptr=torch.arange(nreq + 1, dtype=torch.int32, device=dev) * mf.G_ROWS,
+                loc=torch.zeros(rows, dtype=torch.int64, device=dev),
+                core=self.core[rows],
+                scratch=scratch_region(self.runner.scratch, "front"),
+                peers=self.runner.peer.addresses, rank=self.runner.dcp_rank,
+                layer=e.i, epoch=self.runner.epoch,
+            )  # fmt: skip
+        torch.cuda.synchronize()
+
+    def forward(self, e, positions=None, hidden_states=None, forward_batch=None,
+                zero_allocator=None, **kwargs):  # fmt: skip
+        """``KimiK3MLAAttention.forward`` of layer ``e``: at a front width's
+        target verify, the front and SGLang's o_proj on its gated core."""
+        rows = hidden_states.shape[0]
+        if not (forward_batch.forward_mode.is_target_verify() and rows in self.rows):
+            return type(e.attn).forward(
+                e.attn, positions, hidden_states, forward_batch, zero_allocator, **kwargs
+            )
+        from sglang.srt.model_executor.forward_context import get_attn_backend
+
+        from sgl_amd_mono.kimi_k3.gfx950.attention import mla_front as mf
+        from sgl_amd_mono.kimi_k3.gfx950.layer import scratch_region
+
+        if e.first:
+            # once a forward, before its first front: the steps' mailbox tags
+            self.runner.step_begin()
+        backend = get_attn_backend()
+        backend = getattr(backend, "full_attn_backend", backend)
+        _front_plan_skip(backend)
+        fm = backend.forward_metadata
+        kv = backend.kv_layers.read(e.attn.attn_mqa.layer_id).key()
+        core = self.core[rows]
+        mf.mla_front_launch(
+            e.keys[rows], prefix=hidden_states, blocks=None, w=e.w,
+            kv=kv.view(-1, mf.DQK), kv_idx=fm.cprr_kv_indices,
+            kv_ptr=fm.cprr_kv_indptr, g_kv_ptr=fm.global_kv_indptr,
+            loc=forward_batch.out_cache_loc, core=core,
+            scratch=scratch_region(self.runner.scratch, "front"),
+            peers=self.runner.peer.addresses,
+            rank=self.runner.dcp_rank, layer=e.i, epoch=self.runner.epoch,
+        )  # fmt: skip
+        # the gate is in the core: o_proj's wrapper has no gate input to apply
+        out, _ = e.attn.o_proj(core)
+        return out
 
 
 def _gu_interleaved(moe) -> bool:
@@ -1440,7 +1574,7 @@ class _Built:
         # the MLA layers' backend: the hybrid model's full-attention one
         backend = get_attn_backend()
         backend = getattr(backend, "full_attn_backend", backend)
-        _front_plan_skip(self, backend)
+        _front_plan_skip(backend)
         fm = backend.forward_metadata
         kv = backend.kv_layers.read(attn.attn_mqa.layer_id).key()
         # The launch reads the stream and does not add to it, as K1 does.
