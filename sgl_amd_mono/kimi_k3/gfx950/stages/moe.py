@@ -105,6 +105,7 @@ from sgl_amd_mono.common.sync import (
     sreg,
 )
 from sgl_amd_mono.kimi_k3.gfx950.stages import gemv as gemv
+from sgl_amd_mono.kimi_k3.gfx950.stages.dims import NA
 from sgl_amd_mono.kimi_k3.gfx950.stamps import (
     stamp,
     stamp_begin,
@@ -184,6 +185,15 @@ NARROW = 8
 SGU_SEGMENTS = ((0, 3), (3, 6), (6, 7))
 
 
+WIDE_ABOVE = ROWS  # wider steps take the wide form (``wide``)
+
+
+def wide(s):
+    """Whether an s-row step takes the wide form: GEMVs a 16-row token tile at a
+    time, the latent and INTER from L2, the route table in units."""
+    return s > WIDE_ABOVE
+
+
 def max_u(s):
     """The step's distinct experts at most (the route table's slots)."""
     return min(E, s * TOPK)
@@ -192,7 +202,7 @@ def max_u(s):
 def xl_words(s):
     """The x rows' LDS: up to 8 rows whole, to 16 a 3584 + pad row each, wider
     a 16-row tile of those (or every row of the shared h)."""
-    if s > ROWS:
+    if wide(s):
         return max(ROWS * (LAT + gemv.LDS_PAD), s * (SI + gemv.LDS_PAD)) // 2
     return s * ((HIDDEN if s <= NARROW else LAT) + gemv.LDS_PAD) // 2
 
@@ -544,7 +554,7 @@ def early_loads(c, kind, i, q):
 
 def early_compute(c, kind, i, q, ops):
     """Early task (i, q) of ``kind`` against ``ops`` (``early_loads``)."""
-    if c["S"] > ROWS:
+    if wide(c["S"]):
         return _early_wide(c, kind, i, q, ops)
     return _early_narrow(c, kind, i, q, ops)
 
@@ -1517,20 +1527,27 @@ def max_units(s):
     return max_u(s) + s * TOPK // ROWS
 
 
+# the latent copy's CTAs: the top ones, past the shared gate/up's (which end last)
+COPY_CTAS = BLOCKS - (NA + G_TASKS)
+
+
 @flyc.jit
 def copy_latq(c):
     """Every rank's MXFP8 latent words and codes (LATQ) -> the compact LQC, a
-    (token, quarter) a CTA from the top (whose early work ends first), each
-    quarter's LQR flag; then every flag polled."""
+    (token, quarter) unit at a time on the top COPY_CTAS CTAs (their early work
+    ends before the shared gate/up's), each unit's LQR flag; then every flag
+    polled."""
     s, tid, bid = c["S"], c["tid"], c["bid"]
     qw = LQ_WORDS // 4
-    u = BLOCKS - 1 - bid
-    if u < 4 * s:
-        w = u * qw + fx.min(tid, qw - 1)
-        v = c["poll"]([(c["peer"]["latq_own"], w, 1)])[0][0]
-        if tid < qw:
-            bo.buffer_store(v, rsrc(c["lqc"]), w, cache_modifier=CM_DEV)
-        publish(c["put"], c["lqr"], u, fx.Int32(1), tid == 0)
+    v = BLOCKS - 1 - bid
+    for h in range_constexpr((4 * s + COPY_CTAS - 1) // COPY_CTAS):
+        u = v + h * COPY_CTAS
+        if (v < COPY_CTAS) & (u < 4 * s):
+            w = u * qw + fx.min(tid, qw - 1)
+            got = c["poll"]([(c["peer"]["latq_own"], w, 1)])[0][0]
+            if tid < qw:
+                bo.buffer_store(got, rsrc(c["lqc"]), w, cache_modifier=CM_DEV)
+            publish(c["put"], c["lqr"], u, fx.Int32(1), tid == 0)
     if tid < 4 * s:
         c["poll"]([(c["lqr"], tid, 1)])
     gpu.barrier()

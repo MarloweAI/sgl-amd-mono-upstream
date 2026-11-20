@@ -270,7 +270,7 @@ def build(key: K2Build):
     play = peer_layout(s)
     half = peer_bytes(s) // 2
 
-    wide = s > gemv.ROWS  # past one MFMA token tile: ``k2b``'s wide steps
+    wide = k2b.wide(s)
     mu, mun = k2b.max_u(s), k2b.max_units(s)
 
     if wide:
