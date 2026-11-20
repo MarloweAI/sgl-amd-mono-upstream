@@ -320,6 +320,7 @@ def _build(model, hf_config, ctx):
     """Pack every covered layer and compile the widths, before graph capture."""
     from sglang.srt.runtime_context import get_parallel
 
+    from sgl_amd_mono.kimi_k3.gfx950 import inproj
     from sgl_amd_mono.kimi_k3.gfx950 import k1 as k1_mod
     from sgl_amd_mono.kimi_k3.gfx950.runner import K3MonoRunner
 
@@ -333,9 +334,13 @@ def _build(model, hf_config, ctx):
     if mla_off is not None:
         logger.info("monokernel: no MLA front: %s", mla_off)
     layers, batches = {}, {}
+    covered = _covered_layers(hf_config)
     for rows in ctx.widths:
-        for i in _covered_layers(hf_config):
-            packed = _weights(backbone.layers[i], i, rows, runner, mla_off is None)
+        for i in covered:
+            # K1 takes a layer whose prefix the launch in front wrote: not the
+            # first covered one, whose prefix the dense layer owes
+            k1 = K1 and i - 1 in covered
+            packed = _weights(backbone.layers[i], i, rows, runner, mla_off is None, k1)
             layers.setdefault(rows, {})[i] = packed
         # FlyDSL compiles a launcher on its first call, and the first real call
         # is inside a CUDA graph capture, where compiling aborts the process.
@@ -348,6 +353,8 @@ def _build(model, hf_config, ctx):
         # K1's conv rows come from its batch, so that is built first.
         batches[rows] = k1_mod.build_batch(layers[rows], device)
         _warmup(runner, layers[rows], rows)
+    # SGLang's attention on the packed layers (inproj.py): its verify launches
+    inproj.for_device(device).warmup(k1_mod._draft_tokens())
     return _Built(model, runner, layers, batches)
 
 
@@ -524,7 +531,7 @@ def _mla_front_disable_reason(parallel) -> str | None:
     return None
 
 
-def _weights(layer, i: int, rows: int, runner, mla: bool) -> _Layer:
+def _weights(layer, i: int, rows: int, runner, mla: bool, k1: bool) -> _Layer:
     """This layer's build key at one launch width. The weights themselves are
     read in place at launch, so nothing is packed or copied here."""
     from sgl_amd_mono.kimi_k3.gfx950 import k1 as k1_mod
@@ -537,7 +544,7 @@ def _weights(layer, i: int, rows: int, runner, mla: bool) -> _Layer:
     # layer launch at o_proj's input.
     front = rows <= MAX_ROWS
     return _Layer(
-        k1=k1_mod.build(layer, i, rows) if K1 else None,
+        k1=k1_mod.build(layer, i, rows) if k1 else None,
         mla=_mla_build(layer, rows) if mla and front else None,
         i=i,
         key=K2Build(
@@ -1019,8 +1026,11 @@ class _Built:
             get_attn_tp_context().set_attn_inputs(
                 AttentionInputs(x, forward_batch, latent)
             )
+        from sgl_amd_mono.kimi_k3.gfx950 import inproj
+
         try:
-            return attn.forward_pre_o_proj(
+            # a packed KDA layer: SGLang's own attention, in_proj unpacked
+            return inproj.stock_pre_o_proj(attn)(
                 hidden_states=x,
                 positions=self._positions,
                 forward_batch=forward_batch,

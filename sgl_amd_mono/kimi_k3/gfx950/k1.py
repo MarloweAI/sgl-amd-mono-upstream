@@ -37,9 +37,12 @@ requests of the step's L verify rows, by the width rule ``wide_takes``. It runs
 on the ReplaySSM ring only and reads SGLang's state where SGLang's own verify
 does: the committed state and conv state (read only), the verify windows and
 the ring (written). So it stages no conv buffer and hands nothing back at
-``finish``. It reads in_proj in its own stream order, packed once at build
-(``kda_wide.pack_w_in``: a copy of the weight, 90 MB a layer a rank), and x
-from a buffer of the width that its front writes in ``pack_x``'s layout.
+``finish``. It reads x from a buffer of the width that its front writes in
+``pack_x``'s layout.
+
+Both forms read in_proj in ``kda_wide.pack_w_in``'s layout, the layer's own
+in_proj packed in place at build (``inproj.py``, which also routes SGLang's
+attention on a packed layer).
 """
 
 from __future__ import annotations
@@ -179,7 +182,7 @@ class K1Layer(msgspec.Struct):
     on_w: Any  # o_norm's weight as the kernel reads it, cast once
     conv: Any  # a row of K1Batch.conv, not an allocation of its own
     mamba_idx: int  # this layer's index into the KDA state pools
-    w_in: Any = None  # the wide form's in_proj, packed once (``pack_w_in``)
+    w_in: Any = None  # in_proj, packed in place (``inproj.InProj.pack``)
 
 
 class K1Batch(msgspec.Struct):
@@ -232,6 +235,16 @@ def _unsupported_reasons(layer) -> list[str]:
             "(SGLANG_ROCM_K3_FUSE_KDA_INPROJ=0, or attention weights this "
             "merge may not concatenate)"
         )
+    else:
+        from sgl_amd_mono.kimi_k3.gfx950.attention import kda
+
+        w = attn._qkvgbfa_layer.weight
+        if not (
+            tuple(w.shape) == (kda.NPROJ, HIDDEN)
+            and w.dtype == torch.bfloat16
+            and w.is_contiguous()
+        ):
+            reasons.append("the merged in-projection is not a contiguous bf16 [6288, 7168]")
     conv = getattr(attn, "qkv_conv1d", None)
     if conv is None or conv.weight.dim() != 3 or conv.weight.shape[1] != 1:
         shape = None if conv is None else tuple(conv.weight.shape)
@@ -248,7 +261,9 @@ WIDE_MAX_REQS = 8
 
 def is_wide(packed) -> bool:
     """Whether a K1Layer is the wide form."""
-    return packed.w_in is not None
+    from sgl_amd_mono.kimi_k3.gfx950.attention import kda_wide as kw
+
+    return isinstance(packed.key, kw.KdaWideBuild)
 
 
 def _draft_tokens() -> int:
@@ -274,17 +289,11 @@ def wide_takes(rows: int, qlen: int) -> bool:
     )
 
 
-# in_proj in the wide form's stream order, one copy a layer for every width
-_PACKED: dict[int, torch.Tensor] = {}
+def _packed_w_in(layer, i: int):
+    """This layer's in_proj, packed in place (once for every width)."""
+    from sgl_amd_mono.kimi_k3.gfx950 import inproj
 
-
-def _packed_w_in(weight):
-    from sgl_amd_mono.kimi_k3.gfx950.attention import kda_wide as kw
-
-    key = weight.data_ptr()
-    if key not in _PACKED:
-        _PACKED[key] = kw.pack_w_in(weight)
-    return _PACKED[key]
+    return inproj.for_device(layer.input_layernorm.weight.device).pack(layer, i)
 
 
 def _wide_reasons(layer) -> list[str]:
@@ -296,12 +305,6 @@ def _wide_reasons(layer) -> list[str]:
     inner = getattr(attn, "attn", None)
     checks = (
         (_ring_mode(), "needs the ReplaySSM ring (--enable-linear-replayssm-spec)"),
-        (
-            tuple(attn._qkvgbfa_layer.weight.shape) == (kda.NPROJ, HIDDEN)
-            and attn._qkvgbfa_layer.weight.dtype == torch.bfloat16
-            and attn._qkvgbfa_layer.weight.is_contiguous(),
-            "the merged in-projection is not a contiguous bf16 [6288, 7168]",
-        ),
         (
             isinstance(getattr(inner, "conv_weights", None), torch.Tensor)
             and inner.conv_weights.dtype == torch.float32
@@ -381,6 +384,7 @@ def build(layer, i: int, rows: int) -> Optional[K1Layer]:
         on_w=attn.o_norm.weight.data.to(torch.bfloat16).contiguous(),
         conv=None,  # build_batch
         mamba_idx=-1,  # build_batch
+        w_in=_packed_w_in(layer, i),
     )
 
 
@@ -409,7 +413,7 @@ def _build_wide(layer, i: int, rows: int, qlen: int) -> Optional[K1Layer]:
         on_w=attn.o_norm.weight.data.to(torch.bfloat16).contiguous(),
         conv=None,
         mamba_idx=-1,  # prepare's first call
-        w_in=_packed_w_in(attn._qkvgbfa_layer.weight),
+        w_in=_packed_w_in(layer, i),
     )
 
 
@@ -485,7 +489,7 @@ def _weight_args(packed: K1Layer) -> dict:
         "ares_nw": packed.module.self_attention_res_norm.weight,
         "ares_qk": packed.module.self_attention_res_proj.weight.view(HIDDEN),
         "in_nw": packed.module.input_layernorm.weight,
-        "w_in": attn._qkvgbfa_layer.weight,
+        "w_in": packed.w_in,
         "w_fb": attn.f_b_proj.weight,
         "conv_w": attn.qkv_conv1d.weight.squeeze(1),
         "a_log": attn.A_log.detach().reshape(-1),
@@ -572,7 +576,7 @@ def warmup(runner, packed: K1Layer, prefix, blocks) -> None:
 
 
 def _wide_args(packed: K1Layer) -> dict:
-    """The tensors the wide form reads in place (in_proj its packed copy)."""
+    """The tensors the wide form reads in place."""
     m = packed.module
     attn = m.self_attn
     return {
