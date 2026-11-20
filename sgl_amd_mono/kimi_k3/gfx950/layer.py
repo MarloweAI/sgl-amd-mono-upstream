@@ -123,6 +123,9 @@ class K2Build(msgspec.Struct, frozen=True):
     xp: int = 0  # timing experiments (7: route without its selection)
     guint: bool = False  # w13's AITER layout; see stages.moe.MoeBuild
     opt: int = 0  # the OPT_* bits
+    # an MLA layer's K2 in the attention front's launch: each core chunk is read
+    # once its (request, local head) box (CBOX) holds this launch's tag
+    core_box: bool = False
 
 
 def peer_layout(s):
@@ -227,6 +230,9 @@ def scratch_layout(key: K2Build) -> dict:
         lay[name] = ((end + 15) // 16 * 16 + o, n)
     end = max(o + n for o, n in lay.values())
     lay["xrow"] = ((end + 15) // 16 * 16, s * HIDDEN * 2)
+    if key.core_box:
+        end = lay["xrow"][0] + lay["xrow"][1]
+        lay["cbox"] = ((end + 255) // 256 * 256, k2a.core_boxes(s) * 8)
     return lay
 
 
@@ -310,6 +316,7 @@ def build(key: K2Build):
         f"_t{int(key.timeline)}"
         + ("_f1" if key.fold else "")
         + (f"_o{key.opt}" if key.opt else "")
+        + ("_cb" if key.core_box else "")
     )
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
@@ -473,6 +480,8 @@ def build(key: K2Build):
             c["batch"] = bool(key.opt & OPT_BATCH)
             if const_expr(key.opt & OPT_TAG_X):
                 c["xt"] = sreg(scratch, tag_offset(), "xt")
+            if const_expr(key.core_box):
+                c["core_box"] = sreg(scratch, lay["cbox"][0], "cbox")
             c["sent_ar"] = bool(key.opt & OPT_SENT)
             c["sent_latr"] = bool(key.opt & OPT_SENT_LATR)
             # the K1 that takes a deferred reduce reads tagged pairs

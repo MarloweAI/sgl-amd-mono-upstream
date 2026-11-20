@@ -28,6 +28,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import Int32, Int64, T
 
 from sgl_amd_mono.common.ops import (
+    CM_DEV,
     CM_NT,
     bf16_pair,
     bf16_round,
@@ -153,19 +154,41 @@ def o_loads(c, rg):
     return out
 
 
+CORE_REQ_ROWS = 6  # a request's verify rows: a core box covers one request
+
+
+def core_boxes(s: int) -> int:
+    """A core box a (request, local head) of an s-row step."""
+    return -(-s // CORE_REQ_ROWS) * (OK // 128)
+
+
+def core_ready(c, box, t, k):
+    """Core row t's chunk at K column k is written in this launch: wait for its
+    (request, local head) box to hold this launch's tag."""
+    c["poll"]([(box, (t // CORE_REQ_ROWS) * (OK // 128) + k // 128, 1)])
+
+
 @flyc.jit
 def load_core(c):
-    """The core rows (S x 1536 bf16) -> LDS, rows padded."""
+    """The core rows (S x 1536 bf16) -> LDS, rows padded. With ``core_box``
+    (core from the same launch), each chunk after its box, device scope."""
     s, tid = c["S"], c["tid"]
+    # read before the traced branches (a dict lookup inside one is carried state)
+    box = c.get("core_box")
     words = s * OK // 8
     row = OK + LDS_PAD
     for i in range_constexpr((words + THREADS - 1) // THREADS):
         e = fx.min(tid + THREADS * i, words - 1)
-        v = fx.Vector(
-            bo.buffer_load(rsrc(c["args"]["core"]), e * 4, vec_width=4, dtype=T.i32)
-        )
         t = e // (OK // 8)
         k = e % (OK // 8) * 8
+        if const_expr(box is not None):
+            core_ready(c, box, t, k)
+        v = fx.Vector(
+            bo.buffer_load(
+                rsrc(c["args"]["core"]), e * 4, vec_width=4, dtype=T.i32,
+                cache_modifier=0 if box is None else CM_DEV,
+            )
+        )
         if tid + THREADS * i < words:
             fx.ptr_store(v, c["xl"] + (t * row + k) // 2)
     gpu.barrier()
