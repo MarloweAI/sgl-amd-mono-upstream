@@ -389,17 +389,18 @@ def _build(model, hf_config, ctx):
 
 def _tails(packed_layers: dict, batch, device) -> None:
     """Move a KDA layer's attention-side seam into the previous layer's K2 tail,
-    by layer position: the previous layer is a KDA layer (its K2 is this
-    package's layer launch at every routed width), this layer's K1 is the wide
-    form (2 to 8 requests: 12 rows today), and it is not a block-write layer
-    (whose front writes a bank row its own K2 then reads). Every other layer
-    keeps the seam in its own front: the first covered layer (the dense layer's
-    stream), a layer after an MLA layer (the MLA layer's launch is the MLA
-    workstream's), the block-write layers, the one-request form (6 rows: its
+    by layer position: the previous layer is covered (its K2 is this package's
+    layer launch at every routed width, a KDA layer's and an MLA layer's alike:
+    the MLA front is a launch of its own that ends at the core), this layer's
+    K1 is the wide form (2 to 8 requests: 12 rows today), and it is not a
+    block-write layer (whose front writes a bank row its own K2 then reads).
+    Every other layer keeps the seam in its own front: layer 1 (the dense
+    layer's stream), the block-write layers, the one-request form (6 rows: its
     front overlaps its in_proj stream, so the move costs more in the tail than
-    it saves, tier 0 2026-11-20), and every width K1 declines at, where
-    SGLang's layer runs its own seam. On Kimi-K3 that is 45 of the 69 KDA
-    layers: the second and third of each run of three, and layer 2.
+    it saves, tier 0 2026-11-20), every width K1 declines at, where SGLang's
+    layer runs its own seam, and (``_Built.set_aux``) a layer whose front forms
+    a DSpark capture. On Kimi-K3 that is 60 of the 69 KDA layers, 57 with
+    DSpark's captures (layers 8, 52, 68 keep their fronts).
 
     A K1 that declines a step (no speculative state) runs SGLang's attention,
     which forms its own seam; the x the tail left is then unread."""
@@ -413,7 +414,6 @@ def _tails(packed_layers: dict, batch, device) -> None:
         prev, k1 = packed_layers.get(i - 1), packed.k1
         if (
             prev is None
-            or not k1_mod._is_kda_layer(prev.module)
             or k1 is None
             or not k1_mod.is_wide(k1)
             or packed.module.is_block_write_layer
@@ -1159,6 +1159,8 @@ class _Built:
         for; every other capture stays SGLang's."""
         import dataclasses
 
+        import msgspec
+
         from sgl_amd_mono.kimi_k3.gfx950 import k1 as k1_mod
         from sgl_amd_mono.kimi_k3.gfx950.stages.seam import AUX_SLOTS
 
@@ -1172,13 +1174,21 @@ class _Built:
                 if k is None or (i - 1) not in order or not k1_mod.engages(k):
                     continue
                 if k1_mod.is_wide(k) and not k.key.front:
-                    continue  # its seam is the previous layer's K2 tail (``_tails``)
+                    # its seam moved into the previous layer's K2 tail
+                    # (``_tails``): the captured mixture is its front's, so the
+                    # front comes back
+                    prev = layers[i - 1]
+                    prev.key = msgspec.structs.replace(prev.key, tail=None)
+                    prev.tail = None
+                    k.key = dataclasses.replace(k.key, front=True)
+                    changed[i - 1] = prev
+                    changed[i] = p
                 j = order.index(i - 1)
                 if k.key.aux_slot != j:
                     k.key = dataclasses.replace(k.key, aux_slot=j)
                     changed[i] = p
             if changed:
-                _warmup(self.runner, changed, rows)
+                _warmup(self.runner, dict(sorted(changed.items())), rows)
 
     def _layer(self, i, hidden, forward_batch, zero_allocator, aux_due=False):
         """One layer: the launch where it is covered, else the model's own.
