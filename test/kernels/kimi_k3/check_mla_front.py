@@ -19,7 +19,11 @@ same KV slice and the same rows and positions:
   q and KV: ``|front - ref| <= 1.25 |stock - ref|``;
 * ``core`` (``--ranks 8``): the eight ranks' launches run one after another,
   then SGLang's all-to-all (a copy here), LSE combine and output gate, against
-  SGLang's full DCP8 attention on the same inputs, and run to run bit for bit.
+  SGLang's full DCP8 attention on the same inputs, and run to run bit for bit;
+* ``--invariance``: batch invariance -- each request alone (6 rows) and with 1,
+  3 and 7 others of mixed contexts (12, 24, 48 rows, at different places in the
+  batch): every output of the request bit for bit the same at every width, and
+  the widest batch run to run.
 """
 
 import argparse
@@ -176,6 +180,206 @@ class Rank:
             if i != self.own:
                 self.loc[i] = 7 * DCP + (r + 1) % DCP  # another rank's slot
         self.g_kv_ptr = torch.tensor([0, p + G], dtype=torch.int32, device=device)
+
+
+class Batch:
+    """Rank r's share of several requests in one pool: each request's ``Rank``
+    layout (its own seed), the pools stacked, the index lists and slots
+    shifted, the ragged and global indptrs over the requests."""
+
+    def __init__(self, reqs, r, device):
+        self.r = r
+        self.reqs = [Rank(keys, p, r, device, sd) for p, keys, sd in reqs]
+        idx, loc, ptr, gptr, base = [], [], [0], [0], 0
+        for rk in self.reqs:
+            nloc = int(rk.kv_ptr[1])
+            idx.append(rk.kv_idx[:nloc] + base)
+            lc = rk.loc.clone()
+            if rk.own < G:
+                lc[rk.own] = (int(rk.rows[rk.lr]) + base) * DCP + r
+            loc.append(lc)
+            ptr.append(ptr[-1] + nloc)
+            gptr.append(gptr[-1] + rk.p + G)
+            rk.base = base
+            base += rk.pool.shape[0]
+        self.pool = torch.cat([rk.pool for rk in self.reqs])
+        self.kv_idx = torch.cat(idx)
+        self.loc = torch.cat(loc)
+        self.kv_ptr = torch.tensor(ptr, dtype=torch.int32, device=device)
+        self.g_kv_ptr = torch.tensor(gptr, dtype=torch.int32, device=device)
+        self.s = G * len(self.reqs)
+
+    def own_row(self, j):
+        rk = self.reqs[j]
+        return rk.base + int(rk.rows[rk.lr]) if rk.own < G else None
+
+
+def batch_stream(ids, seed, device):
+    """The requests' rows (6 each, seeded by request id), stacked."""
+    sts = [stream_inputs(seed + 101 * i, device) for i in ids]
+    return {k: torch.cat([x[k] for x in sts]).contiguous() for k in sts[0]}
+
+
+def front_key(w, s, timeline=False):
+    from sgl_amd_mono.kimi_k3.gfx950.attention import mla_front as mf
+
+    return mf.MlaFrontBuild(
+        tokens=s, nblocks=NVB, scale=w["scale"], eps=w["eps"], out_eps=w["out_eps"],
+        q_eps=w["q_eps"], kv_eps=w["kv_eps"], timeline=timeline,
+    )  # fmt: skip
+
+
+_SCRATCH = {}
+
+
+def scratch_for(key, device):
+    """A zeroed scratch a build (its flags never meet another layout's words)."""
+    from sgl_amd_mono.common.peer import PeerBuffer
+    from sgl_amd_mono.kimi_k3.gfx950.attention import mla_front as mf
+
+    if key.tokens not in _SCRATCH:
+        _SCRATCH[key.tokens] = PeerBuffer(mf.scratch_bytes(key), None, 0, 1, device).bytes
+    return _SCRATCH[key.tokens]
+
+
+def run_batch(w, st, b, epoch, layer, *, timeline=False):
+    """The front on batch ``b``: its outputs, scratch hand-offs and pool."""
+    from sgl_amd_mono.kimi_k3.gfx950.attention import mla_front as mf
+
+    s = b.s
+    key = front_key(w, s, timeline)
+    dev = b.pool.device
+    scratch = scratch_for(key, dev)
+    gate = torch.empty(s, NHL * VD, dtype=BF, device=dev)
+    send = torch.zeros(DCP, s, NHL, mf.REC, dtype=BF, device=dev)
+    tl = torch.zeros(256, mf.TL_POINTS, dtype=torch.int64, device=dev) if timeline else None
+    epoch[0].add_(1)
+    mf.mla_front_launch(
+        key, prefix=st["prefix"], blocks=st["blocks"], w=w, kv=b.pool,
+        kv_idx=b.kv_idx, kv_ptr=b.kv_ptr, g_kv_ptr=b.g_kv_ptr, loc=b.loc,
+        gate=gate, send=send, scratch=scratch, rank=b.r, layer=layer, epoch=epoch,
+        tl=tl,
+    )  # fmt: skip
+    torch.cuda.synchronize()
+    v = lambda n, dt, shp: mf.scratch_view(key, scratch, n, dt, shp).clone()  # noqa: E731
+    return {
+        "gate": gate, "send": send, "tl": tl,
+        "x": v("x", BF, (s, HIDDEN)),
+        "lat": v("lat", BF, (s, LATW)),
+        "qb": v("qb", BF, (s, NHA, QHD)),
+        "q8": v("q8", torch.uint8, (s, NHA, DQK)),
+        "pv": v("pv", torch.float16, (mf.MAX_SPLITS, s, NHA, KV)),
+        "ml": v("ml", torch.float32, (mf.MAX_SPLITS, s, NHA, 2)),
+        "splits": [mf.splits_of(rk.p) for rk in b.reqs],
+    }  # fmt: skip
+
+
+def request_view(fr, b, j):
+    """Request j's outputs out of a batch run, as bit patterns."""
+    sl = slice(G * j, G * j + G)
+    n = fr["splits"][j]
+    u8 = lambda t: t.contiguous().view(torch.uint8)  # noqa: E731
+    out = {
+        "x": u8(fr["x"][sl]), "lat": u8(fr["lat"][sl]), "qb": u8(fr["qb"][sl]),
+        "q8": u8(fr["q8"][sl]), "gate": u8(fr["gate"][sl]), "send": u8(fr["send"][:, sl]),
+        "pv": u8(fr["pv"][:n, sl]), "ml": u8(fr["ml"][:n, sl]),
+    }  # fmt: skip
+    row = b.own_row(j)
+    out["rec"] = u8(b.pool[row]) if row is not None else None
+    return out
+
+
+INV_OTHERS = (10000, 100000, 250000, 37000, 3000, 180000, 64)
+# a width's batch: request ids in batch order (request 0 at the context under test)
+INV_BATCHES = {12: (1, 0), 24: (2, 0, 3, 1), 48: (1, 2, 3, 4, 5, 6, 7, 0)}
+
+
+def invariance(w, args, device, epoch):
+    """Each request alone against the same request in wider batches, bit for
+    bit; the widest batch twice."""
+    fails = []
+    ctx_of = lambda i, p: p if i == 0 else INV_OTHERS[i - 1]  # noqa: E731
+    for p in args.ctx:
+        need = max([p, *INV_OTHERS]) + 8 * 997
+        bank = make_keys(w, need, args.seed + p, device, args.temp[0])
+        reqs = {i: (ctx_of(i, p), bank[997 * i : 997 * i + ctx_of(i, p)], args.seed + 13 * i) for i in range(8)}
+        for r in args.rank:
+            alone = {}
+            for i in range(8):
+                b = Batch([reqs[i]], r, device)
+                alone[i] = request_view(run_batch(w, batch_stream([i], args.seed, device), b, epoch, args.layer), b, 0)
+            for s_, ids in INV_BATCHES.items():
+                if s_ > G * args.max_reqs:
+                    continue
+                b = Batch([reqs[i] for i in ids], r, device)
+                st = batch_stream(ids, args.seed, device)
+                fr = run_batch(w, st, b, epoch, args.layer)
+                bad = {}
+                for j, i in enumerate(ids):
+                    got = request_view(fr, b, j)
+                    diff = [
+                        k for k in got
+                        if (got[k] is None) != (alone[i][k] is None)
+                        or (got[k] is not None and not torch.equal(got[k], alone[i][k]))
+                    ]  # fmt: skip
+                    if diff:
+                        bad[f"req{i}@{j} P={ctx_of(i, p)}"] = diff
+                again = ""
+                if s_ == max(INV_BATCHES):
+                    b2 = Batch([reqs[i] for i in ids], r, device)
+                    fr2 = run_batch(w, st, b2, epoch, args.layer)
+                    names = ("x", "lat", "qb", "q8", "pv", "ml", "gate", "send")
+                    dd = [n for n in names if not torch.equal(fr2[n].view(torch.uint8), fr[n].view(torch.uint8))]
+                    dd += [] if torch.equal(b2.pool.view(torch.uint8), b.pool.view(torch.uint8)) else ["pool"]
+                    again = f"; run to run bitwise {not dd} {dd}"
+                    if dd:
+                        fails.append(f"P={p} rank={r} S={s_} run-to-run")
+                tag = f"P={p} rank={r} S={s_} order {ids} splits {fr['splits']}"
+                print(f"INV {tag}: {len(ids) - len(bad)}/{len(ids)} requests bitwise equal to alone"
+                      + (f" BAD {bad}" if bad else "") + again, flush=True)
+                if bad:
+                    fails.append(tag)
+    return fails
+
+
+def time_wide(w, args, device, epoch):
+    """The front at 4 and 8 requests (every request at one context, and mixed),
+    CUDA-graph timed, then its phase stamps."""
+    cells = []
+    for nr in (4, 8):
+        if nr > args.max_reqs:
+            continue
+        for p in args.ctx:
+            cells.append((f"{nr}x{p}", [p] * nr))
+    if args.max_reqs >= 8:
+        cells.append(("mixed8", [10000, 250000, 3000, 100000, 37000, 180000, 64, 100000]))
+    need = max(max(c) for _, c in cells) + 8 * 997
+    bank = make_keys(w, need, args.seed, device, args.temp[0])
+    for name, ctxs in cells:
+        for r in args.rank:
+            b = Batch([(p, bank[997 * i : 997 * i + p], args.seed + 13 * i) for i, p in enumerate(ctxs)], r, device)
+            st = batch_stream(range(len(ctxs)), args.seed, device)
+            from sgl_amd_mono.kimi_k3.gfx950.attention import mla_front as mf
+
+            key = front_key(w, b.s)
+            scratch = scratch_for(key, device)
+            gate = torch.empty(b.s, NHL * VD, dtype=BF, device=device)
+            send = torch.zeros(DCP, b.s, NHL, mf.REC, dtype=BF, device=device)
+
+            def front():
+                epoch[0].add_(1)
+                mf.mla_front_launch(
+                    key, prefix=st["prefix"], blocks=st["blocks"], w=w, kv=b.pool,
+                    kv_idx=b.kv_idx, kv_ptr=b.kv_ptr, g_kv_ptr=b.g_kv_ptr, loc=b.loc,
+                    gate=gate, send=send, scratch=scratch, rank=b.r, layer=args.layer,
+                    epoch=epoch,
+                )  # fmt: skip
+
+            t = graph_time(front, args.sets, args.reps, args.warmup)
+            print(f"TIME {name} rank={r} S={b.s} splits={[mf.splits_of(p) for p in ctxs]}: front {t[0]:.1f} us "
+                  f"[{t[1]:.1f}, {t[2]:.1f}] (sets {args.sets}, reps {args.reps}, warm-up {args.warmup})", flush=True)
+            fr = run_batch(w, st, b, epoch, args.layer, timeline=True)
+            print_stamps(fr["tl"], f"{name} rank={r}")
 
 
 # ---------------------------------------------------------------- the front
@@ -532,6 +736,9 @@ def main():
     ap.add_argument("--sets", type=int, default=10)
     ap.add_argument("--reps", type=int, default=20)
     ap.add_argument("--warmup", type=int, default=10)
+    ap.add_argument("--invariance", action="store_true", help="the batch-invariance suite")
+    ap.add_argument("--time-wide", action="store_true", help="time the front at 4 and 8 requests")
+    ap.add_argument("--max-reqs", type=int, default=8)
     args = ap.parse_args()
     device = torch.device("cuda", 0)
     torch.cuda.set_device(device)
@@ -549,6 +756,14 @@ def main():
         if fb:
             fails.append("frontier")
     w = layer_weights(args, device)
+    if args.invariance or args.time_wide:
+        epoch = torch.zeros(8, dtype=torch.int32, device=device)
+        if args.time_wide:
+            time_wide(w, args, device, epoch)
+        else:
+            fails += invariance(w, args, device, epoch)
+        print("ALL PASS" if not fails else f"FAILED: {fails}", flush=True)
+        sys.exit(1 if fails else 0)
     st = stream_inputs(args.seed, device)
     xr = seam_x(st, w)
     key = mf.MlaFrontBuild(tokens=G, nblocks=NVB, scale=w["scale"])
@@ -783,22 +998,28 @@ def time_cells(w, st, keys, p, r, scratch, epoch, layer, args):
     )
     # phase stamps: per point, the latest CTA past it, from the earliest start
     fr = run_front(w, st, rk, scratch, epoch, layer, timeline=True)
-    tl = fr["tl"]
+    print_stamps(fr["tl"], f"P={p} rank={r}")
+
+
+STAMP_NAMES = ["start", "x seen", "stage 1", "q latent", "q_b", "absorb", "attn q seen", "attn done",
+               "W_UV seen", "W_UV done", "blk start", "blk qk", "blk pv", "blk stored", "blk sm", "blk pv start",
+               "blk bar1", "blk dma issued", "blk dma waited"]
+
+
+def print_stamps(tl, tag):
     t0 = tl[:, 0].min()
-    names = ["start", "x seen", "stage 1", "q latent", "q_b", "absorb", "attn q seen", "attn done",
-             "W_UV seen", "W_UV done", "blk start", "blk qk", "blk pv", "blk stored", "blk sm", "blk pv start", "blk bar1", "blk dma issued", "blk dma waited"]
     pts = []
-    for k, n in enumerate(names):
+    for k, n in enumerate(STAMP_NAMES):
         col = tl[:, k]
         live = col > 0
         if live.any():
             us = ((col[live] - t0).double() / 100.0).sort().values
             pts.append(f"{n} {us[len(us) // 2].item():.1f}/{us[-1].item():.1f}")
-    print(f"STAMPS P={p} rank={r} (us from launch, median/latest CTA): " + ", ".join(pts), flush=True)
+    print(f"STAMPS {tag} (us from launch, median/latest CTA): " + ", ".join(pts), flush=True)
     groups = {"0-27": (0, 28), "28-55": (28, 56), "56-127": (56, 128), "128-191": (128, 192), "192-255": (192, 256)}
     for gname, (a_, b_) in groups.items():
         cols = []
-        for k, n in enumerate(names[:10]):
+        for k, n in enumerate(STAMP_NAMES[:10]):
             col = tl[a_:b_, k]
             live = col > 0
             if live.any():

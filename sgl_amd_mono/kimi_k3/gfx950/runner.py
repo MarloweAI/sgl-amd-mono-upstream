@@ -36,7 +36,11 @@ class K3MonoRunner:
         # The launches run one after another, so one buffer the widest of them
         # fits, then K2's tagged x rows.
         front = mla_front.scratch_bytes(
-            mla_front.MlaFrontBuild(tokens=mla_front.G_ROWS, nblocks=MAX_BLOCKS, scale=1.0)
+            mla_front.MlaFrontBuild(
+                tokens=mla_front.G_ROWS * min(mla_front.MAX_REQS, MAX_ROWS // mla_front.G_ROWS),
+                nblocks=MAX_BLOCKS,
+                scale=1.0,
+            )
         )
         self.scratch_bytes = (max(layer.scratch_alloc_bytes(), front) + 255) // 256 * 256
         # this rank's decode-context-parallel rank (the DCP front's key share)

@@ -641,14 +641,19 @@ def _mla_outputs(rows: int, device) -> dict:
 
 def _front_build(layer, rows: int):
     """An MLA layer's DCP8 front key and the weights it reads in place, or None:
-    a KDA layer, a width other than one request's verify block, or weights the
-    launch does not take (SGLang's path)."""
+    a KDA layer, a width other than 1 .. 8 requests' verify blocks, or weights
+    the launch does not take (SGLang's path). Each width has its own build."""
     from sgl_amd_mono.kimi_k3.gfx950.attention import mla_front as mf
     from sgl_amd_mono.kimi_k3.gfx950.stages.dims import HIDDEN
 
     attn = layer.self_attn
     fused = getattr(attn, "fused_qkv_a_proj_with_mqa", None)
-    if rows != mf.G_ROWS or hasattr(attn, "qkv_conv1d") or fused is None:
+    if (
+        rows % mf.G_ROWS
+        or rows // mf.G_ROWS > mf.MAX_REQS
+        or hasattr(attn, "qkv_conv1d")
+        or fused is None
+    ):
         return None
     mqa = getattr(attn, "attn_mqa", None)
     w = {
@@ -703,18 +708,19 @@ def _front_buffers(rows: int, device) -> dict:
 
 
 def _front_warmup(runner, packed, rows: int, blocks) -> None:
-    """The DCP front once, on throwaway KV and a request at P = 0."""
+    """The DCP front once, on throwaway KV and every request at P = 0."""
     from sgl_amd_mono.kimi_k3.gfx950.attention import mla_front as mf
 
     dev = runner.device
     key, w = packed.front
+    nreq = rows // mf.G_ROWS
     buf = _front_buffers(rows, dev)
     mf.mla_front_launch(
         key, prefix=runner.prefix[:rows], blocks=blocks, w=w,
         kv=torch.zeros(64, mf.DQK, dtype=torch.uint8, device=dev),
         kv_idx=torch.zeros(8, dtype=torch.int32, device=dev),
-        kv_ptr=torch.tensor([0, 1], dtype=torch.int32, device=dev),
-        g_kv_ptr=torch.tensor([0, rows], dtype=torch.int32, device=dev),
+        kv_ptr=torch.tensor([0] + [1] * nreq, dtype=torch.int32, device=dev),
+        g_kv_ptr=torch.arange(nreq + 1, dtype=torch.int32, device=dev) * mf.G_ROWS,
         loc=torch.zeros(rows, dtype=torch.int64, device=dev),
         gate=buf["gate"], send=buf["send"], scratch=runner.scratch,
         rank=runner.dcp_rank, layer=packed.i, epoch=runner.epoch,
