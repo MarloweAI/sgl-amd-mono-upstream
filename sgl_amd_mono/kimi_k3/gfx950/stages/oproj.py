@@ -135,16 +135,17 @@ def o_dims(c):
 
 def o_loads(c, rg):
     """Rows 16 rg .. of o_proj, this wave's K chunks (wave, wave + 8, ...): a lane
-    64 B of its row a chunk."""
+    64 B of its row a chunk. A chunk past the last reads no memory (zeros)."""
     lane, wave = c["lane"], c["wave"]
     k, nch, per = o_dims(c)
-    r_w = rsrc(c["args"]["w_o"])
     row = rg * ROWS + lane % ROWS
     g = lane // ROWS
     out = []
     for i in range(per):
-        ch = fx.min(wave + WAVES * i, nch - 1)
-        base = (row * k + ch * 128 + g * 8) // 2
+        ch = wave + WAVES * i
+        live = ch < nch
+        r_w = rsrc(c["args"]["w_o"], live.select(fx.Int64(OROWS * k * 2), fx.Int64(0)))
+        base = (row * k + fx.min(ch, nch - 1) * 128 + g * 8) // 2
         out.append(
             [
                 fx.Vector(
@@ -276,9 +277,7 @@ def stage_reduce(c, task):
                 )
             else:
                 fx.ptr_store(bf16_round(lo), c["delta_lds"] + (t * COLS + 2 * cp))
-                fx.ptr_store(
-                    bf16_round(hi), c["delta_lds"] + (t * COLS + 2 * cp + 1)
-                )
+                fx.ptr_store(bf16_round(hi), c["delta_lds"] + (t * COLS + 2 * cp + 1))
     gpu.barrier()
 
 

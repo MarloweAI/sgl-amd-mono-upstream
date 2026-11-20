@@ -10,8 +10,9 @@ shared gate/up GEMVs issue their weights before they first wait.
 
     CTAs 0 .. 55     K2a's reduce + AttnRes (slice, gate, mix -> x rows + XRDY);
                      then route (0 .. S-1) and the shared SiTU (8 .. 8+S-1)
-    CTAs 56 .. 159   o_proj (448 x 16 rows) -> partials to every rank; then
-                     the shared gate/up (96 tasks, weights right after o_proj)
+    every CTA        o_proj (448 x 16 rows: one task a CTA below 64, two
+                     above) -> partials to every rank
+    CTAs 56 .. 151   the shared gate/up (96 tasks, weights right after o_proj)
     CTAs 160 .. 243  router parts (28) and latent parts (56): weights first
     every CTA        ug; down (0 .. 223) or the shared down (224 .. 255);
                      lnorm (56 .. 83), up (0 .. 55), reduce (200 .. 255)
@@ -60,10 +61,11 @@ from sgl_amd_mono.kimi_k3.gfx950.tag import step_tag
 
 SOURCES = kernel_sources(__name__)
 
-O0, O1 = NA, BLOCKS  # o_proj CTAs: every CTA past AttnRes's
-O_N = O1 - O0  # 200
+O0 = NA  # the CTAs past AttnRes's
 OTASKS = k2a.OTASKS  # 448
-O_ROUNDS = (OTASKS + O_N - 1) // O_N  # 5
+# o_proj on every CTA: task b on CTA b, then task b + O_SECOND on CTAs O_TWO0 ..
+O_SECOND = OTASKS - BLOCKS  # 192
+O_TWO0 = BLOCKS - O_SECOND  # 64
 E0 = 160  # router / latent CTAs (their weights in flight under their o_proj)
 H0 = 8  # the shared SiTU's CTAs (after their AttnRes work)
 SD0 = k2b.DOWN_TASKS  # 224: the shared down's CTAs
@@ -244,18 +246,20 @@ def scratch_bytes(key: K2Build) -> int:
 
 
 @flyc.jit
-def stage_oproj(c, gi):
-    """o_proj tasks gi, gi + 200, gi + 400 (< 448): every task's weights in
-    flight at once (one memory latency, not three), then the MFMAs."""
-    ops = [k2a.o_loads(c, fx.min(gi + O_N * j, OTASKS - 1)) for j in range(O_ROUNDS)]
+def stage_oproj(c, bid):
+    """o_proj task ``bid``, and ``bid + O_SECOND`` from CTA ``O_TWO0`` on: both
+    tasks' weights in flight at once (one memory latency, not two), then the
+    MFMAs, a token tile at a time."""
+    two = bid >= O_TWO0
+    t1 = fx.min(bid + O_SECOND, OTASKS - 1)
+    ops = [k2a.o_loads(c, bid), k2a.o_loads(c, t1)]
     tiles = gemv.tiles(c["S"])
     for ti in range_constexpr(len(tiles)):
         t0, sj = tiles[ti]
         k2a.load_core(c, t0, sj)
-        for j in range_constexpr(O_ROUNDS):
-            t = gi + O_N * j
-            if t < OTASKS:
-                k2a.stage_o(c, t, ops[j], t0, sj)
+        k2a.stage_o(c, bid, ops[0], t0, sj)
+        if two:
+            k2a.stage_o(c, t1, ops[1], t0, sj)
 
 
 _BUILDS: dict = {}
@@ -584,18 +588,19 @@ def build(key: K2Build):
             # o_proj first (every AttnRes CTA waits on the slowest partial; loads
             # retire in order), the early weights after: they land before x does
             if is_r:
-                stage_oproj(c, bid - O0)
+                stage_oproj(c, bid)
                 stamp(on, tls, tid, 1)
                 rops = k2b.early_loads(c, 0, eb // k2b.R_PARTS, eb % k2b.R_PARTS)
                 k2b.early_compute(c, 0, eb // k2b.R_PARTS, eb % k2b.R_PARTS, rops)
             if is_l:
-                stage_oproj(c, bid - O0)
+                stage_oproj(c, bid)
                 stamp(on, tls, tid, 1)
                 lops = k2b.early_loads(c, 3, lb // k2b.LQ_PARTS, lb % k2b.LQ_PARTS)
                 k2b.early_compute(c, 3, lb // k2b.LQ_PARTS, lb % k2b.LQ_PARTS, lops)
-            if (bid >= O0) & ~is_r & ~is_l:
-                stage_oproj(c, bid - O0)
+            if ~is_r & ~is_l:
+                stage_oproj(c, bid)
                 stamp(on, tls, tid, 1)
+            if (bid >= O0) & ~is_r & ~is_l:
                 gi = bid - O0
                 if gi < k2b.G_TASKS:
                     k2b.early_compute(c, 2, gi, 0, k2b.early_loads(c, 2, gi, 0))
