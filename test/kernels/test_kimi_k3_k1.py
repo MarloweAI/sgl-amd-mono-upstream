@@ -152,6 +152,10 @@ class K1Case:
         self.ares_qk = _randn(g, h, scale=0.02)
         self.in_nw = (1 + _randn(g, h, scale=0.1)).to(BF)
         self.w_in = _randn(g, kda.NPROJ, h, scale=0.02)
+        from sgl_amd_mono.kimi_k3.gfx950.attention import kda_wide
+
+        # the layout K1 reads (the served layers' in_proj is packed in place)
+        self.w_in_packed = kda_wide.pack_w_in(self.w_in)
         self.w_fb = _randn(g, kda.NH * kda.HD, kda.HD, scale=0.02)
         self.conv_w = _randn(g, dim, kda.CONV_W, scale=0.3, dtype=torch.float32)
         self.a_log = _randn(g, kda.NH, scale=0.1, dtype=torch.float32)
@@ -207,7 +211,7 @@ class K1Case:
             ares_nw=self.ares_nw,
             ares_qk=self.ares_qk,
             in_nw=self.in_nw,
-            w_in=self.w_in,
+            w_in=self.w_in_packed,
             w_fb=self.w_fb,
             conv_w=self.conv_w,
             conv_state=self.conv_state,

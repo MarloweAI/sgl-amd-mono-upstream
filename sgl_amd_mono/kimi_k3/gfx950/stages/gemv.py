@@ -64,12 +64,12 @@ def loads(lane, wave, w, row0, k, nt=True, ldk=None, k0=0, nbytes=None):
     return out
 
 
-def mfmas(lane, wave, xl, xrow, k, s, ops):
-    """``loads``' operands against token rows 0 .. s - 1 of the LDS rows ``xl``
-    (``xrow`` bf16 a row) -> this wave's 16x16 accumulator."""
+def mfmas(lane, wave, xl, xrow, k, s, ops, t0=0):
+    """``loads``' operands against token rows t0 .. t0 + s - 1 (s <= 16) of the
+    LDS rows ``xl`` (``xrow`` bf16 a row) -> this wave's 16x16 accumulator."""
     per, n = chunks(k)
     g = lane // ROWS
-    t = fx.min(lane % ROWS, s - 1)
+    t = t0 + fx.min(lane % ROWS, s - 1)
     acc = fx.Vector.filled(4, 0.0, fx.Float32)
     for i in range_constexpr(per):
         ch = wave + WAVES * i
@@ -92,15 +92,41 @@ def mfmas(lane, wave, xl, xrow, k, s, ops):
     return acc
 
 
+def mfmas_rounds(lane, wave, xl, xrow, k0, s, ops, acc, r0, r1):
+    """``mfmas``' rounds r0 .. r1 (chunks wave + 8 i) chained onto ``acc``, the
+    token rows in LDS holding columns k0 .. : the same MFMAs in the same order,
+    so a K staged a segment at a time sums bit for bit as ``mfmas``."""
+    g = lane // ROWS
+    t = fx.min(lane % ROWS, s - 1)
+    for i in range_constexpr(r0, r1):
+        kk = (wave + WAVES * i) * KCH + g * 8 - k0
+        for q in range_constexpr(4):
+            xb = fx.Vector(
+                fx.ptr_load(
+                    xl + (t * xrow + kk + 32 * q) // 2,
+                    result_type=fx.Vector.make_type(4, fx.Int32),
+                )
+            )
+            acc = mfma_bf16(
+                ops[i][q].bitcast(fx.BFloat16), xb.bitcast(fx.BFloat16), acc
+            )
+    return acc
+
+
 def const_live(per, n):
     """Whether some wave's last chunk is past K (its MFMA must add zero)."""
     return per * WAVES != n
 
 
+def tiles(s):
+    """The 16-row token tiles of an s-row step: (first row, rows) each."""
+    return [(t0, min(ROWS, s - t0)) for t0 in range(0, s, ROWS)]
+
+
 @flyc.jit
-def rows_to_lds(tid, src, k, s, xl, xrow, cm=0, ldk=None, k0=0):
-    """Columns k0 .. k0 + k of token rows 0 .. s - 1 of the bf16 [s, ldk] at
-    ``src`` -> LDS (``xrow`` a row), 16 B a lane."""
+def rows_to_lds(tid, src, k, s, xl, xrow, cm=0, ldk=None, k0=0, t0=0):
+    """Columns k0 .. k0 + k of token rows t0 .. t0 + s - 1 of the bf16 [., ldk]
+    at ``src`` -> LDS rows 0 .. s - 1 (``xrow`` a row), 16 B a lane."""
     ldk = k if ldk is None else ldk
     words = s * k // 8
     for i in range_constexpr((words + THREADS - 1) // THREADS):
@@ -110,7 +136,7 @@ def rows_to_lds(tid, src, k, s, xl, xrow, cm=0, ldk=None, k0=0):
         v = fx.Vector(
             bo.buffer_load(
                 rsrc(src),
-                (t * ldk + k0 + kk) // 2,
+                ((t0 + t) * ldk + k0 + kk) // 2,
                 vec_width=4,
                 dtype=T.i32,
                 cache_modifier=cm,
@@ -121,6 +147,6 @@ def rows_to_lds(tid, src, k, s, xl, xrow, cm=0, ldk=None, k0=0):
     gpu.barrier()
 
 
-def dev_rows_to_lds(tid, src, k, s, xl, xrow):
+def dev_rows_to_lds(tid, src, k, s, xl, xrow, t0=0):
     """``rows_to_lds`` at device scope: rows another CTA of this launch wrote."""
-    rows_to_lds(tid, src, k, s, xl, xrow, CM_DEV)
+    rows_to_lds(tid, src, k, s, xl, xrow, CM_DEV, t0=t0)

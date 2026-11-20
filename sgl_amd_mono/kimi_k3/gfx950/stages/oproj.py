@@ -28,10 +28,12 @@ from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import Int32, Int64, T
 
 from sgl_amd_mono.common.ops import (
+    CM_DEV,
     CM_NT,
     bf16_pair,
     bf16_round,
     ld_i32,
+    lds_barrier,
     mfma_bf16,
     peer_bases,
     row_sum,
@@ -84,8 +86,7 @@ SOURCES = kernel_sources(__name__)
 TP = 8
 OROWS = HIDDEN  # o_proj rows (full hidden, a rank's K slice)
 OTASKS = OROWS // ROWS  # 448
-OK = PROJ  # K = 1536 a rank
-OKCH = OK // 128  # 12 chunks
+OK = PROJ  # K = 1536 a rank (the KDA core)
 GEMV0 = NA  # the first gemv CTA
 GEMV_N = BLOCKS - NA  # 200
 TL_POINTS = 6  # start, gemv, pushed, reduced, slice/gate, mix
@@ -125,17 +126,27 @@ def scratch_bytes(key: AttnPostBuild) -> int:
     return max(o + n for o, n in scratch_layout(key).values())
 
 
+def o_dims(c):
+    """o_proj's K (the launch's input width) and its 128-column chunks: (K,
+    chunks, chunks a wave)."""
+    k = c.get("OK", OK)
+    n = k // 128
+    return k, n, (n + WAVES - 1) // WAVES
+
+
 def o_loads(c, rg):
-    """Rows 16 rg .. of o_proj, this wave's K chunks (wave, wave + 8 < 12): a lane
-    64 B of its row a chunk."""
+    """Rows 16 rg .. of o_proj, this wave's K chunks (wave, wave + 8, ...): a lane
+    64 B of its row a chunk. A chunk past the last reads no memory (zeros)."""
     lane, wave = c["lane"], c["wave"]
-    r_w = rsrc(c["args"]["w_o"])
+    k, nch, per = o_dims(c)
     row = rg * ROWS + lane % ROWS
     g = lane // ROWS
     out = []
-    for i in range(2):
-        ch = fx.min(wave + WAVES * i, OKCH - 1)
-        base = (row * OK + ch * 128 + g * 8) // 2
+    for i in range(per):
+        ch = wave + WAVES * i
+        live = ch < nch
+        r_w = rsrc(c["args"]["w_o"], live.select(fx.Int64(OROWS * k * 2), fx.Int64(0)))
+        base = (row * k + fx.min(ch, nch - 1) * 128 + g * 8) // 2
         out.append(
             [
                 fx.Vector(
@@ -153,39 +164,75 @@ def o_loads(c, rg):
     return out
 
 
+CORE_REQ_ROWS = 6  # a request's verify rows: a core box covers one request
+
+
+def core_boxes(s: int) -> int:
+    """A core box a (request, local head) of an s-row step."""
+    return -(-s // CORE_REQ_ROWS) * (OK // 128)
+
+
+def core_ready(c, box, t, k):
+    """Core row t's chunk at K column k is written in this launch: wait for its
+    (request, local head) box to hold this launch's tag."""
+    c["poll"]([(box, (t // CORE_REQ_ROWS) * (OK // 128) + k // 128, 1)])
+
+
 @flyc.jit
-def load_core(c):
-    """The core rows (S x 1536 bf16) -> LDS, rows padded."""
-    s, tid = c["S"], c["tid"]
-    words = s * OK // 8
-    row = OK + LDS_PAD
+def load_core(c, t0=0, s=None):
+    """Core rows t0 .. t0 + s - 1 (bf16, ``core_ld`` elements a row; all S
+    rows by default) -> LDS rows 0 .., padded. With ``core_box`` (core from
+    the same launch), after the rows' boxes (one a thread, all at once),
+    device scope."""
+    tid = c["tid"]
+    s = c["S"] if s is None else s
+    # read before the traced branches (a dict lookup inside one is carried state)
+    box = c.get("core_box")
+    ok, _, _ = o_dims(c)
+    ld = c["args"].get("core_ld", ok)
+    words = s * ok // 8
+    row = ok + LDS_PAD
+    if const_expr(box is not None):
+        r0, r1 = t0 // CORE_REQ_ROWS, (t0 + s - 1) // CORE_REQ_ROWS
+        if tid < (r1 - r0 + 1) * (OK // 128):
+            core_ready(c, box, r0 * CORE_REQ_ROWS, tid * 128)
+        lds_barrier()
     for i in range_constexpr((words + THREADS - 1) // THREADS):
         e = fx.min(tid + THREADS * i, words - 1)
+        t = e // (ok // 8)
+        k = e % (ok // 8) * 8
         v = fx.Vector(
-            bo.buffer_load(rsrc(c["args"]["core"]), e * 4, vec_width=4, dtype=T.i32)
+            bo.buffer_load(
+                rsrc(c["args"]["core"]),
+                ((t0 + t) * ld + k) // 2,
+                vec_width=4,
+                dtype=T.i32,
+                cache_modifier=0 if box is None else CM_DEV,
+            )
         )
-        t = e // (OK // 8)
-        k = e % (OK // 8) * 8
         if tid + THREADS * i < words:
             fx.ptr_store(v, c["xl"] + (t * row + k) // 2)
-    gpu.barrier()
+    lds_barrier()
 
 
 @flyc.jit
-def stage_o(c, rg, ops):
-    """Rows 16 rg ..: GEMV -> bf16 partials -> every rank's AR region, this
+def stage_o(c, rg, ops, t0=0, sj=None):
+    """Rows 16 rg .. against token rows t0 .. t0 + sj - 1 (LDS rows 0 ..; all S
+    rows by default): GEMV -> bf16 partials -> every rank's AR region, this
     rank's slot (thread: token, row pair; a put a peer)."""
     s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
+    sj = s if sj is None else sj
     # read before the traced branches (a dict lookup inside one is carried state)
     sent_ar = c.get("sent_ar", False)
     g = lane // ROWS
-    t = fx.min(lane % ROWS, s - 1)
-    row = OK + LDS_PAD
+    t = fx.min(lane % ROWS, sj - 1)
+    ok, nch, per = o_dims(c)
+    row = ok + LDS_PAD
     acc = fx.Vector.filled(4, 0.0, fx.Float32)
-    for i in range_constexpr(2):
+    for i in range_constexpr(per):
         ch = wave + WAVES * i
-        live = ch < OKCH
-        k = fx.min(ch, OKCH - 1) * 128 + g * 8
+        live = ch < nch
+        k = fx.min(ch, nch - 1) * 128 + g * 8
         for q in range_constexpr(4):
             xb = fx.Vector(
                 fx.ptr_load(
@@ -200,12 +247,15 @@ def stage_o(c, rg, ops):
                 ops[i][q].bitcast(fx.BFloat16), xb.bitcast(fx.BFloat16), acc
             )
     fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
-    gpu.barrier()
-    if tid < s * (ROWS // 2):
-        tt = tid // (ROWS // 2)
+    lds_barrier()
+    # the task's GEMV done, before its pushes (the last task's stamp stays)
+    stamp(c.get("tl_on", False), c.get("tls"), tid, c.get("tl_push", 0))
+    if tid < sj * (ROWS // 2):
+        tl = tid // (ROWS // 2)
+        tt = t0 + tl
         rp = tid % (ROWS // 2)
-        v0 = bf16_round(row_sum(red, 2 * rp, tt))
-        v1 = bf16_round(row_sum(red, 2 * rp + 1, tt))
+        v0 = bf16_round(row_sum(red, 2 * rp, tl))
+        v1 = bf16_round(row_sum(red, 2 * rp + 1, tl))
         if const_expr(sent_ar):
             si = sent_ix(c["rank"], rg * ROWS + 2 * rp, tt, s, HIDDEN)
             word = sent_word(bf16_pair(v0, v1))
@@ -215,33 +265,44 @@ def stage_o(c, rg, ops):
             at = (c["rank"] * s + tt) * HIDDEN + rg * ROWS + 2 * rp
             for p in range_constexpr(TP):
                 c["put_bf"](c["ar_peer"][p], at, [v0, v1])
-    gpu.barrier()
+    lds_barrier()
 
 
 @flyc.jit
 def stage_reduce(c, task):
     """Columns 128 task ..: the 8 ranks' partials, rank order, -> bf16 delta in
-    LDS (thread: token, column pair)."""
+    LDS (an item a (token, column pair), THREADS items a round; packed bf16
+    pairs under ``vals_bf16``)."""
     s, tid = c["S"], c["tid"]
     sent_ar = c.get("sent_ar", False)
-    if tid < s * (COLS // 2):
-        if const_expr(sent_ar):
-            # consecutive threads read consecutive words; re-armed after the mix
-            t, cp = sent_item(tid, s)
-            col = task * COLS + 2 * cp
-            lo, hi = sent_sum(c["ars_own"], col, t, s, HIDDEN, TP, rearm=False)
-        else:
-            t = tid // (COLS // 2)
-            cp = tid % (COLS // 2)
-            col = task * COLS + 2 * cp
-            lo, hi = sum_partials(
-                c["poll"],
-                c["ar_own"],
-                lambda src: ((src * s + t) * HIDDEN + col) // 2,
-                TP,
-            )
-        fx.ptr_store(bf16_round(lo), c["delta_lds"] + (t * COLS + 2 * cp))
-        fx.ptr_store(bf16_round(hi), c["delta_lds"] + (t * COLS + 2 * cp + 1))
+    vals_bf16 = c.get("vals_bf16", False)
+    n = s * (COLS // 2)
+    for i in range_constexpr((n + THREADS - 1) // THREADS):
+        idx = tid + THREADS * i
+        if idx < n:
+            if const_expr(sent_ar):
+                # consecutive threads read consecutive words; re-armed after the mix
+                t, cp = sent_item(idx, s)
+                col = task * COLS + 2 * cp
+                lo, hi = sent_sum(c["ars_own"], col, t, s, HIDDEN, TP, rearm=False)
+            else:
+                t = idx // (COLS // 2)
+                cp = idx % (COLS // 2)
+                col = task * COLS + 2 * cp
+                lo, hi = sum_partials(
+                    c["poll"],
+                    c["ar_own"],
+                    lambda src: ((src * s + t) * HIDDEN + col) // 2,
+                    TP,
+                )
+            if const_expr(vals_bf16):
+                fx.ptr_store(
+                    bf16_pair(lo, hi).bitcast(fx.Int32),
+                    c["delta_lds"] + (t * COLS + 2 * cp) // 2,
+                )
+            else:
+                fx.ptr_store(bf16_round(lo), c["delta_lds"] + (t * COLS + 2 * cp))
+                fx.ptr_store(bf16_round(hi), c["delta_lds"] + (t * COLS + 2 * cp + 1))
     gpu.barrier()
 
 
@@ -250,10 +311,15 @@ def rearm_ar(c, task):
     """Re-arm the sentinel words ``stage_reduce`` read for ``task``: after the
     mix, off the path to x."""
     s, tid = c["S"], c["tid"]
-    if tid < s * (COLS // 2):
-        t, cp = sent_item(tid, s)
-        col = task * COLS + 2 * cp
-        rearm_sent(c["ars_own"], [sent_ix(src, col, t, s, HIDDEN) for src in range(TP)])
+    n = s * (COLS // 2)
+    for i in range_constexpr((n + THREADS - 1) // THREADS):
+        idx = tid + THREADS * i
+        if idx < n:
+            t, cp = sent_item(idx, s)
+            col = task * COLS + 2 * cp
+            rearm_sent(
+                c["ars_own"], [sent_ix(src, col, t, s, HIDDEN) for src in range(TP)]
+            )
 
 
 _BUILDS: dict = {}
@@ -263,7 +329,7 @@ def build(key: AttnPostBuild):
     if key in _BUILDS:
         return _BUILDS[key]
     s, ns = key.tokens, key.nblocks + 1
-    assert s * (ROWS // 2) <= THREADS and s * (COLS // 2) <= THREADS
+    assert s * (ROWS // 2) <= THREADS
     lay = scratch_layout(key)
     half = ar_half_pairs(s) * 8
 

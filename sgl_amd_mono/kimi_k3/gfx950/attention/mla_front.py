@@ -1,0 +1,1291 @@
+# SPDX-License-Identifier: Apache-2.0
+"""``mla_front``: one Kimi-K3 MLA layer's attention under decode context
+parallelism (DCP8), from the AttnRes seam to the gated core (o_proj's input),
+for one request's verify block (6 rows). One launch a layer, ``BLOCKS`` x
+``THREADS``.
+
+Every rank attends all 96 heads over its own share of the request's keys (rank
+``pos % 8`` holds position ``pos``), with q computed for every head from the
+replicated q_b and W_UK, as SGLang's DCP MLA forward does. The 96 heads'
+partials, each V-projected and with its natural-log LSE, go to their owner
+ranks (``mla_combine``), whose combine and output gate write ``core``
+[S, 1536] bf16. The launch also writes this rank's new KV record.
+
+    CTAs 0 .. 55     the attention-side seam (K1's): slice -> gate -> mix,
+                     input_layernorm -> the bf16 x rows (XRDY a slice)
+    stage 1, CTAs 56 .. (and 28 groups on seam CTAs)
+                     fused_qkv_a (132 groups of 16 rows) and g_proj (96): the
+                     raw latent to LAT, a q / kv group's rows' sum of squares to
+                     SS, g_proj to G (GRDY a group)
+    KV CTA           kv_a_layernorm, e4m3 of the latent and the rope part: the
+                     new token this rank owns -> its KV row and NEWKV
+    stage 2, every CTA
+                     q_b over all 96 heads (1152 groups of 16 rows) from the
+                     normed q latent: bf16 to QB; the rope rows as e4m3 into Q8
+    stage 3, every CTA
+                     the absorb q_nope @ W_UK, a (head, 128 latent columns) a
+                     task, e4m3 into Q8 [S, 96, 576]
+    attention, CTAs 128 ..
+                     an item a (16-head group, key split, dim range): e4m3 QK
+                     and bf16 PV (V widened exactly) over 32-key blocks, the
+                     online softmax, the new token from NEWKV; a partial (f16,
+                     over its own sum) and its (max, sum) to PART / ML
+    W_UV, CTAs 0 .. 191
+                     a (head, 64 value columns) a task: the head's split
+                     partials merged in split order to the bf16 latent output,
+                     then W_UV; the values and the head's LSE pushed to the
+                     head's owner rank
+    combine, CTAs 192 .. 203
+                     a (request, local head) a task: the 8 ranks' records
+                     combined by their LSEs, gated by sigmoid(g) -> ``core``
+
+Numerics follow SGLang's hand-offs: bf16 x, latent, q_b and absorb outputs, q
+and the KV record in e4m3 at scale 1 (the round-to-nearest-even, non-saturating
+cast torch uses), the bf16 attention output before W_UV, bf16 partials. The key
+split count is a function of the request's own context, so a row's bits do not
+depend on the batch. The GEMV split-K and the attention's summation orders are
+this kernel's own.
+"""
+
+import math
+from dataclasses import dataclass
+
+import flydsl.compiler as flyc
+import flydsl.expr as fx
+import torch
+from aiter.ops.flydsl.kernels import buffer_ops as bo
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import math as fmath
+from flydsl._mlir.dialects import llvm
+from flydsl.expr.typing import Int32, Int64, T
+
+from sgl_amd_mono.common.ops import (
+    CM_DEV,
+    fp8_to_bf16x8,
+    bf16_round,
+    global_load,
+    hw_exp2,
+    hw_rsq,
+    row_sum,
+    rsrc,
+    uniform,
+    xred,
+)
+from sgl_amd_mono.common.plan import (
+    BLOCKS,
+    THREADS,
+    WAVES,
+    kernel_sources,
+    key_tuple,
+    pair_layout,
+)
+from sgl_amd_mono.common import guard
+from sgl_amd_mono.common.ops import load_ptr64
+from sgl_amd_mono.common.sync import Mailbox, sreg
+from sgl_amd_mono.kimi_k3.gfx950.attention import mla_combine as mc
+from sgl_amd_mono.kimi_k3.gfx950.attention.mla_combine import TL_CORE, TL_G, TL_RECORDS  # noqa: F401
+from sgl_amd_mono.kimi_k3.gfx950.attention.mla_pre import load_qlora, load_x
+from sgl_amd_mono.kimi_k3.gfx950.stages import gemv
+from sgl_amd_mono.kimi_k3.gfx950.stages.dims import COLS, HIDDEN, LDS_PAD, NA, ROWS
+from sgl_amd_mono.kimi_k3.gfx950.stages.seam import (
+    f32_of,
+    stage_mix,
+    stage_slice,
+)
+from sgl_amd_mono.kimi_k3.gfx950.stamps import stamp, stamp_begin, stamp_flush
+from sgl_amd_mono.kimi_k3.gfx950.tag import step_tag
+
+SOURCES = kernel_sources(__name__)
+
+SGLANG_READS = {
+    "srt/models/deepseek_v2.py": (
+        "fused_qkv_a_proj_with_mqa",
+        "q_a_layernorm",
+        "kv_a_layernorm",
+        "q_b_proj_qrep_weight",
+        "w_kc_qrep",
+        "w_vc_qrep",
+    ),
+    "srt/models/kimi_k3.py": ("g_proj",),
+}
+
+G_ROWS = 6  # a request's verify rows (DSpark block 5)
+DCP = 8
+QL = 1536  # q_lora_rank
+KV = 512  # kv_lora_rank
+ROPE = 64
+DQK = KV + ROPE  # 576: an e4m3 KV record and a q row a head
+LATW = QL + KV + ROPE  # 2112: fused_qkv_a's rows
+GATE = 1536  # g_proj's rows a rank (12 heads x 128)
+NHA = 96  # heads every rank attends
+NHL = NHA // DCP  # 12: heads a rank owns after the all-to-all
+QHD, QN, VD = 192, 128, 128  # a head's q_b rows, its nope part, v_head_dim
+REC = VD + 2  # 130: bf16 a send record (128 values, the fp32 LSE)
+G_LAT = LATW // ROWS  # 132
+G_Q = QL // ROWS  # 96
+G_KV = KV // ROWS  # 32
+S1 = (LATW + GATE) // ROWS  # 228 stage-1 groups
+S1_GATE0 = G_LAT
+NCTA1 = BLOCKS - NA  # 200 stage-1 CTAs
+S1_EXTRA = S1 - NCTA1  # 28 stage-1 groups on seam CTAs
+QBG = NHA * QHD // ROWS  # 1152 q_b groups
+QBG_HEAD = QHD // ROWS  # 12 a head: 8 nope, then 4 rope
+QB_ROUNDS = (QBG + BLOCKS - 1) // BLOCKS  # 5
+ABS_BLK = KV // 128  # 4 absorb tasks a head
+ABS = NHA * ABS_BLK  # 384
+HT = 16  # heads an attention item
+NHG = NHA // HT  # 6 head groups
+BK = 64  # keys a block
+KT = BK // 16  # 16-key QK tiles a block
+KC = BK // 32  # 32-key PV steps a block
+RWK = DQK // 4 + 4  # i32 words a key in LDS: its record + 16 bytes of pad
+PW = BK // 2 + 2  # i32 words a (row, head)'s bf16 P in LDS: its keys + pad
+ATT_CTAS = BLOCKS  # every CTA takes an attention item (at most one)
+MAX_SPLITS = 21  # the most splits whose items (at two dim ranges) fit the CTAs
+KEYS_PER_SPLIT = 256  # local keys a split aims at
+UV_HALF = 64  # value columns a W_UV task
+UV_TASKS = NHA * (VD // UV_HALF)  # 192
+UV_CTAS = 192  # a W_UV task a CTA, on CTAs 0 .. 191
+COMB0 = UV_CTAS  # the first combine CTA
+UV_ROW = UV_HALF + 8  # bf16 a W_UV tile row in LDS
+ABS_ROW = 128 + 8  # bf16 an absorb tile row in LDS
+OL_ROW = KV + 8  # bf16 a latent output row in LDS
+KV_CTA = NA - 1  # a seam CTA with no stage-1 group
+NEG = -3.4028234663852886e38
+LOG2E = 1.4426950408889634
+LN2 = 0.6931471805599453
+EMPTY_LSE = -1e30  # SGLang's LSE of a row with no key on this rank
+# start, x seen, stage 1, q latent normed, q_b, absorb, attention q seen,
+# attention done, W_UV partials seen, W_UV done, 4 attention block points,
+# combine g seen, combine records seen, core stored
+TL_POINTS = 17
+TL_START, TL_X, TL_STAGE1, TL_QLAT, TL_QB, TL_ABSORB, TL_ATT_Q, TL_ATT_DONE = range(8)
+TL_UV_SEEN, TL_UV_DONE, TL_BLK, TL_BLK_QK, TL_BLK_PV, TL_BLK_STORED = range(8, 14)
+
+assert S1_EXTRA <= NA - 1 and KV_CTA >= S1_EXTRA
+
+
+def splits_of(p: int) -> int:
+    """Key splits of a request at committed length ``p``: a function of the
+    request's own (global) context only, the same on every rank."""
+    lg = -(-(p + G_ROWS) // DCP)
+    return max(1, min(MAX_SPLITS, -(-lg // KEYS_PER_SPLIT)))
+
+
+def dims_of(n: int) -> int:
+    """Value-dim ranges at ``n`` splits: 4 while the items (6 head groups x n x
+    d) fit the CTAs, else 2."""
+    d = 4 if NHG * n * 4 <= ATT_CTAS else 2
+    assert NHG * n * d <= ATT_CTAS, n
+    return d
+
+
+@dataclass(frozen=True)
+class MlaFrontBuild:
+    tokens: int  # S: one request's verify rows
+    nblocks: int  # AttnRes block sources (the prefix is one more)
+    scale: float  # the softmax scale
+    eps: float = 1e-5  # AttnRes norm
+    out_eps: float = 1e-5  # input_layernorm
+    q_eps: float = 1e-6  # q_a_layernorm
+    kv_eps: float = 1e-6  # kv_a_layernorm
+    write_idx: int = -1  # a block-write layer's block: the updated prefix stored there
+    timeline: bool = False
+    # checks only: the W_UV records also to ``send`` in SGLang's all-to-all
+    # layout [8, S, 12, 130]
+    records: bool = False
+
+
+def scratch_layout(key: MlaFrontBuild) -> dict:
+    s, ns = key.tokens, key.nblocks + 1
+    pairs = {
+        "part": NA * s * ns * 2,
+        "wgt": s * (ns + 1),
+        "msq": NA * s,
+        "xrdy": NA,
+        "ss": (G_Q + G_KV) * s,
+        "qrdy": QBG,
+        "absrdy": ABS,
+        "kvrdy": 1,
+        "itrdy": ATT_CTAS,
+    }
+    lay = pair_layout(pairs.items())
+    end = max(o + n for o, n in lay.values())
+
+    def add(name, nbytes):
+        nonlocal end
+        lay[name] = ((end + 255) // 256 * 256, nbytes)
+        end = lay[name][0] + nbytes
+
+    add("x", s * HIDDEN * 2)
+    add("lat", s * LATW * 2)
+    add("qb", s * NHA * QHD * 2)
+    add("q8", s * NHA * DQK)
+    add("newkv", DQK)
+    add("pv", MAX_SPLITS * s * NHA * KV * 2)
+    add("ml", MAX_SPLITS * s * NHA * 2 * 4)
+    add("g", s * GATE * 2)
+    add("grdy", mc.GATE_GROUPS * 8)
+    return lay
+
+
+def scratch_bytes(key: MlaFrontBuild) -> int:
+    return max(o + n for o, n in scratch_layout(key).values())
+
+
+_BUILDS: dict = {}
+_STREAM = fx.Stream(None)
+
+
+def _bar():
+    """``s_barrier`` for an LDS hand-off: this wave's LDS accesses retired, its
+    global loads still in flight (``gpu.barrier`` drains them)."""
+    llvm.inline_asm(
+        res=None, operands_=[], asm_string="s_waitcnt lgkmcnt(0)\n\ts_barrier",
+        constraints="~{memory}", has_side_effects=True,
+    )  # fmt: skip
+
+
+def _published(nwait):
+    """Every wave's stores landed (its newest ``nwait`` loads may still be in
+    flight), then ``s_barrier``: a hand-off flag may follow."""
+    llvm.inline_asm(
+        res=None, operands_=[],
+        asm_string=f"s_waitcnt vmcnt({nwait}) lgkmcnt(0)\n\ts_barrier",
+        constraints="~{memory}", has_side_effects=True,
+    )  # fmt: skip
+
+
+def _st_bf(ptr, i, v, cm=0):
+    bo.buffer_store(fx.Float32(v).to(fx.BFloat16), rsrc(ptr), i, cache_modifier=cm)
+
+
+def e4m3x2(a, b, old, hi):
+    """Two f32 -> e4m3 bytes into half ``hi`` of ``old`` (v_cvt_pk_fp8_f32:
+    round to nearest even, no saturation), as torch casts bf16 to float8_e4m3fn."""
+    return fx.Int32(rocdl.cvt_pk_fp8_f32(T.i32, a, b, old, hi))
+
+
+def e4m3x4(v):
+    """Four f32 -> one word of four e4m3 bytes, element 0 lowest."""
+    lo = e4m3x2(v[0], v[1], fx.Int32(0), False)
+    return e4m3x2(v[2], v[3], lo, True)
+
+
+def _ld(ptr, i, cm=0):
+    return fx.Int32(
+        bo.buffer_load(rsrc(ptr), i, vec_width=1, dtype=T.i32, cache_modifier=cm)
+    )
+
+
+def _ldf(ptr, i, cm=0):
+    return fx.Float32(
+        bo.buffer_load(rsrc(ptr), i, vec_width=1, dtype=T.f32, cache_modifier=cm)
+    )
+
+
+def _ld4(ptr, i, cm=0):
+    return fx.Vector(
+        bo.buffer_load(rsrc(ptr), i, vec_width=4, dtype=T.i32, cache_modifier=cm)
+    )
+
+
+def _mfma16(a, b, c):
+    return fx.Vector(rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b, c]))
+
+
+def _pack_bytes(words, sh):
+    """Byte ``sh`` / 8 of each of eight words -> one i64, word j's byte at byte j."""
+    lo = fx.Int32(0)
+    hi = fx.Int32(0)
+    for j in range_constexpr(4):
+        lo = lo | (((words[j] >> sh) & 0xFF) << (8 * j))
+        hi = hi | (((words[4 + j] >> sh) & 0xFF) << (8 * j))
+    return fx.Vector.from_elements([lo, hi], fx.Int32).bitcast(fx.Int64)[0]
+
+
+@flyc.jit
+def _tgemv_ops(lane, wl, wrow, col, k0, step):
+    """A transposed GEMV's A operand at one 32-wide K step: weights W[k][col] in
+    LDS (``wrow`` bf16 a row, columns contiguous) read down column ``col`` and
+    ``col + 1`` at rows k0 + 32 step + 8 (lane / 16) ..: (operand of col,
+    operand of col + 1)."""
+    g = lane // 16
+    kb = k0 + 32 * step + 8 * g
+    ws = [fx.ptr_load(wl + ((kb + j) * wrow + col) // 2) for j in range(8)]
+    lo = [(ws[j] & 0xFFFF) for j in range(8)]
+    hi = [((ws[j] >> 16) & 0xFFFF) for j in range(8)]
+    a = fx.Vector.from_elements([lo[2 * i] | (lo[2 * i + 1] << 16) for i in range(4)], fx.Int32)
+    b = fx.Vector.from_elements([hi[2 * i] | (hi[2 * i + 1] << 16) for i in range(4)], fx.Int32)
+    return a.bitcast(fx.BFloat16), b.bitcast(fx.BFloat16)
+
+
+def _tgemv(lane, wl, wrow, col0, k0, steps, xl, xrow, s):
+    """Columns col0 + 2 (lane % 16) + dt (dt = 0, 1) of X W over K = k0 ..
+    k0 + 32 steps, X the token rows in LDS (``xrow`` bf16 a row): two 16x16
+    accumulators C[col][token] (lane: columns col0 + 2 (4 (lane / 16) + i) + dt,
+    token lane % 16)."""
+    g, r16 = lane // 16, lane % 16
+    t = fx.min(r16, s - 1)
+    acc = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(2)]
+    for st in range_constexpr(steps):
+        a0, a1 = _tgemv_ops(lane, wl, wrow, col0 + 2 * r16, k0, st)
+        xb = fx.Vector(
+            fx.ptr_load(
+                xl + (t * xrow + k0 + 32 * st + 8 * g) // 2,
+                result_type=fx.Vector.make_type(4, fx.Int32),
+            )
+        ).bitcast(fx.BFloat16)
+        acc[0] = _mfma16(a0, xb, acc[0])
+        acc[1] = _mfma16(a1, xb, acc[1])
+    return acc
+
+
+# ---------------------------------------------------------------- stage 1
+
+
+def s1_loads(c, g):
+    """Stage-1 group ``g``'s weights for this wave (fused_qkv_a, then g_proj)."""
+    a = c["args"]
+    g = fx.min(g, S1 - 1)
+    w = (g < S1_GATE0).select(a["w_qkv"], a["w_g"])
+    r0 = (g < S1_GATE0).select(g, g - S1_GATE0)
+    return gemv.loads(c["lane"], c["wave"], w, r0 * ROWS, HIDDEN)
+
+
+@flyc.jit
+def stage1(c, g, ops):
+    """Rows 16 g .. of stage 1 against the LDS x: a latent group to LAT (and its
+    rows' squares to SS for the q / kv norms), a g_proj group to ``gate``."""
+    s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
+    a = c["args"]
+    acc = gemv.mfmas(lane, wave, c["xl"], HIDDEN + LDS_PAD, HIDDEN, s, ops)
+    fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
+    gpu.barrier()
+    mine = tid < ROWS * s
+    r = tid % ROWS
+    t = fx.min(tid // ROWS, s - 1)
+    v = bf16_round(row_sum(red, r, t))
+    is_lat = g < S1_GATE0
+    if mine & is_lat:
+        _st_bf(c["lat"], t * LATW + g * ROWS + r, v, CM_DEV)
+    if mine & (g >= S1_GATE0):
+        _st_bf(a["gate"], t * GATE + (g - S1_GATE0) * ROWS + r, v, CM_DEV)
+    gpu.barrier()
+    if mine:
+        fx.ptr_store(v * v, red + tid)
+    rocdl.s_waitcnt(vmcnt=0)
+    gpu.barrier()
+    if (tid < s) & (g < G_Q + G_KV):
+        tot = fx.ptr_load(red + tid * ROWS)
+        for rr in range_constexpr(1, ROWS):
+            tot = tot + fx.ptr_load(red + (tid * ROWS + rr))
+        c["put"](c["ss"], g * s + tid, tot)
+    gpu.barrier()
+
+
+# ---------------------------------------------------------------- the request
+
+
+def request(c):
+    """The request's global committed length P (its global KV indptr span less
+    the verify rows) and this rank's view of it: (P, local prefix keys L, the
+    verify row this rank owns or 8, splits n, dim ranges d)."""
+    a = c["args"]
+    p = uniform(_ld(a["g_kv_ptr"], 1) - _ld(a["g_kv_ptr"], 0)) - G_ROWS
+    rank = c["rank"]
+    pm = p & (DCP - 1)
+    lr = (p >> 3) + (rank < pm).select(fx.Int32(1), fx.Int32(0))
+    own = (rank - pm + DCP) & (DCP - 1)  # the row at position P + own
+    own = (own < G_ROWS).select(own, fx.Int32(DCP))
+    lg = (p + G_ROWS + DCP - 1) >> 3
+    n = fx.max(fx.Int32(1), fx.min(fx.Int32(MAX_SPLITS), (lg + KEYS_PER_SPLIT - 1) // KEYS_PER_SPLIT))
+    d = (NHG * 4 * n <= ATT_CTAS).select(fx.Int32(4), fx.Int32(2))
+    return p, lr, own, n, d
+
+
+# ---------------------------------------------------------------- the KV record
+
+
+@flyc.jit
+def stage_kv(c):
+    """kv_a_layernorm of the latent, then the e4m3 record (normed latent, raw
+    rope part) of the new token this rank owns: its KV row and NEWKV."""
+    s, tid, red = c["S"], c["tid"], c["red"]
+    a = c["args"]
+    _, _, own, _, _ = request(c)
+    n = G_KV * s
+    got = c["poll"]([(c["ss"], G_Q * s + fx.min(tid, n - 1), 1)])
+    if tid < n:
+        fx.ptr_store(f32_of(got[0][0]), red + tid)
+    gpu.barrier()
+    if tid < s:
+        tot = fx.ptr_load(red + tid)
+        for gg in range_constexpr(1, G_KV):
+            tot = tot + fx.ptr_load(red + (gg * s + tid))
+        fx.ptr_store(
+            hw_rsq(tot / fx.Float32(KV) + fx.Float32(c["kv_eps"])),
+            red + (2048 - 16 + tid),
+        )
+    gpu.barrier()
+    t = fx.min(own, s - 1)
+    owned = own < s
+    words = DQK // 4  # 144 record words, 4 dims each
+    if owned & (tid < words):
+        k = tid * 4
+        lw = fx.Vector(
+            bo.buffer_load(rsrc(c["lat"]), (t * LATW + QL + k) // 2, vec_width=2, dtype=T.i32, cache_modifier=CM_DEV)
+        )
+        vals = []
+        for h in range_constexpr(2):
+            w = fx.Int32(lw[h])
+            vals += [(w << 16).bitcast(fx.Float32), (w & fx.Int32(-65536)).bitcast(fx.Float32)]
+        if k < KV:
+            nw = fx.Vector(bo.buffer_load(rsrc(a["kv_nw"]), k // 2, vec_width=2, dtype=T.i32))
+            rs = fx.ptr_load(red + (2048 - 16 + t))
+            ws = []
+            for h in range_constexpr(2):
+                w = fx.Int32(nw[h])
+                ws += [(w << 16).bitcast(fx.Float32), (w & fx.Int32(-65536)).bitcast(fx.Float32)]
+            vals = [bf16_round((vals[j] * rs) * ws[j]) for j in range(4)]
+        word = e4m3x4(vals)
+        row = fx.Int64(_ld(a["loc"], t * c["loc_words"])) >> 3
+        p = fx.inttoptr(
+            fx.PointerType.get(fx.Int32.ir_type, fx.AddressSpace.Global, 4),
+            a["kv"] + row * fx.Int64(DQK) + fx.Int64(k),
+        )
+        fx.generic_store(p, word)
+        bo.buffer_store(word, rsrc(c["newkv"]), tid, cache_modifier=CM_DEV)
+    rocdl.s_waitcnt(vmcnt=0)
+    gpu.barrier()
+    if tid == 0:
+        c["put"](c["kvrdy"], 0, fx.Int32(1))
+    gpu.barrier()
+
+
+# ---------------------------------------------------------------- stage 2: q_b
+
+
+def s2_loads(c, h):
+    """q_b group ``h``'s weights (past the last group: zero-range loads)."""
+    a = c["args"]
+    nbytes = (h < QBG).select(fx.Int64(0xFFFFFFFF), fx.Int64(0))
+    h = fx.min(h, QBG - 1)
+    return gemv.loads(c["lane"], c["wave"], a["w_qb"], h * ROWS, QL, nbytes=nbytes)
+
+
+S2_LOADS = 4 * gemv.chunks(QL)[0]  # a wave's loads of one q_b group
+
+
+@flyc.jit
+def stage2(c, h, ops):
+    """Rows 16 h .. of q_b against the normed q latent in LDS: bf16 to QB; a rope
+    group also as e4m3 into Q8's last 64 dims (``stage2_flag`` publishes)."""
+    s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
+    acc = gemv.mfmas(lane, wave, c["xl"], QL + LDS_PAD, QL, s, ops)
+    fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
+    _bar()
+    mine = tid < ROWS * s
+    r = tid % ROWS
+    t = fx.min(tid // ROWS, s - 1)
+    v = bf16_round(row_sum(red, r, t))
+    row = h * ROWS + r
+    if mine:
+        _st_bf(c["qb"], t * (NHA * QHD) + row, v, CM_DEV)
+    # a rope group: four rows' e4m3 a word into Q8 (rows 4 q .. on lane 4 q)
+    head = h // QBG_HEAD
+    d = (h % QBG_HEAD) * ROWS + r - QN
+    vb = v.bitcast(fx.Int32)
+    nb = [
+        fx.Int32(rocdl.ds_bpermute(T.i32, ((lane + k) % 64) * 4, vb)).bitcast(fx.Float32)
+        for k in range(1, 4)
+    ]
+    if mine & ((h % QBG_HEAD) >= QN // ROWS) & ((r % 4) == 0):
+        bo.buffer_store(
+            e4m3x4([v] + nb),
+            rsrc(c["q8"]),
+            (t * (NHA * DQK) + head * DQK + KV + d) // 4,
+            cache_modifier=CM_DEV,
+        )
+
+
+@flyc.jit
+def stage2_flag(c, h, nwait):
+    """Group h's rows landed (the newest ``nwait`` loads aside), then its QRDY."""
+    _published(nwait)
+    if c["tid"] == 0:
+        c["put"](c["qrdy"], h, fx.Int32(1))
+
+
+# ---------------------------------------------------------------- stage 3: absorb
+
+
+def s3_loads(c, task):
+    """Absorb task ``task``'s W_UK tile, W[h][n][128 b ..+128], 16 bytes a piece
+    (4 pieces a thread, row n = piece / 16)."""
+    a = c["args"]
+    tid = c["tid"]
+    task = fx.min(task, ABS - 1)
+    h = task // ABS_BLK
+    b = task % ABS_BLK
+    out = []
+    for i in range_constexpr(4):
+        p = tid + THREADS * i
+        n = p // 16
+        seg = p % 16
+        out.append(_ld4(a["w_kc"], (h * (QN * KV) + n * KV + b * 128 + seg * 8) // 2))
+    return out
+
+
+@flyc.jit
+def stage3(c, task, wt):
+    """q_nope @ W_UK for head task // 4, latent columns 128 (task % 4) ..: the
+    head's 8 nope q_b groups (QRDY) into LDS, the tile into LDS, transposed MFMAs
+    (wave w: 32 columns, a K half), bf16 -> e4m3 into Q8; then ABSRDY."""
+    s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
+    h = task // ABS_BLK
+    b = task % ABS_BLK
+    if tid < QN // ROWS:
+        c["poll"]([(c["qrdy"], h * QBG_HEAD + tid, 1)])
+    gpu.barrier()
+    xl, wl = c["xl"], c["wl"]
+    # q_nope rows: 6 x 128 bf16, 16 bytes a thread
+    if tid < s * (QN // 8):
+        t = tid // (QN // 8)
+        k = (tid % (QN // 8)) * 8
+        v = _ld4(c["qb"], (t * (NHA * QHD) + h * QHD + k) // 2, CM_DEV)
+        fx.ptr_store(v, xl + (t * (QN + LDS_PAD) + k) // 2)
+    for i in range_constexpr(4):
+        p = tid + THREADS * i
+        n = p // 16
+        seg = p % 16
+        fx.ptr_store(wt[i], wl + (n * ABS_ROW + seg * 8) // 2)
+    gpu.barrier()
+    cq = wave % 4
+    kh = wave // 4
+    acc = _tgemv(lane, wl, ABS_ROW, 32 * cq, 64 * kh, 2, xl, QN + LDS_PAD, s)
+    # the two K halves summed in order: wave w + 4 adds onto wave w's
+    rb = red + (wave * 64 + lane) * 8
+    for dt in range_constexpr(2):
+        fx.ptr_store(acc[dt], rb + 4 * dt)
+    gpu.barrier()
+    g, r16 = lane // 16, lane % 16
+    if (wave < 4) & (r16 < s):
+        lo = red + (wave * 64 + lane) * 8
+        hi = red + ((wave + 4) * 64 + lane) * 8
+        vals = [None] * 8
+        for dt in range_constexpr(2):
+            for i in range_constexpr(4):
+                vals[2 * i + dt] = bf16_round(fx.ptr_load(lo + (4 * dt + i)) + fx.ptr_load(hi + (4 * dt + i)))
+        w0 = e4m3x4(vals[0:4])
+        w1 = e4m3x4(vals[4:8])
+        col = b * 128 + 32 * cq + 8 * g
+        bo.buffer_store(
+            fx.Vector.from_elements([w0, w1], fx.Int32),
+            rsrc(c["q8"]),
+            (r16 * (NHA * DQK) + h * DQK + col) // 4,
+            cache_modifier=CM_DEV,
+        )
+    rocdl.s_waitcnt(vmcnt=0)
+    gpu.barrier()
+    if tid == 0:
+        c["put"](c["absrdy"], task, fx.Int32(1))
+    gpu.barrier()
+
+
+# ---------------------------------------------------------------- attention
+
+
+MAX_SPLIT_BLOCKS = 32  # a split's blocks at most (its rows' indices in LDS)
+
+
+def _kv_piece_addr(c, lr, own, b0, blk, piece):
+    """Piece ``piece`` (16 bytes) of block ``blk``'s keys: key blk 32 + piece / 36,
+    its row from the split's indices in LDS, the new token from NEWKV; a key
+    past the request's reads a valid row (and scores nothing)."""
+    a = c["args"]
+    key = piece // (DQK // 16)
+    part = piece % (DQK // 16)
+    kk = blk * BK + key
+    row = fx.Int64(fx.ptr_load(c["kil"] + ((blk - b0) * BK + key)))
+    pool = a["kv"] + row * fx.Int64(DQK) + fx.Int64(part * 16)
+    new = c["newkv"] + fx.Int64(part * 16)
+    is_new = (kk == lr) & (own < G_ROWS)
+    return is_new.select(new, pool)
+
+
+def _kv_loads(c, lr, own, b0, blk):
+    tid = c["tid"]
+    rounds = -(-(BK * DQK // 16) // THREADS)
+    out = []
+    for j in range_constexpr(rounds):
+        piece = fx.min(tid + THREADS * j, BK * DQK // 16 - 1)
+        out.append(global_load(_kv_piece_addr(c, lr, own, b0, blk, piece), 4))
+    return out
+
+
+@flyc.jit
+def _split_rows(c, kvp, lr, b0, b1):
+    """The split's keys' rows (blocks b0 .. b1) from the request's indices into
+    LDS; a key past the request's prefix takes its last row."""
+    a = c["args"]
+    tid = c["tid"]
+    n = (b1 - b0) * BK
+    for j in range_constexpr(MAX_SPLIT_BLOCKS * BK // THREADS):
+        e = tid + THREADS * j
+        kk = b0 * BK + e
+        row = _ld(a["kv_idx"], kvp + fx.max(fx.min(kk, lr - 1), 0))
+        if e < n:
+            fx.ptr_store(row, c["kil"] + e)
+    gpu.barrier()
+
+
+@flyc.jit
+def _kv_store(c, loads, kvl):
+    tid = c["tid"]
+    for j in range_constexpr(len(loads)):
+        piece = tid + THREADS * j
+        key = piece // (DQK // 16)
+        part = piece % (DQK // 16)
+        if piece < BK * DQK // 16:
+            fx.ptr_store(fx.Vector(loads[j]), kvl + (key * RWK + part * 4))
+
+
+QK_STEPS = -(-DQK // 128)  # 5 K = 128 e4m3 MFMAs a key tile (the last half zero)
+QK_AHEAD = 0  # QK steps whose LDS reads are in flight under a step's MFMAs
+
+
+def _mfma128(a, b, c):
+    """C += A B over 128 e4m3 (E8M0 scales 1): A, B 32 bytes a lane, the same K
+    to lane mapping on both, so any mapping gives the dot product."""
+    one = fx.Int32(127)
+    return fx.Vector(
+        rocdl.mfma_scale_f32_16x16x128_f8f6f4(T.vec(4, T.f32), [a, b, c, 0, 0, 0, one, 0, one])
+    )
+
+
+def _k128(lane, words8, kc):
+    """Step kc's 32 e4m3 of a lane (dims 128 kc + 32 (lane / 16) ..); past the
+    576 dims zero."""
+    g = lane // 16
+    if const_expr(128 * (kc + 1) <= DQK):
+        return words8
+    live = g < (DQK - 128 * kc) // 32
+    return fx.Vector.from_elements([live.select(words8[e], fx.Int32(0)) for e in range(8)], fx.Int32)
+
+
+def _qk(lane, kvl, ql):
+    """The block's scores against one row's 16 heads (``ql``: the row's q in
+    LDS, a head a key-sized row): KT 16-key tiles C[key][head] (element i of
+    tile kt: key 16 kt + 4 (lane / 16) + i, head lane % 16)."""
+    g, r16 = lane // 16, lane % 16
+    v4 = fx.Vector.make_type(4, fx.Int32)
+    acc = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(KT)]
+
+    def row32(base, kc):
+        # past the record the reads stay in the row (its pad, then the next row)
+        w = base + fx.min(32 * kc + 8 * g, DQK // 4 - 8)
+        lo = fx.Vector(fx.ptr_load(w, result_type=v4))
+        hi = fx.Vector(fx.ptr_load(w + 4, result_type=v4))
+        return _k128(lane, fx.Vector.from_elements([lo[e] for e in range(4)] + [hi[e] for e in range(4)], fx.Int32), kc)
+
+    def rd(kc):
+        return [row32(kvl + (16 * kt + r16) * RWK, kc) for kt in range(KT)] + [row32(ql + r16 * RWK, kc)]
+
+    ahead = [rd(kc) for kc in range(QK_AHEAD)]
+    for kc in range_constexpr(QK_STEPS):
+        if const_expr(kc + QK_AHEAD < QK_STEPS):
+            ahead.append(rd(kc + QK_AHEAD))
+        cur = ahead.pop(0) if ahead else rd(kc)
+        for kt in range_constexpr(KT):
+            acc[kt] = _mfma128(cur[kt], cur[KT], acc[kt])
+        rocdl.sched_barrier(0)
+    return acc
+
+
+def _softmax(lane, t, blk, kend, sacc, lr, own, m, l, qk_scale, prow):
+    """Row t's online softmax over the block: the new (max, sum, factor of the
+    earlier sums); its P (e4m3, keys the row does not see 0) to the row's LDS."""
+    g = lane // 16
+    sv = []
+    for kt in range_constexpr(KT):
+        for i in range_constexpr(4):
+            kk = blk * BK + 16 * kt + 4 * g + i
+            ok = ((kk < lr) | ((kk == lr) & (own <= t))) & (kk < kend)
+            sv.append(ok.select(sacc[kt][i] * qk_scale, fx.Float32(NEG)))
+    mb = sv[0]
+    for e in range_constexpr(1, 4 * KT):
+        mb = fx.max(mb, sv[e])
+    # xred reduces an f32 as f32 only when it is typed so
+    mb = xred(xred(fx.Float32(mb), 16, fx.max), 32, fx.max)
+    mn = fx.max(m, mb)
+    a = hw_exp2(m - mn)
+    ps = [(sv[e] > fx.Float32(NEG)).select(hw_exp2(sv[e] - mn), fx.Float32(0.0)) for e in range(4 * KT)]
+    ls = (ps[0] + ps[1]) + (ps[2] + ps[3])
+    for kt in range_constexpr(1, KT):
+        ls = ls + ((ps[4 * kt] + ps[4 * kt + 1]) + (ps[4 * kt + 2] + ps[4 * kt + 3]))
+    ls = xred(xred(fx.Float32(ls), 16, lambda x, y: x + y), 32, lambda x, y: x + y)
+    for kt in range_constexpr(KT):
+        pw = fx.Vector.from_elements(ps[4 * kt : 4 * kt + 4], fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)
+        fx.ptr_store(pw, prow + (8 * kt + 2 * g))
+    return mn, l * a + ls, a
+
+
+def _v_ops(lane, kvl, dbase, nt, kc):
+    """PV's A operands of 32-key step kc for ``nt`` 16-dim tiles: tile dt holds
+    dim dbase + nt (lane % 16) + dt at keys 32 kc + 8 (lane / 16) .. + 8 (e4m3)."""
+    g, r16 = lane // 16, lane % 16
+    dim = dbase + nt * r16
+    ws = [fx.ptr_load(kvl + ((32 * kc + 8 * g + j) * RWK + dim // 4)) for j in range(8)]
+    sh0 = (dim % 4) * 8
+    return [_pack_bytes(ws, sh0 + 8 * dt) for dt in range(nt)]
+
+
+def _scaled(v, a):
+    return fx.Vector.from_elements([v[i] * a for i in range(4)], fx.Float32)
+
+
+def _dbase(wave, dr, nt):
+    """The first dim of this wave's share of dim range ``dr`` (16 nt dims a wave)."""
+    return dr * (128 * nt) + wave * (16 * nt)
+
+
+def _pv(lane, wave, kx, pl, al, dr, acc, nt):
+    """The block's P V onto every row's accumulators (rescaled first) for this
+    wave's ``nt`` 16-dim tiles."""
+    g, r16 = lane // 16, lane % 16
+    # V widened to bf16 (exact), P in bf16
+    vops = [
+        [
+            fp8_to_bf16x8(*[fx.Vector.from_elements([v], fx.Int64).bitcast(fx.Int32)[e] for e in range(2)])
+            for v in _v_ops(lane, kx, _dbase(wave, dr, nt), nt, kc)
+        ]
+        for kc in range(KC)
+    ]
+    out = list(acc)
+    for r in range_constexpr(G_ROWS):
+        alpha = fx.ptr_load(al + (r * HT + r16)).bitcast(fx.Float32)
+        for dt in range_constexpr(nt):
+            out[r * 2 + dt] = _scaled(acc[r * 2 + dt], alpha)
+        for kc in range_constexpr(KC):
+            pw = fx.ptr_load(pl + ((r * HT + r16) * PW + 16 * kc + 4 * g), result_type=fx.Vector.make_type(4, fx.Int32))
+            pb = fx.Vector(pw).bitcast(fx.BFloat16)
+            for dt in range_constexpr(nt):
+                out[r * 2 + dt] = _mfma16(vops[kc][dt], pb, out[r * 2 + dt])
+    return out
+
+
+@flyc.jit
+def _partial_out(c, lane, wave, dr, sp, head, acc, nt):
+    """Each row's partial over its own sum, f16, to PV [split][row][head][512]:
+    lane (g, head) holds dims dbase + 4 nt g + nt i + dt (i < 4, dt < nt)."""
+    s = c["S"]
+    g, r16 = lane // 16, lane % 16
+    dbase = _dbase(wave, dr, nt)
+    mll = c["mll"]
+    for r in range_constexpr(G_ROWS):
+        ll = fx.ptr_load(mll + 2 * (r * HT + r16) + 1).bitcast(fx.Float32)
+        inv = (ll > fx.Float32(0.0)).select(fx.Float32(1.0) / ll, fx.Float32(0.0))
+        vals = [None] * (4 * nt)
+        for i in range_constexpr(4):
+            for dt in range_constexpr(nt):
+                vals[nt * i + dt] = acc[r * 2 + dt][i] * inv
+        o0 = (((sp * s + r) * NHA + head) * KV + dbase + 4 * nt * g) // 2
+        for q in range_constexpr(max(1, nt // 2)):
+            part = vals[8 * q : 8 * q + 8] if nt >= 2 else vals
+            hv = fx.Vector.from_elements(part, fx.Float32).to(fx.Float16).bitcast(fx.Int32)
+            bo.buffer_store(hv, rsrc(c["pv"]), o0 + 4 * q, cache_modifier=CM_DEV)
+
+
+@flyc.jit
+def _step(c, kx, blk, kend, m, l, acc, qf, t, lr, own, nt, dr, qk_scale):
+    """Block ``blk`` (in LDS at ``kx``; past the split it scores nothing): QK and
+    the online softmax on waves 0 .. 5 (a row each), then every wave's P V."""
+    s, lane, wave = c["S"], c["lane"], c["wave"]
+    g, r16 = lane // 16, lane % 16
+    pl, al = c["pl"], c["al"]
+    if wave < s:
+        sacc = _qk(lane, kx, qf)
+        m, l, al_ = _softmax(lane, t, blk, kend, sacc, lr, own, m, l, qk_scale, pl + (wave * HT + r16) * PW)
+        if g == 0:
+            fx.ptr_store(al_.bitcast(fx.Int32), al + (wave * HT + r16))
+    _bar()
+    stamp(c["on"], c["tls"], c["tid"], 11)
+    if nt == 2:
+        acc = _pv(lane, wave, kx, pl, al, dr, acc, 2)
+    if nt == 1:
+        acc = _pv(lane, wave, kx, pl, al, dr, acc, 1)
+    return m, l, acc
+
+
+@flyc.jit
+def attention(c, item):
+    """Item ``item``: (16-head group hg, key split sp, dim range dr) over the
+    split's blocks of this rank's keys; its partial, its (max, sum), ITRDY."""
+    s, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
+    a = c["args"]
+    g, r16 = lane // 16, lane % 16
+    _, lr, own, n, d = request(c)
+    nd = n * d
+    hg = item // nd
+    sp = (item // d) % n
+    dr = item % d
+    # a rank with no key of the request (P < 2) still runs one fully masked block
+    nbl = fx.max((lr + (own < G_ROWS).select(fx.Int32(1), fx.Int32(0)) + BK - 1) // BK, fx.Int32(1))
+    b0 = sp * nbl // n
+    b1 = (sp + 1) * nbl // n
+    kvp = uniform(_ld(a["kv_ptr"], 0))
+    kvl0, pl, al = c["kvl"], c["pl"], c["al"]
+    # the split's rows, then its first two blocks' records in flight before the
+    # waits (the keys need no q)
+    _split_rows(c, kvp, lr, b0, b1)
+    pend = _kv_loads(c, lr, own, b0, b0)
+    p2 = _kv_loads(c, lr, own, b0, fx.min(b0 + 1, b1 - 1))
+    # the group's q: its 16 heads' absorb tasks and rope groups; the new token
+    if tid < HT * ABS_BLK:
+        c["poll"]([(c["absrdy"], (hg * HT + tid // ABS_BLK) * ABS_BLK + tid % ABS_BLK, 1)])
+    if (tid >= HT * ABS_BLK) & (tid < 2 * HT * ABS_BLK):
+        e = tid - HT * ABS_BLK
+        c["poll"]([(c["qrdy"], (hg * HT + e // 4) * QBG_HEAD + QN // ROWS + e % 4, 1)])
+    has_new = (own < G_ROWS) & (b1 > lr // BK) & (b0 <= lr // BK)
+    if has_new & (tid == 2 * HT * ABS_BLK):
+        c["poll"]([(c["kvrdy"], 0, 1)])
+    _bar()
+    stamp(c["on"], c["tls"], tid, 6)
+    t = fx.min(wave, s - 1)
+    # the group's q, every row, into LDS (a head a key-sized row)
+    qrow = DQK // 16  # 16-byte pieces a head
+    for j in range_constexpr(-(-(G_ROWS * HT * qrow) // THREADS)):
+        e = fx.min(tid + THREADS * j, G_ROWS * HT * qrow - 1)
+        tq = e // (HT * qrow)
+        hq = (e // qrow) % HT
+        pq = e % qrow
+        v = _ld4(c["q8"], (tq * (NHA * DQK) + (hg * HT + hq) * DQK) // 4 + 4 * pq, CM_DEV)
+        if tid + THREADS * j < G_ROWS * HT * qrow:
+            fx.ptr_store(v, c["qll"] + ((tq * HT + hq) * RWK + 4 * pq))
+    ql = c["qll"] + t * (HT * RWK)
+    qk_scale = c["scale"] * LOG2E
+    # this item's 16-dim tiles a wave: 512 / d dims over 8 waves
+    nt = (d == 4).select(fx.Int32(1), fx.Int32(2))
+    m = fx.Float32(NEG)
+    l = fx.Float32(0.0)
+    acc = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(G_ROWS * 2)]
+    # q and the first two blocks landed: no load from before the loop is
+    # waited on inside it (the loop's waits then count only its own loads)
+    rocdl.s_waitcnt(vmcnt=0)
+    _kv_store(c, pend, kvl0)
+    _bar()
+    kend = b1 * BK
+    # two blocks a round, the load registers alternating statically: block blk
+    # in LDS, blk + 1 and blk + 2 in flight
+    for pr in range(0, (b1 - b0 + 1) // 2):
+        blk = b0 + 2 * pr
+        p3 = _kv_loads(c, lr, own, b0, fx.min(blk + 2, b1 - 1))
+        stamp(c["on"], c["tls"], tid, 10)
+        m, l, acc = _step(c, kvl0, blk, kend, m, l, acc, ql, t, lr, own, nt, dr, qk_scale)
+        stamp(c["on"], c["tls"], tid, 12)
+        _bar()
+        _kv_store(c, p2, kvl0)
+        _bar()
+        stamp(c["on"], c["tls"], tid, 13)
+        p2 = _kv_loads(c, lr, own, b0, fx.min(blk + 3, b1 - 1))
+        m, l, acc = _step(c, kvl0, blk + 1, kend, m, l, acc, ql, t, lr, own, nt, dr, qk_scale)
+        _bar()
+        _kv_store(c, p3, kvl0)
+        _bar()
+    stamp(c["on"], c["tls"], tid, 7)
+    # (max, sum) a (row, head) to LDS, then the partial over its own sum
+    mll = c["mll"]
+    if (wave < s) & (g == 0):
+        fx.ptr_store(m.bitcast(fx.Int32), mll + 2 * (wave * HT + r16))
+        fx.ptr_store(l.bitcast(fx.Int32), mll + 2 * (wave * HT + r16) + 1)
+    gpu.barrier()
+    head = hg * HT + r16
+    if nt == 2:
+        _partial_out(c, lane, wave, dr, sp, head, acc, 2)
+    if nt == 1:
+        _partial_out(c, lane, wave, dr, sp, head, acc, 1)
+    if (wave < s) & (g == 0) & (dr == 0):
+        bo.buffer_store(
+            fx.Vector.from_elements([m, l], fx.Float32),
+            rsrc(c["ml"]),
+            ((sp * s + wave) * NHA + head) * 2,
+            cache_modifier=CM_DEV,
+        )
+    rocdl.s_waitcnt(vmcnt=0)
+    gpu.barrier()
+    if tid == 0:
+        c["put"](c["itrdy"], item, fx.Int32(1))
+    gpu.barrier()
+
+
+# ---------------------------------------------------------------- W_UV
+
+
+def _touch(c, loads):
+    """Consume ``loads`` into one LDS word (their bytes then sit in L2)."""
+    x = fx.Int32(0)
+    for v in loads:
+        for e in range_constexpr(4):
+            x = x ^ fx.Int32(fx.Vector(v)[e])
+    fx.ptr_store(x, c["red"] + (WAVES * 64 * 8 - 1))
+
+
+def uv_loads(c, task):
+    """W_UV task ``task``'s tile W[h][k][64 half ..+64], 16 bytes a piece (8 a
+    thread, row k = piece / 8)."""
+    a = c["args"]
+    tid = c["tid"]
+    task = fx.min(task, UV_TASKS - 1)
+    h = task // 2
+    half = task % 2
+    out = []
+    for i in range_constexpr(8):
+        p = tid + THREADS * i
+        k = p // 8
+        seg = p % 8
+        out.append(_ld4(a["w_vc"], (h * (KV * VD) + k * VD + half * UV_HALF + seg * 8) // 2))
+    return out
+
+
+@flyc.jit
+def stage_uv(c, task, wt):
+    """Head task // 2's split partials (its group's items) merged in split order
+    -> the bf16 latent output in LDS and the head's LSE; then W_UV for value
+    columns 64 (task % 2) ..: the values, and with the first half the LSE, pushed
+    to the head's owner rank (no system-scope store before the GEMV: a barrier
+    would wait for it)."""
+    s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
+    a = c["args"]
+    h = task // 2
+    half = task % 2
+    _, _, _, n, d = request(c)
+    nd = n * d
+    hg = h // HT
+    if tid < nd:
+        c["poll"]([(c["itrdy"], hg * nd + tid, 1)])
+    gpu.barrier()
+    stamp(c["on"], c["tls"], tid, 8)
+    xl, wl = c["xl"], c["wl"]
+    owner = h // NHL
+    hl = h % NHL
+    # merge: thread (row t, 8 dims at 8 o)
+    if tid < s * (KV // 8):
+        t = tid // (KV // 8)
+        o = tid % (KV // 8)
+        mx = fx.Float32(NEG)
+        mls = []
+        for sp in range_constexpr(MAX_SPLITS):
+            live = sp < n
+            spc = fx.min(fx.Int32(sp), n - 1)
+            mw = fx.Vector(
+                bo.buffer_load(rsrc(c["ml"]), ((spc * s + t) * NHA + h) * 2, vec_width=2, dtype=T.f32, cache_modifier=CM_DEV)
+            )
+            mm = live.select(mw[0], fx.Float32(NEG))
+            ll = live.select(mw[1], fx.Float32(0.0))
+            mls.append((mm, ll, spc))
+            mx = fx.max(mx, mm)
+        lsum = fx.Float32(0.0)
+        tot = [fx.Float32(0.0)] * 8
+        for sp in range_constexpr(MAX_SPLITS):
+            mm, ll, spc = mls[sp]
+            wgt = hw_exp2(mm - mx) * ll
+            lsum = lsum + wgt
+            pv = _ld4(c["pv"], (((spc * s + t) * NHA + h) * KV + 8 * o) // 2, CM_DEV)
+            vals = fx.Vector(pv).bitcast(fx.Float16).to(fx.Float32)
+            tot = [tot[e] + wgt * vals[e] for e in range(8)]
+        inv = (lsum > fx.Float32(0.0)).select(fx.Float32(1.0) / lsum, fx.Float32(0.0))
+        ob = fx.Vector.from_elements([tot[e] * inv for e in range(8)], fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)
+        fx.ptr_store(ob, xl + (t * OL_ROW + 8 * o) // 2)
+        if (o == 0) & (half == 0):
+            lse = (lsum > fx.Float32(0.0)).select(
+                (mx + fx.Float32(fmath.log2(lsum))) * fx.Float32(LN2),
+                fx.Float32(EMPTY_LSE),
+            )
+            # in the row's pad: pushed with the values, after the GEMV
+            fx.ptr_store(lse.bitcast(fx.Int32), xl + (t * OL_ROW + KV) // 2)
+    for i in range_constexpr(8):
+        p = tid + THREADS * i
+        k = p // 8
+        seg = p % 8
+        fx.ptr_store(wt[i], wl + (k * UV_ROW + seg * 8) // 2)
+    gpu.barrier()
+    vq = wave % 2
+    kq = wave // 2
+    acc = _tgemv(lane, wl, UV_ROW, 32 * vq, 128 * kq, 4, xl, OL_ROW, s)
+    rb = red + (wave * 64 + lane) * 8
+    for dt in range_constexpr(2):
+        fx.ptr_store(acc[dt], rb + 4 * dt)
+    gpu.barrier()
+    g, r16 = lane // 16, lane % 16
+    if (wave < 2) & (r16 < s):
+        vals = [None] * 8
+        for dt in range_constexpr(2):
+            for i in range_constexpr(4):
+                tot = fx.Float32(0.0)
+                for q in range_constexpr(4):
+                    tot = tot + fx.ptr_load(red + (((2 * q + wave) * 64 + lane) * 8 + 4 * dt + i))
+                vals[2 * i + dt] = tot
+        col = half * UV_HALF + 32 * wave + 8 * g
+        mc.push_values(c, owner, hl, r16, col, vals)
+        if (wave == 0) & (g == 0) & (half == 0):
+            lse = fx.Int32(fx.ptr_load(xl + (r16 * OL_ROW + KV) // 2)).bitcast(fx.Float32)
+            mc.push_lse(c, owner, hl, r16, lse)
+            if const_expr(c["records"]):
+                bo.buffer_store(lse, rsrc(a["send"]), ((owner * s + r16) * NHL + hl) * (REC // 2) + VD // 2)
+        if const_expr(c["records"]):
+            ob = fx.Vector.from_elements(vals, fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)
+            bo.buffer_store(ob, rsrc(a["send"]), (((owner * s + r16) * NHL + hl) * REC + col) // 2)
+    gpu.barrier()
+
+
+# ---------------------------------------------------------------- the launch
+
+def build(key: MlaFrontBuild):
+    if key in _BUILDS:
+        return _BUILDS[key]
+    from sgl_amd_mono.kimi_k3.gfx950 import layer as k2_layer
+
+    s = key.tokens
+    assert s == G_ROWS, s
+    assert COMB0 + mc.combine_tasks(s) <= BLOCKS
+    ns = key.nblocks + 1
+    lay = scratch_layout(key)
+    flags_off = k2_layer.flags_offset()
+    assert s * (HIDDEN + LDS_PAD) * 2 <= 136 * 1024
+
+    @fx.struct
+    class AttnLds:
+        vals: fx.Array[fx.Float32, s * ns * COLS, 16]
+
+    @fx.struct
+    class GemvLds:
+        xl: fx.Array[fx.Int32, s * (HIDDEN + LDS_PAD) // 2, 16]
+
+    @fx.struct
+    class AbsLds:
+        xl: fx.Array[fx.Int32, s * (QN + LDS_PAD) // 2, 16]
+        wl: fx.Array[fx.Int32, QN * ABS_ROW // 2, 16]
+
+    @fx.struct
+    class CoreLds:
+        kv: fx.Array[fx.Int32, BK * RWK, 16]
+        p: fx.Array[fx.Int32, G_ROWS * HT * PW, 16]
+        alpha: fx.Array[fx.Int32, G_ROWS * HT, 16]
+        ml: fx.Array[fx.Int32, 2 * G_ROWS * HT, 16]
+        kidx: fx.Array[fx.Int32, MAX_SPLIT_BLOCKS * BK, 16]
+        q: fx.Array[fx.Int32, G_ROWS * HT * RWK, 16]
+
+    @fx.struct
+    class UvLds:
+        xl: fx.Array[fx.Int32, s * OL_ROW // 2, 16]
+        wl: fx.Array[fx.Int32, KV * UV_ROW // 2, 16]
+
+    @fx.union
+    class RoleLds:
+        attn: AttnLds
+        gemv: GemvLds
+        absorb: AbsLds
+        core: CoreLds
+        uv: UvLds
+
+    @fx.struct
+    class Smem:
+        red: fx.Array[fx.Float32, WAVES * 64 * 8, 16]
+        tls: fx.Array[fx.Int64, TL_POINTS, 16]
+
+    keyed = key_tuple(key, SOURCES)
+    name = (
+        f"k3_mono_mla_front_s{s}_nb{key.nblocks}_w{int(key.write_idx >= 0)}"
+        f"_t{int(key.timeline)}_r{int(key.records)}"
+    )
+
+    @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
+    def mla_front(
+        prefix: Int64, blocks: Int64, blk_sm: Int32, blk_sr: Int32, ares_nw: Int64,
+        ares_qk: Int64, in_nw: Int64, w_qkv: Int64, w_g: Int64, q_nw: Int64,
+        kv_nw: Int64, w_qb: Int64, w_kc: Int64, w_vc: Int64, kv: Int64, kv_idx: Int64,
+        kv_ptr: Int64, g_kv_ptr: Int64, loc: Int64, core: Int64, send: Int64,
+        scratch: Int64, peers: Int64, rank: Int32, a2a_par: Int32, layer: Int32,
+        epoch: Int64, tl: Int64,
+    ):  # fmt: skip
+        _ = keyed
+        tid = fx.thread_idx.x
+        bid = fx.block_idx.x
+        alloc = fx.SharedAllocator()
+        lds = alloc.allocate(Smem).peek()
+        role = alloc.allocate(RoleLds)
+        al, gl = role.attn.peek(), role.gemv.peek()
+        abl, cl, ul = role.absorb.peek(), role.core.peek(), role.uv.peek()
+        mb = Mailbox(step_tag(epoch, layer) - 1)
+        gbuf = scratch + fx.Int64(lay["g"][0])
+        c = {
+            "S": s, "NS": ns, "NB": key.nblocks, "tid": tid, "bid": bid,
+            "lane": tid % 64, "wave": tid // 64, "delta": False, "debug": False,
+            "eps": key.eps, "out_eps": key.out_eps, "q_eps": key.q_eps,
+            "kv_eps": key.kv_eps, "write_idx": key.write_idx, "gate_local": True,
+            "qlora_out": False, "qn": False, "put": mb.put, "poll": mb.poll,
+            "red": lds.red.ptr, "vals": al.vals.ptr, "xl": gl.xl.ptr,
+            "scale": key.scale, "rank": rank, "loc_words": 2,
+            "xbuf": scratch + fx.Int64(lay["x"][0]),
+            "lat": scratch + fx.Int64(lay["lat"][0]),
+            "qb": scratch + fx.Int64(lay["qb"][0]),
+            "q8": scratch + fx.Int64(lay["q8"][0]),
+            "newkv": scratch + fx.Int64(lay["newkv"][0]),
+            "pv": scratch + fx.Int64(lay["pv"][0]),
+            "ml": scratch + fx.Int64(lay["ml"][0]),
+            "kvl": cl.kv.ptr, "pl": cl.p.ptr, "al": cl.alpha.ptr, "mll": cl.ml.ptr,
+            "kil": cl.kidx.ptr, "qll": cl.q.ptr,
+            "records": key.records, "gate0": S1_GATE0, "gbuf": gbuf,
+            "a2a_peer": mc.PeerRegions(peers, a2a_par),
+            "args": {
+                "prefix": prefix, "delta": 0, "blocks": blocks, "blk_sm": blk_sm,
+                "blk_sr": blk_sr, "ares_nw": ares_nw, "ares_qk": ares_qk, "in_nw": in_nw,
+                "x_dbg": 0, "w_qkv": w_qkv, "w_g": w_g, "q_nw": q_nw, "kv_nw": kv_nw,
+                "w_qb": w_qb, "w_kc": w_kc, "w_vc": w_vc, "kv": kv, "kv_idx": kv_idx,
+                "kv_ptr": kv_ptr, "g_kv_ptr": g_kv_ptr, "loc": loc, "gate": gbuf,
+                "send": send, "core": core, "q_lora": 0,
+            },
+        }  # fmt: skip
+        for region in ("part", "wgt", "msq", "xrdy", "ss", "qrdy", "absrdy", "kvrdy", "itrdy", "grdy"):
+            c[region] = sreg(scratch, lay[region][0], region)
+        on, tls = key.timeline, lds.tls.ptr
+        c["on"], c["tls"] = on, tls
+        stamp_begin(on, tls, tid, TL_POINTS)
+        if bid < NA:
+            stage_slice(c, bid)
+            stage_mix(c, bid)
+            if bid < S1_EXTRA:
+                ge = bid + NCTA1
+                opse = s1_loads(c, ge)
+                load_x(c)
+                stage1(c, ge, opse)
+                mc.gate_ready(c, ge)
+            if bid == KV_CTA:
+                stage_kv(c)
+        if bid >= NA:
+            g0 = bid - NA
+            ops = s1_loads(c, g0)
+            load_x(c)
+            stage1(c, g0, ops)
+            mc.gate_ready(c, g0)
+        stamp(on, tls, tid, 2)
+        # stage 2: groups bid + 256 j, each group's weights issued two groups
+        # ahead; the absorb tiles go out first, under the q latent's polls
+        ops = [s2_loads(c, bid), s2_loads(c, bid + BLOCKS)]
+        w3 = [s3_loads(c, bid), s3_loads(c, bid + BLOCKS)]
+        # this CTA's W_UV tile read once now, under the q latent's polls, so the
+        # task after the attention finds it in its XCD's L2
+        _touch(c, uv_loads(c, bid))
+        load_qlora(c)
+        stamp(on, tls, tid, 3)
+        for j in range_constexpr(QB_ROUNDS):
+            h = bid + BLOCKS * j
+            if h < QBG:
+                stage2(c, h, ops[j])
+            nwait = 0
+            if const_expr(j + 2 < QB_ROUNDS):
+                ops.append(s2_loads(c, h + 2 * BLOCKS))
+                nwait = S2_LOADS
+            if h < QBG:
+                stage2_flag(c, h, nwait)
+            _bar()
+        stamp(on, tls, tid, 4)
+        # stage 3: tasks bid and bid + 256
+        c["xl"], c["wl"] = abl.xl.ptr, abl.wl.ptr
+        stage3(c, bid, w3[0])
+        if bid < ABS - BLOCKS:
+            stage3(c, bid + BLOCKS, w3[1])
+        stamp(on, tls, tid, 5)
+        _, _, _, n, d = request(c)
+        if bid < NHG * n * d:
+            attention(c, bid)
+        c["xl"], c["wl"] = ul.xl.ptr, ul.wl.ptr
+        if bid < UV_CTAS:
+            stage_uv(c, bid, uv_loads(c, bid))
+        stamp(on, tls, tid, 9)
+        # the wait on the other ranks' records runs under the launch's guard
+        own = load_ptr64(peers, rank)
+        with guard.scope(
+            guard.Guard(epoch, own=own, peers=peers, rank=rank, npes=DCP, flags_offset=flags_off)
+        ):
+            if (bid >= COMB0) & (bid < COMB0 + mc.combine_tasks(s)):
+                mc.stage_combine(c, bid - COMB0)
+        stamp_flush(on, tls, tl, tid, bid, TL_POINTS)
+
+    @flyc.jit
+    def launch(
+        prefix: Int64, blocks: Int64, blk_sm: Int32, blk_sr: Int32, ares_nw: Int64,
+        ares_qk: Int64, in_nw: Int64, w_qkv: Int64, w_g: Int64, q_nw: Int64,
+        kv_nw: Int64, w_qb: Int64, w_kc: Int64, w_vc: Int64, kv: Int64, kv_idx: Int64,
+        kv_ptr: Int64, g_kv_ptr: Int64, loc: Int64, core: Int64, send: Int64,
+        scratch: Int64, peers: Int64, rank: Int32, a2a_par: Int32, layer: Int32,
+        epoch: Int64, tl: Int64, stream: fx.Stream = _STREAM,
+    ):  # fmt: skip
+        _ = keyed
+        mla_front(
+            prefix, blocks, blk_sm, blk_sr, ares_nw, ares_qk, in_nw, w_qkv, w_g, q_nw,
+            kv_nw, w_qb, w_kc, w_vc, kv, kv_idx, kv_ptr, g_kv_ptr, loc, core, send,
+            scratch, peers, rank, a2a_par, layer, epoch, tl,
+        ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)  # fmt: skip
+
+    _BUILDS[key] = launch
+    return launch
+
+
+def ptr(t):
+    return 0 if t is None else t.data_ptr()
+
+
+WEIGHT_SHAPES = {
+    "w_qkv": (LATW, HIDDEN), "w_g": (GATE, HIDDEN), "w_qb": (NHA * QHD, QL),
+    "w_kc": (NHA, QN, KV), "w_vc": (NHA, KV, VD),
+}  # fmt: skip
+
+
+def mla_front_launch(
+    key: MlaFrontBuild, *, prefix, blocks, w, kv, kv_idx, kv_ptr, g_kv_ptr, loc,
+    core, scratch, peers, rank, a2a_par, layer, epoch, send=None, tl=None,
+):  # fmt: skip
+    """Host launcher. ``w``: ares_nw, ares_qk, in_nw, q_nw, kv_nw and the
+    ``WEIGHT_SHAPES`` weights (bf16, contiguous); ``kv``: this rank's e4m3 KV
+    rows [rows, 576] (row-contiguous); ``kv_idx`` / ``kv_ptr``: the request's
+    local rows by position (int32, ragged: SGLang's DCP verify indices);
+    ``g_kv_ptr``: its global KV indptr (int32, verify rows included);
+    ``loc``: its rows' KV slots (int64); ``core`` [S, 1536] bf16 out;
+    ``peers``: the int64 table of the DCP ranks' peer buffers (``mla_combine.
+    peer_end`` bytes each, armed), indexed by DCP rank; ``a2a_par``: the
+    layer's MLA ordinal parity; ``send`` [8, S, 12, 130] bf16 out, a
+    ``records`` build only."""
+    assert key.write_idx < blocks.shape[1]
+    for n, shp in WEIGHT_SHAPES.items():
+        t = w[n]
+        assert tuple(t.shape) == shp and t.is_contiguous() and t.dtype == torch.bfloat16, (
+            n, tuple(t.shape), t.dtype,
+        )  # fmt: skip
+    assert kv.dtype in (torch.float8_e4m3fn, torch.uint8) and kv.stride(-2) == DQK
+    assert kv_idx.dtype == torch.int32 and kv_ptr.dtype == torch.int32
+    assert loc.dtype == torch.int64 and g_kv_ptr.dtype == torch.int32
+    assert tuple(core.shape) == (key.tokens, GATE) and core.dtype == torch.bfloat16
+    assert core.is_contiguous()
+    assert peers.dtype == torch.int64 and peers.numel() == DCP
+    assert (send is not None) == key.records
+    if send is not None:
+        assert tuple(send.shape) == (DCP, key.tokens, NHL, REC) and send.dtype == torch.bfloat16
+    f = build(key)
+    f(
+        prefix.data_ptr(), blocks.data_ptr(), blocks.stride(0), blocks.stride(1),
+        w["ares_nw"].data_ptr(), w["ares_qk"].data_ptr(), w["in_nw"].data_ptr(),
+        w["w_qkv"].data_ptr(), w["w_g"].data_ptr(), w["q_nw"].data_ptr(),
+        w["kv_nw"].data_ptr(), w["w_qb"].data_ptr(), w["w_kc"].data_ptr(),
+        w["w_vc"].data_ptr(), kv.data_ptr(), kv_idx.data_ptr(), kv_ptr.data_ptr(),
+        g_kv_ptr.data_ptr(), loc.data_ptr(), core.data_ptr(), ptr(send),
+        scratch.data_ptr(), peers.data_ptr(), rank, a2a_par, layer, epoch.data_ptr(),
+        ptr(tl), stream=torch.cuda.current_stream(),
+    )  # fmt: skip
+
+
+def scratch_view(key: MlaFrontBuild, scratch, name: str, dtype, shape):
+    """A scratch region as a tensor, for the checks."""
+    off, nbytes = scratch_layout(key)[name]
+    return scratch[off : off + nbytes].view(dtype).view(shape)

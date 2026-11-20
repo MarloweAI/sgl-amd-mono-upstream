@@ -13,7 +13,13 @@ except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
     from sglang.srt.monokernels import spec as registry
 
 import sgl_amd_mono
-from sgl_amd_mono.kimi_k3 import HF_CONFIG, LINEAR_ATTN_CONFIG, MAX_BLOCKS, MAX_ROWS
+from sgl_amd_mono.kimi_k3 import (
+    HF_CONFIG,
+    K2_MAX_ROWS,
+    LINEAR_ATTN_CONFIG,
+    MAX_BLOCKS,
+    MAX_ROWS,
+)
 from sgl_amd_mono.kimi_k3 import spec as k3
 
 # Kimi-K3's layer structure (its config.json): 93 layers, a dense layer 0, then
@@ -69,13 +75,13 @@ def test_the_plugin_registers_the_spec():
     assert found is k3.SPEC, why
 
 
-def test_the_spec_is_tp8_and_at_most_eight_rows():
+def test_the_spec_is_tp8_and_at_most_k2_max_rows():
     limits = k3.SPEC.devices["gfx950"]
     assert limits.tp_sizes == (8,)
-    assert limits.widths == tuple(range(1, MAX_ROWS + 1))
-    # With DSpark the runtime serves only the widths that hold whole requests,
-    # so block size 7 (8 tokens a request) leaves batch size 1.
-    assert [w // 8 for w in limits.widths if w % 8 == 0] == [1]
+    assert limits.widths == tuple(range(1, K2_MAX_ROWS + 1))
+    # With DSpark the runtime serves only the widths that hold whole requests:
+    # block size 5 (6 tokens a request) gives batch sizes 1 .. K2_MAX_ROWS // 6.
+    assert [w // 6 for w in limits.widths if w % 6 == 0] == list(range(1, K2_MAX_ROWS // 6 + 1))
 
 
 def test_the_shapes_are_checked_on_the_text_config():
@@ -190,15 +196,17 @@ def test_the_guard_flags_sit_past_every_width(monkeypatch):
     from sgl_amd_mono.kimi_k3.gfx950.stages import moe
 
     off = layer.flags_offset()
-    for width in range(1, MAX_ROWS + 1):
+    for width in range(1, K2_MAX_ROWS + 1):
         assert layer.peer_bytes(width) <= off, width
         assert moe.peer_bytes(width) <= off, width
     # the widest launch ends exactly there: a larger offset wastes a peer page
-    assert off == max(layer.peer_bytes(MAX_ROWS), moe.peer_bytes(MAX_ROWS))
+    assert off == max(layer.peer_bytes(K2_MAX_ROWS), moe.peer_bytes(K2_MAX_ROWS))
 
 
-# A TP8 + DCP8 DSpark server, as SGLang's feature probes read it.
+# A TP8 + DCP8 DSpark server on the ReplaySSM ring, as SGLang's feature probes
+# read it.
 TP8_DCP8 = SimpleNamespace(
+    enable_linear_replayssm_spec=True,
     tp_size=8, dcp_size=8, attn_cp_size=1, enable_prefill_cp=False, pp_size=1,
     nnodes=1, attn_dp_size=1, ep_size=1, enable_eplb=False,
     speculative_algorithm="DSPARK", enable_two_batch_overlap=False,
@@ -245,6 +253,18 @@ def test_other_context_parallel_shapes_are_refused(monkeypatch):
     assert any("--dcp-size 4" in r for r in _config_reasons(monkeypatch, dcp4))
     cp = SimpleNamespace(**{**vars(TP8_DCP8), "attn_cp_size": 2})
     assert any("attention context" in r for r in _config_reasons(monkeypatch, cp))
+
+
+def test_the_replayssm_ring_is_required(monkeypatch):
+    snapshots = SimpleNamespace(**{**vars(TP8_DCP8), "enable_linear_replayssm_spec": False})
+    assert any(
+        "--enable-linear-replayssm-spec" in r for r in _config_reasons(monkeypatch, snapshots)
+    )
+    monkeypatch.setenv("SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT", "1")
+    from sglang.srt.mem_cache import kv_cache_configurator as kvc
+
+    monkeypatch.setattr(kvc, "host_only_mamba_checkpoint", lambda: True)
+    assert any("by request" in r for r in _config_reasons(monkeypatch, TP8_DCP8))
 
 
 def test_kda_dwdp_is_refused(monkeypatch):

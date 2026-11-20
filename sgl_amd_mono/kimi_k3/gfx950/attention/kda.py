@@ -176,24 +176,31 @@ def sigmoid(z):
 
 
 # ---------------------------------------------------------------- gemv CTAs
+# in_proj as ``kda_wide.pack_w_in`` lays it out: AITER's 16x16 preshuffle, 1 KB
+# pieces (group of 16 rows, 32 K) in (group, K) order, a lane's 16 B at lane * 16
+# (row lane % 16, K 8 (lane // 16) ..)
+def w_piece(rg, k32):
+    """Dword offset of in_proj's packed piece (group ``rg``, K 32 k32 ..)."""
+    return (rg * (HIDDEN // 32) + k32) * 256
+
+
 def gemv_loads(c, rg, chunks):
     """This wave's weight operands of rows 16 rg .. for its K chunks ``chunks``
-    (indices into wave, wave + 8, ..): a lane 64 contiguous bytes of its row a
-    chunk (4 dwordx4). ``rg`` past the last group loads the last group."""
+    (indices into wave, wave + 8, ..): a lane 16 B of its row a 32-K piece
+    (4 dwordx4 a chunk), from in_proj packed (``w_piece``). ``rg`` past the last
+    group loads the last group."""
     lane, wave = c["lane"], c["wave"]
     r_w = rsrc(c["args"]["w_in"])
-    row = fx.min(rg, GEMV_TASKS - 1) * ROWS + lane % ROWS
-    g = lane // ROWS
+    rgc = fx.min(rg, GEMV_TASKS - 1)
     out = []
     for i in chunks:
-        k = (wave + WAVES * i) * KCH + g * 8
-        base = (row * HIDDEN + k) // 2  # dwords
+        k32 = (wave + WAVES * i) * (KCH // 32)
         out.append(
             [
                 fx.Vector(
                     bo.buffer_load(
                         r_w,
-                        base + 16 * q,
+                        w_piece(rgc, k32 + q) + lane * 4,
                         vec_width=4,
                         dtype=T.i32,
                         cache_modifier=CM_NT,
@@ -902,7 +909,8 @@ def kda_pre(
     rstate0=None,
     init_slot=None,
 ):
-    """Host launcher. ``conv_state`` [slots, dim, state_len] or a transposed view
+    """Host launcher. ``w_in`` in_proj as ``kda_wide.pack_w_in`` lays it out;
+    ``conv_state`` [slots, dim, state_len] or a transposed view
     of [slots, state_len, dim] (strides read); ``rstate`` [slots, 12, 128, 128]
     fp32; ``st_idx`` [R, >= L] int32; ``scratch`` zeroed before the step's first
     layer (tags are a layer's); ``epoch`` a device int32 bumped once a step and
