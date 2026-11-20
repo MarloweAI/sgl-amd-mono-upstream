@@ -25,13 +25,13 @@ HF_CONFIG = dict(
 LINEAR_ATTN_CONFIG = dict(head_dim=128, num_heads=96, short_conv_kernel_size=4)
 
 # One launch's token rows at most: the x rows fit one CTA's LDS. K1 and the MLA
-# front take MAX_ROWS; the layer launch (K2) takes K2_MAX_ROWS (2 DSpark
+# front take MAX_ROWS; the layer launch (K2) takes K2_MAX_ROWS (3 DSpark
 # requests), its GEMVs a 16-row token tile at a time. Its wide form is correct
-# to 48 rows, but from 18 rows SGLang's MoE layer is as fast or faster (a8w4,
+# to 48 rows, but from 24 rows SGLang's MoE layer is as fast or faster (a8w4,
 # uniform and recorded routes), so wider steps take SGLang's.
 MAX_ROWS = 8
 K1_MAX_ROWS = MAX_ROWS
-K2_MAX_ROWS = 12
+K2_MAX_ROWS = 18
 # The attention's TP-local output per rank at TP8: 12 heads of 128. o_proj's
 # input, which is where the launch starts.
 CORE = 1536
