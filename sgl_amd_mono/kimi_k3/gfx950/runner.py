@@ -34,7 +34,7 @@ class K3MonoRunner:
         # through first, compiled into this rank's build key
         self.fault_site, self.fault_after = guard.fault_injection(rank) or (0, 0)
         # The launches run one after another, so one buffer the widest of them
-        # fits, then K2's tagged x rows.
+        # fits, then K2's tagged x rows, then the DCP front's regions.
         front = mla_front.scratch_bytes(
             mla_front.MlaFrontBuild(
                 tokens=mla_front.G_ROWS
