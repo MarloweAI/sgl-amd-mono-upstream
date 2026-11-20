@@ -59,8 +59,10 @@ class K3MonoRunner:
         # past the two parity halves, the guard's flag word a rank, then K2's
         # sentinel regions. The kernel reads them at the same offsets, from the
         # same functions.
-        self.peer = PeerBuffer(layer.peer_alloc_bytes(), group, rank, tp, device)
-        layer.init_peer(self.peer.bytes)
+        # ... and the DCP front's q all-gather (QG) copies past them
+        self.peer = PeerBuffer(max(layer.peer_alloc_bytes(), mla_front.peer_end()), group, rank, tp, device)
+        layer.init_peer(self.peer.bytes[: layer.peer_alloc_bytes()])
+        self.peer.bytes[layer.peer_alloc_bytes() :].zero_()
         # One prefix buffer, not one a layer: the layers run in sequence.
         self.prefix = torch.empty(
             MAX_ROWS, layer.HIDDEN, dtype=torch.bfloat16, device=device

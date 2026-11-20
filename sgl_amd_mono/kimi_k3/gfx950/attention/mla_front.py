@@ -63,6 +63,7 @@ from flydsl.expr.typing import Int32, Int64, T, as_ir_value
 
 from sgl_amd_mono.common.ops import (
     CM_DEV,
+    CM_SYS,
     clock,
     bf_hi,
     bf_lo,
@@ -73,6 +74,8 @@ from sgl_amd_mono.common.ops import (
     hw_rsq,
     row_sum,
     rsrc,
+    sfresh64,
+    sload64,
     uniform,
     xred,
 )
@@ -84,7 +87,7 @@ from sgl_amd_mono.common.plan import (
     key_tuple,
     pair_layout,
 )
-from sgl_amd_mono.common.sync import Mailbox, sreg
+from sgl_amd_mono.common.sync import Addr, Mailbox, Space, sreg
 from sgl_amd_mono.kimi_k3.gfx950.attention.mla_pre import load_qlora, load_x
 from sgl_amd_mono.kimi_k3.gfx950.stages import gemv
 from sgl_amd_mono.kimi_k3.gfx950.stages.dims import COLS, HIDDEN, LDS_PAD, NA, ROWS
@@ -104,8 +107,8 @@ SGLANG_READS = {
         "fused_qkv_a_proj_with_mqa",
         "q_a_layernorm",
         "kv_a_layernorm",
-        "q_b_proj_qrep_weight",
-        "w_kc_qrep",
+        "q_b_proj",
+        "w_kc",
         "w_vc_qrep",
     ),
     "srt/models/kimi_k3.py": ("g_proj",),
@@ -131,19 +134,28 @@ G_KV = KV // ROWS  # 32
 S1 = (LATW + GATE) // ROWS  # 228 stage-1 groups
 S1_GATE0 = G_LAT
 # The CTA roles before the attention (every CTA then takes an attention item):
-#   0 .. 55      the seam, then 5 q_b groups
-#   56 .. 187    a fused_qkv_a group at launch, then 7 (to 135) or 6 q_b groups
+#   0 .. 55      the seam
+#   56 .. 187    a fused_qkv_a group at launch
 #   188 .. 255   g_proj, off the q path: a group each, 188 .. 215 a second one
+#   0 .. 143     a q_b group of this rank's 12 heads; 144 .. 187 and 216 .. 219
+#                an absorb task
+#   255          the q all-gather's flags
 QKV0 = NA  # the first fused_qkv_a CTA
 GP0 = QKV0 + G_LAT  # 188: the first g_proj CTA
 GP2 = GATE // ROWS - (BLOCKS - GP0)  # 28 g_proj CTAs with a second group
-QB_SEAM, QB_HI, QB_LO = 5, 7, 6  # q_b groups a seam / early / late qkv_a CTA
 QBG = NHA * QHD // ROWS  # 1152 q_b groups
 QBG_HEAD = QHD // ROWS  # 12 a head: 8 nope, then 4 rope
-QB_ROUNDS = QB_HI  # q_b groups a CTA at most
-QB_HI_N = QBG - NA * QB_SEAM - G_LAT * QB_LO  # 80 qkv_a CTAs with 7
 ABS_BLK = KV // 128  # 4 absorb tasks a head
 ABS = NHA * ABS_BLK  # 384
+# q is computed for this rank's 12 heads only (the local q_b / W_UK shards)
+# and all-gathered: every rank's producers store their fp8 q into every rank's
+# QG region; one tagged flag a (source, request) follows
+QBG_L = NHL * QBG_HEAD  # 144 local q_b groups: CTAs 0 .. 143, one each
+ABS_L = NHL * ABS_BLK  # 48 local absorb tasks: CTAs 144 .. 187, then 216 .. 219
+ABS0 = QBG_L
+ABS_N0 = 188 - ABS0  # 44 tasks on qkv_a CTAs; the rest past the two-group g_proj CTAs
+ABS1 = 216
+QG_FLAG_CTA = 255  # raises the (source, request) flags once the local q landed
 # heads an attention item: 16 (96 (row, head) columns) past one request, 8 (48)
 # for one (its 12 head groups x splits fill the CTAs); a column's arithmetic is
 # the same either way. An item's 16-column MFMA tiles: tile T = row pair T % 3
@@ -185,7 +197,30 @@ TL_PHASES = 4
 TL_STEPS = TL_ROLE + TL_PHASES * WAVES
 TL_POINTS = TL_STEPS + 1
 
-assert GP2 >= 0 and QB_HI_N >= 0 and NA * QB_SEAM + QB_HI_N * QB_HI + (G_LAT - QB_HI_N) * QB_LO == QBG
+assert GP2 >= 0 and ABS1 >= 188 + GP2 and ABS1 + ABS_L - ABS_N0 <= QG_FLAG_CTA
+
+
+QG_REC = DQK  # bytes a (source, request, local head, row) q record
+QG_DATA = DCP * MAX_REQS * NHL * G_ROWS * QG_REC  # one copy's records
+QG_COPY = -(-(QG_DATA + DCP * MAX_REQS * 8) // 4096) * 4096  # records, then the flag pairs
+QG_RESERVE = 4 << 20  # room past K2's region for the DCP all-to-all's (merged later)
+
+
+def qg_offset() -> int:
+    """Where a rank's QG region starts in its peer buffer."""
+    from sgl_amd_mono.kimi_k3.gfx950 import layer
+
+    return -(-layer.peer_alloc_bytes() // 4096) * 4096 + QG_RESERVE
+
+
+def peer_end() -> int:
+    """A rank's peer buffer with the QG region's two copies."""
+    return qg_offset() + 2 * QG_COPY
+
+
+def qg_word(src, rq, hl, t, byte):
+    """i32 word of (source rank, request, local head, row, byte) in a QG copy."""
+    return ((((src * MAX_REQS + rq) * NHL + hl) * G_ROWS + t) * QG_REC + byte) // 4
 
 
 def splits_of(p: int) -> int:
@@ -277,6 +312,20 @@ def _published(nwait):
         asm_string=f"s_waitcnt vmcnt({nwait}) lgkmcnt(0)\n\ts_barrier",
         constraints="~{memory}", has_side_effects=True,
     )  # fmt: skip
+
+
+def qg_base(c, p):
+    """Rank p's QG copy (the launch's parity): its base, loaded where used."""
+    return sload64(sfresh64(c["args"]["peers"]) + fx.Int64(p) * fx.Int64(8)) + c["qg_off"]
+
+
+def push_q(c, t, head, byte, words):
+    """One piece of row t's q of (global) head ``head`` -- ``words`` (i32) at
+    ``byte`` of its 576 -- into every rank's QG copy, system scope."""
+    src = c["rank"]
+    w = qg_word(src, t // G_ROWS, head - NHL * src, t % G_ROWS, byte)
+    for p in range_constexpr(DCP):
+        bo.buffer_store(words, rsrc(qg_base(c, p)), w, cache_modifier=CM_SYS)
 
 
 def _st_bf(ptr, i, v, cm=0):
@@ -611,28 +660,14 @@ def stage_kv(c):
 # ---------------------------------------------------------------- stage 2: q_b
 
 
-def qb_range(bid):
-    """(first group, count) of CTA ``bid``'s q_b groups (contiguous)."""
-    seam = bid < NA
-    hi = (bid >= QKV0) & (bid < QKV0 + QB_HI_N)
-    lo = (bid >= QKV0 + QB_HI_N) & (bid < GP0)
-    first = seam.select(
-        bid * QB_SEAM,
-        hi.select(
-            NA * QB_SEAM + (bid - QKV0) * QB_HI,
-            NA * QB_SEAM + QB_HI_N * QB_HI + (bid - QKV0 - QB_HI_N) * QB_LO,
-        ),
-    )
-    count = seam.select(fx.Int32(QB_SEAM), hi.select(fx.Int32(QB_HI), lo.select(fx.Int32(QB_LO), fx.Int32(0))))
-    return first, count
-
-
 def s2_loads(c, h):
     """q_b group ``h``'s weights (past the last group: zero-range loads)."""
     a = c["args"]
-    nbytes = (h < QBG).select(fx.Int64(0xFFFFFFFF), fx.Int64(0))
-    h = fx.min(h, QBG - 1)
-    return gemv.loads(c["lane"], c["wave"], a["w_qb"], h * ROWS, QL, nbytes=nbytes)
+    # the local q_b shard's rows: group h of head 12 rank + hl is its row 16 (h - 144 rank)
+    hl = h - QBG_L * c["rank"]
+    nbytes = ((hl >= 0) & (hl < QBG_L)).select(fx.Int64(0xFFFFFFFF), fx.Int64(0))
+    hl = fx.max(fx.min(hl, QBG_L - 1), 0)
+    return gemv.loads(c["lane"], c["wave"], a["w_qb"], hl * ROWS, QL, nbytes=nbytes)
 
 
 S2_LOADS = 4 * gemv.chunks(QL)[0]  # a wave's loads of one q_b group
@@ -676,12 +711,9 @@ def s2_out(c, h, acc, t0, sj):
         for k in range(1, 4)
     ]
     if mine & ((h % QBG_HEAD) >= QN // ROWS) & ((r % 4) == 0):
-        bo.buffer_store(
-            e4m3x4([v] + nb),
-            rsrc(c["q8"]),
-            (t * (NHA * DQK) + head * DQK + KV + d) // 4,
-            cache_modifier=CM_DEV,
-        )
+        word = e4m3x4([v] + nb)
+        bo.buffer_store(word, rsrc(c["q8"]), (t * (NHA * DQK) + head * DQK + KV + d) // 4, cache_modifier=CM_DEV)
+        push_q(c, t, head, KV + d, word)
 
 
 @flyc.jit
@@ -701,7 +733,8 @@ def s3_loads(c, task):
     a = c["args"]
     tid = c["tid"]
     task = fx.min(task, ABS - 1)
-    h = task // ABS_BLK
+    h = task // ABS_BLK - NHL * c["rank"]  # the local W_UK shard's head
+    h = fx.max(fx.min(h, NHL - 1), 0)
     b = task % ABS_BLK
     out = []
     for i in range_constexpr(4):
@@ -761,12 +794,9 @@ def stage3(c, task, wt):
             w0 = e4m3x4(vals[0:4])
             w1 = e4m3x4(vals[4:8])
             col = b * 128 + 32 * cq + 8 * g
-            bo.buffer_store(
-                fx.Vector.from_elements([w0, w1], fx.Int32),
-                rsrc(c["q8"]),
-                ((t0 + r16) * (NHA * DQK) + h * DQK + col) // 4,
-                cache_modifier=CM_DEV,
-            )
+            words = fx.Vector.from_elements([w0, w1], fx.Int32)
+            bo.buffer_store(words, rsrc(c["q8"]), ((t0 + r16) * (NHA * DQK) + h * DQK + col) // 4, cache_modifier=CM_DEV)
+            push_q(c, t0 + r16, h, col, words)
         if const_expr(ti + 1 < len(tiles)):
             _bar()
     rocdl.s_waitcnt(vmcnt=0)
@@ -774,6 +804,43 @@ def stage3(c, task, wt):
     if tid == 0:
         c["put"](c["absrdy"], task, fx.Int32(1))
     gpu.barrier()
+
+
+@flyc.jit
+def qg_flags(c):
+    """This rank's q landed in every rank's QG copy (its 48 absorb tasks, its
+    48 rope groups): the (this source, request) flag pairs into every rank's."""
+    tid = c["tid"]
+    src = c["rank"]
+    if tid < ABS_L:
+        c["poll"]([(c["absrdy"], ABS_L * src + tid, 1)])
+    if (tid >= ABS_L) & (tid < 2 * ABS_L):
+        e = tid - ABS_L
+        c["poll"]([(c["qrdy"], (NHL * src + e // 4) * QBG_HEAD + QN // ROWS + e % 4, 1)])
+    gpu.barrier()
+    if tid < c["NREQ"]:
+        for p in range_constexpr(DCP):
+            c["put"](Addr("qgf", Space.PEER, qg_base(c, p) + fx.Int64(QG_DATA)), src * MAX_REQS + tid, fx.Int32(1))
+    rocdl.s_waitcnt(vmcnt=0)
+    gpu.barrier()
+
+
+@flyc.jit
+def qg_wait(c, rq, h0, nh):
+    """Heads h0 .. h0 + nh of request rq: their sources' flags in this rank's
+    QG copy (at most two sources)."""
+    tid = c["tid"]
+    s0 = h0 // NHL
+    s1 = (h0 + nh - 1) // NHL
+    if tid < 2:
+        src = (tid == 0).select(s0, s1)
+        c["poll"]([(Addr("qgf", Space.PEER, qg_base(c, c["rank"]) + fx.Int64(QG_DATA)), src * MAX_REQS + rq, 1)])
+
+
+def qg_load4(c, rq, head, t, byte):
+    """16 bytes of row t's q of head ``head`` (request rq) from this rank's QG copy."""
+    w = qg_word(head // NHL, rq, head % NHL, t, byte)
+    return fx.Vector(bo.buffer_load(rsrc(qg_base(c, c["rank"])), w, vec_width=4, dtype=T.i32, cache_modifier=CM_SYS))
 
 
 # ---------------------------------------------------------------- attention
@@ -1094,14 +1161,10 @@ def attention(c, rq, hg, sa, sb):
     for sp in range(sa, sb):
         if sp * nbl // n == (sp + 1) * nbl // n:
             _empty_out(c, lane, wave, sp, hg, row0)
-    # the group's q: its 16 heads' absorb tasks and rope groups; the new token
-    if tid < HQ * ABS_BLK:
-        c["poll"]([(c["absrdy"], (hg * HQ + tid // ABS_BLK) * ABS_BLK + tid % ABS_BLK, 1)])
-    if (tid >= HQ * ABS_BLK) & (tid < 2 * HQ * ABS_BLK):
-        e = tid - HQ * ABS_BLK
-        c["poll"]([(c["qrdy"], (hg * HQ + e // 4) * QBG_HEAD + QN // ROWS + e % 4, 1)])
+    # the group's q: its sources' QG flags; the new token
+    qg_wait(c, rq, hg * HQ, HQ)
     has_new = (own < G_ROWS) & (b1 > lr // BK) & (b0 <= lr // BK)
-    if has_new & (tid == 2 * HQ * ABS_BLK):
+    if has_new & (tid == 64):
         c["poll"]([(c["kvrdy"], rq, 1)])
     _bar()
     stamp(c["on"], c["tls"], tid, 6)
@@ -1110,11 +1173,10 @@ def attention(c, rq, hg, sa, sb):
     t = 2 * (ct_w % 3) + r16 // 8
     # the tile's q in registers, a K step's operands (as ``_qk`` reads them)
     tq, hq = _col(ct_w, r16, row0, hg, HQ)
-    qb = (tq * (NHA * DQK) + hq * DQK) // 4
     qops = []
     for kc in range_constexpr(QK_STEPS):
         wd = 32 * kc + 8 * g if 128 * (kc + 1) <= DQK else fx.min(32 * kc + 8 * g, DQK // 4 - 8)
-        lo, hi = _ld4(c["q8"], qb + wd, CM_DEV), _ld4(c["q8"], qb + wd + 4, CM_DEV)
+        lo, hi = qg_load4(c, rq, hq, tq - row0, 4 * wd), qg_load4(c, rq, hq, tq - row0, 4 * wd + 16)
         qops.append(_k128(lane, fx.Vector.from_elements([lo[e] for e in range(4)] + [hi[e] for e in range(4)], fx.Int32), kc))
     qk_scale = c["scale"] * LOG2E
     m = fx.Float32(NEG)
@@ -1395,13 +1457,9 @@ def attention1(c, rq, hg, sa, sb):
         if sp * nbl // n == (sp + 1) * nbl // n:
             _empty_out1(c, lane, wave, sp, hg, row0)
     # the group's q: its 8 heads' absorb tasks and rope groups; the new token
-    if tid < HQ1 * ABS_BLK:
-        c["poll"]([(c["absrdy"], (hg * HQ1 + tid // ABS_BLK) * ABS_BLK + tid % ABS_BLK, 1)])
-    if (tid >= HQ1 * ABS_BLK) & (tid < 2 * HQ1 * ABS_BLK):
-        e = tid - HQ1 * ABS_BLK
-        c["poll"]([(c["qrdy"], (hg * HQ1 + e // 4) * QBG_HEAD + QN // ROWS + e % 4, 1)])
+    qg_wait(c, rq, hg * HQ1, HQ1)
     has_new = (own < G_ROWS) & (b1 > lr // BK) & (b0 <= lr // BK)
-    if has_new & (tid == 2 * HQ1 * ABS_BLK):
+    if has_new & (tid == 64):
         c["poll"]([(c["kvrdy"], rq, 1)])
     _bar()
     stamp(c["on"], c["tls"], tid, 6)
@@ -1416,7 +1474,7 @@ def attention1(c, rq, hg, sa, sb):
         pq = e % qrow
         tq = row0 + 2 * (rr // 16) + (rr % 16) // HQ1
         hq = hg * HQ1 + rr % HQ1
-        v = _ld4(c["q8"], (tq * (NHA * DQK) + hq * DQK) // 4 + 4 * pq, CM_DEV)
+        v = qg_load4(c, rq, hq, tq - row0, 16 * pq)
         if tid + THREADS * j < NRP1 * 16 * qrow:
             fx.ptr_store(v, c["qll"] + (rr * RWK + 4 * pq))
     qf = c["qll"] + rp * (16 * RWK)
@@ -1765,7 +1823,7 @@ def build(key: MlaFrontBuild):
         ares_qk: Int64, in_nw: Int64, w_qkv: Int64, w_g: Int64, q_nw: Int64,
         kv_nw: Int64, w_qb: Int64, w_kc: Int64, w_vc: Int64, kv: Int64, kv_idx: Int64,
         kv_ptr: Int64, g_kv_ptr: Int64, loc: Int64, gate: Int64, send: Int64,
-        scratch: Int64, rank: Int32, layer: Int32, epoch: Int64, tl: Int64,
+        scratch: Int64, peers: Int64, qg_par: Int32, rank: Int32, layer: Int32, epoch: Int64, tl: Int64,
     ):  # fmt: skip
         _ = keyed
         tid = fx.thread_idx.x
@@ -1786,6 +1844,7 @@ def build(key: MlaFrontBuild):
             # every role but the attention's starts with the same red (offset 0)
             "red": al.red.ptr, "vals": al.vals.ptr, "xl": gl.xl.ptr,
             "scale": key.scale, "rank": rank, "loc_words": 2,
+            "qg_off": fx.Int64(qg_offset()) + fx.Int64(qg_par) * fx.Int64(QG_COPY),
             "xbuf": scratch + fx.Int64(lay["x"][0]),
             "lat": scratch + fx.Int64(lay["lat"][0]),
             "qb": scratch + fx.Int64(lay["qb"][0]),
@@ -1801,7 +1860,7 @@ def build(key: MlaFrontBuild):
                 "x_dbg": 0, "w_qkv": w_qkv, "w_g": w_g, "q_nw": q_nw, "kv_nw": kv_nw,
                 "w_qb": w_qb, "w_kc": w_kc, "w_vc": w_vc, "kv": kv, "kv_idx": kv_idx,
                 "kv_ptr": kv_ptr, "g_kv_ptr": g_kv_ptr, "loc": loc, "gate": gate,
-                "send": send, "q_lora": 0,
+                "send": send, "q_lora": 0, "peers": peers,
             },
         }  # fmt: skip
         for region in ("part", "wgt", "msq", "xrdy", "ss", "qrdy", "absrdy", "kvrdy", "itrdy"):
@@ -1842,34 +1901,34 @@ def build(key: MlaFrontBuild):
                 else:
                     stage1(c, S1_GATE0 + BLOCKS - GP0 + bid - GP0, ops2)
         stamp(on, tls, tid, 2)
-        # stage 2: this CTA's q_b groups, two groups of weights in flight
-        q0, qn_ = qb_range(bid)
-        # (a group index past QBG loads nothing)
-        ops = [s2_loads(c, (j < qn_).select(q0 + j, fx.Int32(QBG))) for j in range(2)]
-        if bid < GP0:
+        # stage 2: this rank's 144 q_b groups, one a CTA on CTAs 0 .. 143 (a
+        # group index past them loads nothing)
+        qbg = QBG_L * rank + bid
+        live_qb = bid < QBG_L
+        ops = s2_loads(c, live_qb.select(qbg, fx.Int32(QBG)))
+        # stage 3's tile (the absorb CTAs) in flight meanwhile
+        lo_abs = (bid >= ABS0) & (bid < ABS0 + ABS_N0)
+        hi_abs = (bid >= ABS1) & (bid < ABS1 + ABS_L - ABS_N0)
+        task = ABS_L * rank + lo_abs.select(bid - ABS0, bid - ABS1 + ABS_N0)
+        live_abs = lo_abs | hi_abs
+        w3 = s3_loads(c, live_abs.select(task, fx.Int32(0)))
+        if live_qb:
             if const_expr(wd):
                 load_qlora_wide(c)
             else:
                 load_qlora(c)
         stamp(on, tls, tid, 3)
-        for j in range_constexpr(QB_ROUNDS):
-            h = q0 + j
-            if j < qn_:
-                stage2(c, h, ops[j])
-            nwait = 0
-            if const_expr(j + 2 < QB_ROUNDS):
-                ops.append(s2_loads(c, (j + 2 < qn_).select(h + 2, fx.Int32(QBG))))
-                nwait = S2_LOADS
-            if j < qn_:
-                stage2_flag(c, h, nwait)
-            _bar()
+        if live_qb:
+            stage2(c, qbg, ops)
+            stage2_flag(c, qbg, 0)
+        _bar()
         stamp(on, tls, tid, 4)
-        # stage 3: tasks bid and bid + 256
+        # stage 3: this rank's 48 absorb tasks, one a CTA; then the q flags
         c["xl"], c["wl"] = abl.xl.ptr, abl.wl.ptr
-        w3 = [s3_loads(c, bid), s3_loads(c, bid + BLOCKS)]
-        stage3(c, bid, w3[0])
-        if bid < ABS - BLOCKS:
-            stage3(c, bid + BLOCKS, w3[1])
+        if live_abs:
+            stage3(c, task, w3)
+        if bid == QG_FLAG_CTA:
+            qg_flags(c)
         stamp(on, tls, tid, 5)
         if const_expr(nreq == 1):
             _, _, _, n, _ = request(c)
@@ -1901,14 +1960,14 @@ def build(key: MlaFrontBuild):
         ares_qk: Int64, in_nw: Int64, w_qkv: Int64, w_g: Int64, q_nw: Int64,
         kv_nw: Int64, w_qb: Int64, w_kc: Int64, w_vc: Int64, kv: Int64, kv_idx: Int64,
         kv_ptr: Int64, g_kv_ptr: Int64, loc: Int64, gate: Int64, send: Int64,
-        scratch: Int64, rank: Int32, layer: Int32, epoch: Int64, tl: Int64,
+        scratch: Int64, peers: Int64, qg_par: Int32, rank: Int32, layer: Int32, epoch: Int64, tl: Int64,
         stream: fx.Stream = _STREAM,
     ):  # fmt: skip
         _ = keyed
         mla_front(
             prefix, blocks, blk_sm, blk_sr, ares_nw, ares_qk, in_nw, w_qkv, w_g, q_nw,
             kv_nw, w_qb, w_kc, w_vc, kv, kv_idx, kv_ptr, g_kv_ptr, loc, gate, send,
-            scratch, rank, layer, epoch, tl,
+            scratch, peers, qg_par, rank, layer, epoch, tl,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)  # fmt: skip
 
     _BUILDS[key] = launch
@@ -1920,14 +1979,14 @@ def ptr(t):
 
 
 WEIGHT_SHAPES = {
-    "w_qkv": (LATW, HIDDEN), "w_g": (GATE, HIDDEN), "w_qb": (NHA * QHD, QL),
-    "w_kc": (NHA, QN, KV), "w_vc": (NHA, KV, VD),
+    "w_qkv": (LATW, HIDDEN), "w_g": (GATE, HIDDEN), "w_qb": (NHL * QHD, QL),
+    "w_kc": (NHL, QN, KV), "w_vc": (NHA, KV, VD),
 }  # fmt: skip
 
 
 def mla_front_launch(
     key: MlaFrontBuild, *, prefix, blocks, w, kv, kv_idx, kv_ptr, g_kv_ptr, loc,
-    gate, send, scratch, rank, layer, epoch, tl=None,
+    gate, send, scratch, peers, rank, layer, epoch, qg_par=0, tl=None,
 ):  # fmt: skip
     """Host launcher. ``w``: ares_nw, ares_qk, in_nw, q_nw, kv_nw and the
     ``WEIGHT_SHAPES`` weights (bf16, contiguous); ``kv``: this rank's e4m3 KV
@@ -1935,7 +1994,10 @@ def mla_front_launch(
     local rows by position (int32, ragged: SGLang's DCP verify indices);
     ``g_kv_ptr``: their global KV indptr (int32, verify rows included);
     ``loc``: the rows' KV slots (int64);
-    ``gate`` [S, 1536] bf16 out; ``send`` [8, S, 12, 130] bf16 out."""
+    ``gate`` [S, 1536] bf16 out; ``send`` [8, S, 12, 130] bf16 out; ``peers``:
+    the DCP ranks' peer buffers (int64 [8], ``peer_end`` bytes each: the q
+    all-gather's QG copies, ``qg_par`` the one this launch uses); ``w_qb`` /
+    ``w_kc`` this rank's 12 heads' shards."""
     assert key.write_idx < blocks.shape[1]
     for n, shp in WEIGHT_SHAPES.items():
         t = w[n]
@@ -1945,6 +2007,7 @@ def mla_front_launch(
     assert kv.dtype in (torch.float8_e4m3fn, torch.uint8) and kv.stride(-2) == DQK
     assert kv_idx.dtype == torch.int32 and kv_ptr.dtype == torch.int32
     assert loc.dtype == torch.int64 and g_kv_ptr.dtype == torch.int32
+    assert peers.dtype == torch.int64 and peers.numel() == DCP and qg_par in (0, 1)
     nreq = reqs_of(key.tokens)
     assert kv_ptr.numel() >= nreq + 1 and g_kv_ptr.numel() >= nreq + 1 and loc.numel() >= key.tokens
     assert tuple(send.shape) == (DCP, key.tokens, NHL, REC) and send.dtype == torch.bfloat16
@@ -1957,7 +2020,7 @@ def mla_front_launch(
         w["kv_nw"].data_ptr(), w["w_qb"].data_ptr(), w["w_kc"].data_ptr(),
         w["w_vc"].data_ptr(), kv.data_ptr(), kv_idx.data_ptr(), kv_ptr.data_ptr(),
         g_kv_ptr.data_ptr(), loc.data_ptr(), gate.data_ptr(), send.data_ptr(),
-        scratch.data_ptr(), rank, layer, epoch.data_ptr(), ptr(tl),
+        scratch.data_ptr(), peers.data_ptr(), qg_par, rank, layer, epoch.data_ptr(), ptr(tl),
         stream=torch.cuda.current_stream(),
     )  # fmt: skip
 

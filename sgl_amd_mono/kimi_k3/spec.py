@@ -664,8 +664,9 @@ def _front_build(layer, rows: int):
         "w_g": getattr(getattr(attn, "g_proj", None), "weight", None),
         "q_nw": attn.q_a_layernorm.weight,
         "kv_nw": attn.kv_a_layernorm.weight,
-        "w_qb": getattr(attn, "q_b_proj_qrep_weight", None),
-        "w_kc": getattr(attn, "w_kc_qrep", None),
+        # this rank's 12 heads' shards (the q all-gather covers the rest)
+        "w_qb": getattr(getattr(attn, "q_b_proj", None), "weight", None),
+        "w_kc": getattr(attn, "w_kc", None),
         "w_vc": getattr(attn, "w_vc_qrep", None),
     }
     for n, shp in mf.WEIGHT_SHAPES.items():
@@ -723,7 +724,8 @@ def _front_warmup(runner, packed, rows: int, blocks) -> None:
         g_kv_ptr=torch.arange(nreq + 1, dtype=torch.int32, device=dev) * mf.G_ROWS,
         loc=torch.zeros(rows, dtype=torch.int64, device=dev),
         gate=buf["gate"], send=buf["send"], scratch=runner.scratch,
-        rank=runner.dcp_rank, layer=packed.i, epoch=runner.epoch,
+        peers=runner.peer.addresses, rank=runner.dcp_rank, layer=packed.i,
+        epoch=runner.epoch,
     )  # fmt: skip
 
 
@@ -1092,8 +1094,8 @@ class _Built:
             kv=kv.view(-1, mf.DQK), kv_idx=fm.cprr_kv_indices,
             kv_ptr=fm.cprr_kv_indptr, g_kv_ptr=fm.global_kv_indptr,
             loc=forward_batch.out_cache_loc, gate=buf["gate"], send=buf["send"],
-            scratch=self.runner.scratch, rank=self.runner.dcp_rank, layer=packed.i,
-            epoch=self.runner.epoch,
+            scratch=self.runner.scratch, peers=self.runner.peer.addresses,
+            rank=self.runner.dcp_rank, layer=packed.i, epoch=self.runner.epoch,
         )  # fmt: skip
         if key.write_idx >= 0:
             bank._count_write(None)  # the launch wrote the bank row
