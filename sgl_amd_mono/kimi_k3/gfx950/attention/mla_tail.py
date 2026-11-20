@@ -102,7 +102,9 @@ def init_peer(buf: torch.Tensor) -> None:
 
 @dataclass(frozen=True)
 class MlaTailBuild:
-    tokens: int  # S: the requests' verify rows (6 a request)
+    """One build serves every width (S, MIN_ROWS .. MAX_ROWS, is a launch
+    argument)."""
+
     # the A2A copy: the parity of the layer's ordinal among the step's MLA layers
     par: int = 0
     # checks only: the W_UV records also to ``send`` in SGLang's all-to-all
@@ -115,8 +117,7 @@ def scratch_layout(key: MlaTailBuild) -> dict:
 
 
 def scratch_bytes(key: MlaTailBuild = None) -> int:
-    key = key or MlaTailBuild(tokens=MAX_ROWS)
-    return max(o + n for o, n in scratch_layout(key).values())
+    return max(o + n for o, n in scratch_layout(key or MlaTailBuild()).values())
 
 
 def _ld(ptr, i, cm=0):
@@ -325,11 +326,11 @@ def stage_wuv(c, task):
     vq = wave % 2
     kq = wave // 2
     g, r16 = lane // 16, lane % 16
-    tiles = gemv.tiles(s)
-    for ti in range_constexpr(len(tiles)):
-        t0, sj = tiles[ti]
+    for ti in range((s + gemv.ROWS - 1) // gemv.ROWS):
+        t0 = fx.Int32(ti) * gemv.ROWS
+        sj = fx.min(fx.Int32(gemv.ROWS), s - t0)
         words = sj * (KV // 8)
-        for i in range_constexpr(-(-words // THREADS)):
+        for i in range_constexpr(gemv.ROWS * (KV // 8) // THREADS):
             e = fx.min(tid + THREADS * i, words - 1)
             t = t0 + e // (KV // 8)
             o = e % (KV // 8)
@@ -373,9 +374,7 @@ ARGS = ("logits", "plse", "indptr", "fmap", "pmap", "o", "lse", "empty", "w_vc",
 def build(key: MlaTailBuild):
     if key in _BUILDS:
         return _BUILDS[key]
-    s = key.tokens
-    assert s % G_ROWS == 0 and MIN_ROWS <= s <= MAX_ROWS, s
-    ntask = mc.combine_tasks(s)
+    rounds = -(-mc.combine_tasks(MAX_ROWS) // BLOCKS)
 
     @fx.struct
     class Smem:
@@ -387,13 +386,14 @@ def build(key: MlaTailBuild):
 
     keyed = key_tuple(key, SOURCES)
     lay = scratch_layout(key)
-    name = f"k3_mono_mla_tail_s{s}_r{int(key.records)}"
+    name = f"k3_mono_mla_tail_r{int(key.records)}"
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def mla_tail(
         logits: Int64, plse: Int64, indptr: Int64, fmap: Int64, pmap: Int64, o: Int64,
         lse: Int64, empty: Int64, w_vc: Int64, gate: Int64, core: Int64, send: Int64,
-        nt: Int32, scratch: Int64, peers: Int64, rank: Int32, layer: Int32, epoch: Int64,
+        s: Int32, nt: Int32, scratch: Int64, peers: Int64, rank: Int32, layer: Int32,
+        epoch: Int64,
     ):  # fmt: skip
         _ = keyed
         with guard.scope(
@@ -429,7 +429,8 @@ def build(key: MlaTailBuild):
                 stage_wuv(c, bid)
             # the combine tasks from the last CTA down: the W_UV-free CTAs take
             # the second round's
-            for k in range_constexpr(-(-ntask // BLOCKS)):
+            ntask = (s // G_ROWS) * NHL
+            for k in range_constexpr(rounds):
                 task = k * BLOCKS + (BLOCKS - 1 - bid)
                 if task < ntask:
                     mc.stage_combine(c, task)
@@ -438,13 +439,13 @@ def build(key: MlaTailBuild):
     def launch(
         logits: Int64, plse: Int64, indptr: Int64, fmap: Int64, pmap: Int64, o: Int64,
         lse: Int64, empty: Int64, w_vc: Int64, gate: Int64, core: Int64, send: Int64,
-        nt: Int32, scratch: Int64, peers: Int64, rank: Int32, layer: Int32, epoch: Int64,
-        stream: fx.Stream = _STREAM,
+        s: Int32, nt: Int32, scratch: Int64, peers: Int64, rank: Int32, layer: Int32,
+        epoch: Int64, stream: fx.Stream = _STREAM,
     ):  # fmt: skip
         _ = keyed
         mla_tail(
             logits, plse, indptr, fmap, pmap, o, lse, empty, w_vc, gate, core, send,
-            nt, scratch, peers, rank, layer, epoch,
+            s, nt, scratch, peers, rank, layer, epoch,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)  # fmt: skip
 
     _BUILDS[key] = launch
@@ -456,7 +457,7 @@ _STREAM = fx.Stream(None)
 
 
 def mla_tail_launch(
-    key: MlaTailBuild, *, logits, plse, indptr, fmap, pmap, o, lse, empty, w_vc,
+    key: MlaTailBuild, *, s, logits, plse, indptr, fmap, pmap, o, lse, empty, w_vc,
     gate, core, scratch, peers, rank, layer, epoch, send=None,
 ):  # fmt: skip
     """Host launcher. ``logits`` / ``plse``: the decode's split partials (fp32,
@@ -467,8 +468,9 @@ def mla_tail_launch(
     cprr_empty_rows (bool [S]); ``w_vc``: W_UV of all 96 heads (bf16 [96, 512,
     128]); ``gate``: g_proj's rows (bf16 [S, 1536]); ``core`` [S, 1536] bf16
     out; ``peers``: the DCP ranks' peer buffers (``peer_end`` bytes each);
-    ``send`` [8, S, 12, 130] bf16 out, a ``records`` build only."""
-    s = key.tokens
+    ``send`` [8, S, 12, 130] bf16 out, a ``records`` build only. ``s``: the
+    step's verify rows."""
+    assert s % G_ROWS == 0 and MIN_ROWS <= s <= MAX_ROWS, s
     f32, i32, bf = torch.float32, torch.int32, torch.bfloat16
     assert logits.dtype == f32 and logits.is_contiguous() and logits.shape[-2:] == (NHA, KV)
     assert plse.dtype == f32 and plse.is_contiguous() and plse.numel() * KV == logits.numel()
@@ -489,6 +491,6 @@ def mla_tail_launch(
     build(key)(
         logits.data_ptr(), plse.data_ptr(), indptr.data_ptr(), fmap.data_ptr(),
         pmap.data_ptr(), o.data_ptr(), lse.data_ptr(), empty.data_ptr(), w_vc.data_ptr(),
-        gate.data_ptr(), core.data_ptr(), mf.ptr(send), nt, scratch.data_ptr(),
+        gate.data_ptr(), core.data_ptr(), mf.ptr(send), s, nt, scratch.data_ptr(),
         peers.data_ptr(), rank, layer, epoch.data_ptr(), stream=torch.cuda.current_stream(),
     )  # fmt: skip

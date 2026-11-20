@@ -266,7 +266,7 @@ def tail_once(cap, w_vc, gate, r, peers, epoch, par, layer=3, records=False):
     from sgl_amd_mono.kimi_k3.gfx950.attention import mla_tail as mt
 
     s = cap["o"].shape[0]
-    key = mt.MlaTailBuild(tokens=s, par=par, records=records)
+    key = mt.MlaTailBuild(par=par, records=records)
     dev = w_vc.device
     scratch = PeerBuffer(mt.scratch_bytes(key), None, 0, 1, dev).bytes
     scratch.zero_()
@@ -275,7 +275,7 @@ def tail_once(cap, w_vc, gate, r, peers, epoch, par, layer=3, records=False):
     send = torch.zeros(DCP, s, NHL, VD + 2, dtype=BF, device=dev) if records else None
     epoch[0].add_(1)
     mt.mla_tail_launch(
-        key, logits=cap["logits"], plse=cap["plse"], indptr=cap["indptr"], fmap=cap["fmap"],
+        key, s=s, logits=cap["logits"], plse=cap["plse"], indptr=cap["indptr"], fmap=cap["fmap"],
         pmap=cap["pmap"], o=o, lse=lse, empty=cap["empty"], w_vc=w_vc, gate=gate, core=core,
         scratch=scratch, peers=peers.table, rank=r, layer=layer, epoch=epoch, send=send,
     )  # fmt: skip
