@@ -3,6 +3,11 @@
 (S = R L rows, R >= 1): the layer input (after ``input_layernorm``) to the gated
 core output, on the ReplaySSM ring. One launch, ``BLOCKS`` CTAs x ``THREADS``.
 
+    front   (``front`` builds) the attention-side AttnRes seam and
+            ``input_layernorm`` on CTAs 0 .. NA - 1, as K1 runs them (slice,
+            gate, mix: ``stages/seam.py``), x written in ``pack_x``'s layout
+            with an XRDY flag a slice; every CTA issues its first weight loads,
+            then waits for the flags before its first x load
     gemv    in_proj: 131 sets of three 16-row groups x 14 K steps of 64 a
             wave (wave w streams K 896 w .. 896 (w + 1)), 1834 units in equal
             runs of 7 or 8 over the CTAs, the weights read from ``pack_w_in``'s
@@ -40,7 +45,7 @@ import flydsl.expr as fx
 import torch
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from aiter.ops.flydsl.kernels.dpp_utils import update_dpp_i32
-from flydsl.expr import const_expr, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import Int32, Int64, T
 
@@ -71,8 +76,14 @@ from sgl_amd_mono.kimi_k3.gfx950.attention.kda import (
     NPROJ,
     ld_f32,
 )
-from sgl_amd_mono.kimi_k3.gfx950.stages.dims import HD, HIDDEN, LOG2E, NH, PROJ, ROWS
-from sgl_amd_mono.kimi_k3.gfx950.stages.seam import bf16r, f32_of
+from sgl_amd_mono.kimi_k3.gfx950.stages.dims import COLS, HD, HIDDEN, LOG2E, NA, NH, PROJ, ROWS
+from sgl_amd_mono.kimi_k3.gfx950.stages.seam import (
+    bf16r,
+    f32_of,
+    stage_gate,
+    stage_mix,
+    stage_slice,
+)
 from sgl_amd_mono.kimi_k3.gfx950.stamps import stamp, stamp_begin, stamp_flush
 from sgl_amd_mono.kimi_k3.gfx950.tag import step_tag
 
@@ -111,6 +122,14 @@ class KdaWideBuild:
     depth: int = 0  # K chunks of loads in flight ahead of the MFMAs (0: by width)
     debug: bool = False  # also the bf16 in_proj rows and the pre-norm core
     timeline: bool = False  # per-CTA phase stamps (``stamps.py``)
+    # the AttnRes seam and input_layernorm in front: x from the prefix and the
+    # bank's ``nblocks`` blocks (a block-write layer stores the prefix at block
+    # ``write_idx``) instead of given
+    front: bool = False
+    nblocks: int = 0
+    eps: float = 1e-5  # AttnRes norm
+    out_eps: float = 1e-5  # input_layernorm
+    write_idx: int = -1
 
 
 def tiles(key):
@@ -137,12 +156,19 @@ def scratch_layout(key: KdaWideBuild) -> dict:
     ``part`` two a (CTA, group row, request) (its L f32 piece sums), ``ox`` a
     task half's outputs."""
     r = key.tokens // key.qlen
+    s, ns = key.tokens, key.nblocks + 1
+    front = (
+        [("fpart", NA * s * ns * 2), ("fwgt", s * (ns + 1)), ("fmsq", NA * s), ("fxrdy", NA)]
+        if key.front
+        else []
+    )
     return pair_layout(
         [
             ("proj", r * NPROJ * 2),
             ("part", BLOCKS * G * ROWS * r * 2 * 2),
             ("ox", r * NH * 2 * OXW * 2),
-        ],
+        ]
+        + front,
         align=16,
     )
 
@@ -228,16 +254,12 @@ def _soff(c, hs):
     return uniform((c["wave"] * HSTEPS + hs) * KSTEP * 2)
 
 
-def _loads(c, u, hs, live):
-    """One step (unit ``u``, K step ``hs``) of this wave: 2 x 16 B a lane of each
-    group's weights (``pack_w_in``: a unit's bytes are contiguous, 1 KB an
-    instruction) and of every token tile's x (``pack_x``: 1 KB an instruction)
-    (zeros, with no memory read, unless ``live``)."""
+def _wloads(c, u, hs, live):
+    """Unit ``u``'s weights of this wave: 2 x 16 B a lane of each group
+    (``pack_w_in``: a unit's bytes are contiguous, 1 KB an instruction; zeros,
+    with no memory read, unless ``live``)."""
     lane = c["lane"]
-    soff = _soff(c, hs)
-    nt = c["T"]
     wr = rsrc(c["args"]["w_in"], live.select(fx.Int64(NPROJ * HIDDEN * 2), fx.Int64(0)))
-    xr = rsrc(c["args"]["x"], live.select(fx.Int64(nt * 16 * HIDDEN * 2), fx.Int64(0)))
     wo = uniform((u * WAVES + c["wave"]) * (G * 2 * 1024))
 
     def wld(g, q):
@@ -248,6 +270,17 @@ def _loads(c, u, hs, live):
             )
         )  # fmt: skip
 
+    return [[wld(g, q) for q in range(KSTEP // 32)] for g in range(G)]
+
+
+def _xloads(c, hs, live):
+    """K step ``hs`` of every token tile's x for this wave (``pack_x``: 1 KB an
+    instruction; zeros, with no memory read, unless ``live``)."""
+    lane = c["lane"]
+    soff = _soff(c, hs)
+    nt = c["T"]
+    xr = rsrc(c["args"]["x"], live.select(fx.Int64(nt * 16 * HIDDEN * 2), fx.Int64(0)))
+
     def xld(tt, q):
         return fx.Vector(
             bo.buffer_load(
@@ -256,9 +289,12 @@ def _loads(c, u, hs, live):
             )
         )  # fmt: skip
 
-    ws = [[wld(g, q) for q in range(KSTEP // 32)] for g in range(G)]
-    xs = [[xld(tt, q) for q in range(KSTEP // 32)] for tt in range(nt)]
-    return ws, xs
+    return [[xld(tt, q) for q in range(KSTEP // 32)] for tt in range(nt)]
+
+
+def _loads(c, u, hs, live):
+    """One step (unit ``u``, K step ``hs``) of this wave: its weights, then x."""
+    return _wloads(c, u, hs, live), _xloads(c, hs, live)
 
 
 def pack_w_in(w_in):
@@ -279,6 +315,17 @@ def pack_x(x, nt):
     xp[:s] = x
     v = xp.view(nt, 16, HIDDEN // KSTEP, KSTEP // 32, 4, 8)
     return v.permute(2, 0, 3, 4, 1, 5).contiguous().view(16 * nt, HIDDEN)
+
+
+@flyc.jit
+def wait_x(c):
+    """Every slice's XRDY flag, then this XCD's L2 made current (x is cached: its
+    lines from an earlier launch must not be read)."""
+    poll, xrdy, tid = c["fc"]["poll"], c["fc"]["xrdy"], c["tid"]
+    if tid < NA:
+        poll([(xrdy, tid, 1)])
+    fx.memory_fence(ordering=fx.AtomicOrdering.Acquire, syncscope="agent")
+    gpu.barrier()
 
 
 def _slot_w(c):
@@ -316,9 +363,17 @@ def gemv_loop(c):
         for n in ("st_idx", "win_row")
     ]
     pend = {}
-    for i in range_constexpr(min(d, NMAX)):
-        p, hs, live = unit(i)
-        pend[i] = _loads(c, p, hs, live)
+    if const_expr(c["front"]):
+        # the first steps' weights go out before x is ready, their x after
+        ws0 = [_wloads(c, *unit(i)) for i in range(min(d, NMAX))]
+        wait_x(c)
+        for i in range_constexpr(min(d, NMAX)):
+            _, hs, live = unit(i)
+            pend[i] = (ws0[i], _xloads(c, hs, live))
+    else:
+        for i in range_constexpr(min(d, NMAX)):
+            p, hs, live = unit(i)
+            pend[i] = _loads(c, p, hs, live)
     c["slot0"], c["w_row"] = (uniform(v) for v in idx)
     # the barriers keep each step's loads ``d`` steps ahead of its MFMAs (the
     # scheduler would otherwise sink them to their use)
@@ -741,10 +796,18 @@ def build(key: KdaWideBuild):
     assert 2 * 8 * ((ntasks + 7) // 8) <= BLOCKS - TASK0, "a KDA task half a CTA"
     nt = tiles(key)
     lay = scratch_layout(key)
+    ns = key.nblocks + 1
+    assert not key.front or (key.nblocks >= 1 and s <= NA), "the front's gate runs token t on CTA t"
 
     @fx.struct
     class GemvLds:
         red: fx.Array[fx.Float32, 2 * G * nt * WAVES * 64 * 4, 16]
+
+    # the seam's sources as packed bf16 pairs (exact: every source is bf16)
+    @fx.struct
+    class FrontLds:
+        vals: fx.Array[fx.Int32, (s * ns * COLS // 2) if key.front else 4, 16]
+        red: fx.Array[fx.Float32, WAVES * 64 * 4, 16]
 
     @fx.struct
     class KdaLds:
@@ -761,6 +824,7 @@ def build(key: KdaWideBuild):
     class RoleLds:
         gemv: GemvLds
         kda: KdaLds
+        front: FrontLds
 
     @fx.struct
     class Smem:
@@ -768,6 +832,8 @@ def build(key: KdaWideBuild):
 
     keyed = key_tuple(key, SOURCES)
     name = f"k3_mono_kda_wide_s{s}_l{L}_d{depth(key)}_g{int(key.debug)}_t{int(key.timeline)}"
+    if key.front:
+        name += f"_f{key.nblocks}" + (f"w{key.write_idx}" if key.write_idx >= 0 else "")
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def kda_wide(
@@ -806,6 +872,13 @@ def build(key: KdaWideBuild):
         layer: Int32,
         epoch: Int64,
         tl: Int64,
+        prefix: Int64,
+        blocks: Int64,
+        blk_sm: Int32,
+        blk_sr: Int32,
+        ares_nw: Int64,
+        ares_qk: Int64,
+        in_nw: Int64,
     ):
         _ = keyed
         tid = fx.thread_idx.x
@@ -813,7 +886,7 @@ def build(key: KdaWideBuild):
         alloc = fx.SharedAllocator()
         lds = alloc.allocate(Smem).peek()
         role = alloc.allocate(RoleLds)
-        gl, kl = role.gemv.peek(), role.kda.peek()
+        gl, kl, fl = role.gemv.peek(), role.kda.peek(), role.front.peek()
         mb = Mailbox(step_tag(epoch, layer) - 1)
         c = {
             "S": s,
@@ -826,6 +899,7 @@ def build(key: KdaWideBuild):
             "lane": tid % 64,
             "wave": uniform(tid // 64),
             "debug": key.debug,
+            "front": key.front,
             "lb": key.lower_bound,
             "onorm_eps": key.onorm_eps,
             "tag": mb.tag,
@@ -876,7 +950,48 @@ def build(key: KdaWideBuild):
                 "ring_len": ring_len,
             },
         }
+        if const_expr(key.front):
+            # the seam's state, as K1 builds it (attention side: no delta)
+            fc = {
+                "S": s,
+                "NS": ns,
+                "NB": key.nblocks,
+                "tid": tid,
+                "lane": tid % 64,
+                "wave": tid // 64,
+                "delta": False,
+                "debug": False,
+                "eps": key.eps,
+                "out_eps": key.out_eps,
+                "write_idx": key.write_idx,
+                "gate_local": False,
+                "vals_bf16": True,
+                "x_tiles": nt,
+                "put": mb.put,
+                "poll": mb.poll,
+                "red": fl.red.ptr,
+                "vals": fl.vals.ptr,
+                "xbuf": x,
+                "args": {
+                    "prefix": prefix,
+                    "blocks": blocks,
+                    "blk_sm": blk_sm,
+                    "blk_sr": blk_sr,
+                    "ares_nw": ares_nw,
+                    "ares_qk": ares_qk,
+                    "in_nw": in_nw,
+                },
+            }
+            for region in ("part", "wgt", "msq", "xrdy"):
+                fc[region] = sreg(scratch, lay["f" + region][0], "f" + region)
+            c["fc"] = fc
         stamp_begin(key.timeline, lds.tls.ptr, tid, TL_POINTS)
+        if const_expr(key.front):
+            if bid < NA:
+                stage_slice(fc, bid)
+                if bid < s:
+                    stage_gate(fc, bid)
+                stage_mix(fc, bid)
         # task t = (request, head), half hf on CTA TASK0 + 16 (t // 8) + 8 hf + t % 8,
         # its inputs in flight under the emit
         o = fx.max(bid - TASK0, 0)
@@ -929,6 +1044,13 @@ def build(key: KdaWideBuild):
         layer: Int32,
         epoch: Int64,
         tl: Int64,
+        prefix: Int64,
+        blocks: Int64,
+        blk_sm: Int32,
+        blk_sr: Int32,
+        ares_nw: Int64,
+        ares_qk: Int64,
+        in_nw: Int64,
         stream: fx.Stream = _STREAM,
     ):
         _ = keyed
@@ -936,7 +1058,8 @@ def build(key: KdaWideBuild):
             x, w_in, w_fb, conv_w, conv_st, a_log, dt_bias, on_w, rstate, st_idx,
             win_row, conv_win, ring_k, ring_v, ring_g, ring_b, core_out, proj_dbg,
             o_dbg, cs_seq, cs_dim, cs_tok, rs_seq, cw_seq, cw_tok, cw_q, rk_seq,
-            rv_seq, rg_seq, rb_seq, ring_len, scratch, layer, epoch, tl,
+            rv_seq, rg_seq, rb_seq, ring_len, scratch, layer, epoch, tl, prefix,
+            blocks, blk_sm, blk_sr, ares_nw, ares_qk, in_nw,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)  # fmt: skip
 
     _BUILDS[key] = launch
@@ -970,9 +1093,18 @@ def kda_wide(
     proj_dbg=None,
     o_dbg=None,
     tl=None,
+    prefix=None,
+    blocks=None,
+    ares_nw=None,
+    ares_qk=None,
+    in_nw=None,
 ):
     """Host launcher. ``x`` the input-normed layer input [S, 7168] bf16 as
-    ``pack_x`` lays it out;
+    ``pack_x`` lays it out (a ``front`` build writes it: [16 tiles, 7168], its
+    rows past S zero or anything; then ``prefix`` [S, 7168] bf16 is the stream,
+    ``blocks`` the AttnRes bank [S, >= nblocks (+ 1 for a write), 7168] bf16 and
+    ``ares_nw`` / ``ares_qk`` / ``in_nw`` the seam's and input_layernorm's
+    weights);
     ``w_in`` in_proj as ``pack_w_in`` lays it out;
     ``conv_state`` [slot, channel, entry] by its strides (SGLang's conv cache
     [slot, CONV_W - 1, C] is its ``.mT``), read only; ``rstate`` [slots, 12, 128,
@@ -1002,6 +1134,16 @@ def kda_wide(
     assert core_out.shape == (s, PROJ) and core_out.is_contiguous()
     assert key.debug == (proj_dbg is not None) == (o_dbg is not None)
     assert key.timeline == (tl is not None)
+    blk_sm = blk_sr = 0
+    if key.front:
+        assert prefix.shape == (s, HIDDEN) and prefix.dtype == torch.bfloat16
+        assert prefix.is_contiguous()
+        assert blocks.dtype == torch.bfloat16 and blocks.size(0) >= s
+        assert blocks.size(2) == HIDDEN and blocks.stride(2) == 1
+        assert blocks.size(1) > max(key.nblocks - 1, key.write_idx)
+        blk_sm, blk_sr = blocks.stride(0), blocks.stride(1)
+    else:
+        assert prefix is None and blocks is None
     f = build(key)
     f(
         x.data_ptr(),
@@ -1039,5 +1181,12 @@ def kda_wide(
         layer,
         epoch.data_ptr(),
         ptr(tl),
+        ptr(prefix),
+        ptr(blocks),
+        blk_sm,
+        blk_sr,
+        ptr(ares_nw),
+        ptr(ares_qk),
+        ptr(in_nw),
         stream=torch.cuda.current_stream(),
     )

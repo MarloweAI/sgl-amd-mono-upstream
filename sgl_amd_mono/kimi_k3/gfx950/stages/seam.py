@@ -309,16 +309,26 @@ def stage_gate_local(c):
     gpu.barrier()
 
 
+def x_packed_word(t, col, tiles):
+    """The word of element (t, col) of x (col a multiple of 2) in the wide KDA
+    launch's ``pack_x`` layout over ``tiles`` 16-row tiles: K step of 64, token
+    tile, K half, K group of 8, row, 8 K."""
+    i = (((((col // 64) * tiles + t // 16) * 2 + (col % 64) // 32) * 4 + (col % 32) // 8) * 16 + t % 16) * 8
+    return (i + col % 8) // 2
+
+
 @flyc.jit
 def stage_mix(c, task):
     """Columns 128 task ..: the softmax mix of ``vals`` (4 columns a thread), its
     sum of squares (MSQ), every slice's -> rstd, then bf16 x = mixed rstd w ->
-    the plain x rows, and the slice's XRDY flag."""
+    the plain x rows (``x_tiles``: in ``pack_x``'s layout), and the slice's XRDY
+    flag."""
     s, ns, tid, lane, red = c["S"], c["NS"], c["tid"], c["lane"], c["red"]
     a = c["args"]
     # read before the traced branches (a dict lookup inside one is carried state)
     tag_x = c.get("tag_x", False)
     vals_bf16 = c.get("vals_bf16", False)
+    x_tiles = c.get("x_tiles", 0)
     c0 = task * COLS
     nw = s * (ns + 1)
     if const_expr(c.get("gate_local", False)):
@@ -382,7 +392,10 @@ def stage_mix(c, task):
             if const_expr(tag_x):
                 # also as tagged pairs: the router and latent GEMVs poll these, not XRDY
                 c["put_words"](c["xt"], at, [xw[0], xw[1]])
-            bo.buffer_store(xw, rsrc(c["xbuf"]), at, cache_modifier=CM_DEV)
+            xat = at
+            if const_expr(x_tiles):
+                xat = x_packed_word(t, c0 + cc, x_tiles)
+            bo.buffer_store(xw, rsrc(c["xbuf"]), xat, cache_modifier=CM_DEV)
             if const_expr(c["debug"]):
                 bo.buffer_store(xw, rsrc(a["x_dbg"]), at)
     publish(c["put"], c["xrdy"], task, fx.Int32(1), tid == 0)
