@@ -72,6 +72,13 @@ def _f4(w):
     return [bf_lo(w[0]), bf_hi(w[0]), bf_lo(w[1]), bf_hi(w[1])]
 
 
+def lds_words2(ptr, i):
+    """Two LDS words at word i (packed bf16 pairs)."""
+    return fx.Vector(
+        fx.ptr_load(ptr + i, result_type=fx.Vector.make_type(2, fx.Int32))
+    )
+
+
 def _slice_item(c, task, i):
     """Round i's work item of this thread: (live, row, token, source, column)."""
     s, ns, tid = c["S"], c["NS"], c["tid"]
@@ -115,6 +122,7 @@ def stage_slice(c, task, ld=None):
     ``slice_loads`` issued earlier (else each round loads its own)."""
     s, ns, nb, lane = c["S"], c["NS"], c["NB"], c["lane"]
     a = c["args"]
+    vals_bf16 = c.get("vals_bf16", False)
     # the incoming prefix; K2 under ``fold`` reads it where the stream left it
     pre_in = a["prefix_in"] if "prefix_in" in a else a["prefix"]
     # under ``fold`` the reduce CTAs read the updated prefix back: store it
@@ -132,7 +140,10 @@ def stage_slice(c, task, ld=None):
         else:
             blk, pre = _f4(ld["blk"][i]), _f4(ld["pre"][i])
         if const_expr(c["delta"]):
-            if const_expr(c.get("delta_lds") is not None):
+            if const_expr(c.get("delta_lds") is not None and vals_bf16):
+                # the delta reduced into LDS first, as packed bf16 pairs
+                dl = _f4(lds_words2(c["delta_lds"], (t * COLS + (e % QC) * 4) // 2))
+            elif const_expr(c.get("delta_lds") is not None):
                 # the delta reduced into LDS first (K2a: the all-reduced o_proj)
                 dl = [
                     fx.ptr_load(c["delta_lds"] + (t * COLS + (e % QC) * 4 + j))
@@ -173,7 +184,13 @@ def stage_slice(c, task, ld=None):
             w, q = _f4(ld["w"]), _f4(ld["q"])
         # a thread past the end holds a clamped copy of the last element: it
         # must not store (it raced the owner with zeros)
-        if live:
+        if const_expr(vals_bf16):
+            # every source is bf16: packed pairs hold it exactly
+            if live:
+                fx.ptr_store(
+                    bf4_words(v), c["vals"] + (row * COLS + (e % QC) * 4) // 2
+                )
+        elif live:
             for j in range_constexpr(4):
                 fx.ptr_store(v[j], c["vals"] + (row * COLS + (e % QC) * 4 + j))
         sq = v[0] * v[0] + v[1] * v[1] + v[2] * v[2] + v[3] * v[3]
@@ -301,6 +318,7 @@ def stage_mix(c, task):
     a = c["args"]
     # read before the traced branches (a dict lookup inside one is carried state)
     tag_x = c.get("tag_x", False)
+    vals_bf16 = c.get("vals_bf16", False)
     c0 = task * COLS
     nw = s * (ns + 1)
     if const_expr(c.get("gate_local", False)):
@@ -310,46 +328,62 @@ def stage_mix(c, task):
             v = c["poll"]([(c["wgt"], tid, 1)])[0][0]
             fx.ptr_store(f32_of(v), red + tid)
         gpu.barrier()
-    mine = tid < s * QC
-    t = fx.min(tid // QC, s - 1)
+    # the slice's group sums past the weights
+    moff = 128 if nw <= 128 else 512
     cc = (tid % QC) * 4
-    mixed = []
-    for j in range_constexpr(4):
-        acc = fx.Float32(0.0)
-        for src in range_constexpr(ns):
-            acc = acc + fx.ptr_load(red + (t * (ns + 1) + src)) * fx.ptr_load(
-                c["vals"] + ((t * ns + src) * COLS + cc + j)
-            )
-        mixed.append(acc / fx.ptr_load(red + (t * (ns + 1) + ns)))
-    sq = (
-        mixed[0] * mixed[0]
-        + mixed[1] * mixed[1]
-        + mixed[2] * mixed[2]
-        + mixed[3] * mixed[3]
-    )
-    sq = butterfly(sq, (16, 8, 4, 2, 1))
-    if mine & (lane % 32 == 0):
-        c["put"](c["msq"], task * s + t, sq)
+    # a thread a (token, 4 columns), 16 tokens a round
+    items = []
+    for gi in range_constexpr((s * QC + THREADS - 1) // THREADS):
+        tt = gi * (THREADS // QC) + tid // QC
+        mine = tt < s
+        t = fx.min(tt, s - 1)
+        mixed = []
+        if const_expr(vals_bf16):
+            vs = [
+                _f4(lds_words2(c["vals"], ((t * ns + src) * COLS + cc) // 2))
+                for src in range(ns)
+            ]
+        for j in range_constexpr(4):
+            acc = fx.Float32(0.0)
+            for src in range_constexpr(ns):
+                if const_expr(vals_bf16):
+                    v = vs[src][j]
+                else:
+                    v = fx.ptr_load(c["vals"] + ((t * ns + src) * COLS + cc + j))
+                acc = acc + fx.ptr_load(red + (t * (ns + 1) + src)) * v
+            mixed.append(acc / fx.ptr_load(red + (t * (ns + 1) + ns)))
+        sq = (
+            mixed[0] * mixed[0]
+            + mixed[1] * mixed[1]
+            + mixed[2] * mixed[2]
+            + mixed[3] * mixed[3]
+        )
+        sq = butterfly(sq, (16, 8, 4, 2, 1))
+        if mine & (lane % 32 == 0):
+            c["put"](c["msq"], task * s + t, sq)
+        items.append((mine, t, mixed))
     gpu.barrier()
     if tid < 8 * s:
         g = tid // s
         tt = tid % s
         vals = c["poll"]([(c["msq"], (g * GSL + k) * s + tt, 1) for k in range(GSL)])
-        fx.ptr_store(sum_polled(vals), red + (128 + g * s + tt))
+        fx.ptr_store(sum_polled(vals), red + (moff + g * s + tt))
     gpu.barrier()
-    tot = fx.ptr_load(red + (128 + t))
-    for g in range_constexpr(1, 8):
-        tot = tot + fx.ptr_load(red + (128 + g * s + t))
-    r = hw_rsq(tot * fx.Float32(1.0 / HIDDEN) + fx.Float32(c["out_eps"]))
     wn = ld_bf4(a["in_nw"], c0 + cc)
-    xw = bf4_words([mixed[j] * r * wn[j] for j in range(4)])
-    if mine:
-        at = (t * HIDDEN + c0 + cc) // 2
-        if const_expr(tag_x):
-            # also as tagged pairs: the router and latent GEMVs poll these, not XRDY
-            c["put_words"](c["xt"], at, [xw[0], xw[1]])
-        bo.buffer_store(xw, rsrc(c["xbuf"]), at, cache_modifier=CM_DEV)
-        if const_expr(c["debug"]):
-            bo.buffer_store(xw, rsrc(a["x_dbg"]), at)
+    for gi in range_constexpr(len(items)):
+        mine, t, mixed = items[gi]
+        tot = fx.ptr_load(red + (moff + t))
+        for g in range_constexpr(1, 8):
+            tot = tot + fx.ptr_load(red + (moff + g * s + t))
+        r = hw_rsq(tot * fx.Float32(1.0 / HIDDEN) + fx.Float32(c["out_eps"]))
+        xw = bf4_words([mixed[j] * r * wn[j] for j in range(4)])
+        if mine:
+            at = (t * HIDDEN + c0 + cc) // 2
+            if const_expr(tag_x):
+                # also as tagged pairs: the router and latent GEMVs poll these, not XRDY
+                c["put_words"](c["xt"], at, [xw[0], xw[1]])
+            bo.buffer_store(xw, rsrc(c["xbuf"]), at, cache_modifier=CM_DEV)
+            if const_expr(c["debug"]):
+                bo.buffer_store(xw, rsrc(a["x_dbg"]), at)
     publish(c["put"], c["xrdy"], task, fx.Int32(1), tid == 0)
     gpu.barrier()
