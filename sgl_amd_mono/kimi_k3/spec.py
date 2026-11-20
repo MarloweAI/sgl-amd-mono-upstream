@@ -339,11 +339,12 @@ def _build(model, hf_config, ctx):
     if mla_off is not None:
         logger.info("monokernel: no MLA projection front: %s", mla_off)
     dcp = p.attn_dcp_size > 1
+    vcs = _front_vcs(backbone, _covered_layers(hf_config), p.dcp_group) if dcp else {}
     layers, batches = {}, {}
     for rows in ctx.widths:
         for i in _covered_layers(hf_config):
             packed = _weights(
-                backbone.layers[i], i, rows, runner, mla_off is None, dcp
+                backbone.layers[i], i, rows, runner, mla_off is None, dcp, vcs.get(i)
             )
             layers.setdefault(rows, {})[i] = packed
         # consecutive DCP fronts take alternate QG copies (mla_front.peer_end)
@@ -544,9 +545,12 @@ def _mla_front_disable_reason(parallel) -> str | None:
     return None
 
 
-def _weights(layer, i: int, rows: int, runner, mla: bool, dcp: bool) -> _Layer:
+def _weights(
+    layer, i: int, rows: int, runner, mla: bool, dcp: bool, vc=None
+) -> _Layer:
     """This layer's build key at one launch width. The weights themselves are
-    read in place at launch, so nothing is packed or copied here."""
+    read in place at launch, so nothing is packed or copied here; ``vc`` is the
+    DCP front's all-head W_UV (_front_vcs)."""
     from sgl_amd_mono.kimi_k3.gfx950 import k1 as k1_mod
     from sgl_amd_mono.kimi_k3.gfx950 import layer as k2
     from sgl_amd_mono.kimi_k3.gfx950.layer import K2Build
@@ -558,7 +562,7 @@ def _weights(layer, i: int, rows: int, runner, mla: bool, dcp: bool) -> _Layer:
     return _Layer(
         k1=k1_mod.build(layer, i, rows) if K1 and narrow else None,
         mla=_mla_build(layer, rows) if mla and narrow else None,
-        front=_front_build(layer, rows) if dcp else None,
+        front=_front_build(layer, rows, vc) if dcp else None,
         i=i,
         key=K2Build(
             tokens=rows,
@@ -652,7 +656,23 @@ def _mla_outputs(rows: int, device) -> dict:
     }  # fmt: skip
 
 
-def _front_build(layer, rows: int):
+def _front_vcs(backbone, layers, group) -> dict:
+    """Each MLA layer's W_UV for all 96 heads, [96, 512, 128] bf16: the DCP
+    ranks' 12-head shards gathered in rank order. SGLang's own full-head copy
+    (dcp_replicate_q_proj) is made only after this build. A collective: every
+    rank gathers the same layers in the same order."""
+    out = {}
+    for i in layers:
+        attn = getattr(backbone.layers[i], "self_attn", None)
+        w = getattr(attn, "w_vc", None)
+        if hasattr(attn, "qkv_conv1d") or not isinstance(w, torch.Tensor):
+            continue
+        if w.dtype == torch.bfloat16:
+            out[i] = group.all_gather(w.contiguous(), dim=0)
+    return out
+
+
+def _front_build(layer, rows: int, vc):
     """An MLA layer's DCP8 front key and the weights it reads in place, or None:
     a KDA layer, a width other than 1 .. 8 requests' verify blocks, or weights
     the launch does not take (SGLang's path). Each width has its own build."""
@@ -680,7 +700,7 @@ def _front_build(layer, rows: int):
         # this rank's 12 heads' shards (the q all-gather covers the rest)
         "w_qb": getattr(getattr(attn, "q_b_proj", None), "weight", None),
         "w_kc": getattr(attn, "w_kc", None),
-        "w_vc": getattr(attn, "w_vc_qrep", None),
+        "w_vc": vc,
     }
     for n in mf.WEIGHT_SHAPES:
         t = w[n]

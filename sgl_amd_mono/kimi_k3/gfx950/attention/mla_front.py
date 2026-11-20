@@ -112,7 +112,7 @@ SGLANG_READS = {
         "kv_a_layernorm",
         "q_b_proj",
         "w_kc",
-        "w_vc_qrep",
+        "w_vc",
     ),
     "srt/models/kimi_k3.py": ("g_proj",),
 }
