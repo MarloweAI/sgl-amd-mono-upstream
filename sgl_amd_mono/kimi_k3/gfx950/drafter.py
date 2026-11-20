@@ -31,6 +31,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import msgspec
 from aiter.ops.flydsl.kernels import buffer_ops as bo
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, T
 
@@ -60,7 +61,7 @@ from sgl_amd_mono.common.plan import (
     key_tuple,
     pair_layout,
 )
-from sgl_amd_mono.common.sync import Mailbox, preg, sreg
+from sgl_amd_mono.common.sync import FLAG_STRIDE, Mailbox, preg, publish, sreg
 from sgl_amd_mono.kimi_k3.gfx950.stamps import stamp, stamp_begin, stamp_flush
 from sgl_amd_mono.kimi_k3.gfx950.tag import step_tag
 
@@ -95,13 +96,13 @@ G_RGS, G_ROWS, G_ROUND = 16, 224, 7
 G_TILES = G_ROWS // ROWS  # 14
 G_TASKS = G_RGS * K_PARTS  # 224
 ACT_CTAS, ACT_DIMS = 224, 8
-D_KPARTS, D_KPART, D_KPW = 7, 256, 32
-D_KSTEPS = D_KPW // K_STEP  # 1
-D_RGS, D_ROWS, D_ROUND = 32, 224, 7
-D_TILES = D_ROWS // ROWS  # 14
-D_TASKS = D_RGS * D_KPARTS  # 224
-OUT_ROWS = H // BLOCKS  # 28 rows a CTA of the final reduce
-SS_PARTS = BLOCKS  # a token's sums-of-squares slots: one an all-reduce CTA
+# down: 224 tasks of 32 rows over the whole K (224 a wave)
+DN_ROWS = 32
+DN_TILES = DN_ROWS // ROWS
+DN_TASKS = H // DN_ROWS  # 224
+DN_KW = I // WAVES  # 224
+DN_STEPS = DN_KW // K_STEP  # 7
+SS_PARTS = BLOCKS  # a token's sums-of-squares slots (an all-reduce CTA's)
 # D-pre: qkv (16 row groups of 48 x 14 K parts)
 A_RGS, A_ROWS = 16, 48
 A_TILES = A_ROWS // ROWS  # 3
@@ -115,9 +116,7 @@ O_STEPS = Q_K // WAVES // K_STEP  # 2
 assert K_PARTS * K_PART == H and K_PART == WAVES * K_PER_WAVE
 assert G_RGS * G_ROWS == GU_ROWS and G_TILES % G_ROUND == 0 and G_TASKS <= BLOCKS
 assert ACT_CTAS * ACT_DIMS == I and ACT_DIMS % 2 == 0
-assert D_KPARTS * D_KPART == I and D_KPART == WAVES * D_KPW
-assert D_RGS * D_ROWS == H and D_TILES % D_ROUND == 0 and D_TASKS <= BLOCKS
-assert OUT_ROWS * BLOCKS == H and OUT_ROWS % 2 == 0
+assert DN_TASKS == G_TASKS == ACT_CTAS and DN_STEPS * K_STEP * WAVES == I
 assert A_RGS * A_ROWS == QKV_ROWS and A_TASKS <= BLOCKS
 assert O_TASKS * O_ROWS == H and O_TASKS <= BLOCKS and O_STEPS * K_STEP * WAVES == Q_K
 assert THREADS == 64 * WAVES and HEAD_DIM == 64
@@ -133,13 +132,14 @@ def scratch_bytes(layout: dict) -> int:
 
 def dm_scratch_layout() -> dict:
     """D-MLP's scratch regions (pairs) at MAX_TOKENS: the K parts' sums of squares,
-    the gate / up partials, the activations (bf16 pairs), the down partials."""
+    the gate / up partials, the activations (bf16 [token][I], plain words) and the
+    activation CTAs' flags (a 128-byte line each)."""
     return pair_layout(
         [
             ("dm_ss", K_PARTS * MAX_TOKENS),
             ("dm_gpart", K_PARTS * MAX_TOKENS * GU_ROWS),
-            ("dm_act", MAX_TOKENS * I // 2),
-            ("dm_dpart", D_KPARTS * MAX_TOKENS * H),
+            ("dm_act", MAX_TOKENS * I // 4),
+            ("dm_flags", ACT_CTAS * FLAG_STRIDE),
         ],
         align=256,
     )
@@ -413,10 +413,11 @@ def stage_ar(c, bid, nrows, vals_of):
 @flyc.jit
 def stage_act(c, bid):
     """Dims 8 bid .. of the intermediate for every token: the K parts' gate and up
-    partials summed in part order, bf16, a = bf16(silu(g)) u -> ``act`` [token][dim]
-    bf16 pairs (two dims a thread)."""
-    S, tid, poll, put_bf = c["S"], c["tid"], c["poll"], c["put_bf"]
-    gpart, act = c["gpart"], c["act"]
+    partials summed in part order, bf16, a = bf16(silu(g)) u -> ``act`` [token][I]
+    bf16 (two dims a thread, device scope), then this CTA's flag."""
+    S, tid, poll = c["S"], c["tid"], c["poll"]
+    gpart = c["gpart"]
+    r_act = rsrc(c["act"].value)
     PAIRS = ACT_DIMS // 2
     N = PAIRS * S
     for p in range_constexpr(-(-N // THREADS)):
@@ -438,86 +439,70 @@ def stage_act(c, bid):
         a0 = bf16_round(g0 * sigmoid(g0)) * u0
         a1 = bf16_round(g1 * sigmoid(g1)) * u1
         if tid + p * THREADS < N:
-            put_bf(act, t * I + d0, [a0, a1])
+            bo.buffer_store(
+                fx.Vector.from_elements([a0, a1], fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)[0],
+                r_act, (t * I + d0) // 2, cache_modifier=CM_DEV,
+            )  # fmt: skip
+    publish(c["put"], c["flags"], bid * FLAG_STRIDE, fx.Int32(1), tid == 0)
+
+
+def dn_loads(c, bid):
+    """The down task's weights: rows 32 bid .. (2 tiles) x this wave's 7 K steps
+    (224 of the 1792), in flight."""
+    return w_loads(c, c["args"]["w_down"], I, bid * DN_ROWS, DN_TILES, 0, DN_KW, DN_STEPS)
 
 
 @flyc.jit
-def down_loads(c, rg, kp, rd=0):
-    """Round ``rd`` of the down task (``rg``, ``kp``)'s weights, in flight."""
-    return w_loads(c, c["args"]["w_down"], I, rg * D_ROWS + rd * D_ROUND * ROWS, D_ROUND, kp * D_KPART, D_KPW, D_KSTEPS)
-
-
-@flyc.jit
-def stage_down(c, rg, kp, ws):
-    """The down GEMV task (``rg``, ``kp``): rows 224 rg .. of W_down over K part kp
-    (of 7, 256 wide; ``ws``: every round's weights, issued earlier) against the
-    activations (polled bf16 pairs); fp32 partials to ``dpart`` [kp][token][row]."""
-    S, lane, wave, put, poll = c["S"], c["lane"], c["wave"], c["put"], c["poll"]
-    dpart, act = c["dpart"], c["act"]
-    a = c["args"]
-    k0 = kp * D_KPART
-    k_lane = [k0 + wave * D_KPW + kc * K_STEP + 8 * (lane // 16) for kc in range(D_KSTEPS)]
-
-    # every token tile's B operands in one poll (a spec is at most two pairs: four
-    # pairs a step as two specs); the rounds reuse them
-    nt = token_tiles(S)
-    toks = [fx.min(t * TILE + lane % 16, S - 1) for t in range(nt)]
-    got = poll(
-        [(act, (toks[t] * I + k_lane[kc]) // 2 + 2 * q, 2) for t in range(nt) for kc in range(D_KSTEPS) for q in range(2)],
-        batch=2 * D_KSTEPS * nt,
-    )  # fmt: skip
-
-    def word(t, kc, q, e):
-        return fx.Int32(got[(t * D_KSTEPS + kc) * 2 + q][e])
-
-    xbs = [
-        [
-            fx.Vector.from_elements([word(t, kc, 0, 0), word(t, kc, 0, 1), word(t, kc, 1, 0), word(t, kc, 1, 1)], fx.Int32)
-            .bitcast(fx.BFloat16)
-            for kc in range(D_KSTEPS)
-        ]
-        for t in range(nt)
-    ]  # fmt: skip
-
-    def xb_of(t):
-        return xbs[t]
-
-    rows0 = rg * D_ROWS
-    for rd in range_constexpr(D_TILES // D_ROUND):
-
-        def publish(r, tk, v, rd=rd):
-            put(dpart, (kp * MAX_TOKENS + tk) * H + rows0 + rd * D_ROUND * ROWS + r, v)
-
-        gemv_tiles(c, ws[rd], xb_of, D_ROUND, D_KSTEPS, publish)
-
-
-@flyc.jit
-def stage_out(c, bid):
-    """Rows 28 bid .. of d for every token: the K parts' partials summed in part
-    order, then the all-reduce -> ``out``."""
-    poll, dpart = c["poll"], c["dpart"]
+def stage_down_ar(c, bid, w):
+    """The down task: every activation CTA's flag, then rows 32 bid .. of W_down
+    over the whole K (``w``: its weights, issued earlier) against the activations
+    (device-scope loads), the waves' sums in wave order -> the all-reduce. An
+    agent-scope acquire here (an L2 invalidate) costs about 12 us a launch."""
+    S, tid, lane, wave, red, dbuf = c["S"], c["tid"], c["lane"], c["wave"], c["red"], c["dbuf"]
+    if tid < ACT_CTAS:
+        c["poll"]([(c["flags"], tid * FLAG_STRIDE, 1)])
+    gpu.barrier()
+    # orders the loads below after the polls (device-scope loads: L2 holds no stale copy)
+    llvm.FenceOp(llvm.AtomicOrdering.acquire, syncscope="workgroup")
+    r_act = rsrc(c["act"].value)
+    for t in range_constexpr(token_tiles(S)):
+        tok = fx.min(t * TILE + lane % 16, S - 1)
+        xb = [
+            fx.Vector(
+                bo.buffer_load(r_act, (tok * I + wave * DN_KW + i * K_STEP + 8 * (lane // 16)) // 2, vec_width=4,
+                               dtype=T.i32, cache_modifier=CM_DEV)
+            )
+            for i in range(DN_STEPS)
+        ]  # fmt: skip
+        rocdl.sched_barrier(0)
+        for it in range_constexpr(DN_TILES):
+            acc = fx.Vector.filled(4, 0.0, fx.Float32)
+            for i in range_constexpr(DN_STEPS):
+                acc = mfma_bf16(w[it][i].bitcast(fx.BFloat16), xb[i].bitcast(fx.BFloat16), acc)
+            fx.ptr_store(acc, red + (it * RED_FLOATS + (wave * 64 + lane) * 4))
+        gpu.barrier()
+        n_out = DN_ROWS * min(TILE, S - t * TILE)
+        for p in range_constexpr(-(-n_out // THREADS)):
+            idx = tid + p * THREADS
+            if idx < n_out:
+                r = idx % DN_ROWS
+                tk = t * TILE + idx // DN_ROWS
+                fx.ptr_store(row_sum(red + (r // ROWS) * RED_FLOATS, r % ROWS, idx // DN_ROWS), dbuf + (tk * DN_ROWS + r))
+        gpu.barrier()
 
     def vals_of(t, j):
-        col = bid * OUT_ROWS + 2 * j
-        got = poll([(dpart, (kp * MAX_TOKENS + t) * H + col, 2) for kp in range(D_KPARTS)], batch=D_KPARTS)
-        v0, v1 = fx.Float32(0.0), fx.Float32(0.0)
-        for kp in range_constexpr(D_KPARTS):
-            v0 = v0 + got[kp][0].bitcast(fx.Float32)
-            v1 = v1 + got[kp][1].bitcast(fx.Float32)
-        return v0, v1
+        return fx.ptr_load(dbuf + (t * DN_ROWS + 2 * j)), fx.ptr_load(dbuf + (t * DN_ROWS + 2 * j + 1))
 
-    stage_ar(c, bid, OUT_ROWS, vals_of)
+    stage_ar(c, bid, DN_ROWS, vals_of)
 
 
 @flyc.jit
 def run_dmlp(c):
     """Every stage's weights are issued before the wait it follows: gate / up's first
-    round with the norm's loads, down's first round with gate / up's last, its
-    second before the activations' wait."""
+    round with the norm's loads, down's (a task's 114 KB) with gate / up's last."""
     bid, on, tls, tid = c["bid"], c["tl_on"], c["tls"], c["tid"]
     a = c["args"]
     rg, kp = bid // K_PARTS, bid % K_PARTS
-    drg, dkp = bid // D_KPARTS, bid % D_KPARTS
     if bid < G_TASKS:
         gw = stage_norm_in(
             c, kp, O_TASKS, lambda: w_loads(c, a["w_gu"], H, rg * G_ROWS, G_ROUND, kp * K_PART, K_PER_WAVE, K_STEPS)
@@ -525,18 +510,13 @@ def run_dmlp(c):
         stamp(on, tls, tid, 1)
         dw = stage_split_gemv(
             c, a["w_gu"], rg * G_ROWS, G_ROUND, G_TILES // G_ROUND, kp, c["gpart"], GU_ROWS, gw,
-            tail=lambda: down_loads(c, drg, dkp),
+            tail=lambda: dn_loads(c, bid),
         )  # fmt: skip
         stamp(on, tls, tid, 2)
-        rocdl.sched_barrier(0)
-        dw1 = down_loads(c, drg, dkp, 1)  # in flight across the activations' wait
-        rocdl.sched_barrier(0)
         stage_act(c, bid)
         stamp(on, tls, tid, 3)
-        stage_down(c, drg, dkp, [dw, dw1])
+        stage_down_ar(c, bid, dw)
         stamp(on, tls, tid, 4)
-    stage_out(c, bid)
-    stamp(on, tls, tid, 5)
 
 
 # ---------------------------------------------------------------- D-pre stages
@@ -602,7 +582,7 @@ def run_dpre(c):
         if const_expr(c["first"]):
             aw = stage_norm(c, kp, rg == 0, qkv_loads)
         else:
-            aw = stage_norm_in(c, kp, SS_PARTS, qkv_loads)
+            aw = stage_norm_in(c, kp, DN_TASKS, qkv_loads)
         stamp(on, tls, tid, 1)
         stage_split_gemv(c, a["w_qkv"], rg * A_ROWS, A_TILES, 1, kp, c["apart"], QKV_ROWS, aw)
         stamp(on, tls, tid, 2)
@@ -676,7 +656,7 @@ class DrafterBuild(msgspec.Struct, frozen=True):
     timeline: bool = False  # per-CTA stage stamps into ``tl`` (debugging)
 
 
-TL_POINTS = {"pre": 4, "post": 3, "mlp": 6}  # start, then each stage's end
+TL_POINTS = {"pre": 4, "post": 3, "mlp": 5}  # start, then each stage's end
 
 
 def _lds(key: DrafterBuild):
@@ -692,7 +672,7 @@ def _lds(key: DrafterBuild):
             tls: fx.Array[fx.Int64, 8, 16]
 
         return Lds
-    tiles = max(G_ROUND, D_ROUND) if key.kind == "mlp" else A_TILES
+    tiles = G_ROUND if key.kind == "mlp" else A_TILES
 
     @fx.struct
     class Lds:
@@ -700,7 +680,8 @@ def _lds(key: DrafterBuild):
         hbuf: fx.Array[fx.BFloat16, S * K_PART, 16]
         ssl: fx.Array[fx.Float32, S * K_PARTS, 16]
         nf: fx.Array[fx.Float32, S, 16]
-        ssp: fx.Array[fx.Float32, S * OUT_ROWS // 2, 16]
+        ssp: fx.Array[fx.Float32, S * DN_ROWS // 2, 16]
+        dbuf: fx.Array[fx.Float32, S * DN_ROWS, 16]
         tls: fx.Array[fx.Int64, 8, 16]
 
     return Lds
@@ -746,9 +727,8 @@ def build(key: DrafterBuild):
             }  # fmt: skip
             stamp_begin(on, c["tls"], tid, points)
             c["ssp"] = lds.ssp.ptr
-            if kind == "post":
-                c["dbuf"] = lds.dbuf.ptr
-            else:
+            c["dbuf"] = lds.dbuf.ptr
+            if kind != "post":
                 c.update(hbuf=lds.hbuf.ptr, ssl=lds.ssl.ptr, nf=lds.nf.ptr)
             if kind != "pre":
                 c["rank"] = kw["rank"]
