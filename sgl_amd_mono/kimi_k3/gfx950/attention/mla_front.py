@@ -857,8 +857,9 @@ def _k128(lane, words8, kc):
 
 
 def _qk(lane, kvl, ql):
-    """The block's scores against one row pair's 8 heads (``ql``: its e4m3 q in
-    LDS, a (row, head) a key-sized row): KT 16-key tiles C[key][rh] (element i of tile kt:
+    """The block's scores against a 16-column tile (``ql``: its e4m3 q in LDS, a
+    (row, head) a key-sized row, or its operands a K step in registers): KT
+    16-key tiles C[key][rh] (element i of tile kt:
     key 16 kt + 4 (lane / 16) + i; rh = lane % 16: row 2 rp + rh / 8, head rh % 8)."""
     g, r16 = lane // 16, lane % 16
     acc = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(KT)]
@@ -874,7 +875,7 @@ def _qk(lane, kvl, ql):
         return _k128(lane, fx.Vector.from_elements([lo[e] for e in range(4)] + [hi[e] for e in range(4)], fx.Int32), kc)
 
     for kc in range_constexpr(QK_STEPS):
-        qo = row32(ql + r16 * RWK, kc)
+        qo = ql[kc] if isinstance(ql, list) else row32(ql + r16 * RWK, kc)
         for kt in range_constexpr(KT):
             acc[kt] = _mfma128(row32(kvl + (16 * kt + r16) * RWK, kc), qo, acc[kt])
     return acc
@@ -929,24 +930,23 @@ def _byte_q(w, q):
     return _perm(y, x, 0 | (1 << 8) | (4 << 16) | (5 << 24))
 
 
-VT_KEYS = BK * (KV // 4) // THREADS  # 16 keys a thread transposes, for one 4-dim word
+VT_THREADS = 2 * 64  # the transposing waves' threads: a 4-dim word each
+VT_PASS = 16  # keys a pass
 
 
 @flyc.jit
-def _transpose_v(c, kx):
-    """The block's value part (its 512 latent dims) transposed in place, dim
-    major: row d at ``kx`` + d VTW holds dim d of keys 0 .. 63 (key j at byte
-    j). Thread t: dims 4 (t % 128) .., keys 16 (t / 128) .. (reads across a
-    wave's consecutive words, 16-byte writes). Every thread reads before any
-    writes."""
-    tid = c["tid"]
-    dq = tid % (KV // 4)
-    k0 = (tid // (KV // 4)) * VT_KEYS
-    ws = [fx.Int32(fx.ptr_load(kx + ((k0 + j) * RWK + dq))) for j in range(VT_KEYS)]
-    _bar()
-    for i in range_constexpr(4):
-        out = [_byte_q(ws[4 * q : 4 * q + 4], i) for q in range(VT_KEYS // 4)]
-        fx.ptr_store(fx.Vector.from_elements(out, fx.Int32), kx + ((4 * dq + i) * VTW + k0 // 4))
+def _transpose_v(c, kx, vt):
+    """The block's value part (its 512 latent dims) transposed, dim major, into
+    ``vt``: row d at ``vt`` + d VTW holds dim d of keys 0 .. 63 (key j at byte
+    j). On the two waves the QK leaves idle, thread t a 4-dim word (reads
+    across a wave's consecutive words, 16-byte writes)."""
+    tt = c["tid"] - (WAVES - 2) * 64
+    if tt >= 0:
+        for p_ in range_constexpr(BK // VT_PASS):
+            ws = [fx.Int32(fx.ptr_load(kx + ((VT_PASS * p_ + j) * RWK + tt))) for j in range(VT_PASS)]
+            for i in range_constexpr(4):
+                out = [_byte_q(ws[4 * q : 4 * q + 4], i) for q in range(VT_PASS // 4)]
+                fx.ptr_store(fx.Vector.from_elements(out, fx.Int32), vt + ((4 * tt + i) * VTW + VT_PASS * p_ // 4))
 
 
 def _scaled(v, a):
@@ -1108,16 +1108,14 @@ def attention(c, rq, hg, sa, sb):
     # the group's q into LDS: tile ct's column rh a key-sized row
     ct_w = fx.min(wave, NCT - 1)
     t = 2 * (ct_w % 3) + r16 // 8
-    qrow = DQK // 16  # 16-byte pieces a (row, head)
-    for j in range_constexpr(-(-(NCT * 16 * qrow) // THREADS)):
-        e = fx.min(tid + THREADS * j, NCT * 16 * qrow - 1)
-        rr = e // qrow
-        pq = e % qrow
-        tq, hq = _col(rr // 16, rr % 16, row0, hg, HQ)
-        v = _ld4(c["q8"], (tq * (NHA * DQK) + hq * DQK) // 4 + 4 * pq, CM_DEV)
-        if tid + THREADS * j < NCT * 16 * qrow:
-            fx.ptr_store(v, c["qll"] + (rr * RWK + 4 * pq))
-    qf = c["qll"] + ct_w * (16 * RWK)
+    # the tile's q in registers, a K step's operands (as ``_qk`` reads them)
+    tq, hq = _col(ct_w, r16, row0, hg, HQ)
+    qb = (tq * (NHA * DQK) + hq * DQK) // 4
+    qops = []
+    for kc in range_constexpr(QK_STEPS):
+        wd = 32 * kc + 8 * g if 128 * (kc + 1) <= DQK else fx.min(32 * kc + 8 * g, DQK // 4 - 8)
+        lo, hi = _ld4(c["q8"], qb + wd, CM_DEV), _ld4(c["q8"], qb + wd + 4, CM_DEV)
+        qops.append(_k128(lane, fx.Vector.from_elements([lo[e] for e in range(4)] + [hi[e] for e in range(4)], fx.Int32), kc))
     qk_scale = c["scale"] * LOG2E
     m = fx.Float32(NEG)
     l = fx.Float32(0.0)
@@ -1126,11 +1124,11 @@ def attention(c, rq, hg, sa, sb):
     rocdl.s_waitcnt(vmcnt=0)
     _kv_patch(c, rq, lr, own, b0, kvl0)
     _bar()
-    pl0, al0, mll0 = c["pl"], c["al"], c["mll"]
-    # a step a block: the next block's records in flight (wave 6), QK and the
-    # online softmax (waves 0 .. 5, a tile each), the block's values
-    # transposed in place, P V (every wave, 64 dims). Buffers: records
-    # (blk - b0) % 2.
+    pl0, al0, mll0, vt = c["pl"], c["al"], c["mll"], c["vt"]
+    # a step a block: the next block's records in flight (every wave a share),
+    # QK and the online softmax (waves 0 .. 5, a tile each) while waves 6, 7
+    # transpose the block's values into ``vt``, then P V (every wave, 64
+    # dims). Buffers: records (blk - b0) % 2.
     for sp in range(sa, sb):
         e0 = sp * nbl // n
         e1 = (sp + 1) * nbl // n
@@ -1150,7 +1148,13 @@ def attention(c, rq, hg, sa, sb):
             fst = blk == e0
             m = fst.select(fx.Float32(NEG), m)
             l = fst.select(fx.Float32(0.0), l)
-            m, l = _qk_softmax(c, kx, blk, kend, m, l, qf, t, lr, own, qk_scale, pl0, al0)
+            if wave < NCT:
+                sacc = _qk(lane, kx, qops)
+                m, l, al_ = _softmax(lane, t, blk, kend, sacc, lr, own, m, l, qk_scale, pl0 + (wave * 16 + r16) * PW)
+                if g == 0:
+                    fx.ptr_store(al_.bitcast(fx.Int32), al0 + (wave * 16 + r16))
+            # meanwhile the other two waves transpose the block's values
+            _transpose_v(c, kx, vt)
             if (blk + 1 == e1) & (wave < NCT) & (g == 0):
                 mb = mll0 + 2 * (wave * 16 + r16)
                 fx.ptr_store(m.bitcast(fx.Int32), mb)
@@ -1158,11 +1162,9 @@ def attention(c, rq, hg, sa, sb):
             if const_expr(c["on"]):
                 ts.append(clock())
             _bar()
-            _transpose_v(c, kx)
-            _bar()
             if const_expr(c["on"]):
                 ts.append(clock())
-            acc = _pv(c, lane, wave, kx, pl0, al0, acc)
+            acc = _pv(c, lane, wave, vt, pl0, al0, acc)
             if const_expr(c["on"]):
                 ts.append(clock())
             rocdl.s_waitcnt(vmcnt=0)
@@ -1728,10 +1730,10 @@ def build(key: MlaFrontBuild):
         @fx.struct
         class CoreLds:
             kv: fx.Array[fx.Int32, KV_BUFS * BK * RWK, 16]
+            vt: fx.Array[fx.Int32, KV * VTW, 16]
             p: fx.Array[fx.Int32, nct * 16 * PW, 16]
             alpha: fx.Array[fx.Int32, nct * 16, 16]
             ml: fx.Array[fx.Int32, 2 * nct * 16, 16]
-            q: fx.Array[fx.Int32, nct * 16 * RWK, 16]
 
     @fx.struct
     class UvLds:
@@ -1792,7 +1794,7 @@ def build(key: MlaFrontBuild):
             "pv": scratch + fx.Int64(lay["pv"][0]),
             "ml": scratch + fx.Int64(lay["ml"][0]),
             "kvl": cl.kv.ptr, "pl": cl.p.ptr, "al": cl.alpha.ptr, "mll": cl.ml.ptr,
-            "qll": cl.q.ptr,
+            "qll": cl.q.ptr if nreq == 1 else None, "vt": cl.vt.ptr if nreq > 1 else None,
             "args": {
                 "prefix": prefix, "delta": 0, "blocks": blocks, "blk_sm": blk_sm,
                 "blk_sr": blk_sr, "ares_nw": ares_nw, "ares_qk": ares_qk, "in_nw": in_nw,
