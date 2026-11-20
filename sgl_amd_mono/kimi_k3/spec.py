@@ -375,6 +375,8 @@ def _build(model, hf_config, ctx):
         batches[rows] = k1_mod.build_batch(layers[rows], device)
         _warmup(runner, layers[rows], rows)
     sgl = _SglFronts.install(backbone, runner, vcs, layers, ctx.widths) if dcp else None
+    if dcp:
+        _SglTails.install(backbone, runner, vcs, ctx.widths)
     global _FRONT_ROWS
     _FRONT_ROWS = frozenset(
         rows for rows, packed in layers.items()
@@ -955,6 +957,188 @@ class _SglFronts:
         # the gate is in the core: o_proj's wrapper has no gate input to apply
         out, _ = e.attn.o_proj(core)
         return out
+
+
+# The MLA layer a tail stands in for, while SGLang runs its attention core:
+# aiter's split reduce dispatch hands over its arguments (and does not run),
+# SGLang's fills do not run, and the DCP exchange is the tail. None outside.
+_TAIL_PENDING = None
+
+
+def _tail_hooks(tails) -> None:
+    """aiter's reduce dispatch, SGLang's DCP verify and its DCP all-to-all
+    reduce in the ROCm MLA core, each routed to the tail while a tail's layer
+    runs (``_TAIL_PENDING``); every other call, and every call while another
+    copy of this module is the loaded one, runs as theirs."""
+    import sys
+
+    import aiter.mla as am
+    from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
+    from sglang.srt.models.deepseek_common.attention_forward_methods import forward_mla_rocm as frm
+
+    mod = sys.modules[__name__]
+
+    def pending():
+        return mod._TAIL_PENDING if sys.modules.get(__name__) is mod else None
+
+    reduce = am._mla_decode_reduce_v1_dispatch
+
+    @functools.wraps(reduce)
+    def dispatch(*args):
+        pend = pending()
+        if pend is None:
+            return reduce(*args)
+        pend["reduce"] = args
+
+    am._mla_decode_reduce_v1_dispatch = dispatch
+    verify = AiterAttnBackend._forward_verify_dcp
+
+    @functools.wraps(verify)
+    def forward_verify_dcp(self, q, k_window, layer, k_descale):
+        pend = pending()
+        if pend is None:
+            return verify(self, q, k_window, layer, k_descale)
+        fm = self.forward_metadata
+        assert fm.use_asm_cprr_verify and fm.cprr_kernel_heads == layer.tp_q_head_num
+        out, lse = self._forward_verify_asm_cprr(q, layer, k_descale, fm.local_kv_lens.shape[0])
+        pend.update(out=out, empty=fm.cprr_empty_rows)
+        return out, lse
+
+    AiterAttnBackend._forward_verify_dcp = forward_verify_dcp
+    a2a = frm.dcp_a2a_lse_reduce
+
+    @functools.wraps(a2a)
+    def dcp_a2a_lse_reduce(*args, **kwargs):
+        pend = pending()
+        if pend is None:
+            return a2a(*args, **kwargs)
+        return tails.tail(pend)
+
+    frm.dcp_a2a_lse_reduce = dcp_a2a_lse_reduce
+
+
+class _SglTails:
+    """The MLA tail (``mla_tail``) inside SGLang's own MLA attention at the
+    verify widths past the front's, ``mla_tail.MIN_ROWS`` .. ``MAX_ROWS``:
+    SGLang's ROCm MLA core runs the layer's attention up to aiter's decode
+    kernel (q path, KV write) and takes its project-before-merge branch, whose
+    exchange is the tail: the decode's split partials in place of the split
+    reduce, the fills, the all-to-all, the LSE combine, W_UV and the output
+    gate, then SGLang's o_proj on the gated core. Every other step of these
+    layers is SGLang's own forward. One static rule a width."""
+
+    def __init__(self, runner, entries: list, rows: frozenset) -> None:
+        self.runner, self.entries, self.rows = runner, entries, rows
+        self.core = {r: _front_core_buffer(r, runner.device) for r in rows}
+
+    @classmethod
+    def install(cls, backbone, runner, vcs: dict, widths):
+        """Every MLA layer's tail at the widths the spec and the front leave
+        to SGLang, its builds run once (every rank the same launches in the
+        same order), then each layer's ROCm MLA core routed through it. None
+        where no width or no layer qualifies."""
+        from sgl_amd_mono.kimi_k3.gfx950.attention import mla_tail as mt
+
+        rows = frozenset(
+            r for r in range(mt.MIN_ROWS, mt.MAX_ROWS + 1, mt.G_ROWS)
+            if r not in widths and r > FRONT_MAX_ROWS
+        )  # fmt: skip
+        mla = [
+            i for i, layer in enumerate(backbone.layers)
+            if hasattr(layer, "self_attn") and not hasattr(layer.self_attn, "qkv_conv1d")
+        ]  # fmt: skip
+        if not rows or not mla or any(vcs.get(i) is None for i in mla):
+            return None
+        entries = [
+            # consecutive layers take alternate A2A copies (mla_tail.peer_end)
+            SimpleNamespace(
+                i=i, attn=backbone.layers[i].self_attn, w_vc=vcs[i],
+                key=mt.MlaTailBuild(par=n % 2), first=n == 0,
+            )
+            for n, i in enumerate(mla)
+        ]  # fmt: skip
+        self = cls(runner, entries, rows)
+        self._warmup()
+        _tail_hooks(self)
+        for e in entries:
+            e.attn.forward_absorb_rocm_core = functools.partial(self.core_forward, e)
+        logger.info(
+            "monokernel: MLA tail in SGLang's MLA attention at %d .. %d rows (%d layers)",
+            min(rows), max(rows), len(entries),
+        )  # fmt: skip
+        return self
+
+    def _warmup(self) -> None:
+        """Both A2A copies' builds once, on no reduce tile and every row
+        empty, in an epoch of their own."""
+        from sgl_amd_mono.kimi_k3.gfx950.attention import mla_tail as mt
+        from sgl_amd_mono.kimi_k3.gfx950.layer import scratch_region
+
+        dev, s = self.runner.device, min(self.rows)
+        f32, i32 = torch.float32, torch.int32
+        self.runner.step_begin()
+        for e in self.entries[:2]:
+            mt.mla_tail_launch(
+                e.key, s=s, logits=torch.zeros(1, mt.NHA, mt.KV, dtype=f32, device=dev),
+                plse=torch.zeros(1, mt.NHA, dtype=f32, device=dev),
+                indptr=torch.zeros(2, dtype=i32, device=dev),
+                fmap=torch.zeros(2, dtype=i32, device=dev),
+                pmap=torch.zeros(1, dtype=i32, device=dev),
+                o=torch.zeros(s, mt.NHA, mt.KV, dtype=torch.bfloat16, device=dev),
+                lse=torch.zeros(s, mt.NHA, dtype=f32, device=dev),
+                empty=torch.ones(s, dtype=torch.bool, device=dev), w_vc=e.w_vc,
+                gate=torch.zeros(s, mt.GATE, dtype=torch.bfloat16, device=dev),
+                core=self.core[s], scratch=scratch_region(self.runner.scratch, "mla_tail"),
+                peers=self.runner.peer.addresses, rank=self.runner.dcp_rank,
+                layer=e.i, epoch=self.runner.epoch,
+            )  # fmt: skip
+        torch.cuda.synchronize()
+
+    def core_forward(self, e, *args, **kwargs):
+        """``forward_absorb_rocm_core`` of layer ``e``: at a tail width's
+        target verify, SGLang's core with its project-before-merge branch
+        (the partials as they are), its exchange the tail."""
+        global _TAIL_PENDING
+        attn = e.attn
+        q_nope_out, forward_batch = args[2], args[4]
+        rows = q_nope_out.shape[0]
+        core = type(attn).forward_absorb_rocm_core
+        if not (forward_batch.forward_mode.is_target_verify() and rows in self.rows):
+            return core(attn, *args, **kwargs)
+        if e.first:
+            # once a forward, before its first tail: the steps' mailbox tags
+            self.runner.step_begin()
+        _TAIL_PENDING = {"e": e, "rows": rows}
+        attn._dcp_project_before_merge = lambda: True
+        attn._dcp_project_partials = lambda x: x
+        try:
+            return core(attn, *args, **kwargs)
+        finally:
+            del attn._dcp_project_before_merge, attn._dcp_project_partials
+            _TAIL_PENDING = None
+
+    def tail(self, pend):
+        """The tail on the decode ``pend`` holds: the gated core [S, 12, 128]
+        (g_proj taken here, so o_proj's wrapper applies no gate)."""
+        from sgl_amd_mono.kimi_k3.gfx950.attention import mla_tail as mt
+        from sgl_amd_mono.kimi_k3.gfx950.layer import scratch_region
+
+        e, rows = pend["e"], pend["rows"]
+        attn = e.attn
+        logits, plse, indptr, fmap, pmap, _, _, o, lse = pend["reduce"]
+        assert o.data_ptr() == pend["out"].data_ptr()
+        gate = attn._compute_output_gate(attn._gate_hidden_states)
+        attn._gate_hidden_states = None
+        core = self.core[rows]
+        mt.mla_tail_launch(
+            e.key, s=rows, logits=logits, plse=plse, indptr=indptr, fmap=fmap, pmap=pmap,
+            o=o.view(rows, mt.NHA, mt.KV), lse=lse.view(rows, mt.NHA), empty=pend["empty"],
+            w_vc=e.w_vc, gate=gate, core=core,
+            scratch=scratch_region(self.runner.scratch, "mla_tail"),
+            peers=self.runner.peer.addresses, rank=self.runner.dcp_rank, layer=e.i,
+            epoch=self.runner.epoch,
+        )  # fmt: skip
+        return core.view(rows, mt.NHL, mt.VD)
 
 
 def _gu_interleaved(moe) -> bool:
