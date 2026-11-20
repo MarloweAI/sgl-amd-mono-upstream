@@ -1027,6 +1027,17 @@ def print_stamps(tl, tag):
             if live.any():
                 cols.append(f"{n} {((col[live].max() - t0).double() / 100.0).item():.1f}")
         print(f"  CTAs {gname} latest: " + ", ".join(cols), flush=True)
+    from sgl_amd_mono.kimi_k3.gfx950.attention import mla_front as mf
+
+    steps = tl[:, mf.TL_STEPS].double()
+    live = steps > 0
+    if live.any():
+        # 100 MHz ticks a step, the median over the CTAs that ran attention steps
+        per = lambda k: (tl[live, k].double() / steps[live] / 100.0).median().item()  # noqa: E731
+        roles = ["QK", "QK", "QK", "DMA", "PV", "PV", "PV", "PV"]
+        cells = [f"w{w} {roles[w]} {per(mf.TL_ROLE + 2 * w):.2f}+{per(mf.TL_ROLE + 2 * w + 1):.2f}" for w in range(8)]
+        print(f"  ROLES {tag} (us a step, role + barrier; steps a CTA median {steps[live].median().item():.0f}): "
+              + ", ".join(cells), flush=True)
 
 
 def emulate(sends, stock_sends, gates, stock_gates, refs, tag, emus=None):

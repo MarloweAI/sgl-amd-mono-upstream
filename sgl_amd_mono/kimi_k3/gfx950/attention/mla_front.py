@@ -63,6 +63,7 @@ from flydsl.expr.typing import Int32, Int64, T
 
 from sgl_amd_mono.common.ops import (
     CM_DEV,
+    clock,
     bf_hi,
     bf_lo,
     fp8_to_bf16x8,
@@ -171,7 +172,11 @@ S1_SEGS = ((0, 4), (4, 7))  # stage 1's K segments in rounds (x 16 rows x 4096 /
 RSTD_W = 2048 - 64  # red words of the rows' rstd (q / kv norms)
 # start, x seen, stage 1, q latent normed, q_b, absorb, attention q seen,
 # attention done, W_UV partials seen, W_UV done
-TL_POINTS = 19
+# a timeline build's attention step accounting: wave w's time in its role at
+# point TL_ROLE + 2 w, at the step's barrier at + 1; the steps at TL_STEPS
+TL_ROLE = 19
+TL_STEPS = TL_ROLE + 2 * WAVES
+TL_POINTS = TL_STEPS + 1
 
 assert GP2 >= 0 and QB_HI_N >= 0 and NA * QB_SEAM + QB_HI_N * QB_HI + (G_LAT - QB_HI_N) * QB_LO == QBG
 
@@ -783,8 +788,6 @@ DMA_N = BK * KV_SLOTS // 64  # 37 wave-wide DMAs a block
 DMA_W0 = NRP  # the DMA wave: 3 (QK on waves 0 .. 2, P V on 4 .. 7)
 DMA_WAVES = 1
 PV_W0 = DMA_W0 + 1  # the P V waves, 128 value dims each
-DMA_ROUNDS = -(-DMA_N // DMA_WAVES)  # 8 a wave at most
-DMA_FULL = DMA_N - (DMA_ROUNDS - 1) * DMA_WAVES  # waves with DMA_ROUNDS (the rest one fewer)
 KV_BUFS = 3  # LDS record buffers: block i in use, i + 1 landed, i + 2 in flight
 assert BK * KV_SLOTS % 64 == 0
 
@@ -1017,6 +1020,19 @@ def _empty_out(c, lane, wave, sp, hg, row0):
 
 
 @flyc.jit
+def _account(c, ta, tb, tc):
+    """Timeline builds: this wave's step, in its role (ta .. tb) and at the
+    barrier (tb .. tc), onto its sums; wave 0 counts the steps."""
+    lane, wave, tls = c["lane"], c["wave"], c["tls"]
+    if lane == 0:
+        r = tls + (TL_ROLE + 2 * wave)
+        fx.ptr_store(fx.ptr_load(r) + (tb - ta), r)
+        fx.ptr_store(fx.ptr_load(r + 1) + (tc - tb), r + 1)
+        if wave == 0:
+            fx.ptr_store(fx.ptr_load(tls + TL_STEPS) + fx.Int64(1), tls + TL_STEPS)
+
+
+@flyc.jit
 def attention(c, rq, hg, sa, sb):
     """Request rq's 8-head group hg, key splits sa .. sb (items first + hg n +
     sp), over the splits' blocks of this rank's keys as one pipeline: each
@@ -1098,6 +1114,8 @@ def attention(c, rq, hg, sa, sb):
             pc, ac = pl0 + par * (NRP * 16 * PW), al0 + par * (NRP * 16)
             pn, an = pl0 + (1 - par) * (NRP * 16 * PW), al0 + (1 - par) * (NRP * 16)
             stamp(c["on"], c["tls"], tid, 10)
+            if const_expr(c["on"]):
+                ta = clock()
             # the next split's first block: the split's (max, sum) to LDS
             # (buffer e1 % 2), the softmax afresh
             nxt = blk + 1 == e1
@@ -1114,7 +1132,11 @@ def attention(c, rq, hg, sa, sb):
             _kv_patch(c, rq, lr, own, blk + 2, kz)
             if wave >= PV_W0:
                 acc = _pv(lane, wave, kx, pc, ac, acc)
+            if const_expr(c["on"]):
+                tb = clock()
             _bar()
+            if const_expr(c["on"]):
+                _account(c, ta, tb, clock())
             stamp(c["on"], c["tls"], tid, 13)
         # the split's partial (its (max, sum) stay in buffer e1 % 2 until the
         # next split's last step)
