@@ -32,6 +32,12 @@ LINEAR_ATTN_CONFIG = dict(head_dim=128, num_heads=96, short_conv_kernel_size=4)
 MAX_ROWS = 8
 K1_MAX_ROWS = MAX_ROWS
 K2_MAX_ROWS = 18
+# Under DCP8, the widest verify step whose MLA attention is the DCP front: past
+# K2's widths the front runs inside SGLang's own MLA attention (spec._SglFronts),
+# and SGLang's o_proj, all-reduce and MoE follow. Wider steps keep SGLang's MLA
+# attention: from 6 requests stock is as fast (5 requests: the front ahead by
+# 3 us or more at every context measured).
+FRONT_MAX_ROWS = 30
 # The attention's TP-local output per rank at TP8: 12 heads of 128. o_proj's
 # input, which is where the launch starts.
 CORE = 1536

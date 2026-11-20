@@ -277,6 +277,9 @@ class MlaFrontBuild:
     # checks only: the W_UV records also to ``send`` in SGLang's all-to-all
     # layout [8, S, 12, 130]
     records: bool = False
+    # the x rows given (``prefix``: SGLang's input_layernorm output, its own
+    # seam done): no seam roles, stage 1 reads them in place
+    x_in: bool = False
 
 
 def scratch_layout(key: MlaFrontBuild) -> dict:
@@ -551,11 +554,13 @@ def s1_out(c, g, acc, t0, sj):
 
 @flyc.jit
 def x_seen(c):
-    """Every slice's x ready (the wide stage 1 stages it itself)."""
+    """Every slice's x ready (the wide stage 1 stages it itself); given x
+    rows are ready at launch."""
     tid = c["tid"]
-    if tid < NA:
-        c["poll"]([(c["xrdy"], tid, 1)])
-    gpu.barrier()
+    if const_expr(not c["x_in"]):
+        if tid < NA:
+            c["poll"]([(c["xrdy"], tid, 1)])
+        gpu.barrier()
     stamp(c["on"], c["tls"], tid, 1)
 
 
@@ -1895,7 +1900,7 @@ def build(key: MlaFrontBuild):
     keyed = key_tuple(key, SOURCES)
     name = (
         f"k3_mono_mla_front_s{s}_nb{key.nblocks}_w{int(key.write_idx >= 0)}"
-        f"_t{int(key.timeline)}_r{int(key.records)}"
+        f"_t{int(key.timeline)}_r{int(key.records)}_x{int(key.x_in)}"
     )
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
@@ -1935,7 +1940,8 @@ def build(key: MlaFrontBuild):
                 "red": al.red.ptr, "vals": al.vals.ptr, "xl": gl.xl.ptr,
                 "scale": key.scale, "rank": rank, "loc_words": 2,
                 "qg_off": fx.Int64(qg_offset() + key.qg_par * QG_COPY),
-                "xbuf": scratch + fx.Int64(lay["x"][0]),
+                "xbuf": prefix if key.x_in else scratch + fx.Int64(lay["x"][0]),
+                "x_in": key.x_in,
                 "lat": scratch + fx.Int64(lay["lat"][0]),
                 "qb": scratch + fx.Int64(lay["qb"][0]),
                 "q8": scratch + fx.Int64(lay["q8"][0]),
@@ -1960,12 +1966,13 @@ def build(key: MlaFrontBuild):
             on, tls = key.timeline, lds.tls.ptr
             c["on"], c["tls"] = on, tls
             stamp_begin(on, tls, tid, TL_POINTS)
-            if bid < NA:
-                stage_slice(c, bid)
-                if const_expr(wd):
-                    if bid < s:
-                        stage_gate(c, bid)
-                stage_mix(c, bid)
+            if const_expr(not key.x_in):
+                if bid < NA:
+                    stage_slice(c, bid)
+                    if const_expr(wd):
+                        if bid < s:
+                            stage_gate(c, bid)
+                    stage_mix(c, bid)
             if (bid >= QKV0) & (bid < GP0):
                 # fused_qkv_a: the q path's first weights, at launch
                 ops = s1_loads(c, bid - QKV0)
@@ -2108,8 +2115,15 @@ def mla_front_launch(
     peer buffers (int64 [8], ``peer_end`` bytes each: the q all-gather's QG
     copies and the all-to-all's A2A copies, ``key.qg_par`` the one this launch
     uses); ``send`` [8, S, 12, 130] bf16 out, a ``records`` build only;
-    ``w_qb`` / ``w_kc`` this rank's 12 heads' shards."""
-    assert key.write_idx < blocks.shape[1]
+    ``w_qb`` / ``w_kc`` this rank's 12 heads' shards. An ``x_in`` build takes
+    the x rows [S, 7168] bf16 as ``prefix`` and no ``blocks`` (None)."""
+    if key.x_in:
+        assert blocks is None and key.write_idx < 0
+        assert prefix.is_contiguous() and tuple(prefix.shape) == (key.tokens, HIDDEN)
+        blk = (0, 0, 0)
+    else:
+        assert key.write_idx < blocks.shape[1]
+        blk = (blocks.data_ptr(), blocks.stride(0), blocks.stride(1))
     for n, shp in WEIGHT_SHAPES.items():
         assert weight_ok(n, w[n]), (n, tuple(w[n].shape), w[n].stride(), w[n].dtype)
     assert kv.dtype in (torch.float8_e4m3fn, torch.uint8) and kv.stride(-2) == DQK
@@ -2124,7 +2138,7 @@ def mla_front_launch(
     assert tuple(core.shape) == (key.tokens, GATE) and core.dtype == torch.bfloat16 and core.is_contiguous()
     f = build(key)
     f(
-        prefix.data_ptr(), blocks.data_ptr(), blocks.stride(0), blocks.stride(1),
+        prefix.data_ptr(), *blk,
         w["ares_nw"].data_ptr(), w["ares_qk"].data_ptr(), w["in_nw"].data_ptr(),
         w["w_qkv"].data_ptr(), w["w_g"].data_ptr(), w["q_nw"].data_ptr(),
         w["kv_nw"].data_ptr(), w["w_qb"].data_ptr(), w["w_kc"].data_ptr(),

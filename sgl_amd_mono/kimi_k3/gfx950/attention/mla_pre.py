@@ -158,11 +158,13 @@ def _st_bf(ptr, i, v, cm=0):
 
 @flyc.jit
 def load_x(c):
-    """Every slice's x ready -> the bf16 x rows into LDS (rows padded)."""
+    """Every slice's x ready -> the bf16 x rows into LDS (rows padded); given
+    x rows (``x_in``) are ready at launch."""
     s, tid = c["S"], c["tid"]
-    if tid < NA:
-        c["poll"]([(c["xrdy"], tid, 1)])
-    gpu.barrier()
+    if const_expr(not c.get("x_in", False)):
+        if tid < NA:
+            c["poll"]([(c["xrdy"], tid, 1)])
+        gpu.barrier()
     stamp(c["on"], c["tls"], tid, 1)  # a stage-1 CTA: x seen
     gemv.rows_to_lds(tid, c["xbuf"], HIDDEN, s, c["xl"], HIDDEN + LDS_PAD, CM_DEV)
     stamp(c["on"], c["tls"], tid, 2)  # x in LDS

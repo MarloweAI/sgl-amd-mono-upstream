@@ -241,13 +241,13 @@ def new_epoch(device, seconds=30.0):
     return epoch
 
 
-def front_key(w, s, timeline=False, records=True):
+def front_key(w, s, timeline=False, records=True, x_in=False):
     from sgl_amd_mono.kimi_k3.gfx950.attention import mla_front as mf
 
     return mf.MlaFrontBuild(
-        tokens=s, nblocks=NVB, scale=w["scale"], eps=w["eps"], out_eps=w["out_eps"],
-        q_eps=w["q_eps"], kv_eps=w["kv_eps"], qg_par=QG_PAR[0], timeline=timeline,
-        records=records,
+        tokens=s, nblocks=0 if x_in else NVB, scale=w["scale"], eps=w["eps"],
+        out_eps=w["out_eps"], q_eps=w["q_eps"], kv_eps=w["kv_eps"], qg_par=QG_PAR[0],
+        timeline=timeline, records=records, x_in=x_in,
     )  # fmt: skip
 
 
@@ -348,13 +348,14 @@ def rank_weights(w, o):
     return _WRANK[key]
 
 
-def launch_one(w, st, b, epoch, layer, peers, *, timeline=False):
+def launch_one(w, st, b, epoch, layer, peers, *, timeline=False, x=None):
     """Rank b.r's launch (its peers' q already in its QG copy or arriving): its
-    outputs, scratch hand-offs and pool."""
+    outputs, scratch hand-offs and pool. ``x``: the x rows, for the ``x_in``
+    build (SGLang's seam done) instead of the seam on ``st``."""
     from sgl_amd_mono.kimi_k3.gfx950.attention import mla_front as mf
 
     s = getattr(b, "s", G)
-    key = front_key(w, s, timeline)
+    key = front_key(w, s, timeline, x_in=x is not None)
     dev = b.pool.device
     scratch = scratch_for(key, dev)
     core = torch.zeros(s, NHL * VD, dtype=BF, device=dev)
@@ -363,17 +364,17 @@ def launch_one(w, st, b, epoch, layer, peers, *, timeline=False):
     peers.stand_in(b.r, next_tag(epoch, layer))
     epoch[0].add_(1)
     mf.mla_front_launch(
-        key, prefix=st["prefix"], blocks=st["blocks"], w=rank_weights(w, b.r), kv=b.pool,
-        kv_idx=b.kv_idx, kv_ptr=b.kv_ptr, g_kv_ptr=b.g_kv_ptr, loc=b.loc,
-        core=core, send=send, scratch=scratch, peers=peers.table, rank=b.r, layer=layer,
-        epoch=epoch, tl=tl,
+        key, prefix=st["prefix"] if x is None else x, blocks=st["blocks"] if x is None else None,
+        w=rank_weights(w, b.r), kv=b.pool, kv_idx=b.kv_idx, kv_ptr=b.kv_ptr,
+        g_kv_ptr=b.g_kv_ptr, loc=b.loc, core=core, send=send, scratch=scratch,
+        peers=peers.table, rank=b.r, layer=layer, epoch=epoch, tl=tl,
     )  # fmt: skip
     torch.cuda.synchronize()
     v = lambda n, dt, shp: mf.scratch_view(key, scratch, n, dt, shp).clone()  # noqa: E731
     reqs = getattr(b, "reqs", [b])
     return {
         "key": key, "gate": v("g", BF, (s, NHL * VD)), "send": send, "core": core, "tl": tl,
-        "x": v("x", BF, (s, HIDDEN)),
+        "x": v("x", BF, (s, HIDDEN)) if x is None else x.clone(),
         "lat": v("lat", BF, (s, LATW)),
         "qb": v("qb", BF, (s, NHA, QHD)),
         "q8": peers.q_of(b.r, s),
@@ -383,7 +384,7 @@ def launch_one(w, st, b, epoch, layer, peers, *, timeline=False):
     }  # fmt: skip
 
 
-def run_ranks(w, st, bs, epoch, layer, *, timeline_rank=None):
+def run_ranks(w, st, bs, epoch, layer, *, timeline_rank=None, x=None):
     """The eight ranks' launches (``bs``: each rank's share) one after another,
     three times: the first pass lands every rank's q in every QG copy (rank o's
     combine reads zeros for the later ranks' records); the second pushes every
@@ -395,8 +396,8 @@ def run_ranks(w, st, bs, epoch, layer, *, timeline_rank=None):
         peers.a2a_stand_in(o, s, range(o + 1, DCP))
     for _ in range(2):
         for b in bs:
-            launch_one(w, st, b, epoch, layer, peers)
-    out = [launch_one(w, st, b, epoch, layer, peers, timeline=b.r == timeline_rank) for b in bs]
+            launch_one(w, st, b, epoch, layer, peers, x=x)
+    out = [launch_one(w, st, b, epoch, layer, peers, timeline=b.r == timeline_rank, x=x) for b in bs]
     peers.rearm()
     return out
 
@@ -508,6 +509,105 @@ def invariance(w, args, device, epoch):
                         fails.append(f"P={p} rank={r} S={s_} run-to-run")
                 tag = f"P={p} rank={r} S={s_} order {ids} splits {fr['splits']}"
                 print(f"INV {tag}: {len(ids) - len(bad)}/{len(ids)} requests bitwise equal to alone"
+                      + (f" BAD {bad}" if bad else "") + again, flush=True)
+                if bad:
+                    fails.append(tag)
+    return fails
+
+
+# the served widths up to FRONT_MAX_ROWS: a request alone (6 rows) and in 2-5
+# request batches; from 24 rows the x_in build (the front inside SGLang's MLA
+# attention), on the x rows the seam build of the same batch made
+XIN_BATCHES = {12: (1, 0), 18: (2, 0, 1), 24: (2, 0, 3, 1), 30: (4, 2, 0, 3, 1)}
+XIN_ABOVE = 18
+
+
+def sgl_core(frs, s):
+    """SGLang's all-to-all (a copy), LSE combine and output gate on the eight
+    ranks' records and g_proj: each owner's gated core [S, 1536]."""
+    from sglang.kernels.ops.attention.dcp_kernels import dcp_lse_combine_triton
+    from sglang.kernels.ops.elementwise import mla_output_gate
+
+    outs = []
+    for o in range(DCP):
+        recv = torch.stack([frs[src]["send"][o] for src in range(DCP)])  # [8, S, 12, 130]
+        comb, _ = dcp_lse_combine_triton(
+            recv[..., :VD].contiguous(), recv.view(torch.float32)[..., VD // 2].contiguous(),
+            is_lse_base_on_e=True,
+        )
+        x = comb.reshape(s, NHL * VD).contiguous()
+        outs.append(mla_output_gate.kimi_k3_mla_output_gate(x, frs[o]["gate"]))
+    return outs
+
+
+def x_in_suite(w, args, device, epoch):
+    """The front at the widths SGLang's MLA attention takes it (``x_in``, past
+    XIN_ABOVE rows) on eight emulated ranks: every output bit for bit the seam
+    build's on the same x rows; the in-launch core bit for bit SGLang's combine
+    + gate of the same records; each request bit for bit itself alone and at
+    every narrower width; the widest batch run to run."""
+    u8 = lambda t: t.contiguous().view(torch.uint8)  # noqa: E731
+    fails = []
+    ctx_of = lambda i, p: p if i == 0 else INV_OTHERS[i - 1]  # noqa: E731
+    bank = make_keys(w, max([*args.ctx, *INV_OTHERS]) + 8 * 997, args.seed, device, args.temp[0])
+    names = ("x", "lat", "qb", "q8", "pv", "ml", "gate", "send", "core")
+    for p in args.ctx:
+        reqs = {i: (ctx_of(i, p), bank[997 * i : 997 * i + ctx_of(i, p)], args.seed + 13 * i) for i in range(8)}
+        alone = {}
+        for i in range(max(len(v) for v in XIN_BATCHES.values())):
+            bs = [Batch([reqs[i]], o, device) for o in range(DCP)]
+            frs = run_ranks(w, batch_stream([i], args.seed, device), bs, epoch, args.layer)
+            for r in args.rank:
+                alone[(i, r)] = request_view(frs[r], bs[r], 0)
+        for s_, ids in XIN_BATCHES.items():
+            st = batch_stream(ids, args.seed, device)
+            bs = [Batch([reqs[i] for i in ids], o, device) for o in range(DCP)]
+            frs = run_ranks(w, st, bs, epoch, args.layer)
+            run, form = frs, "seam"
+            if s_ > XIN_ABOVE:
+                x = frs[0]["x"]
+                xs_eq = all(torch.equal(u8(frs[o]["x"]), u8(x)) for o in range(DCP))
+                bx = [Batch([reqs[i] for i in ids], o, device) for o in range(DCP)]
+                frx = run_ranks(w, st, bx, epoch, args.layer, x=x)
+                for r in range(DCP):
+                    dd = [n for n in names if n != "x" and not torch.equal(u8(frx[r][n]), u8(frs[r][n]))]
+                    dd += [] if torch.equal(u8(bx[r].pool), u8(bs[r].pool)) else ["pool"]
+                    print(f"XIN P={p} S={s_} rank={r}: x_in vs seam build bitwise {not dd} {dd}"
+                          f" (x the same on every rank {xs_eq})", flush=True)
+                    if dd or not xs_eq:
+                        fails.append(f"P={p} S={s_} rank={r} x_in vs seam")
+                run, bs, form = frx, bx, "x_in"
+            sg = sgl_core(run, s_)
+            for r in range(DCP):
+                neq = int((u8(run[r]["core"]) != u8(sg[r])).sum())
+                if neq:
+                    fails.append(f"P={p} S={s_} rank={r} {form} core vs SGLang combine")
+                if r in args.rank or neq:
+                    print(f"XIN P={p} S={s_} rank={r} {form}: in-launch core "
+                          f"{'bitwise' if not neq else f'{neq} bytes differ from'} SGLang's combine + gate of the same records",
+                          flush=True)
+            again = ""
+            if s_ == max(XIN_BATCHES):
+                b2 = [Batch([reqs[i] for i in ids], o, device) for o in range(DCP)]
+                fr2 = run_ranks(w, st, b2, epoch, args.layer, x=frs[0]["x"] if s_ > XIN_ABOVE else None)
+                dd = [f"{n}@{r}" for r in args.rank for n in names if not torch.equal(u8(fr2[r][n]), u8(run[r][n]))]
+                dd += [f"pool@{r}" for r in args.rank if not torch.equal(u8(b2[r].pool), u8(bs[r].pool))]
+                again = f"; run to run bitwise {not dd} {dd}"
+                if dd:
+                    fails.append(f"P={p} S={s_} run-to-run")
+            for r in args.rank:
+                bad = {}
+                for j, i in enumerate(ids):
+                    got = request_view(run[r], bs[r], j)
+                    diff = [
+                        k for k in got
+                        if (got[k] is None) != (alone[(i, r)][k] is None)
+                        or (got[k] is not None and not torch.equal(got[k], alone[(i, r)][k]))
+                    ]  # fmt: skip
+                    if diff:
+                        bad[f"req{i}@{j} P={ctx_of(i, p)}"] = diff
+                tag = f"P={p} rank={r} S={s_} {form} order {ids} splits {run[r]['splits']}"
+                print(f"XIN-INV {tag}: {len(ids) - len(bad)}/{len(ids)} requests bitwise equal to alone"
                       + (f" BAD {bad}" if bad else "") + again, flush=True)
                 if bad:
                     fails.append(tag)
@@ -864,6 +964,7 @@ def main():
     ap.add_argument("--reps", type=int, default=20)
     ap.add_argument("--warmup", type=int, default=10)
     ap.add_argument("--invariance", action="store_true", help="the batch-invariance suite")
+    ap.add_argument("--x-in", action="store_true", help="the SGLang-attention (x_in) widths' suite")
     ap.add_argument("--time-wide", action="store_true", help="time the front at 4 and 8 requests")
     ap.add_argument("--max-reqs", type=int, default=8)
     ap.add_argument("--qg-par", type=int, default=0, choices=(0, 1), help="the QG copy the launches take")
@@ -885,10 +986,12 @@ def main():
         if fb:
             fails.append("frontier")
     w = layer_weights(args, device)
-    if args.invariance or args.time_wide:
+    if args.invariance or args.time_wide or args.x_in:
         epoch = new_epoch(device)
         if args.time_wide:
             time_wide(w, args, device, epoch)
+        elif args.x_in:
+            fails += x_in_suite(w, args, device, epoch)
         else:
             fails += invariance(w, args, device, epoch)
         print("ALL PASS" if not fails else f"FAILED: {fails}", flush=True)

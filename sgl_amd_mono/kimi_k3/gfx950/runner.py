@@ -13,7 +13,7 @@ import torch
 
 from sgl_amd_mono.common import guard
 from sgl_amd_mono.common.peer import PeerBuffer
-from sgl_amd_mono.kimi_k3 import K2_MAX_ROWS
+from sgl_amd_mono.kimi_k3 import FRONT_MAX_ROWS, K2_MAX_ROWS
 
 
 class K3MonoRunner:
@@ -37,7 +37,8 @@ class K3MonoRunner:
         # fits, then K2's tagged x rows.
         front = mla_front.scratch_bytes(
             mla_front.MlaFrontBuild(
-                tokens=mla_front.G_ROWS * min(mla_front.MAX_REQS, K2_MAX_ROWS // mla_front.G_ROWS),
+                tokens=mla_front.G_ROWS
+                * min(mla_front.MAX_REQS, max(K2_MAX_ROWS, FRONT_MAX_ROWS) // mla_front.G_ROWS),
                 nblocks=MAX_BLOCKS,
                 scale=1.0,
             )
