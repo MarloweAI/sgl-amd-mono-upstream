@@ -80,8 +80,8 @@ def test_the_spec_is_tp8_and_at_most_k2_max_rows():
     assert limits.tp_sizes == (8,)
     assert limits.widths == tuple(range(1, K2_MAX_ROWS + 1))
     # With DSpark the runtime serves only the widths that hold whole requests:
-    # block size 5 (6 tokens a request) gives batch sizes 1 .. 8.
-    assert [w // 6 for w in limits.widths if w % 6 == 0] == list(range(1, 9))
+    # block size 5 (6 tokens a request) gives batch sizes 1 .. K2_MAX_ROWS // 6.
+    assert [w // 6 for w in limits.widths if w % 6 == 0] == list(range(1, K2_MAX_ROWS // 6 + 1))
 
 
 def test_the_shapes_are_checked_on_the_text_config():
