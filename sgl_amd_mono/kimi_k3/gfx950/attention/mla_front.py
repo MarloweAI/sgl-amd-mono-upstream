@@ -1,23 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 """``mla_front``: one Kimi-K3 MLA layer's attention under decode context
-parallelism (DCP8), from the AttnRes seam to the V-projected head partials in
-the DCP all-to-all's send layout, for one request's verify block (6 rows). One
-launch a layer, ``BLOCKS`` x ``THREADS``.
+parallelism (DCP8), from the AttnRes seam to the gated core (o_proj's input),
+for one request's verify block (6 rows). One launch a layer, ``BLOCKS`` x
+``THREADS``.
 
 Every rank attends all 96 heads over its own share of the request's keys (rank
 ``pos % 8`` holds position ``pos``), with q computed for every head from the
-replicated q_b and W_UK, as SGLang's DCP MLA forward does. The launch ends where
-SGLang's all-to-all starts: the 96 heads' partials, each V-projected and with
-its natural-log LSE, at ``send[owner][row][local head]`` (``[8, S, 12, 130]``
-bf16; the LSE is fp32 word 64 of a record). It also writes the output gate's
-g_proj and this rank's new KV record.
+replicated q_b and W_UK, as SGLang's DCP MLA forward does. The 96 heads'
+partials, each V-projected and with its natural-log LSE, go to their owner
+ranks (``mla_combine``), whose combine and output gate write ``core``
+[S, 1536] bf16. The launch also writes this rank's new KV record.
 
     CTAs 0 .. 55     the attention-side seam (K1's): slice -> gate -> mix,
                      input_layernorm -> the bf16 x rows (XRDY a slice)
     stage 1, CTAs 56 .. (and 28 groups on seam CTAs)
                      fused_qkv_a (132 groups of 16 rows) and g_proj (96): the
                      raw latent to LAT, a q / kv group's rows' sum of squares to
-                     SS, g_proj to ``gate``
+                     SS, g_proj to G (GRDY a group)
     KV CTA           kv_a_layernorm, e4m3 of the latent and the rope part: the
                      new token this rank owns -> its KV row and NEWKV
     stage 2, every CTA
@@ -31,10 +30,14 @@ g_proj and this rank's new KV record.
                      and bf16 PV (V widened exactly) over 32-key blocks, the
                      online softmax, the new token from NEWKV; a partial (f16,
                      over its own sum) and its (max, sum) to PART / ML
-    W_UV, CTAs 0 .. 127
+    W_UV, CTAs 0 .. 191
                      a (head, 64 value columns) a task: the head's split
                      partials merged in split order to the bf16 latent output,
-                     then W_UV -> ``send``, and the head's LSE
+                     then W_UV; the values and the head's LSE pushed to the
+                     head's owner rank
+    combine, CTAs 192 .. 203
+                     a (request, local head) a task: the 8 ranks' records
+                     combined by their LSEs, gated by sigmoid(g) -> ``core``
 
 Numerics follow SGLang's hand-offs: bf16 x, latent, q_b and absorb outputs, q
 and the KV record in e4m3 at scale 1 (the round-to-nearest-even, non-saturating
@@ -76,7 +79,10 @@ from sgl_amd_mono.common.plan import (
     key_tuple,
     pair_layout,
 )
+from sgl_amd_mono.common import guard
+from sgl_amd_mono.common.ops import load_ptr64, peer_bases
 from sgl_amd_mono.common.sync import Mailbox, sreg
+from sgl_amd_mono.kimi_k3.gfx950.attention import mla_combine as mc
 from sgl_amd_mono.kimi_k3.gfx950.attention.mla_pre import load_qlora, load_x
 from sgl_amd_mono.kimi_k3.gfx950.stages import gemv
 from sgl_amd_mono.kimi_k3.gfx950.stages.dims import COLS, HIDDEN, LDS_PAD, NA, ROWS
@@ -139,6 +145,7 @@ KEYS_PER_SPLIT = 256  # local keys a split aims at
 UV_HALF = 64  # value columns a W_UV task
 UV_TASKS = NHA * (VD // UV_HALF)  # 192
 UV_CTAS = 192  # a W_UV task a CTA, on CTAs 0 .. 191
+COMB0 = UV_CTAS  # the first combine CTA
 UV_ROW = UV_HALF + 8  # bf16 a W_UV tile row in LDS
 ABS_ROW = 128 + 8  # bf16 an absorb tile row in LDS
 OL_ROW = KV + 8  # bf16 a latent output row in LDS
@@ -148,8 +155,9 @@ LOG2E = 1.4426950408889634
 LN2 = 0.6931471805599453
 EMPTY_LSE = -1e30  # SGLang's LSE of a row with no key on this rank
 # start, x seen, stage 1, q latent normed, q_b, absorb, attention q seen,
-# attention done, W_UV partials seen, W_UV done
-TL_POINTS = 14
+# attention done, W_UV partials seen, W_UV done, 4 attention block points,
+# combine g seen, combine records seen, core stored
+TL_POINTS = 17
 
 assert S1_EXTRA <= NA - 1 and KV_CTA >= S1_EXTRA
 
@@ -180,6 +188,9 @@ class MlaFrontBuild:
     kv_eps: float = 1e-6  # kv_a_layernorm
     write_idx: int = -1  # a block-write layer's block: the updated prefix stored there
     timeline: bool = False
+    # checks only: the W_UV records also to ``send`` in SGLang's all-to-all
+    # layout [8, S, 12, 130]
+    records: bool = False
 
 
 def scratch_layout(key: MlaFrontBuild) -> dict:
@@ -194,6 +205,7 @@ def scratch_layout(key: MlaFrontBuild) -> dict:
         "absrdy": ABS,
         "kvrdy": 1,
         "itrdy": ATT_CTAS,
+        "grdy": mc.GATE_GROUPS,
     }
     lay = pair_layout(pairs.items())
     end = max(o + n for o, n in lay.values())
@@ -204,6 +216,7 @@ def scratch_layout(key: MlaFrontBuild) -> dict:
         end = lay[name][0] + nbytes
 
     add("x", s * HIDDEN * 2)
+    add("g", s * GATE * 2)
     add("lat", s * LATW * 2)
     add("qb", s * NHA * QHD * 2)
     add("q8", s * NHA * DQK)
@@ -354,7 +367,7 @@ def stage1(c, g, ops):
     if mine & is_lat:
         _st_bf(c["lat"], t * LATW + g * ROWS + r, v, CM_DEV)
     if mine & (g >= S1_GATE0):
-        _st_bf(a["gate"], t * GATE + (g - S1_GATE0) * ROWS + r, v)
+        _st_bf(a["gate"], t * GATE + (g - S1_GATE0) * ROWS + r, v, CM_DEV)
     gpu.barrier()
     if mine:
         fx.ptr_store(v * v, red + tid)
@@ -935,7 +948,8 @@ def uv_loads(c, task):
 def stage_uv(c, task, wt):
     """Head task // 2's split partials (its group's items) merged in split order
     -> the bf16 latent output in LDS and the head's LSE; then W_UV for value
-    columns 64 (task % 2) .. -> ``send`` (bf16), the LSE word with the first half."""
+    columns 64 (task % 2) ..: the values, and with the first half the LSE, pushed
+    to the head's owner rank."""
     s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
     a = c["args"]
     h = task // 2
@@ -983,7 +997,9 @@ def stage_uv(c, task, wt):
                 (mx + fx.Float32(fmath.log2(lsum))) * fx.Float32(LN2),
                 fx.Float32(EMPTY_LSE),
             )
-            bo.buffer_store(lse, rsrc(a["send"]), ((owner * s + t) * NHL + hl) * (REC // 2) + VD // 2)
+            mc.push_lse(c, owner, hl, t, lse)
+            if const_expr(c["records"]):
+                bo.buffer_store(lse, rsrc(a["send"]), ((owner * s + t) * NHL + hl) * (REC // 2) + VD // 2)
     for i in range_constexpr(8):
         p = tid + THREADS * i
         k = p // 8
@@ -1006,28 +1022,27 @@ def stage_uv(c, task, wt):
                 for q in range_constexpr(4):
                     tot = tot + fx.ptr_load(red + (((2 * q + wave) * 64 + lane) * 8 + 4 * dt + i))
                 vals[2 * i + dt] = tot
-        ob = fx.Vector.from_elements(vals, fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)
         col = half * UV_HALF + 32 * wave + 8 * g
-        bo.buffer_store(ob, rsrc(a["send"]), (((owner * s + r16) * NHL + hl) * REC + col) // 2)
+        mc.push_values(c, owner, hl, r16, col, vals)
+        if const_expr(c["records"]):
+            ob = fx.Vector.from_elements(vals, fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)
+            bo.buffer_store(ob, rsrc(a["send"]), (((owner * s + r16) * NHL + hl) * REC + col) // 2)
     gpu.barrier()
 
 
 # ---------------------------------------------------------------- the launch
 
-ARGS = (
-    "prefix", "blocks", "ares_nw", "ares_qk", "in_nw", "w_qkv", "w_g", "q_nw",
-    "kv_nw", "w_qb", "w_kc", "w_vc", "kv", "kv_idx", "kv_ptr", "g_kv_ptr", "loc",
-    "gate", "send",
-)  # fmt: skip
-
-
 def build(key: MlaFrontBuild):
     if key in _BUILDS:
         return _BUILDS[key]
+    from sgl_amd_mono.kimi_k3.gfx950 import layer as k2_layer
+
     s = key.tokens
     assert s == G_ROWS, s
+    assert COMB0 + mc.combine_tasks(s) <= BLOCKS
     ns = key.nblocks + 1
     lay = scratch_layout(key)
+    flags_off = k2_layer.flags_offset()
     assert s * (HIDDEN + LDS_PAD) * 2 <= 136 * 1024
 
     @fx.struct
@@ -1073,7 +1088,7 @@ def build(key: MlaFrontBuild):
     keyed = key_tuple(key, SOURCES)
     name = (
         f"k3_mono_mla_front_s{s}_nb{key.nblocks}_w{int(key.write_idx >= 0)}"
-        f"_t{int(key.timeline)}"
+        f"_t{int(key.timeline)}_r{int(key.records)}"
     )
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
@@ -1081,8 +1096,9 @@ def build(key: MlaFrontBuild):
         prefix: Int64, blocks: Int64, blk_sm: Int32, blk_sr: Int32, ares_nw: Int64,
         ares_qk: Int64, in_nw: Int64, w_qkv: Int64, w_g: Int64, q_nw: Int64,
         kv_nw: Int64, w_qb: Int64, w_kc: Int64, w_vc: Int64, kv: Int64, kv_idx: Int64,
-        kv_ptr: Int64, g_kv_ptr: Int64, loc: Int64, gate: Int64, send: Int64,
-        scratch: Int64, rank: Int32, layer: Int32, epoch: Int64, tl: Int64,
+        kv_ptr: Int64, g_kv_ptr: Int64, loc: Int64, core: Int64, send: Int64,
+        scratch: Int64, peers: Int64, rank: Int32, a2a_par: Int32, layer: Int32,
+        epoch: Int64, tl: Int64,
     ):  # fmt: skip
         _ = keyed
         tid = fx.thread_idx.x
@@ -1093,6 +1109,9 @@ def build(key: MlaFrontBuild):
         al, gl = role.attn.peek(), role.gemv.peek()
         abl, cl, ul = role.absorb.peek(), role.core.peek(), role.uv.peek()
         mb = Mailbox(step_tag(epoch, layer) - 1)
+        own = load_ptr64(peers, rank)
+        a2a_peer, a2a_own = mc.peer_regions(peer_bases(peers, DCP), own, a2a_par)
+        gbuf = scratch + fx.Int64(lay["g"][0])
         c = {
             "S": s, "NS": ns, "NB": key.nblocks, "tid": tid, "bid": bid,
             "lane": tid % 64, "wave": tid // 64, "delta": False, "debug": False,
@@ -1110,16 +1129,18 @@ def build(key: MlaFrontBuild):
             "ml": scratch + fx.Int64(lay["ml"][0]),
             "kvl": cl.kv.ptr, "pl": cl.p.ptr, "al": cl.alpha.ptr, "mll": cl.ml.ptr,
             "kil": cl.kidx.ptr, "qll": cl.q.ptr,
+            "records": key.records, "gate0": S1_GATE0, "gbuf": gbuf,
+            "a2a_peer": a2a_peer, "a2a_own": a2a_own,
             "args": {
                 "prefix": prefix, "delta": 0, "blocks": blocks, "blk_sm": blk_sm,
                 "blk_sr": blk_sr, "ares_nw": ares_nw, "ares_qk": ares_qk, "in_nw": in_nw,
                 "x_dbg": 0, "w_qkv": w_qkv, "w_g": w_g, "q_nw": q_nw, "kv_nw": kv_nw,
                 "w_qb": w_qb, "w_kc": w_kc, "w_vc": w_vc, "kv": kv, "kv_idx": kv_idx,
-                "kv_ptr": kv_ptr, "g_kv_ptr": g_kv_ptr, "loc": loc, "gate": gate,
-                "send": send, "q_lora": 0,
+                "kv_ptr": kv_ptr, "g_kv_ptr": g_kv_ptr, "loc": loc, "gate": gbuf,
+                "send": send, "core": core, "q_lora": 0,
             },
         }  # fmt: skip
-        for region in ("part", "wgt", "msq", "xrdy", "ss", "qrdy", "absrdy", "kvrdy", "itrdy"):
+        for region in ("part", "wgt", "msq", "xrdy", "ss", "qrdy", "absrdy", "kvrdy", "itrdy", "grdy"):
             c[region] = sreg(scratch, lay[region][0], region)
         on, tls = key.timeline, lds.tls.ptr
         c["on"], c["tls"] = on, tls
@@ -1132,6 +1153,7 @@ def build(key: MlaFrontBuild):
                 opse = s1_loads(c, ge)
                 load_x(c)
                 stage1(c, ge, opse)
+                mc.gate_ready(c, ge)
             if bid == KV_CTA:
                 stage_kv(c)
         if bid >= NA:
@@ -1139,6 +1161,7 @@ def build(key: MlaFrontBuild):
             ops = s1_loads(c, g0)
             load_x(c)
             stage1(c, g0, ops)
+            mc.gate_ready(c, g0)
         stamp(on, tls, tid, 2)
         # stage 2: groups bid + 256 j, each group's weights issued two groups
         # ahead; the absorb tiles go out first, under the q latent's polls
@@ -1174,6 +1197,12 @@ def build(key: MlaFrontBuild):
         if bid < UV_CTAS:
             stage_uv(c, bid, uv_loads(c, bid))
         stamp(on, tls, tid, 9)
+        # the wait on the other ranks' records runs under the launch's guard
+        with guard.scope(
+            guard.Guard(epoch, own=own, peers=peers, rank=rank, npes=DCP, flags_offset=flags_off)
+        ):
+            if (bid >= COMB0) & (bid < COMB0 + mc.combine_tasks(s)):
+                mc.stage_combine(c, bid - COMB0)
         stamp_flush(on, tls, tl, tid, bid, TL_POINTS)
 
     @flyc.jit
@@ -1181,15 +1210,15 @@ def build(key: MlaFrontBuild):
         prefix: Int64, blocks: Int64, blk_sm: Int32, blk_sr: Int32, ares_nw: Int64,
         ares_qk: Int64, in_nw: Int64, w_qkv: Int64, w_g: Int64, q_nw: Int64,
         kv_nw: Int64, w_qb: Int64, w_kc: Int64, w_vc: Int64, kv: Int64, kv_idx: Int64,
-        kv_ptr: Int64, g_kv_ptr: Int64, loc: Int64, gate: Int64, send: Int64,
-        scratch: Int64, rank: Int32, layer: Int32, epoch: Int64, tl: Int64,
-        stream: fx.Stream = _STREAM,
+        kv_ptr: Int64, g_kv_ptr: Int64, loc: Int64, core: Int64, send: Int64,
+        scratch: Int64, peers: Int64, rank: Int32, a2a_par: Int32, layer: Int32,
+        epoch: Int64, tl: Int64, stream: fx.Stream = _STREAM,
     ):  # fmt: skip
         _ = keyed
         mla_front(
             prefix, blocks, blk_sm, blk_sr, ares_nw, ares_qk, in_nw, w_qkv, w_g, q_nw,
-            kv_nw, w_qb, w_kc, w_vc, kv, kv_idx, kv_ptr, g_kv_ptr, loc, gate, send,
-            scratch, rank, layer, epoch, tl,
+            kv_nw, w_qb, w_kc, w_vc, kv, kv_idx, kv_ptr, g_kv_ptr, loc, core, send,
+            scratch, peers, rank, a2a_par, layer, epoch, tl,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)  # fmt: skip
 
     _BUILDS[key] = launch
@@ -1208,15 +1237,18 @@ WEIGHT_SHAPES = {
 
 def mla_front_launch(
     key: MlaFrontBuild, *, prefix, blocks, w, kv, kv_idx, kv_ptr, g_kv_ptr, loc,
-    gate, send, scratch, rank, layer, epoch, tl=None,
+    core, scratch, peers, rank, a2a_par, layer, epoch, send=None, tl=None,
 ):  # fmt: skip
     """Host launcher. ``w``: ares_nw, ares_qk, in_nw, q_nw, kv_nw and the
     ``WEIGHT_SHAPES`` weights (bf16, contiguous); ``kv``: this rank's e4m3 KV
     rows [rows, 576] (row-contiguous); ``kv_idx`` / ``kv_ptr``: the request's
     local rows by position (int32, ragged: SGLang's DCP verify indices);
     ``g_kv_ptr``: its global KV indptr (int32, verify rows included);
-    ``loc``: its rows' KV slots (int64);
-    ``gate`` [S, 1536] bf16 out; ``send`` [8, S, 12, 130] bf16 out."""
+    ``loc``: its rows' KV slots (int64); ``core`` [S, 1536] bf16 out;
+    ``peers``: the int64 table of the DCP ranks' peer buffers (``mla_combine.
+    peer_end`` bytes each, armed), indexed by DCP rank; ``a2a_par``: the
+    layer's MLA ordinal parity; ``send`` [8, S, 12, 130] bf16 out, a
+    ``records`` build only."""
     assert key.write_idx < blocks.shape[1]
     for n, shp in WEIGHT_SHAPES.items():
         t = w[n]
@@ -1226,8 +1258,12 @@ def mla_front_launch(
     assert kv.dtype in (torch.float8_e4m3fn, torch.uint8) and kv.stride(-2) == DQK
     assert kv_idx.dtype == torch.int32 and kv_ptr.dtype == torch.int32
     assert loc.dtype == torch.int64 and g_kv_ptr.dtype == torch.int32
-    assert tuple(send.shape) == (DCP, key.tokens, NHL, REC) and send.dtype == torch.bfloat16
-    assert tuple(gate.shape) == (key.tokens, GATE) and gate.dtype == torch.bfloat16
+    assert tuple(core.shape) == (key.tokens, GATE) and core.dtype == torch.bfloat16
+    assert core.is_contiguous()
+    assert peers.dtype == torch.int64 and peers.numel() == DCP
+    assert (send is not None) == key.records
+    if send is not None:
+        assert tuple(send.shape) == (DCP, key.tokens, NHL, REC) and send.dtype == torch.bfloat16
     f = build(key)
     f(
         prefix.data_ptr(), blocks.data_ptr(), blocks.stride(0), blocks.stride(1),
@@ -1235,9 +1271,9 @@ def mla_front_launch(
         w["w_qkv"].data_ptr(), w["w_g"].data_ptr(), w["q_nw"].data_ptr(),
         w["kv_nw"].data_ptr(), w["w_qb"].data_ptr(), w["w_kc"].data_ptr(),
         w["w_vc"].data_ptr(), kv.data_ptr(), kv_idx.data_ptr(), kv_ptr.data_ptr(),
-        g_kv_ptr.data_ptr(), loc.data_ptr(), gate.data_ptr(), send.data_ptr(),
-        scratch.data_ptr(), rank, layer, epoch.data_ptr(), ptr(tl),
-        stream=torch.cuda.current_stream(),
+        g_kv_ptr.data_ptr(), loc.data_ptr(), core.data_ptr(), ptr(send),
+        scratch.data_ptr(), peers.data_ptr(), rank, a2a_par, layer, epoch.data_ptr(),
+        ptr(tl), stream=torch.cuda.current_stream(),
     )  # fmt: skip
 
 

@@ -26,7 +26,7 @@ class K3MonoRunner:
     def __init__(self, tp: int, rank: int, group, device) -> None:
         from sgl_amd_mono.kimi_k3 import MAX_BLOCKS
         from sgl_amd_mono.kimi_k3.gfx950 import layer
-        from sgl_amd_mono.kimi_k3.gfx950.attention import mla_front
+        from sgl_amd_mono.kimi_k3.gfx950.attention import mla_combine, mla_front
         from sgl_amd_mono.kimi_k3.gfx950.stages import moe
 
         self.tp, self.rank, self.device = tp, rank, device
@@ -53,10 +53,11 @@ class K3MonoRunner:
         # has no queue -- and this is here for the kernel checks' MoE launch.
         self.queue = torch.zeros(moe.QUEUE_BYTES // 4, dtype=torch.int32, device=device)
         # past the two parity halves, the guard's flag word a rank, then K2's
-        # sentinel regions. The kernel reads them at the same offsets, from the
-        # same functions.
-        self.peer = PeerBuffer(layer.peer_alloc_bytes(), group, rank, tp, device)
+        # sentinel regions, then the MLA front's all-to-all cells. The kernels
+        # read them at the same offsets, from the same functions.
+        self.peer = PeerBuffer(mla_combine.peer_end(), group, rank, tp, device)
         layer.init_peer(self.peer.bytes)
+        mla_combine.init_peer(self.peer.bytes)
         # One prefix buffer, not one a layer: the layers run in sequence.
         self.prefix = torch.empty(
             MAX_ROWS, layer.HIDDEN, dtype=torch.bfloat16, device=device
