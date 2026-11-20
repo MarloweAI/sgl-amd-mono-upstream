@@ -49,6 +49,7 @@ from sgl_amd_mono.kimi_k3.gfx950.stages import gemv as gemv
 from sgl_amd_mono.kimi_k3.gfx950.stages import moe as k2b
 from sgl_amd_mono.kimi_k3.gfx950.stages import oproj as k2a
 from sgl_amd_mono.kimi_k3.gfx950.stages.dims import COLS, HIDDEN, NA
+from sgl_amd_mono.kimi_k3.gfx950.stages import seam as tail_seam
 from sgl_amd_mono.kimi_k3.gfx950.stages.seam import (
     slice_loads,
     stage_gate,
@@ -75,11 +76,16 @@ SD0 = k2b.DOWN_TASKS  # 224: the shared down's CTAs
 # timeline points: 0 start, 1 o_proj done / AR reduced, 2 early done / slice,
 # 3 ug, 4 down/sdown, 5 lnorm, 6 up, 7 reduce, 8 gate, 9 mix (x published),
 # 10 route, 11 route table, 12 latent quant, 13 route starts
-TL_POINTS = 27  # + 20-24 router: x / LDS / GEMV / parts / pushed; + 14 route logits in, 15 INTER loaded, 16 down done, 17-19 route keys / select / rank
+TL_POINTS = 30  # + 20-24 router: x / LDS / GEMV / parts / pushed; + 14 route logits in, 15 INTER loaded, 16 down done, 17-19 route keys / select / rank
 TL_OPROJ = (
     25  # o_proj CTAs: the last task's GEMV done, before its AR pushes (point 1: pushed)
 )
 TL_AR_WAIT = 26  # AttnRes CTAs: the AR poll starts (point 1: reduced)
+# the tail seam (``K2Build.tail``): reduce CTAs' TPART pushed; row CTAs' gate
+# (TPART in), x stored
+TL_TAIL_PART = 27
+TL_TAIL_GATE = 28
+TL_TAIL_X = 29
 
 assert E0 + k2b.R_TASKS + k2b.L_TASKS <= BLOCKS and k2b.G_TASKS <= E0 - O0
 
@@ -114,6 +120,21 @@ NARROW_ROWS = (
 _STREAM = fx.Stream(None)
 
 
+class TailSeam(msgspec.Struct, frozen=True):
+    """The next layer's attention-side AttnRes seam and input_layernorm, run in
+    this launch's tail (``stages/seam.py``: ``tail_slice``, ``tail_row``) on the
+    stream its final reduce writes: the next layer's x, for its K1 (the wide
+    form) with no front. Its bank blocks are this launch's ``nblocks``; the next layer's
+    weights and x come in the ``tail`` argument (``TAIL_ARGS``)."""
+
+    eps: float = 1e-5  # the next layer's self_attention_res_norm
+    out_eps: float = 1e-5  # its input_layernorm
+    tiles: int = 1  # x in ``kda_wide.pack_x``'s layout over this many tiles
+
+
+TAIL_ARGS = tail_seam.TAIL_ARGS  # ``tail``'s device table
+
+
 class K2Build(msgspec.Struct, frozen=True):
     tokens: int
     nblocks: int  # the MLP AttnRes block sources
@@ -144,6 +165,8 @@ class K2Build(msgspec.Struct, frozen=True):
     # BLOCKS - o_shift .. + O_TWO0 - 1 take one task, the rest two (a launch
     # whose CTAs there carry other work first)
     o_shift: int = 0
+    # the next layer's attention seam in this launch's tail (``TailSeam``)
+    tail: TailSeam | None = None
 
 
 def peer_layout(s):
@@ -233,7 +256,9 @@ def scratch_regions(rows: int = K2_MAX_ROWS, front_rows: int = K2_MAX_ROWS) -> d
     - ``k1``: K1's own launches (``k1.scratch_bytes``);
     - ``mla_pre``: the MLA projection front;
     - ``front``: the DCP MLA front (``mla_front.scratch_layout`` inside it);
-    - ``attn``: the one-launch KDA layer's attention, then its core.
+    - ``attn``: the one-launch KDA layer's attention, then its core;
+    - ``tpart``, ``tstream``: K2's tail seam, its slices' partials and the
+      stream rows it pushes (``tail_part_bytes``, ``tail_stream_bytes``).
 
     Every launch takes its offset from here, and the end sizes the runner's
     allocation (``scratch_alloc_bytes``)."""
@@ -259,12 +284,26 @@ def scratch_regions(rows: int = K2_MAX_ROWS, front_rows: int = K2_MAX_ROWS) -> d
             kda_layer.region_bytes(kw.KdaWideBuild(tokens=s, qlen=kw.WT, front=True, nblocks=MAX_BLOCKS))
             for s in range(k1.WIDE_FROM_REQS * kw.WT, rows + 1, kw.WT)
         ),
+        # K2's tail seam (``TailSeam``): the slices' partials and the stream rows
+        "tpart": tail_part_bytes(rows),
+        "tstream": tail_stream_bytes(rows),
     }
     out, off = {}, 0
     for name, n in sizes.items():
         out[name] = (off, n)
         off = -(-(off + n) // 4096) * 4096
     return out
+
+
+def tail_part_bytes(rows: int) -> int:
+    """TPART at ``rows`` rows: a tagged pair a (slice, token, partial) at the
+    deepest bank."""
+    return NA * rows * tail_seam.front_nq(MAX_BLOCKS + 1) * 8
+
+
+def tail_stream_bytes(rows: int) -> int:
+    """TSTREAM at ``rows`` rows: a tagged pair a bf16 pair of a stream row."""
+    return rows * HIDDEN // 2 * 8
 
 
 def scratch_region(scratch, name: str):
@@ -354,6 +393,7 @@ K2_ARGS = (
     "epoch",
     "layer",
     "tl",
+    "tail",
 )  # k2_body's ``args``: the K2 kernel's parameters
 
 
@@ -450,6 +490,10 @@ def lds_types(key: K2Build) -> K2LdsTypes:
     class PartsLds:
         rlp: fx.Array[fx.Float32, k2b.R_PARTS * k2b.E, 16]
 
+    @fx.struct
+    class TailLds:  # the tail seam: the stream the reduce CTA reduced, bf16 pairs
+        pre: fx.Array[fx.Int32, s * COLS // 2, 16]
+
     @fx.union
     class StageLds:
         early: EarlyLds
@@ -458,6 +502,7 @@ def lds_types(key: K2Build) -> K2LdsTypes:
         down: DownLds
         parts: PartsLds  # the route's router parts (OPT_RLOG_PARTS), after the mix
         table: TableLds
+        tail: TailLds
 
     @fx.struct
     class Smem:
@@ -503,6 +548,7 @@ def k2_body(key: K2Build, k2_lds: K2Lds, scratch_base, args: dict) -> None:
     epoch = args["epoch"]
     layer = args["layer"]
     tl = args["tl"]
+    tail = args["tail"]
     s, ns = key.tokens, key.nblocks + 1
     lay = scratch_layout(key)
     play = peer_layout(s)
@@ -683,6 +729,21 @@ def k2_body(key: K2Build, k2_lds: K2Lds, scratch_base, args: dict) -> None:
             "dnd",
         ):
             c[region] = sreg(scratch_base, lay[region][0], region)
+        if const_expr(key.tail is not None):
+            c["tpre"] = st.tail.peek().pre.ptr
+            regions = scratch_regions()
+            c["tstream"] = sreg(scratch_base, regions["tstream"][0], "tstream")
+            # the tail's own copy: the next layer's seam weights and eps
+            tc = {
+                **c,
+                "eps": key.tail.eps,
+                "out_eps": key.tail.out_eps,
+                "tail": key.tail,
+                "tail_tab": tail,
+                "tpart": sreg(scratch_base, regions["tpart"][0], "tpart"),
+                "poll_issue": mb.poll_issue,
+                "poll_wait": mb.poll_wait,
+            }
         on, tls = key.timeline, lds.tls.ptr
         stamp_begin(on, tls, tid, TL_POINTS)
         # ---- o_proj on every CTA past AttnRes's
@@ -793,8 +854,26 @@ def k2_body(key: K2Build, k2_lds: K2Lds, scratch_base, args: dict) -> None:
         stamp(on, tls, tid, 6)
         if const_expr(key.reduce):  # noqa: SIM102 (traced: `and` does not combine traced values)
             if (bid >= k2b.RED0) & (bid < k2b.RED0 + k2b.RED_TASKS):
+                if const_expr(key.tail is not None):
+                    # the slice's bank and weight loads in flight across FINAL's poll
+                    tld = tail_seam.tail_loads(tc, bid - k2b.RED0)
                 k2b.stage_reduce(c, bid - k2b.RED0)
-        stamp(on, tls, tid, 7)
+                if const_expr(key.tail is not None):
+                    stamp(on, tls, tid, 7)
+                    tail_seam.tail_slice(tc, bid - k2b.RED0, tld)
+                    stamp(on, tls, tid, TL_TAIL_PART)
+        if const_expr(key.tail is not None):
+            row = bid - tail_seam.TAIL_ROW0
+            if (row >= 0) & (row < s):
+                rld = tail_seam.row_loads(tc, row)
+                tail_seam.tail_row(tc, row, rld, lambda: stamp(on, tls, tid, TL_TAIL_GATE))
+                stamp(on, tls, tid, TL_TAIL_X)
+        if const_expr(key.tail is None):
+            stamp(on, tls, tid, 7)
+        else:
+            # a reduce CTA stamped its reduce before its tail work
+            if (bid < k2b.RED0) | (bid >= k2b.RED0 + k2b.RED_TASKS):
+                stamp(on, tls, tid, 7)
         stamp_flush(on, tls, tl, tid, bid, TL_POINTS)
 
 
@@ -813,6 +892,7 @@ def build(key: K2Build):
         + (f"_o{key.opt}" if key.opt else "")
         + ("_cb" if key.core_box else "")
         + (f"_os{key.o_shift}" if key.o_shift else "")
+        + (f"_tl{key.tail.tiles}" if key.tail is not None else "")
     )
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
@@ -846,6 +926,7 @@ def build(key: K2Build):
         epoch: Int64,
         layer: Int32,
         tl: Int64,
+        tail: Int64,
     ):
         _ = keyed
         alloc = fx.SharedAllocator()
@@ -886,6 +967,7 @@ def build(key: K2Build):
                     epoch,
                     layer,
                     tl,
+                    tail,
                 ),
             )
         )
@@ -922,6 +1004,7 @@ def build(key: K2Build):
         epoch: Int64,
         layer: Int32,
         tl: Int64,
+        tail: Int64,
         stream: fx.Stream = _STREAM,
     ):
         _ = keyed
@@ -955,6 +1038,7 @@ def build(key: K2Build):
             epoch,
             layer,
             tl,
+            tail,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 
     _BUILDS[key] = launch
@@ -998,13 +1082,15 @@ def k2_launch(
     tl=None,
     prefix_in=None,
     attn=None,
+    tail=None,
 ):
     """Host launcher: ``core`` [S, key.kin] bf16 (o_proj's input; rows may be
     strided, 16-B aligned), ``prefix`` updated in
     place (read from ``prefix_in`` when given), ``out`` the MoE output [S, 7168]
     (plus the updated prefix under ``key.fold``); MoE weights as ``moe``.
     ``attn`` (``kda_layer.Attn``): the layer's KDA attention in the same launch,
-    its core into ``core`` (``kda_layer.core_view``; ``key.core_box``)."""
+    its core into ``core`` (``kda_layer.core_view``; ``key.core_box``).
+    ``tail``: ``key.tail``'s int64 device table (``TAIL_ARGS``)."""
     assert (
         w_o.shape == (HIDDEN, key.kin)
         and key.kin % 128 == 0
@@ -1019,6 +1105,10 @@ def k2_launch(
     assert not key.opt & OPT_TAG_X or scratch.numel() >= scratch_alloc_bytes(), (
         "OPT_TAG_X without scratch_alloc_bytes of scratch"
     )
+    assert (key.tail is None) == (tail is None), "a tail build takes its table, and only it"
+    if tail is not None:
+        assert tail.dtype == torch.int64 and tail.numel() == len(TAIL_ARGS) and tail.is_cuda
+        assert key.reduce and key.fold, "the tail seam slices the stream the fold writes"
     vals = (
         core.data_ptr(),
         core.stride(0),
@@ -1049,6 +1139,7 @@ def k2_launch(
         epoch.data_ptr(),
         layer,
         ptr(tl),
+        ptr(tail),
     )
     if attn is not None:
         from sgl_amd_mono.kimi_k3.gfx950 import kda_layer

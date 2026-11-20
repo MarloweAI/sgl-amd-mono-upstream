@@ -40,6 +40,12 @@ the ring (written). So it stages no conv buffer and hands nothing back at
 ``finish``. It reads x from a buffer of the width that its front writes in
 ``pack_x``'s layout.
 
+**The seam in the previous layer's K2** (``layer.TailSeam``): where the layer
+before is a KDA layer, its K2 computes this wide-form layer's attention seam and
+``input_layernorm`` in its tail and writes x (``x_view``: the width's buffer of
+this layer's parity, ``pack_x``'s layout), and this layer's K1 is built with no
+front (``front_less``). The spec decides it by layer position (``spec._tails``).
+
 Both forms read in_proj in ``kda_wide.pack_w_in``'s layout, the layer's own
 in_proj packed in place at build (``inproj.py``, which also routes SGLang's
 attention on a packed layer).
@@ -199,7 +205,9 @@ class K1Batch(msgspec.Struct):
 
     layers: Any  # the K1Layer list, in layer order
     conv: Any  # [n, 3 * PROJ, state_len], one row a layer (None: the wide form)
-    x: Any = None  # the wide form's x, ``pack_x``'s layout, one buffer the width
+    # the wide form's x, [layer parity, 16 tiles, 7168] in ``pack_x``'s layout
+    # (its front, or the previous layer's K2 tail, writes it)
+    x: Any = None
     idx: Any = None  # int64 [n]: those layers' indices into the state pools
     where: Any = None  # int64: the rows that engage, None when every one does
     where_key: Any = None  # the engaged layer ids `where` was built for
@@ -280,6 +288,30 @@ def is_wide(packed) -> bool:
     from sgl_amd_mono.kimi_k3.gfx950.attention import kda_wide as kw
 
     return isinstance(packed.key, kw.KdaWideBuild)
+
+
+def engages(packed) -> bool:
+    """Whether a K1Layer's width is one a verify step can engage at: the wide
+    form's, or one request's verify rows. A width K1 declines at every step
+    (another row count) runs SGLang's attention."""
+    return is_wide(packed) or packed.key.tokens == packed.key.qlen == _draft_tokens()
+
+
+def x_view(batch: K1Batch, packed) -> torch.Tensor:
+    """A wide-form layer's x: its parity's copy, so a layer's K2 tail writes the
+    next layer's while its own launch may still read its own."""
+    return batch.x[packed.i % 2]
+
+
+def front_less(packed) -> None:
+    """This wide-form layer's K1 without its seam front: the previous layer's
+    K2 tail computes its x (``layer.TailSeam``), which it reads from ``x_view``."""
+    import dataclasses
+
+    assert is_wide(packed) and packed.key.write_idx < 0 and packed.key.aux_slot < 0, (
+        "a block-write or aux front stays in K1"
+    )
+    packed.key = dataclasses.replace(packed.key, front=False)
 
 
 def _draft_tokens() -> int:
@@ -456,8 +488,8 @@ def build_batch(packed_layers, device) -> Optional[K1Batch]:
 
         assert all(is_wide(k) for k in ks), "a width's K1 layers are of one form"
         nt = kw.tiles(ks[0].key)
-        # rows past the width stay zero; the front writes the width's rows
-        x = torch.zeros(16 * nt, HIDDEN, dtype=torch.bfloat16, device=device)
+        # rows past the width stay zero; the front (or the K2 tail) writes the width's rows
+        x = torch.zeros(2, 16 * nt, HIDDEN, dtype=torch.bfloat16, device=device)
         return K1Batch(layers=ks, conv=None, x=x)
     sl = ks[0].key.state_len
     assert all(k.key.state_len == sl for k in ks), "the K1 layers disagree on state_len"
@@ -563,6 +595,7 @@ def warmup(runner, packed: K1Layer, prefix, blocks, k2=None) -> None:
         delta=None,
         blocks=blocks,
         **_weight_args(packed),
+        aux=_aux_standin(packed.key, rows, device),
         rstate=torch.zeros(
             slots, kda.NH, kda.HD, kda.HD, dtype=torch.float32, device=device
         ),
@@ -650,9 +683,19 @@ def _warmup_wide(runner, packed: K1Layer, prefix, blocks, k2=None) -> None:
         ),
         layer=packed.i,
         epoch=runner.epoch,
-        prefix=prefix,
-        blocks=blocks,
+        prefix=prefix if key.front else None,
+        blocks=blocks if key.front else None,
+        aux=_aux_standin(key, rows, device),
     )
+
+
+def _aux_standin(key, rows: int, device):
+    """A warmup's throwaway aux buffer, where the build stores an aux slot."""
+    from sgl_amd_mono.kimi_k3.gfx950.stages.seam import AUX_ROW
+
+    if key.aux_slot < 0:
+        return None
+    return torch.zeros(rows, AUX_ROW, dtype=torch.bfloat16, device=device)
 
 
 def prepare(batch: Optional[K1Batch], forward_batch) -> Optional[dict]:
@@ -736,7 +779,7 @@ def prepare(batch: Optional[K1Batch], forward_batch) -> Optional[dict]:
         st["wide_slots"] = slots[:reqs].to(torch.int32)
         st["wide_rows"] = rows[:reqs].to(torch.int32)
         st["reqs"] = num_reqs
-        st["wide_x"] = batch.x
+        st["batch"] = batch
         return st
     # One request a launch, so one slot and one state row for the whole step.
     slot = slots[:1].long()
@@ -987,10 +1030,11 @@ def covered(packed: K1Layer, prefix, attn_res, state) -> bool:
     return True
 
 
-def launch(runner, packed: K1Layer, prefix, attn_res, state, k2=None) -> torch.Tensor:
+def launch(runner, packed: K1Layer, prefix, attn_res, state, k2=None, aux=None) -> torch.Tensor:
     """Run K1 and return this layer's gated core output. A one-launch layer
     runs inside ``k2(core, attn)``, the layer's K2 launch given the core
-    buffer and the attention part (``kda_layer.Attn``).
+    buffer and the attention part (``kda_layer.Attn``). ``aux``: the drafter's
+    packed aux buffer, whose slot ``key.aux_slot`` the front fills.
 
     Every index below stays on the device. Reading one out with ``int()`` is a
     host sync, which a CUDA graph capture rejects, and this runs inside a
@@ -1000,7 +1044,7 @@ def launch(runner, packed: K1Layer, prefix, attn_res, state, k2=None) -> torch.T
     from sgl_amd_mono.kimi_k3.gfx950.attention import kda
 
     if is_wide(packed):
-        return _launch_wide(runner, packed, prefix, attn_res, state, k2)
+        return _launch_wide(runner, packed, prefix, attn_res, state, k2, aux)
     qlen = packed.key.qlen
     device = prefix.device
     # prepare() filled the conv window for every layer, and the SSM scratch
@@ -1027,6 +1071,7 @@ def launch(runner, packed: K1Layer, prefix, attn_res, state, k2=None) -> torch.T
         delta=None,
         blocks=attn_res.block_residual,
         **_weight_args(packed),
+        aux=aux,
         rstate=rstate,
         st_idx=state["st_idx_i32"],
         num_acc=state["num_acc"],
@@ -1056,14 +1101,14 @@ def launch(runner, packed: K1Layer, prefix, attn_res, state, k2=None) -> torch.T
     return core
 
 
-def _launch_wide(runner, packed: K1Layer, prefix, attn_res, state, k2=None) -> torch.Tensor:
+def _launch_wide(runner, packed: K1Layer, prefix, attn_res, state, k2=None, aux=None) -> torch.Tensor:
     """The wide form on this layer's state; returns the gated core output."""
     mi = packed.mamba_idx
     core = _run_wide(
         runner,
         packed,
         k2,
-        x=state["wide_x"],
+        x=x_view(state["batch"], packed),
         **_wide_args(packed),
         conv_state=state["committed_conv"][mi].mT,
         rstate=state["committed_ssm"][mi],
@@ -1074,8 +1119,9 @@ def _launch_wide(runner, packed: K1Layer, prefix, attn_res, state, k2=None) -> t
         # K2 takes slot 128 + i (see launch())
         layer=packed.i,
         epoch=runner.epoch,
-        prefix=prefix,
-        blocks=attn_res.block_residual,
+        prefix=prefix if packed.key.front else None,
+        blocks=attn_res.block_residual if packed.key.front else None,
+        aux=aux,
     )
     if packed.key.write_idx >= 0:
         attn_res._count_write(None)  # the front wrote the bank row

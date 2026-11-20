@@ -2286,6 +2286,9 @@ def stage_reduce(c, j):
     fold = c.get("fold", False)
     # the MoE launch has no prefix: only the layer launch's fold reads it
     prefix = c["args"]["prefix"] if fold else None
+    # K2's tail (``seam.tail_slice``): the stream also into LDS, and to the row
+    # CTAs as tagged pairs
+    tpre = c.get("tpre")
     n = s * 64
     for i in range_constexpr((n + THREADS - 1) // THREADS):
         idx = tid + THREADS * i
@@ -2319,6 +2322,9 @@ def stage_reduce(c, j):
                 .bitcast(fx.Int32)[0]
             )
             bo.buffer_store(w, rsrc(c["args"]["out"]), (t * HIDDEN + col) // 2)
+            if const_expr(tpre is not None):
+                fx.ptr_store(w, tpre + (t * 64 + cp))
+                c["put_words"](c["tstream"], (t * HIDDEN + col) // 2, [w])
             if const_expr(sent_final):
                 rearm_sent(
                     c["finals_own"],

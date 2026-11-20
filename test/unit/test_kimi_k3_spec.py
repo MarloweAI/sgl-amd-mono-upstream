@@ -242,6 +242,19 @@ def test_the_scratch_regions_are_disjoint_at_every_width(rows, front_rows):
         for nb in blocks:
             akey = kw.KdaWideBuild(tokens=s, qlen=kw.WT, front=True, nblocks=nb)
             assert kda_layer.region_bytes(akey) <= reg["attn"][1], (s, nb)
+    # K2's tail seam: TPART a pair a (slice, token, partial), TSTREAM a pair a
+    # bf16 pair of every stream row, at the widest step and deepest bank
+    from sgl_amd_mono.kimi_k3.gfx950.stages import seam
+    from sgl_amd_mono.kimi_k3.gfx950.stages.dims import NA
+
+    for s in range(1, rows + 1):
+        for nb in blocks:
+            assert NA * s * seam.front_nq(nb + 1) * 8 <= reg["tpart"][1], (s, nb)
+        assert s * HIDDEN // 2 * 8 <= reg["tstream"][1], s
+    # and K2's own layout keeps none of them, tail or not
+    for s in range(1, rows + 1):
+        tail = layer.K2Build(tokens=s, nblocks=MAX_BLOCKS, core_box=True, tail=layer.TailSeam())
+        assert layer.scratch_bytes(tail) <= reg["k2"][1]
 
 
 def test_every_launch_takes_its_region_from_the_one_layout():

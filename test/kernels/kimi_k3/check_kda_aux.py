@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The DSpark aux capture from the KDA seam (``KdaWideBuild.aux_slot``): at the
+"""The DSpark aux capture from the KDA seam (``KdaWideBuild.aux_slot``, and the
+one-request form's ``KdaPreBuild.aux_slot``): at the
 layer after each captured target layer (7 / 23 / 51 / 67 / 83), the front's
 pre-norm AttnRes mixture into ``aux_hidden_states_buffer[row, j * 7168 ..]``,
 against SGLang's capture (``aggregate_stream_hip``: ``attn_res_hip`` with no
@@ -25,6 +26,79 @@ from check_kda_layer import Front, seam_weights  # noqa: E402
 
 LAYERS = (8, 24, 52, 68, 84)  # slot j's layer
 BLOCK = 12  # attn_res_block_size
+
+
+def judge(r, got, ref):
+    """bf16 steps apart at the element and at its row's scale."""
+    steps = (got.view(torch.int16).int() - ref.view(torch.int16).int()).abs()
+    row_step = ref.float().abs().amax(dim=1, keepdim=True) * 2.0**-7
+    d = (got.float() - ref.float()).abs()
+    r["max_bf16_steps"] = int(steps.max())
+    r["max_row_steps"] = float((d / row_step).max())
+    r["ok"] = r["max_row_steps"] <= 1 and r["others_untouched"] and r["x_unchanged"]
+    return r
+
+
+def one_request(copy, j, layer, device, gen, attn_res_hip):
+    """The one-request form (``kda.py``, 6 rows): its front's mixture, the same
+    checks."""
+    import dataclasses
+
+    from sgl_amd_mono.kimi_k3.gfx950.attention import kda
+    from sgl_amd_mono.kimi_k3.gfx950.attention import kda_wide as kw
+
+    S, nb = kc.L, -(-layer // BLOCK)
+    w = kc.load_layer(copy, layer, device)
+    sw = seam_weights(copy, layer, device, gen)
+    cw = (sw["ares_nw"].float() * sw["ares_qk"].float()).contiguous()
+    g = torch.Generator(device=device).manual_seed(950 + layer)
+    stream = (torch.randn(S, kc.H, generator=g, device=device) * 0.3).to(kc.BF)
+    blocks = (torch.randn(S, nb + 1, kc.H, generator=g, device=device) * 0.3).to(kc.BF)
+    ref = torch.empty_like(stream)
+    attn_res_hip(stream, blocks, cw, None, ref, nb, kc.EPS, 0.0)
+    key = kda.KdaPreBuild(
+        tokens=S, qlen=S, nblocks=nb, delta=False, state_len=S + kda.CONV_W - 1, eps=kc.EPS,
+        out_eps=kc.EPS, onorm_eps=kc.EPS, lower_bound=kc.LB, ring=True,
+    )  # fmt: skip
+    w_in = kw.pack_w_in(w["w_in"])
+    # K1's own conv buffer, which the launch rolls: a fresh copy a run
+    conv = (torch.randn(1, 3 * kda.PROJ, S + kda.CONV_W - 1, generator=g, device=device) * 0.5).to(kc.BF)
+    rstate = torch.randn(2, kda.NH, kda.HD, kda.HD, generator=g, device=device) * 0.05
+    outs = {}
+    for slot in (-1, j):
+        k = dataclasses.replace(key, aux_slot=slot)
+        aux = torch.full((S, 5 * kc.H), 7.0, dtype=kc.BF, device=device) if slot >= 0 else None
+        ring = (
+            torch.zeros(2, kda.NH, kc.RING_LEN, kda.HD, dtype=kc.BF, device=device),
+            torch.zeros(2, kda.NH, kc.RING_LEN, kda.HD, dtype=kc.BF, device=device),
+            torch.zeros(2, kda.NH, kc.RING_LEN, kda.HD, dtype=torch.float32, device=device),
+            torch.zeros(2, kda.NH, kc.RING_LEN, dtype=torch.float32, device=device),
+        )
+        scratch = torch.zeros(kda.scratch_bytes(k), dtype=torch.uint8, device=device)
+        core = torch.empty(S, kda.PROJ, dtype=kc.BF, device=device)
+        kda.kda_pre(
+            k, prefix=stream, delta=None, blocks=blocks, w_in=w_in, w_fb=w["w_fb"],
+            conv_w=w["conv_w"], conv_state=conv.clone().expand(2, -1, -1), a_log=w["a_log"],
+            dt_bias=w["dt_bias"], on_w=w["on_w"], rstate=rstate,
+            st_idx=torch.ones(1, S, dtype=torch.int32, device=device),
+            num_acc=torch.ones(1, dtype=torch.int32, device=device), ring=ring, core_out=core,
+            scratch=scratch, layer=layer, epoch=torch.ones(1, dtype=torch.int32, device=device),
+            aux=aux, **sw,
+        )  # fmt: skip
+        torch.cuda.synchronize()
+        off, n = kda.scratch_layout(k)["x"]
+        outs[slot] = (scratch[off : off + n].view(kc.BF).view(S, kc.H).clone(), core.clone(), aux)
+    aux = outs[j][2]
+    got = aux[:, j * kc.H : (j + 1) * kc.H]
+    others = torch.cat([aux[:, : j * kc.H], aux[:, (j + 1) * kc.H :]], dim=1)
+    r = {
+        "form": "one-request", "layer": layer, "slot": j, "R": 1, "nvb": nb,
+        "vs_sglang": kc.cmp(got, ref),
+        "others_untouched": bool((others == 7.0).all()),
+        "x_unchanged": bool(torch.equal(outs[j][0], outs[-1][0]))
+        and bool(torch.equal(outs[j][1], outs[-1][1])),
+    }  # fmt: skip
+    return judge(r, got, ref)
 
 
 def main():
@@ -88,6 +162,10 @@ def main():
             r["ok"] = r["max_row_steps"] <= 1 and r["others_untouched"] and r["x_unchanged"]
             bad += not r["ok"]
             print("KDA_AUX", json.dumps(r), flush=True)
+    for j, layer in enumerate(LAYERS):
+        r = one_request(args.copy, j, layer, device, gen, attn_res_hip)
+        bad += not r["ok"]
+        print("KDA_AUX_ONE", json.dumps(r), flush=True)
     print("KDA_AUX_DONE", "fail" if bad else "pass", flush=True)
     sys.exit(1 if bad else 0)
 

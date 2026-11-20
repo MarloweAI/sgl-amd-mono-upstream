@@ -147,9 +147,13 @@ SGLANG_READS = {
     ),
     # the attention stops here and the launch runs o_proj; both attention
     # classes expose it. The rest are what the forward and the checks read.
+    "srt/layers/aux_hidden_states.py": ("AuxHiddenStatePacker",),
+    "srt/model_executor/forward_batch_info.py": ("aux_hidden_states_buffer",),
     "srt/models/kimi_k3.py": (
-        "AuxHiddenStateList",
         "_cdiv",
+        "_dspark_capture_stream",
+        "dspark_layers_to_capture",
+        "set_dspark_layers_to_capture",
         "forward_pre_o_proj",
         "use_latent_moe",
         "routed_expert_norm",
@@ -379,12 +383,89 @@ def _build(model, hf_config, ctx):
         # runs the same launches in the same order, so the peer waits pair up
         # exactly as they do on a served step.
         #
-        # K1's conv rows come from its batch, so that is built first.
+        # K1's conv rows come from its batch, so that is built first, and the
+        # tails write the batch's x.
         batches[rows] = k1_mod.build_batch(layers[rows], device)
+        _tails(layers[rows], batches[rows], device)
         _warmup(runner, layers[rows], rows)
     # SGLang's attention on the packed layers (inproj.py): its verify launches
     inproj.for_device(device).warmup(k1_mod._draft_tokens())
-    return _Built(model, runner, layers, batches)
+    built = _Built(model, runner, layers, batches)
+    _follow_captures(model, built)
+    return built
+
+
+def _tails(packed_layers: dict, batch, device) -> None:
+    """Move a KDA layer's attention-side seam into the previous layer's K2 tail,
+    by layer position: the previous layer is covered (its K2 is this package's
+    layer launch at every routed width, a KDA layer's and an MLA layer's alike:
+    the MLA front is a launch of its own that ends at the core), this layer's
+    K1 is the wide form (2 to 8 requests: 12 rows today), and it is not a
+    block-write layer (whose front writes a bank row its own K2 then reads).
+    Every other layer keeps the seam in its own front: layer 1 (the dense
+    layer's stream), the block-write layers, the one-request form (6 rows: its
+    front overlaps its in_proj stream, so the move costs more in the tail than
+    it saves, tier 0 2026-11-20), every width K1 declines at, where SGLang's
+    layer runs its own seam, and (``_Built.set_aux``) a layer whose front forms
+    a DSpark capture. On Kimi-K3 that is 60 of the 69 KDA layers, 57 with
+    DSpark's captures (layers 8, 52, 68 keep their fronts).
+
+    A K1 that declines a step (no speculative state) runs SGLang's attention,
+    which forms its own seam; the x the tail left is then unread."""
+    import msgspec
+
+    from sgl_amd_mono.kimi_k3.gfx950 import k1 as k1_mod
+    from sgl_amd_mono.kimi_k3.gfx950 import layer as k2
+    from sgl_amd_mono.kimi_k3.gfx950.attention import kda_wide as kw
+
+    for i, packed in packed_layers.items():
+        prev, k1 = packed_layers.get(i - 1), packed.k1
+        if (
+            prev is None
+            or k1 is None
+            or not k1_mod.is_wide(k1)
+            or packed.module.is_block_write_layer
+        ):
+            continue
+        # the next layer's seam reads the blocks this K2's seam read
+        assert prev.key.nblocks == k1.key.nblocks, (i, prev.key.nblocks, k1.key.nblocks)
+        k1_mod.front_less(k1)
+        m = packed.module
+        prev.key = msgspec.structs.replace(
+            prev.key,
+            tail=k2.TailSeam(
+                eps=m.self_attention_res_norm.variance_epsilon,
+                out_eps=m.input_layernorm.variance_epsilon,
+                tiles=kw.tiles(k1.key),
+            ),
+        )
+        ptrs = {
+            "ares_nw": m.self_attention_res_norm.weight,
+            "ares_qk": m.self_attention_res_proj.weight,
+            "in_nw": m.input_layernorm.weight,
+            "x": k1_mod.x_view(batch, k1),
+        }
+        prev.tail = torch.tensor(
+            [ptrs[n].data_ptr() for n in k2.TAIL_ARGS], dtype=torch.int64, device=device
+        )
+
+
+def _follow_captures(model, built) -> None:
+    """DSpark's capture layers are set after the build (SGLang's attention
+    backend setup, before any graph capture): when they are, the K1 fronts
+    that form a captured layer's mixture store it too (``_Built.set_aux``)."""
+    caps = getattr(_backbone(model), "dspark_layers_to_capture", None)
+    if caps:
+        built.set_aux(caps)
+    inner = getattr(model, "set_dspark_layers_to_capture", None)
+    if inner is None:
+        return
+
+    def set_dspark_layers_to_capture(layer_ids):
+        inner(layer_ids)
+        built.set_aux(_backbone(model).dspark_layers_to_capture or ())
+
+    model.set_dspark_layers_to_capture = set_dspark_layers_to_capture
 
 
 def _warmup(runner, packed_layers: dict, rows: int) -> None:
@@ -550,6 +631,9 @@ class _Layer(msgspec.Struct):
     key: Any
     module: Any  # the KimiK3DecoderLayer, for the tensors read per step
     k1: Any = None  # the KDA front launch (gfx950/k1.py), where it applies
+    # the next layer's seam in this K2's tail: ``key.tail``'s device table
+    # (``layer.TAIL_ARGS``), set by ``_tails``
+    tail: Any = None
     mla: Any = None  # (MlaPreBuild, weights): an MLA layer's projection front
     # (MlaFrontBuild, weights): an MLA layer's attention under DCP8, up to the
     # gated core (gfx950/attention/mla_front.py)
@@ -926,6 +1010,7 @@ def _k2_launch(
         out=out,
         prefix_in=prefix_in,
         attn=attn,
+        tail=packed.tail,
         **runner.launch_args(),
         # One tag a layer: a layer takes at most one launch in a step.
         layer=128 + packed.i,
@@ -1047,6 +1132,8 @@ class _Built:
         # This step's shared K1 state and the layers that took it, set by
         # _backbone before the first layer and read by _core and finish().
         self._k1_state, self._k1_engaged = None, []
+        # This step's DSpark captures: (packer, its buffer), or None
+        self._aux = None
         # {layer id: its output}, where the layer ran as one launch in _core
         self._one_out = {}
         # Read once: _core asks this for every layer of every step, and a
@@ -1097,8 +1184,9 @@ class _Built:
         """``KimiK3LinearModel.forward``: the embedding, every layer, the final
         norm. Pipeline and DP attention are refused, so this rank is the first
         and the last, and the bank is always open."""
+        from sglang.srt.layers.aux_hidden_states import AuxHiddenStatePacker
         from sglang.srt.layers.layer_boundary.residual.batch import final_norm, start
-        from sglang.srt.models.kimi_k3 import AuxHiddenStateList, _cdiv
+        from sglang.srt.models.kimi_k3 import _cdiv
         from sglang.srt.utils.common import BumpAllocator
 
         from sgl_amd_mono.kimi_k3.gfx950 import k1 as k1_mod
@@ -1121,13 +1209,25 @@ class _Built:
         )
         m.attn_bank.open(hidden, _cdiv(m.end_layer, m.config.attn_res_block_size), None)
         # The bank's stream is captured after a layer, not at the next layer's
-        # input (``captures_at_input`` is False whenever the bank is open).
-        aux = AuxHiddenStateList()
-        captures = m.dspark_layers_to_capture or ()
+        # input (``captures_at_input`` is False whenever the bank is open): the
+        # mixture the next layer's attention seam forms. Captured into one packed
+        # buffer, as SGLang's model packs them with no pipeline (the decode
+        # graph's buffer where the batch carries one), slots in layer order; a K1
+        # front that forms a captured mixture stores its slot itself
+        # (``set_aux``), else the capture runs before that next layer.
+        captures = m.dspark_layers_to_capture
+        aux = None
+        if captures is not None:
+            buf = forward_batch.aux_hidden_states_buffer
+            if buf is None:
+                buf = hidden.new_empty(hidden.shape[0], len(captures) * hidden.shape[1])
+            aux = AuxHiddenStatePacker(len(captures), out=buf)
+        self._aux = (aux, buf) if aux is not None else None
         for i in range(m.start_layer, m.end_layer):
-            hidden = self._layer(i, hidden, forward_batch, zero_allocator)
-            if i in captures:
-                aux.append(m._dspark_capture_stream(i, hidden, forward_batch))
+            due = aux is not None and i - 1 in captures
+            hidden = self._layer(i, hidden, forward_batch, zero_allocator, aux_due=due)
+        if aux is not None and m.end_layer - 1 in captures:
+            aux.append(m._dspark_capture_stream(m.end_layer - 1, hidden, forward_batch))
         # Once a step, after the last layer: the conv inputs handed back to
         # SGLang's speculative window, which only reads them at accept.
         k1_mod.finish(k1_batch, self._k1_state, self._k1_engaged)
@@ -1141,17 +1241,65 @@ class _Built:
             hidden, forward_batch, m._final_read, capture=None, skip_empty=True
         )
         m.attn_bank.close()
-        if m.dspark_layers_to_capture is not None:
-            return hidden, aux
+        if aux is not None:
+            return hidden, aux.finalize()
         return hidden
 
-    def _layer(self, i, hidden, forward_batch, zero_allocator):
-        """One layer: the launch where it is covered, else the model's own."""
+    def _capture_prev(self, i, hidden, forward_batch) -> None:
+        """Layer i - 1's DSpark capture, SGLang's: before layer i, whose input
+        is that layer's output and whose bank rows it reads are unchanged."""
+        self._aux[0].append(self.backbone._dspark_capture_stream(i - 1, hidden, forward_batch))
+
+    def set_aux(self, captures) -> None:
+        """The K1 fronts that form a captured layer's mixture (layer c + 1's
+        attention seam, for a captured c) store it into its slot j of the aux
+        buffer (``aux_slot``), compiled here: the build runs before SGLang names
+        the capture layers, and both run before any graph capture. Only for a
+        packed buffer of ``AUX_SLOTS`` captures, the row the kernels are built
+        for; every other capture stays SGLang's."""
+        import dataclasses
+
+        import msgspec
+
+        from sgl_amd_mono.kimi_k3.gfx950 import k1 as k1_mod
+        from sgl_amd_mono.kimi_k3.gfx950.stages.seam import AUX_SLOTS
+
+        order = sorted(set(captures))
+        if len(order) != AUX_SLOTS or len(order) != len(captures):
+            return
+        for rows, layers in self._by_width.items():
+            changed = {}
+            for i, p in layers.items():
+                k = p.k1
+                if k is None or (i - 1) not in order or not k1_mod.engages(k):
+                    continue
+                if k1_mod.is_wide(k) and not k.key.front:
+                    # its seam moved into the previous layer's K2 tail
+                    # (``_tails``): the captured mixture is its front's, so the
+                    # front comes back
+                    prev = layers[i - 1]
+                    prev.key = msgspec.structs.replace(prev.key, tail=None)
+                    prev.tail = None
+                    k.key = dataclasses.replace(k.key, front=True)
+                    changed[i - 1] = prev
+                    changed[i] = p
+                j = order.index(i - 1)
+                if k.key.aux_slot != j:
+                    k.key = dataclasses.replace(k.key, aux_slot=j)
+                    changed[i] = p
+            if changed:
+                _warmup(self.runner, dict(sorted(changed.items())), rows)
+
+    def _layer(self, i, hidden, forward_batch, zero_allocator, aux_due=False):
+        """One layer: the launch where it is covered, else the model's own.
+        ``aux_due``: layer i - 1's DSpark capture is still to be made."""
         from sglang.srt.layers.layer_boundary.residual.batch import set_written
 
         layer = self.backbone.layers[i]
         packed = self._by_width[self._plan.key.rows].get(i)
         if packed is None:  # the dense prefix keeps the model's forward
+            if aux_due:
+                self._capture_prev(i, hidden, forward_batch)
             return layer(
                 positions=self._positions,
                 hidden_states=hidden,
@@ -1160,7 +1308,9 @@ class _Built:
                 capture_gathered=None,
             )
         bank = self.backbone.attn_bank.current
-        core = self._core(layer, packed, hidden, bank, forward_batch, zero_allocator)
+        core = self._core(
+            layer, packed, hidden, bank, forward_batch, zero_allocator, aux_due=aux_due
+        )
         out = _launch(
             self.runner, packed, bank, core, forward_batch, out=self._one_out.pop(i, None)
         )
@@ -1168,7 +1318,7 @@ class _Built:
         # than finished through ffn_boundary.
         return set_written(out, forward_batch)
 
-    def _core(self, layer, packed, hidden, bank, forward_batch, zero_allocator):
+    def _core(self, layer, packed, hidden, bank, forward_batch, zero_allocator, aux_due=False):
         """This layer's TP-local attention output, which the layer launch takes.
 
         A KDA layer takes the K1 launch where it is covered: K1 runs the
@@ -1188,18 +1338,35 @@ class _Built:
         from sgl_amd_mono.kimi_k3.gfx950 import k1 as k1_mod
 
         state = self._k1_state
-        if packed.front is not None and _mla_covered(packed.front, hidden, bank):
+        front = packed.front is not None and _mla_covered(packed.front, hidden, bank)
+        mla = not front and packed.mla is not None and _mla_covered(packed.mla, hidden, bank)
+        k1 = (
+            not front
+            and not mla
+            and packed.k1 is not None
+            and k1_mod.covered(packed.k1, hidden, bank, state)
+        )
+        aux = None
+        if aux_due:
+            packer, buf = self._aux
+            if k1 and packed.k1.key.aux_slot == len(packer):
+                # K1's front stores this slot (``set_aux``)
+                packer.slot(hidden)
+                aux = buf
+            else:
+                self._capture_prev(packed.i, hidden, forward_batch)
+        if front:
             return self._front_core(layer, packed, hidden, bank, forward_batch)
         # At these widths SGLang's verify plan is not made: an MLA layer must
         # take the front
         assert packed.front is None or hidden.shape[0] not in _FRONT_ROWS, (
             "an MLA layer declined the DCP front at a width without SGLang's plan"
         )
-        if packed.mla is not None and _mla_covered(packed.mla, hidden, bank):
+        if mla:
             return self._mla_core(
                 layer, packed, hidden, bank, forward_batch, zero_allocator
             )
-        if packed.k1 is not None and k1_mod.covered(packed.k1, hidden, bank, state):
+        if k1:
             ref = None
             # the check scores K1's one-request form only
             check = self._check and not k1_mod.is_wide(packed.k1)
@@ -1213,8 +1380,8 @@ class _Built:
             set_written(hidden, forward_batch)
             self._k1_engaged.append(packed.i)
             if packed.k1.one_launch:
-                return self._one_launch(packed, hidden, bank, forward_batch, state)
-            core = k1_mod.launch(self.runner, packed.k1, hidden, bank, state)
+                return self._one_launch(packed, hidden, bank, forward_batch, state, aux)
+            core = k1_mod.launch(self.runner, packed.k1, hidden, bank, state, aux=aux)
             if check:
                 from sgl_amd_mono.kimi_k3 import check as check_mod
 
@@ -1223,7 +1390,7 @@ class _Built:
         x = layer.attn_boundary.prepare(hidden, forward_batch, capture_gathered=None)
         return self._pre_o_proj(layer, x, forward_batch, zero_allocator)
 
-    def _one_launch(self, packed, hidden, bank, forward_batch, state):
+    def _one_launch(self, packed, hidden, bank, forward_batch, state, aux=None):
         """A KDA layer as one launch, K1's wide form inside its K2 launch:
         returns the core it left; the layer's output waits in ``_one_out``."""
         from sglang.srt.layers.layer_boundary.residual.batch import written_residual
@@ -1241,7 +1408,7 @@ class _Built:
                 self.runner, packed, core, prefix, bank.block_residual, out, prefix_sum, attn=attn
             )
 
-        core = k1_mod.launch(self.runner, packed.k1, hidden, bank, state, k2=k2)
+        core = k1_mod.launch(self.runner, packed.k1, hidden, bank, state, k2=k2, aux=aux)
         self._one_out[packed.i] = out
         return core
 
