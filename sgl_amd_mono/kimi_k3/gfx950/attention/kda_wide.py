@@ -116,6 +116,14 @@ def depth(key):
 
 
 KPT = 16  # K columns a lane holds of a state row, at every width
+# q, k and the decay in LDS: a row's 16-column pieces 20 floats apart, so the
+# recurrence's eight K pieces a wave reads sit on eight disjoint bank quads
+HDP = HD // KPT * (KPT + 4)
+
+
+def kp_(c):
+    """LDS index of column ``c`` of a q / k / decay row."""
+    return c + c // KPT * 4
 
 
 def scratch_layout(key: KdaWideBuild) -> dict:
@@ -524,7 +532,7 @@ def kda_task(c, req, h, k):
     if tid < 3 * HD:
         for j in range_constexpr(L):
             if part < 2:
-                fx.ptr_store(outs[j], qkl + ((2 * j + part) * HD + d))
+                fx.ptr_store(outs[j], qkl + ((2 * j + part) * HDP + kp_(d)))
             if part == 2:
                 fx.ptr_store(outs[j], vloc + (j * HD + d))
     if tid < HD:
@@ -554,14 +562,14 @@ def kda_task(c, req, h, k):
         kk = wave * 16 + 4 * (lane // 16) + i
         gate = fx.Float32(c["lb"]) * sigmoid(aa * (bf16r(gacc[i]) + dtb[i]))
         if lane % 16 < L:
-            fx.ptr_store(exp_(gate), decay + (t * HD + kk))
+            fx.ptr_store(exp_(gate), decay + (t * HDP + kp_(kk)))
             if live:
                 bo.buffer_store(gate, rg, (h * ring_len + t) * HD + kk)
     # l2norm: (token, q / k) row r = tid / 16 of the 2 L rows, 8 channels a lane
     if tid < 2 * L * 16:
         r = tid // 16
         c8 = (tid % 16) * 8
-        ys = [fx.ptr_load(qkl + (r * HD + c8 + e)) for e in range(8)]
+        ys = [fx.ptr_load(qkl + (r * HDP + kp_(c8) + e)) for e in range(8)]
         ss = fx.Float32(0.0)
         for e in range_constexpr(8):
             ss = fmath.fma(ys[e], ys[e], ss)
@@ -569,7 +577,7 @@ def kda_task(c, req, h, k):
         rn = fx.Float32(1.0) / fx.Float32(fmath.sqrt(ss + fx.Float32(1e-6)))
         rn = (r % 2 == 0).select(rn * fx.Float32(SCALE), rn)
         for e in range_constexpr(8):
-            fx.ptr_store(ys[e] * rn, qkl + (r * HD + c8 + e))
+            fx.ptr_store(ys[e] * rn, qkl + (r * HDP + kp_(c8) + e))
     lds_barrier()
     stamp(c["on"], c["tls"], tid, 6)
 
@@ -593,9 +601,9 @@ def kda_task(c, req, h, k):
 
     os_ = []
     for j in range_constexpr(L):
-        qv = lds_vec(qkl + ((2 * j) * HD + k0))
-        kv = lds_vec(qkl + ((2 * j + 1) * HD + k0))
-        dk = lds_vec(decay + (j * HD + k0))
+        qv = lds_vec(qkl + ((2 * j) * HDP + kp_(k0)))
+        kv = lds_vec(qkl + ((2 * j + 1) * HDP + kp_(k0)))
+        dk = lds_vec(decay + (j * HDP + kp_(k0)))
         bj = fx.ptr_load(beta + j)
         vs = [fx.ptr_load(vloc + (j * HD + grp * rpt + i)) for i in range(rpt)]
         for i in range_constexpr(rpt):
@@ -662,8 +670,8 @@ def build(key: KdaWideBuild):
     @fx.struct
     class KdaLds:
         fa: fx.Array[fx.Float32, L * HD, 16]
-        qkl: fx.Array[fx.Float32, 2 * L * HD, 16]
-        decay: fx.Array[fx.Float32, L * HD, 16]
+        qkl: fx.Array[fx.Float32, 2 * L * HDP, 16]
+        decay: fx.Array[fx.Float32, L * HDP, 16]
         vloc: fx.Array[fx.Float32, L * HD, 16]
         ol: fx.Array[fx.Float32, L * HD, 16]
         g2l: fx.Array[fx.Float32, L * HD, 16]
