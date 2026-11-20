@@ -783,17 +783,18 @@ def time_cells(w, st, keys, p, r, scratch, epoch, layer, args):
     )
     # phase stamps: per point, the latest CTA past it, from the earliest start
     fr = run_front(w, st, rk, scratch, epoch, layer, timeline=True)
-    tl = fr["tl"].float()
+    tl = fr["tl"]
     t0 = tl[:, 0].min()
     names = ["start", "x seen", "stage 1", "q latent", "q_b", "absorb", "attn q seen", "attn done",
-             "W_UV seen", "W_UV done"]
+             "W_UV seen", "W_UV done", "blk start", "blk qk+sm", "blk pv", "blk stored"]
     pts = []
     for k, n in enumerate(names):
         col = tl[:, k]
         live = col > 0
         if live.any():
-            pts.append(f"{n} {((col[live].max() - t0) / 100.0).item():.1f}")
-    print(f"STAMPS P={p} rank={r} (us from launch, latest CTA): " + ", ".join(pts), flush=True)
+            us = ((col[live] - t0).double() / 100.0).sort().values
+            pts.append(f"{n} {us[len(us) // 2].item():.1f}/{us[-1].item():.1f}")
+    print(f"STAMPS P={p} rank={r} (us from launch, median/latest CTA): " + ", ".join(pts), flush=True)
 
 
 def emulate(sends, stock_sends, gates, stock_gates, refs, tag, emus=None):
