@@ -55,7 +55,7 @@ from sgl_amd_mono.common.sync import (
     rearm_sent,
     sent_item,
     sent_ix,
-    sent_sum,
+    sent_sums,
     sent_word,
     shift,
     sreg,
@@ -252,14 +252,25 @@ def stage_reduce(c, task):
     sent_ar = c.get("sent_ar", False)
     vals_bf16 = c.get("vals_bf16", False)
     n = s * (COLS // 2)
-    for i in range_constexpr((n + THREADS - 1) // THREADS):
+    rounds = (n + THREADS - 1) // THREADS
+    if const_expr(sent_ar):
+        # every round's words in one poll; consecutive threads read consecutive
+        # words; re-armed after the mix
+        its = [sent_item(fx.min(tid + THREADS * i, n - 1), s) for i in range(rounds)]
+        sums = sent_sums(
+            c["ars_own"],
+            [(task * COLS + 2 * cp, t) for t, cp in its],
+            s,
+            HIDDEN,
+            TP,
+            [tid + THREADS * i < n for i in range(rounds)],
+        )
+    for i in range_constexpr(rounds):
         idx = tid + THREADS * i
         if idx < n:
             if const_expr(sent_ar):
-                # consecutive threads read consecutive words; re-armed after the mix
-                t, cp = sent_item(idx, s)
-                col = task * COLS + 2 * cp
-                lo, hi = sent_sum(c["ars_own"], col, t, s, HIDDEN, TP, rearm=False)
+                t, cp = its[i]
+                lo, hi = sums[i]
             else:
                 t = idx // (COLS // 2)
                 cp = idx % (COLS // 2)

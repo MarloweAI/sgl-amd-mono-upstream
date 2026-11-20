@@ -100,7 +100,7 @@ from sgl_amd_mono.common.sync import (
     rearm_sent,
     sent_item,
     sent_ix,
-    sent_sum,
+    sent_sums,
     sent_word,
     shift,
     sreg,
@@ -527,6 +527,79 @@ def early_out_lq(c, i, q, accs, t0=0, sj=None):
     gpu.barrier()
 
 
+@flyc.jit
+def early_lq_wide(c, i, q, ops):
+    """latq_push latent task (i, q) past one token tile: each tile's two 16-row
+    halves' partials (``early_out_lq``'s); part q > 0 pushes them a tile at a
+    time, part 0 keeps its own and polls every tile's other parts once, after
+    its last tile, then sums each in part order, rounds, quantizes and pushes
+    as ``early_out_lq``."""
+    s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
+    klen, _ = early_shape(3)
+    xrow = klen + gemv.LDS_PAD
+    region = c["lpart"]
+    tiles = gemv.tiles(s)
+    at = lambda qq, t, h, r: ((i * LQ_PARTS + qq) * s + t) * 2 * ROWS + h * ROWS + r  # noqa: E731
+    own = []
+    for ti in range_constexpr(len(tiles)):
+        t0, sj = tiles[ti]
+        poll_rows_to_lds(c, c["xt"], klen, sj, c["xl"], xrow, HIDDEN, q * klen, t0)
+        if const_expr(t0 == 0):
+            stamp(c["tl_on"], c["tls"], c["tid"], 27)  # latent: x tile 0 in
+        accs = [gemv.mfmas(lane, wave, c["xl"], xrow, klen, sj, o) for o in ops]
+        for h in range_constexpr(2):
+            fx.ptr_store(accs[h], red + (wave * 64 + lane) * 4)
+            lds_barrier()
+            r = tid % ROWS
+            t = t0 + fx.min(tid // ROWS, sj - 1)
+            v = row_sum(red, r, fx.min(tid // ROWS, sj - 1))
+            if (q > 0) & (tid < ROWS * sj):
+                c["put"](region, at(q, t, h, r), v)
+            own.append(v)
+            lds_barrier()
+    if q == 0:
+        # thread (row, token) of every tile: its other parts, one batch a tile
+        for ti in range_constexpr(len(tiles)):
+            t0, sj = tiles[ti]
+            r = tid % ROWS
+            tl = fx.min(tid // ROWS, sj - 1)
+            if tid < ROWS * sj:
+                specs = [
+                    (region, at(qq, t0 + tl, h, r), 1)
+                    for h in range(2)
+                    for qq in range(1, LQ_PARTS)
+                ]
+                got = c["poll"](specs, batch=len(specs))
+                for h in range_constexpr(2):
+                    v = own[2 * ti + h]
+                    for qq in range_constexpr(LQ_PARTS - 1):
+                        v = v + f32_of(got[h * (LQ_PARTS - 1) + qq][0])
+                    fx.ptr_store(bf16_round(v), c["av"] + (tl * 2 * ROWS + h * ROWS + r))
+            lds_barrier()
+            if tid < sj:
+                t = t0 + tid
+                ws = [
+                    bf16_pair(
+                        fx.ptr_load(c["av"] + (tid * 2 * ROWS + 2 * j)),
+                        fx.ptr_load(c["av"] + (tid * 2 * ROWS + 2 * j + 1)),
+                    ).bitcast(fx.Int32)
+                    for j in range(16)
+                ]
+                pks, code = quant_block_bf16(ws)
+                blk = c["rank"] * LQ_GROUPS + i
+                for p in range_constexpr(TP):
+                    for qw in range_constexpr(4):
+                        c["put_words"](
+                            c["peer"]["latq"][p],
+                            t * LQ_WORDS + blk * 8 + 2 * qw,
+                            pks[2 * qw : 2 * qw + 2],
+                        )
+                    c["put_words"](c["peer"]["latq"][p], t * LQ_WORDS + LAT // 4 + blk, [code])
+            lds_barrier()
+    gpu.barrier()
+    stamp(c["tl_on"], c["tls"], c["tid"], 28)  # latent: parts summed, LATQ pushed
+
+
 def early_shape(kind):
     """(K a part, parts) of an early kind: router a quarter, latent a half, sgu all."""
     return {
@@ -568,10 +641,19 @@ def early_compute(c, kind, i, q, ops):
 
 @flyc.jit
 def _early_wide(c, kind, i, q, ops):
+    """A wide step's early task: the latent's (``early_lq_wide``), the router's
+    or the shared gate/up's (``_early_wide_gemv``)."""
+    if const_expr(kind == 3):
+        return early_lq_wide(c, i, q, ops)
+    return _early_wide_gemv(c, kind, i, q, ops)
+
+
+@flyc.jit
+def _early_wide_gemv(c, kind, i, q, ops):
     """``_early_narrow`` past one MFMA token tile: x's rows 16 at a time into
-    LDS (the router and latent from the mix's tagged pairs, the shared gate/up
-    from the plain rows a K segment at a time), each tile's GEMV and
-    ``early_out`` in turn; the weights stay in registers."""
+    LDS (the router from the mix's tagged pairs, the shared gate/up from the
+    plain rows a K segment at a time), each tile's GEMV and ``early_out`` in
+    turn; the weights stay in registers."""
     s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
     klen, _ = early_shape(kind)
     xrow = klen + gemv.LDS_PAD
@@ -600,15 +682,11 @@ def _early_wide(c, kind, i, q, ops):
             poll_rows_to_lds(c, c["xt"], klen, sj, c["xl"], xrow, HIDDEN, q * klen, t0)
             if const_expr(kind == 0 and t0 == 0):
                 stamp(c["tl_on"], c["tls"], c["tid"], 20)  # router: x published
-        if const_expr(kind == 3):
-            accs = [gemv.mfmas(lane, wave, c["xl"], xrow, klen, sj, o) for o in ops]
-            early_out_lq(c, i, q, accs, t0, sj)
-        else:
-            if const_expr(kind != 2):
-                acc = gemv.mfmas(lane, wave, c["xl"], xrow, klen, sj, ops)
-            fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
-            gpu.barrier()
-            early_out(c, kind, i, q, red, t0, sj)
+        if const_expr(kind != 2):
+            acc = gemv.mfmas(lane, wave, c["xl"], xrow, klen, sj, ops)
+        fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
+        gpu.barrier()
+        early_out(c, kind, i, q, red, t0, sj)
     if const_expr(kind == 0):
         stamp(c["tl_on"], c["tls"], c["tid"], 24)  # router: logits pushed
 
@@ -1535,6 +1613,8 @@ def copy_latq(c):
             if tid < qw:
                 bo.buffer_store(got, rsrc(c["lqc"]), w, cache_modifier=CM_DEV)
             publish(c["put"], c["lqr"], u, fx.Int32(1), tid == 0)
+    if v < COPY_CTAS:
+        stamp(c["tl_on"], c["tls"], c["tid"], 29)  # latent copied
 
 
 @flyc.jit
@@ -2152,17 +2232,31 @@ def stage_lnorm(c, j):
     a = c["args"]
     cp = tid % 64
     col = j * 128 + 2 * cp
+    rounds = (s + 7) // 8
+    if const_expr(sent_latr):
+        # every round's words in one poll; a dead thread holds a clamped copy
+        # of a live one's words: it must not take them; re-armed once the LN
+        # rows are out
+        tts = [g * 8 + tid // 64 for g in range(rounds)]
+        sidxs = [
+            [sent_ix(src, col, fx.min(tt, s - 1), s, LAT) for src in range(TP)]
+            for tt in tts
+        ]
+        wall = poll_sent(
+            c["latrs_own"],
+            [i for sx in sidxs for i in sx],
+            [tt < s for tt in tts for _ in range(TP)],
+            rearm=False,
+        )
     items = []
-    for g in range_constexpr((s + 7) // 8):
+    for g in range_constexpr(rounds):
         tt = g * 8 + tid // 64
         mine = tt < s
         t = fx.min(tt, s - 1)
         sidx = None
         if const_expr(sent_latr):
-            # a dead thread holds a clamped copy of a live one's words: it must
-            # not take them; re-armed once the LN rows are out
-            sidx = [sent_ix(src, col, t, s, LAT) for src in range(TP)]
-            ws = poll_sent(c["latrs_own"], sidx, [mine] * TP, rearm=False)
+            sidx = sidxs[g]
+            ws = [wall[g * TP + src] for src in range(TP)]
             lo, hi = bf2_f32(ws[0])
             for src in range_constexpr(1, TP):
                 l2, h2 = bf2_f32(ws[src])
@@ -2287,17 +2381,29 @@ def stage_reduce(c, j):
     # the MoE launch has no prefix: only the layer launch's fold reads it
     prefix = c["args"]["prefix"] if fold else None
     n = s * 64
-    for i in range_constexpr((n + THREADS - 1) // THREADS):
+    rounds = (n + THREADS - 1) // THREADS
+    if const_expr(sent_final):
+        # every round's words in one poll; consecutive threads read
+        # consecutive words
+        its = [sent_item(fx.min(tid + THREADS * i, n - 1), s) for i in range(rounds)]
+        sums = sent_sums(
+            c["finals_own"],
+            [(j * 128 + 2 * cp, t) for t, cp in its],
+            s,
+            HIDDEN,
+            TP,
+            [tid + THREADS * i < n for i in range(rounds)],
+        )
+    for i in range_constexpr(rounds):
         idx = tid + THREADS * i
         if idx < n:
             if const_expr(sent_final):
-                # consecutive threads read consecutive words
-                t, cp = sent_item(idx, s)
+                t, cp = its[i]
             else:
                 t, cp = idx // 64, idx % 64
             col = j * 128 + 2 * cp
             if const_expr(sent_final):
-                lo, hi = sent_sum(c["finals_own"], col, t, s, HIDDEN, TP, rearm=False)
+                lo, hi = sums[i]
             else:
                 lo, hi = sum_partials(
                     c["poll"],
