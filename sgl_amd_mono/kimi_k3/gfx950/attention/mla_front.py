@@ -188,7 +188,6 @@ LN2 = 0.6931471805599453
 EMPTY_LSE = -1e30  # SGLang's LSE of a row with no key on this rank
 MAX_REQS = 8
 WIDE_ABOVE = 8  # wider steps run their GEMVs a 16-row token tile at a time
-S1_SEGS = ((0, 4), (4, 7))  # stage 1's K segments in rounds (x 16 rows x 4096 / 3072 in LDS)
 RSTD_W = 2048 - 64  # red words of the rows' rstd (q / kv norms)
 # start, x seen, stage 1, q latent normed, q_b, absorb, attention q seen,
 # attention done, W_UV partials seen, W_UV done
@@ -478,23 +477,36 @@ def stage1(c, g, ops):
 
 @flyc.jit
 def stage1_wide(c, g, ops):
-    """``stage1`` a 16-row token tile at a time, x into LDS a K segment at a
-    time (``mfmas_rounds``: the same MFMAs in the same order)."""
+    """``stage1`` a 16-row token tile at a time, x into LDS a round (1024
+    columns, every wave's next chunk) at a time through two buffers: a round's
+    loads are in flight while the round before's MFMAs run (``mfmas_rounds``:
+    the same MFMAs in the same order)."""
     s, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
-    tiles = gemv.tiles(s)
-    for ti in range_constexpr(len(tiles)):
-        t0, sj = tiles[ti]
-        acc = fx.Vector.filled(4, 0.0, fx.Float32)
-        for si in range_constexpr(len(S1_SEGS)):
-            r0, r1 = S1_SEGS[si]
-            k0, k1 = r0 * WAVES * gemv.KCH, r1 * WAVES * gemv.KCH
-            srow = k1 - k0 + LDS_PAD
-            gemv.rows_to_lds(
-                tid, c["xbuf"], k1 - k0, sj, c["xl"], srow, CM_DEV, ldk=HIDDEN, k0=k0, t0=t0
-            )  # fmt: skip
-            acc = gemv.mfmas_rounds(lane, wave, c["xl"], srow, k0, sj, ops, acc, r0, r1)
+    rk = WAVES * gemv.KCH
+    nr = HIDDEN // rk
+    srow = rk + LDS_PAD
+    bufs = [c["xl"], c["xl"] + ROWS * srow // 2]
+    rounds = [(t0, sj, r) for t0, sj in gemv.tiles(s) for r in range(nr)]
+
+    def load(j):
+        t0, sj, r = rounds[j]
+        return gemv.rows_load(tid, c["xbuf"], rk, sj, CM_DEV, ldk=HIDDEN, k0=r * rk, t0=t0)
+
+    vals = load(0)
+    gemv.rows_store(tid, vals, rk, rounds[0][1], bufs[0], srow)
+    gpu.barrier()
+    acc = fx.Vector.filled(4, 0.0, fx.Float32)
+    for j in range_constexpr(len(rounds)):
+        t0, sj, r = rounds[j]
+        if const_expr(j + 1 < len(rounds)):
+            vals = load(j + 1)
+        acc = gemv.mfmas_rounds(lane, wave, bufs[j % 2], srow, r * rk, sj, ops, acc, r, r + 1)
+        if const_expr(r == nr - 1):
+            s1_out(c, g, acc, t0, sj)
+            acc = fx.Vector.filled(4, 0.0, fx.Float32)
+        if const_expr(j + 1 < len(rounds)):
+            gemv.rows_store(tid, vals, rk, rounds[j + 1][1], bufs[(j + 1) % 2], srow)
             gpu.barrier()
-        s1_out(c, g, acc, t0, sj)
 
 
 @flyc.jit
@@ -1803,9 +1815,9 @@ def build(key: MlaFrontBuild):
     lay = scratch_layout(key)
     # the GEMV x rows: every row (narrow), or a 16-row tile of a K segment and
     # every row's normed q latent (wide)
-    seg = max(r1 - r0 for r0, r1 in S1_SEGS) * WAVES * gemv.KCH
+    seg = 2 * WAVES * gemv.KCH  # stage 1's two x round buffers (wide)
     xl_words = (
-        max(ROWS * (seg + LDS_PAD), s * (QL + LDS_PAD)) // 2 if wd else s * (HIDDEN + LDS_PAD) // 2
+        max(ROWS * (seg + 2 * LDS_PAD), s * (QL + LDS_PAD)) // 2 if wd else s * (HIDDEN + LDS_PAD) // 2
     )
 
     @fx.struct
