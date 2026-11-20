@@ -261,13 +261,18 @@ WIDE_FROM_REQS = 2
 WIDE_MAX_REQS = 8
 
 
-def one_launch_takes(layer, qlen: int) -> bool:
-    """Whether a wide-form layer runs inside its K2 launch: not a block-write
-    layer (its K2 would read the bank row the front writes cached), and a
-    request's verify rows are a core box's."""
+def one_launch_takes(layer, rows: int, qlen: int) -> bool:
+    """Whether a wide-form layer runs inside its K2 launch: K2 takes the width,
+    not a block-write layer (its K2 would read the bank row the front writes
+    cached), and a request's verify rows are a core box's."""
+    from sgl_amd_mono.kimi_k3 import K2_MAX_ROWS
     from sgl_amd_mono.kimi_k3.gfx950.stages import oproj
 
-    return not layer.is_block_write_layer and qlen == oproj.CORE_REQ_ROWS
+    return (
+        rows <= K2_MAX_ROWS
+        and not layer.is_block_write_layer
+        and qlen == oproj.CORE_REQ_ROWS
+    )
 
 
 def is_wide(packed) -> bool:
@@ -425,7 +430,7 @@ def _build_wide(layer, i: int, rows: int, qlen: int) -> Optional[K1Layer]:
         conv=None,
         mamba_idx=-1,  # prepare's first call
         w_in=_packed_w_in(layer, i),
-        one_launch=one_launch_takes(layer, qlen),
+        one_launch=one_launch_takes(layer, rows, qlen),
     )
 
 
