@@ -1,19 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 """The KDA layers' in_proj, one copy a layer: packed in place.
 
-K1 (both forms) reads in_proj in ``kda_wide.pack_w_in``'s layout. The layer's
-merged in-projection is rewritten in that layout once at build, so no second
-copy is kept (90 MB a layer a rank). SGLang's own KDA attention on a packed
-layer then takes one of two paths, by forward mode:
+K1 (both forms) reads in_proj in ``kda_wide.pack_w_in``'s layout, AITER's 16x16
+preshuffle. The layer's merged in-projection is rewritten in that layout once
+at build, so no second copy of it is kept (90 MB a layer a rank); only its
+f_a | b | pad tail (144 rows, 2 MB) is kept plain beside it, for SGLang's own
+tail GEMM. SGLang's own KDA attention on a packed layer:
 
-* target verify: ``kda_wide`` in chunks of at most ``CHUNK`` requests, on
-  SGLang's x (after ``input_layernorm``) and its ReplaySSM state. A request's
-  outputs are the bits K1's wide form gives it in any batch (the launch is
-  batch invariant), so the bits do not change across the routed widths and the
-  wider ones.
-* every other mode (extend, decode): in_proj unpacked into one buffer the
-  process shares, which every packed layer's SGLang weights are views of; then
-  SGLang's own ``forward_pre_o_proj``.
+* target verify: one ``kda_wide`` launch for the step's requests (its GEMM
+  form past 8), on SGLang's x (after ``input_layernorm``) and its ReplaySSM
+  state. A request's outputs are the bits K1's wide form gives it in any batch
+  (the launch is batch invariant), so the bits do not change across the routed
+  widths and the wider ones.
+* every other mode (extend, decode): SGLang's own ``forward_pre_o_proj``, its
+  q, k, v, g GEMM on the packed rows (AITER's preshuffled-weight GEMMs,
+  ``Preshuffled``), its f_a | b GEMM on the plain tail.
 
 The first covered layer is not packed: its prefix is owed by the dense layer in
 front, so K1 never takes it and SGLang's attention reads its in_proj as loaded.
@@ -30,12 +31,8 @@ import triton.language as tl
 
 from sgl_amd_mono.kimi_k3.gfx950.stages.dims import HIDDEN
 
-# requests a verify chunk: kda_wide's widest
-CHUNK = 8
-# verify requests SGLang's path takes on a packed layer: (MAX_REQS / CHUNK)
-# chunks, each with its own epoch word (tags stay distinct across the chunks)
+# verify requests SGLang's path takes on a packed layer, one launch
 MAX_REQS = 64
-EPOCH_STRIDE = MAX_REQS // CHUNK
 
 # the SGLang names this reads
 SGLANG_READS = {
@@ -46,7 +43,9 @@ SGLANG_READS = {
         "b_proj",
         "_bfa_w",
         "_qkvgbfa_layer",
+        "_qkvgbfa_sizes",
     ),
+    "srt/layers/linear.py": ("quant_method",),
     "srt/model_executor/forward_mode.py": ("is_target_verify",),
     "srt/model_executor/forward_context.py": ("get_attn_backend",),
     "srt/layers/attention/hybrid_linear_attn_backend.py": (
@@ -76,24 +75,6 @@ SGLANG_READS = {
 
 # ---------------------------------------------------------------- layouts
 @triton.jit
-def _unpack(src, dst, HSTEPS: tl.constexpr, WAVES: tl.constexpr, G: tl.constexpr):
-    """One (set, K step, wave slice, group) run of ``pack_w_in``'s layout (128
-    16-B units: K half, K group, row) -> its 16 rows x 128 B of in_proj."""
-    p = tl.program_id(0)
-    g = p % G
-    ws = (p // G) % WAVES
-    hs = (p // (G * WAVES)) % HSTEPS
-    s = p // (G * WAVES * HSTEPS)
-    u = tl.arange(0, 128)
-    q, kg, row = u // 64, (u // 16) % 4, u % 16
-    w = tl.arange(0, 4)
-    rows_k = 896  # 16-B units a row (HIDDEN / 8)
-    o = ((s * G + g) * 16 + row) * rows_k + (ws * HSTEPS + hs) * 8 + q * 4 + kg
-    v = tl.load(src + (p * 128 + u)[:, None] * 4 + w[None, :])
-    tl.store(dst + o[:, None] * 4 + w[None, :], v)
-
-
-@triton.jit
 def _pack_chunks(x, xp, S, CROWS: tl.constexpr, XROWS: tl.constexpr):
     """x [S, 7168] bf16 -> chunk c's x rows (CROWS a chunk) in ``pack_x``'s layout
     for its own token tiles, at row c XROWS of ``xp``; rows past S zero.
@@ -110,16 +91,6 @@ def _pack_chunks(x, xp, S, CROWS: tl.constexpr, XROWS: tl.constexpr):
         tl.store(xp + c * XROWS * 7168 + (ks * nt + tt) * 1024 + e, v)
 
 
-def unpack_w_in(packed: torch.Tensor, out: torch.Tensor) -> None:
-    """``pack_w_in``'s inverse, into ``out`` (both [NPROJ, HIDDEN] bf16)."""
-    from sgl_amd_mono.kimi_k3.gfx950.attention import kda_wide as kw
-
-    _unpack[(kw.SETS * kw.HSTEPS * kw.WAVES * kw.G,)](
-        packed.view(torch.int32), out.view(torch.int32),
-        HSTEPS=kw.HSTEPS, WAVES=kw.WAVES, G=kw.G,
-    )  # fmt: skip
-
-
 def pack_chunks(x: torch.Tensor, xp: torch.Tensor, crows: int) -> None:
     """x [S, HIDDEN] -> ``xp`` [chunks, >= 16 tiles, HIDDEN], chunk c's ``crows``
     rows as ``pack_x`` lays out its own tiles."""
@@ -131,6 +102,78 @@ def pack_chunks(x: torch.Tensor, xp: torch.Tensor, crows: int) -> None:
     )
 
 
+# ---------------------------------------------------------------- prefill GEMM
+# The q, k, v, g GEMM on the preshuffled rows, by M: (largest M, AITER kernel).
+# ("asm", name): AITER's preshuffled-weight asm GEMM; ("fly", tile_m, tile_n,
+# tile_k, waves_per_eu): AITER's FlyDSL preshuffle GEMM.
+_ASM = "_ZN5aiter{}bf16gemm_{}E"
+PRE_TILES = (
+    (384, ("asm", _ASM.format(43, "fp32bf16_tn_128x64_bshuffle_splitk"))),
+    (640, ("asm", _ASM.format(43, "fp32bf16_tn_128x64_bshuffle_splitk"))),
+    (896, ("asm", _ASM.format(43, "fp32bf16_tn_160x64_bshuffle_splitk"))),
+    (1280, ("fly", 64, 192, 64, 2)),
+    # the 256 x 256 tile while its tiles fit one wave of CUs (6144 / 256 = 24 a row)
+    (2730, ("asm", _ASM.format(36, "bf16_tn_256x256_bpreshuffle"))),
+    (3584, ("fly", 96, 192, 128, 0)),
+    (1 << 30, ("asm", _ASM.format(36, "bf16_tn_256x256_bpreshuffle"))),
+)
+
+
+class Preshuffled:
+    """``fused_qkvg_proj``'s method on a packed layer: its weight is the packed
+    buffer's q, k, v, g rows, AITER's 16x16 preshuffle (``is_shuffled``)."""
+
+    def __init__(self) -> None:
+        self._exe: dict = {}
+        self._dev: dict = {}
+
+    def _fly(self, n, k, tm, tn, tk, wpe):
+        key = (n, k, tm, tn, tk, wpe)
+        if key not in self._exe:
+            from aiter.ops.flydsl.kernels.preshuffle_gemm import compile_preshuffle_gemm
+
+            self._exe[key] = compile_preshuffle_gemm(
+                N=n, K=k, tile_m=tm, tile_n=tn, tile_k=tk, in_dtype="bf16",
+                out_dtype="bf16", waves_per_eu=wpe or None,
+            )  # fmt: skip
+        return self._exe[key]
+
+    def apply(self, layer, x, bias=None):
+        w = layer.weight
+        assert bias is None and getattr(w, "is_shuffled", False) and x.dtype == torch.bfloat16
+        x2 = x.reshape(-1, x.shape[-1]).contiguous()
+        m, (n, k) = x2.shape[0], w.shape
+        out = torch.empty(m, n, dtype=x.dtype, device=x.device)
+        if m == 0:
+            return out.view(*x.shape[:-1], n)
+        cfg = next(c for top, c in PRE_TILES if m <= top)
+        if cfg[0] == "asm":
+            from aiter.ops.gemm_op_a16w16 import gemm_a16w16_asm
+
+            gemm_a16w16_asm(x2, w, out, None, 1, cfg[1], True)
+        else:
+            import flydsl.expr as fx
+            from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+
+            dev = x.device
+            if dev not in self._dev:
+                self._dev[dev] = (
+                    torch.empty(0, dtype=torch.int32, device=dev),
+                    torch.empty(1, dtype=torch.float32, device=dev),
+                    torch.empty(0, dtype=torch.bfloat16, device=dev),
+                )
+            sem, sc, nobias = self._dev[dev]
+            exe = self._fly(n, k, *cfg[1:])
+            _run_compiled(
+                exe, out.view(-1), out.view(-1), sem, x2.view(-1), w.view(-1), sc, sc,
+                nobias, m, n, fx.Stream(torch.cuda.current_stream()),
+            )  # fmt: skip
+        return out.view(*x.shape[:-1], n)
+
+
+PRESHUFFLED = Preshuffled()
+
+
 # ---------------------------------------------------------------- the layers
 class InProj:
     """The process's packed KDA layers and SGLang's path on them."""
@@ -139,45 +182,41 @@ class InProj:
         from sgl_amd_mono.kimi_k3.gfx950.attention import kda, kda_wide as kw
 
         self.device = device
-        # every packed layer's SGLang in_proj views, unpacked by the layer that runs
-        self.plain = torch.empty(kda.NPROJ, HIDDEN, dtype=torch.bfloat16, device=device)
         self.layers: dict[int, Any] = {}  # id(attn) -> the layer's packed in_proj
         self.first: Optional[int] = None  # the lowest packed layer id
-        # the verify chunks: one scratch, chunk c's epoch word c
-        crows = CHUNK * kw.WT
-        self.crows = crows
+        # the verify launches: one scratch and epoch word, x in pack_x's layout
         self.scratch = torch.zeros(
-            kw.scratch_bytes(kw.KdaWideBuild(tokens=crows, qlen=kw.WT)),
-            dtype=torch.uint8,
-            device=device,
+            kw.scratch_bytes(kw.gemm_key(MAX_REQS, kw.WT)), dtype=torch.uint8, device=device
         )
-        self.epochs = torch.zeros(EPOCH_STRIDE, 8, dtype=torch.int32, device=device)
-        self.epochs[:, 0] = torch.arange(EPOCH_STRIDE, dtype=torch.int32, device=device)
-        # chunk c's x at row c * crows, in its own tiles' pack_x layout
-        self.xp = torch.zeros(
-            MAX_REQS // CHUNK, crows, HIDDEN, dtype=torch.bfloat16, device=device
-        )
+        self.epochs = torch.zeros(1, 8, dtype=torch.int32, device=device)
+        self.xp = torch.zeros(1, MAX_REQS * kw.WT, HIDDEN, dtype=torch.bfloat16, device=device)
         self.step: dict = {}
 
     def pack(self, layer, i: int) -> torch.Tensor:
-        """This layer's in_proj packed in place (once); its SGLang weights made
-        views of ``plain``; SGLang's attention routed through ``pre_o_proj``."""
-        from sgl_amd_mono.kimi_k3.gfx950.attention import kda_wide as kw
+        """This layer's in_proj packed in place (once); SGLang's q, k, v, g GEMM
+        pointed at the packed rows, its f_a | b views at a plain copy of the
+        tail; SGLang's attention routed through ``pre_o_proj``."""
+        from sgl_amd_mono.kimi_k3.gfx950.attention import kda, kda_wide as kw
 
         attn = layer.self_attn
         if id(attn) in self.layers:
             return self.layers[id(attn)].w_in
         w = attn._qkvgbfa_layer.weight
-        views = self._views(attn, w)
+        qkvg, tail = self._views(attn, w)
         with torch.no_grad():
+            # SGLang's f_a | b GEMM reads the tail rows plain
+            plain = w[kda.FA_0 :].clone()
+            for obj, name, r0, n in tail:
+                t = plain[r0 - kda.FA_0 : r0 - kda.FA_0 + n]
+                if isinstance(getattr(obj, name), torch.nn.Parameter):
+                    getattr(obj, name).data = t
+                else:
+                    setattr(obj, name, t)
             w.copy_(kw.pack_w_in(w))
-        for obj, name, off, n in views:
-            plain = self.plain[off : off + n]
-            if isinstance(getattr(obj, name), torch.nn.Parameter):
-                getattr(obj, name).data = plain
-            else:
-                setattr(obj, name, plain)
-        attn._qkvgbfa_layer = SimpleNamespace(weight=self.plain)
+        qkvg.is_shuffled = True
+        attn.fused_qkvg_proj.quant_method = PRESHUFFLED
+        # SGLang's one GEMM over the whole merged buffer reads it plain
+        attn._qkvgbfa_sizes = None
         entry = layer_entry(
             i,
             {
@@ -199,9 +238,12 @@ class InProj:
 
     @staticmethod
     def _views(attn, w):
-        """SGLang's views into the merged in_proj: (owner, attribute, first row, rows)."""
+        """SGLang's views into the merged in_proj: the q, k, v, g weight (rows
+        0 .. FA_0 - 1), and the tail views (owner, attribute, first row, rows)."""
+        from sgl_amd_mono.kimi_k3.gfx950.attention import kda
+
         row_bytes = w.stride(0) * w.element_size()
-        out = []
+        tail = []
         for obj, name in (
             (attn.fused_qkvg_proj, "weight"),
             (attn.f_a_proj, "weight"),
@@ -216,21 +258,21 @@ class InProj:
                 f"{name} is not a view of the merged in_proj"
             )
             assert t.is_contiguous() and t.shape[1] == HIDDEN and off % row_bytes == 0
-            out.append((obj, name, off // row_bytes, t.shape[0]))
-        return out
+            r0 = off // row_bytes
+            if obj is attn.fused_qkvg_proj:
+                assert (r0, t.shape[0]) == (0, kda.FA_0)
+            else:
+                assert r0 >= kda.FA_0
+                tail.append((obj, name, r0, t.shape[0]))
+        return attn.fused_qkvg_proj.weight, tail
 
     # ------------------------------------------------------------ SGLang's path
-    def stock(self, entry, **kw_):
-        """SGLang's own attention on this layer, in_proj unpacked first."""
-        unpack_w_in(entry.w_in, self.plain)
-        attn = entry.attn
-        return type(attn).forward_pre_o_proj(attn, **kw_)
-
     def pre_o_proj(self, entry, *, hidden_states, positions, forward_batch, zero_allocator):
         if forward_batch.forward_mode.is_target_verify():
             return self.verify(entry, hidden_states, forward_batch)
-        return self.stock(
-            entry,
+        attn = entry.attn
+        return type(attn).forward_pre_o_proj(
+            attn,
             hidden_states=hidden_states,
             positions=positions,
             forward_batch=forward_batch,
@@ -268,10 +310,10 @@ class InProj:
     def verify(self, entry, x, forward_batch) -> torch.Tensor:
         """kda_wide over the step's requests on SGLang's pools."""
         if entry.i == self.first:
-            # once a step, in the step's first packed layer: a step's chunks and
-            # layers differ by epoch word and slot, the steps by the epoch
+            # once a step, in the step's first packed layer: a step's layers
+            # differ by slot, the steps by the epoch
             self.step = self._step_state(forward_batch)
-            self.epochs[:, 0].add_(EPOCH_STRIDE)
+            self.epochs[:, 0].add_(1)
         st = self.step
         if entry.mamba_idx is None:
             entry.mamba_idx = st["backend"].state_layer(
@@ -294,56 +336,53 @@ class InProj:
             slots=st["slots"],
             rows=st["rows"],
         )
-        return self.chunks(entry, x, st["reqs"], pools)
+        return self.launch(entry, x, st["reqs"], pools)
 
-    def chunks(self, entry, x, reqs: int, pools) -> torch.Tensor:
-        """kda_wide on requests 0 .. reqs - 1 of x [reqs L, HIDDEN], CHUNK of them a
-        launch: the gated core output [reqs L, PROJ]."""
+    def launch(self, entry, x, reqs: int, pools) -> torch.Tensor:
+        """kda_wide on requests 0 .. reqs - 1 of x [reqs L, HIDDEN]: the gated
+        core output [reqs L, PROJ]."""
         from sgl_amd_mono.kimi_k3.gfx950.attention import kda, kda_wide as kw
 
         rows = x.shape[0]
         qlen = rows // reqs
         assert rows == reqs * qlen and 1 <= qlen <= kw.WT and reqs <= MAX_REQS
-        pack_chunks(x, self.xp, CHUNK * qlen)
+        key = entry.key(reqs, qlen)
+        nt = kw.tiles(key)
+        pack_chunks(x, self.xp, rows)
         core = torch.empty(rows, kda.PROJ, dtype=torch.bfloat16, device=x.device)
-        for c, r0 in enumerate(range(0, reqs, CHUNK)):
-            r = min(CHUNK, reqs - r0)
-            key = entry.key(r, qlen)
-            nt = kw.tiles(key)
-            kw.kda_wide(
-                key,
-                x=self.xp[c, : 16 * nt],
-                **entry.w,
-                conv_state=pools.conv_state,
-                rstate=pools.rstate,
-                st_idx=pools.slots[r0 : r0 + r],
-                conv_win=pools.conv_win,
-                win_row=pools.rows[r0 : r0 + r],
-                ring=pools.ring,
-                core_out=core[r0 * qlen : (r0 + r) * qlen],
-                scratch=self.scratch,
-                layer=entry.i,
-                epoch=self.epochs[c],
-            )
+        kw.kda_wide(
+            key,
+            x=self.xp[0, : 16 * nt],
+            **entry.w,
+            conv_state=pools.conv_state,
+            rstate=pools.rstate,
+            st_idx=pools.slots[:reqs],
+            conv_win=pools.conv_win,
+            win_row=pools.rows[:reqs],
+            ring=pools.ring,
+            core_out=core,
+            scratch=self.scratch,
+            layer=entry.i,
+            epoch=self.epochs[0],
+        )
         return core
 
     def warmup(self, qlen: int) -> None:
-        """Compile every chunk width's launch and the two layout kernels, on a
-        packed layer's weights and throwaway state, before any capture."""
+        """Compile every width's launch and the x layout kernel, on a packed
+        layer's weights and throwaway state, before any capture."""
         from sgl_amd_mono.kimi_k3.gfx950.attention import kda, kda_wide as kw
 
         if not self.layers or qlen < 1 or qlen > kw.WT:
             return
-        unpack_w_in(next(iter(self.layers.values())).w_in, self.plain)
         f32, bf16, dev = torch.float32, torch.bfloat16, self.device
 
         def z(*shape, dt=bf16):
             return torch.zeros(*shape, dtype=dt, device=dev)
 
         chans = 3 * kda.PROJ
-        pack_chunks(z(MAX_REQS * qlen, HIDDEN), self.xp, CHUNK * qlen)
+        pack_chunks(z(MAX_REQS * qlen, HIDDEN), self.xp, MAX_REQS * qlen)
         for entry in self.layers.values():
-            for r in range(1, CHUNK + 1):
+            for r in range(1, MAX_REQS + 1):
                 key = entry.key(r, qlen)
                 if key in _WARM:
                     continue
@@ -383,11 +422,11 @@ def layer_entry(i: int, w: dict, onorm_eps: float, lower_bound: float):
 
     def key(reqs: int, qlen: int):
         if (reqs, qlen) not in keys:
-            keys[(reqs, qlen)] = kw.KdaWideBuild(
-                tokens=reqs * qlen,
-                qlen=qlen,
-                onorm_eps=onorm_eps,
-                lower_bound=lower_bound,
+            kw_ = dict(onorm_eps=onorm_eps, lower_bound=lower_bound)
+            keys[(reqs, qlen)] = (
+                kw.KdaWideBuild(tokens=reqs * qlen, qlen=qlen, **kw_)
+                if reqs <= kw.WIDE_REQS
+                else kw.gemm_key(reqs, qlen, **kw_)
             )
         return keys[(reqs, qlen)]
 
@@ -406,10 +445,9 @@ def for_device(device) -> InProj:
 
 
 def stock_pre_o_proj(attn):
-    """SGLang's own ``forward_pre_o_proj`` on this layer: in_proj unpacked first
-    on a packed layer."""
+    """SGLang's own ``forward_pre_o_proj`` on this layer (on a packed layer it
+    reads the packed buffer as it is)."""
     p = _INPROJ.get("p")
-    entry = None if p is None else p.layers.get(id(attn))
-    if entry is None:
+    if p is None or id(attn) not in p.layers:
         return attn.forward_pre_o_proj
-    return lambda **kw_: p.stock(entry, **kw_)
+    return type(attn).forward_pre_o_proj.__get__(attn)

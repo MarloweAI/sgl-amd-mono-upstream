@@ -10,9 +10,9 @@ core output, on the ReplaySSM ring. One launch, ``BLOCKS`` CTAs x ``THREADS``.
             then waits for the flags before its first x load
     gemv    in_proj: 131 sets of three 16-row groups x 14 K steps of 64 a
             wave (wave w streams K 896 w .. 896 (w + 1)), 1834 units in equal
-            runs of 7 or 8 over the CTAs, the weights read from ``pack_w_in``'s
-            layout (a run's weights contiguous) and x from ``pack_x``'s (1 KB
-            an instruction); a set's groups share every x load. A run's pieces
+            runs of 7 or 8 over the CTAs, the weights read in ``pack_w_in``'s
+            layout (1 KB an instruction) and x in ``pack_x``'s (1 KB an
+            instruction); a set's groups share every x load. A run's pieces
             are summed in wave order; a set's head CTA adds the pieces of the
             next one or two CTAs in order -> bf16 PROJ words (16-B tagged
             words, a request's L rows of a channel)
@@ -110,8 +110,6 @@ TL_POINTS = 14
 
 # a set spans at most 3 CTAs; a run at most 2 sets
 assert GROUPS * ROWS == NPROJ and SETS * G == GROUPS
-# K1's one-request form reads the same packed in_proj (``kda.w_piece``)
-assert (_kda.W_G, _kda.W_KSTEP, _kda.W_HSTEPS) == (G, KSTEP, HSTEPS)
 assert NMAX < HSTEPS <= 2 * (UNITS // BLOCKS)
 
 _STREAM = fx.Stream(None)
@@ -140,8 +138,43 @@ def tiles(key):
     return (key.tokens + 15) // 16
 
 
+# Past WIDE_T token tiles the launch is its GEMM form (``gemm_pass``): the same
+# units on the same CTAs over every token tile, PASS_T tiles a pass (their
+# accumulators in registers; a pass streams the CTA's run), the pieces folded
+# CHUNK_T tiles at a time through LDS (a run's first piece parked in LDS where
+# the run crosses into the next set if it fits, else folded there); then the
+# (request, head) tasks, TASK_SLOTS a round, the request count a launch argument
+# (at most ``gemm_reqs``).
+WIDE_T = 3
+WIDE_REQS = 8  # requests the launch takes in its first form
+PASS_T = 12
+CHUNK_T = 6  # a fold's partials in LDS (G x CHUNK_T x WAVES KB)
+TASK_SLOTS = BLOCKS // 2
+
+
+def xla(npt):
+    """x loads in flight ahead of the GEMM form's MFMAs: what the registers
+    beside ``npt`` tiles' accumulators hold without spilling."""
+    return 16 if npt <= CHUNK_T else (8 if npt <= 8 else 4)
+
+
+def is_gemm(key):
+    return tiles(key) > WIDE_T
+
+
+def gemm_reqs(key):
+    """Requests a GEMM-form build takes (its tiles' worth)."""
+    return 16 * tiles(key) // key.qlen if is_gemm(key) else key.tokens // key.qlen
+
+
+def gemm_key(reqs, qlen, **kw):
+    """The GEMM-form build for ``reqs`` requests of ``qlen`` rows."""
+    nt = max((reqs * qlen + 15) // 16, WIDE_T + 1)
+    return KdaWideBuild(tokens=16 * nt // qlen * qlen, qlen=qlen, **kw)
+
+
 def depth(key):
-    return key.depth or (3, 2, 1)[tiles(key) - 1]
+    return key.depth or ((3, 2, 1)[tiles(key) - 1] if tiles(key) <= WIDE_T else 1)
 
 
 KPT = 16  # K columns a lane holds of a state row, at every width
@@ -159,7 +192,7 @@ def scratch_layout(key: KdaWideBuild) -> dict:
     """16-B tagged words: ``proj`` a (request, in_proj row) (its L bf16 rows),
     ``part`` two a (CTA, group row, request) (its L f32 piece sums), ``ox`` a
     task half's outputs."""
-    r = key.tokens // key.qlen
+    r = gemm_reqs(key)
     s, ns = key.tokens, key.nblocks + 1
     front = (
         [("fpart", NA * s * front_nq(ns)), ("fwgt", s * (ns + 2)), ("fxrdy", NA)]
@@ -259,18 +292,19 @@ def _soff(c, hs):
 
 
 def _wloads(c, u, hs, live):
-    """Unit ``u``'s weights of this wave: 2 x 16 B a lane of each group
-    (``pack_w_in``: a unit's bytes are contiguous, 1 KB an instruction; zeros,
-    with no memory read, unless ``live``)."""
+    """Unit ``u``'s weights of this wave: 2 x 16 B a lane of each group, 1 KB an
+    instruction at lane * 16 (``pack_w_in``; zeros, with no memory read, unless
+    ``live``)."""
     lane = c["lane"]
     wr = rsrc(c["args"]["w_in"], live.select(fx.Int64(NPROJ * HIDDEN * 2), fx.Int64(0)))
-    wo = uniform((u * WAVES + c["wave"]) * (G * 2 * 1024))
+    k32 = (c["wave"] * HSTEPS + hs) * (KSTEP // 32)
+    wo = uniform(((u // HSTEPS) * G * (HIDDEN // 32) + k32) * 1024)
 
     def wld(g, q):
         return fx.Vector(
             bo.buffer_load(
                 wr, lane * 4, vec_width=4, dtype=T.i32, cache_modifier=CM_NT,
-                soffset_bytes=wo + (g * 2 + q) * 1024,
+                soffset_bytes=wo + (g * (HIDDEN // 32) + q) * 1024,
             )
         )  # fmt: skip
 
@@ -302,11 +336,19 @@ def _loads(c, u, hs, live):
 
 
 def pack_w_in(w_in):
-    """in_proj [NPROJ, HIDDEN] in the launch's stream order: unit (set, K step),
-    wave, group, K half, lane (K group, row), 8 K a lane."""
+    """in_proj [NPROJ, HIDDEN] in AITER's 16x16 preshuffle
+    (``aiter.ops.shuffle.shuffle_weight``): 1 KB pieces of 16 rows x 32 K in
+    (row group, K) order, a lane's 16 B at lane * 16 (row lane % 16, K
+    8 (lane // 16) ..). AITER's preshuffled-weight GEMMs read it as it is."""
     assert w_in.shape == (NPROJ, HIDDEN)
-    v = w_in.view(SETS, G, ROWS, WAVES, HSTEPS, KSTEP // 32, 4, 8)
-    return v.permute(0, 4, 3, 1, 5, 6, 2, 7).contiguous().view(NPROJ, HIDDEN)
+    v = w_in.view(GROUPS, ROWS, HIDDEN // 32, 4, 8)
+    return v.permute(0, 2, 3, 1, 4).contiguous().view(NPROJ, HIDDEN)
+
+
+def unpack_w_in(packed):
+    """``pack_w_in``'s inverse."""
+    v = packed.view(GROUPS, HIDDEN // 32, 4, ROWS, 8)
+    return v.permute(0, 3, 1, 2, 4).contiguous().view(NPROJ, HIDDEN)
 
 
 def pack_x(x, nt):
@@ -491,6 +533,247 @@ def gemv_emit(c):
                         )  # fmt: skip
     lds_barrier()
     stamp(c["on"], c["tls"], tid, 2)
+
+
+# ---------------------------------------------------------------- the GEMM form
+def _xload1(c, xr, hs, tt, q):
+    """Half ``q`` of K step ``hs`` of token tile ``tt``'s x for this wave (``pack_x``)."""
+    return fx.Vector(
+        bo.buffer_load(
+            xr, c["lane"] * 4 + (tt * 2 + q) * 256, vec_width=4, dtype=T.i32,
+            soffset_bytes=uniform(_soff(c, hs) * (c["T"] * 16)),
+        )
+    )  # fmt: skip
+
+
+@flyc.jit
+def gemm_pass(c, p):
+    """Pass ``p``: token tiles PASS_T p .. of this CTA's run of units, each
+    (group, tile) chained over the run's K steps as ``gemv_loop`` chains it; a
+    piece folded (``gemm_fold``) once its last unit is in."""
+    bid, nt, d = c["bid"], c["T"], c["D"]
+    t0 = p * PASS_T
+    npt = min(PASS_T, nt - t0)
+    u0, u1 = uniform(_u0(bid)), uniform(_u0(bid + 1))
+
+    def unit(i):
+        u = u0 + i
+        return u, u % HSTEPS, u < u1
+
+    def xres(i):
+        live = unit(i)[2]
+        return rsrc(c["args"]["x"], live.select(fx.Int64(nt * 16 * HIDDEN * 2), fx.Int64(0)))
+
+    zero = fx.Vector.filled(4, 0.0, fx.Float32)
+    acc = [[zero for _ in range(npt)] for _ in range(G)]
+    la = xla(npt)
+    park = npt <= CHUNK_T  # a crossing run's first piece waits in LDS
+    wq = {i: _wloads(c, *unit(i)) for i in range(min(d, NMAX))}
+    seq = [(i, q, tt) for i in range(NMAX) for q in range(KSTEP // 32) for tt in range(npt)]
+    xr = [xres(i) for i in range(NMAX)]
+    xq = {}
+
+    def issue(k):
+        i, q, tt = seq[k]
+        xq[k] = _xload1(c, xr[i], unit(i)[1], t0 + tt, q)
+
+    for k in range_constexpr(min(la, len(seq))):
+        issue(k)
+    rocdl.sched_barrier(0)
+    ws = None
+    for k in range_constexpr(len(seq)):
+        i, q, tt = seq[k]
+        if const_expr(q == 0 and tt == 0):
+            if const_expr(i + d < NMAX):
+                wq[i + d] = _wloads(c, *unit(i + d))
+            ws = wq.pop(i)
+            if const_expr(i > 0):
+                # the run crosses into the next set here: the first piece is done
+                _, hs, live = unit(i)
+                cross = (hs == 0) & live
+                if cross:
+                    if const_expr(park):
+                        gemm_store(c, acc, 0, npt)
+                    else:
+                        gemm_fold(c, acc, p, False)
+                for gs in range_constexpr(G):
+                    for t in range_constexpr(npt):
+                        acc[gs][t] = cross.select(zero, acc[gs][t])
+        if const_expr(k + la < len(seq)):
+            issue(k + la)
+        xb = xq.pop(k).bitcast(fx.BFloat16)
+        for gs in range_constexpr(G):
+            acc[gs][tt] = mfma_bf16(ws[gs][q].bitcast(fx.BFloat16), xb, acc[gs][tt])
+        rocdl.sched_barrier(0)
+    stamp(c["on"], c["tls"], c["tid"], 1)
+    if const_expr(park):
+        if (u1 - 1) // HSTEPS != u0 // HSTEPS:
+            gemm_fold(c, None, p, False)
+    gemm_fold(c, acc, p, True)
+    stamp(c["on"], c["tls"], c["tid"], 2)
+
+
+def gemm_store(c, acc, t0, nt):
+    """This wave's partial sums of tiles t0 .. t0 + nt - 1 into LDS."""
+    red, wave, lane = c["red"], c["wave"], c["lane"]
+    for gs in range_constexpr(G):
+        for tl in range_constexpr(nt):
+            fx.ptr_store(
+                acc[gs][t0 + tl], red + (((gs * CHUNK_T + tl) * WAVES + wave) * 64 + lane) * 4
+            )
+
+
+SP = 16 * CHUNK_T + 4  # LDS floats a (group, row) of a fold's summed tokens
+
+
+@flyc.jit
+def gemm_fold(c, acc, p, last):
+    """A piece of pass ``p`` (``acc``: this wave's partial sums; None: parked in
+    LDS already), CHUNK_T tiles at a time, summed in wave order a (group row,
+    token) through LDS: a thread a (group, tile, MFMA lane) adds the waves' 4
+    rows of one token, then a thread a (group row, request) takes its L tokens.
+    The first piece of a run that crosses into the next set (not ``last``), or
+    a last piece that does not start its set: published for the set's head CTA.
+    The head piece (``last``, starting its set): plus the set's later pieces
+    (the next one or two CTAs') in order -> bf16 PROJ words. The same sums, in
+    the same order, as ``gemv_emit``'s."""
+    tid, bid, L, nt = c["tid"], c["bid"], c["L"], c["T"]
+    tag, red, R, rmax = c["tag"], c["red"], c["R"], c["RMAX"]
+    npt = min(PASS_T, nt - p * PASS_T)
+    rqc = CHUNK_T * 16 // L  # requests a chunk
+    u0, u1 = uniform(_u0(bid)), uniform(_u0(bid + 1))
+    pa, hsa = u0 // HSTEPS, u0 % HSTEPS
+    crosses = (u1 - 1) // HSTEPS != pa
+    head = crosses | (hsa == 0)
+    n = G * ROWS * rmax
+    held = []
+    for ch in range_constexpr((npt + CHUNK_T - 1) // CHUNK_T):
+        t0 = ch * CHUNK_T
+        ntc = min(CHUNK_T, npt - t0)
+        if const_expr(acc is not None):
+            lds_barrier()
+            gemm_store(c, acc, t0, ntc)
+            if const_expr(last and t0 + ntc == npt and p == c["NPASS"] - 1):
+                # the first task round's inputs, in flight under the fold
+                c["nxt"] = c["task_pre"](0)
+        lds_barrier()
+        n1 = G * ntc * 64
+        s1 = []
+        for it in range_constexpr((n1 + THREADS - 1) // THREADS):
+            e = fx.min(tid + THREADS * it, n1 - 1)
+            blk, ln = e // 64, e % 64
+            base = ((blk // ntc) * CHUNK_T + blk % ntc) * WAVES
+            tot = fx.Vector.filled(4, 0.0, fx.Float32)
+            for w in range_constexpr(WAVES):
+                tot = tot + fx.Vector(
+                    fx.ptr_load(
+                        red + ((base + w) * 64 + ln) * 4,
+                        result_type=fx.Vector.make_type(4, fx.Float32),
+                    )
+                )
+            s1.append((tot, blk, ln, tid + THREADS * it < n1))
+        lds_barrier()
+        for tot, blk, ln, live in s1:
+            if live:
+                gs, tl = blk // ntc, blk % ntc
+                for k in range_constexpr(4):
+                    fx.ptr_store(
+                        tot[k], red + ((gs * ROWS + 4 * (ln // 16) + k) * SP + 16 * tl + ln % 16)
+                    )
+        lds_barrier()
+        items = G * ROWS * rqc
+        for it in range_constexpr((items + THREADS - 1) // THREADS):
+            e = fx.min(tid + THREADS * it, items - 1)
+            gs, r, rq = e // (ROWS * rqc), e % ROWS, (e // ROWS) % rqc
+            q = p * (PASS_T * 16 // L) + ch * rqc + rq
+            ok = (tid + THREADS * it < items) & (q < R)
+            v = [fx.ptr_load(red + ((gs * ROWS + r) * SP + rq * L + j)) for j in range(L)]
+            v += [fx.Float32(0.0)] * (WT - L)
+            ge = gs * (ROWS * rmax) + fx.min(q, R - 1) * ROWS + r
+            pub = (ok & ~head) if last else ok
+            if pub:
+                for hh in range_constexpr(2):
+                    put_word(
+                        c["part"], (bid * n + ge) * 2 + hh,
+                        [x.bitcast(fx.Int32) for x in v[3 * hh : 3 * hh + 3]], tag,
+                    )  # fmt: skip
+            held.append((v, ok, ge, gs, r, q))
+    lds_barrier()
+    if const_expr(last):
+        gemm_head(c, held, head, crosses, pa, n)
+
+
+@flyc.jit
+def gemm_head(c, held, head, crosses, pa, n):
+    """The head's pieces ``held`` (every round's) plus its set's later pieces,
+    polled at once, in order -> bf16 PROJ words."""
+    L, tag, bid = c["L"], c["tag"], c["bid"]
+    ph = crosses.select(pa + 1, pa)
+    nb1, nb2 = fx.min(bid + 1, BLOCKS - 1), fx.min(bid + 2, BLOCKS - 1)
+    two = (bid + 2 < BLOCKS) & (_u0(bid + 2) < (ph + 1) * HSTEPS)
+    nb2 = two.select(nb2, nb1)
+    if head:
+        pidx = [(nb * n + h[2]) * 2 + hh for h in held for nb in (nb1, nb2) for hh in (0, 1)]
+        got = poll_words(c["part"], pidx, tag)
+        for k in range_constexpr(len(held)):
+            v, ok, ge, gs, r, q = held[k]
+            g1 = [f32_of(w) for w in got[4 * k] + got[4 * k + 1]]
+            g2 = [f32_of(w) for w in got[4 * k + 2] + got[4 * k + 3]]
+            vs = []
+            for j in range_constexpr(WT):
+                tot = v[j] + g1[j]
+                vs.append(bf16r(two.select(tot + g2[j], tot)))
+            row = (G * ph + gs) * ROWS + r
+            if ok:
+                put_word(
+                    c["proj"], q * NPROJ + row,
+                    [bf16_pair(vs[2 * m], vs[2 * m + 1]).bitcast(fx.Int32) for m in range(WT // 2)],
+                    tag,
+                )  # fmt: skip
+                if const_expr(c["debug"]):
+                    for j in range_constexpr(L):
+                        bo.buffer_store(
+                            vs[j].to(fx.BFloat16), rsrc(c["args"]["proj_dbg"]),
+                            (q * L + j) * NPROJ + row,
+                        )  # fmt: skip
+
+
+def task_pre(c):
+    """Round k's task inputs on this CTA (``kda_pre``): (has, task, request, inputs)."""
+    bid, a = c["bid"], c["args"]
+    ntasks = c["R"] * NH
+    slot = (bid // 16) * 8 + bid % 8
+    hf = (bid % 16) // 8
+
+    def pre(k):
+        t = k * TASK_SLOTS + slot
+        has = t < ntasks
+        tc = uniform(fx.min(t, ntasks - 1))
+        req = tc // NH
+        idx = [
+            uniform(fx.Int32(bo.buffer_load(rsrc(a[nm]), req, vec_width=1, dtype=T.i32)))
+            for nm in ("st_idx", "win_row")
+        ]
+        return has, tc, req, kda_pre(c, req, tc % NH, hf, has, idx[0], idx[1])
+
+    return pre
+
+
+@flyc.jit
+def gemm_tasks(c):
+    """Every (request, head) task, its two halves on CTAs b and b + 8 (a block of
+    16 holds 8 tasks), TASK_SLOTS a round; the first round's inputs issued in the
+    last fold (``c["nxt"]``), each next round's under the round before."""
+    hf = (c["bid"] % 16) // 8
+    rounds = (c["RMAX"] * NH + TASK_SLOTS - 1) // TASK_SLOTS
+    pre = c["task_pre"]
+    nxt = c["nxt"]
+    for k in range_constexpr(rounds):
+        has, tc, req, kk = nxt
+        if const_expr(k + 1 < rounds):
+            nxt = pre(k + 1)
+        if has:
+            kda_task(c, tc, req, tc % NH, hf, kk)
 
 
 # ---------------------------------------------------------------- kda
@@ -798,15 +1081,19 @@ def build(key: KdaWideBuild):
     s, L = key.tokens, key.qlen
     assert s % L == 0 and 1 <= L <= WT, (s, L)
     ntasks = s // L * NH
-    assert 2 * 8 * ((ntasks + 7) // 8) <= BLOCKS - TASK0, "a KDA task half a CTA"
+    gemm = is_gemm(key)
     nt = tiles(key)
+    if gemm:
+        assert not key.front and (16 * CHUNK_T) % L == 0, "the GEMM form: no front, whole requests a fold"
+    else:
+        assert 2 * 8 * ((ntasks + 7) // 8) <= BLOCKS - TASK0, "a KDA task half a CTA"
     lay = scratch_layout(key)
     ns = key.nblocks + 1
     assert not key.front or (key.nblocks >= 1 and s <= NA), "the front's gate runs token t on CTA t"
 
     @fx.struct
     class GemvLds:
-        red: fx.Array[fx.Float32, 2 * G * nt * WAVES * 64 * 4, 16]
+        red: fx.Array[fx.Float32, (G * CHUNK_T if gemm else 2 * G * nt) * WAVES * 64 * 4, 16]
 
     # the seam's sources as packed bf16 pairs (exact: every source is bf16)
     @fx.struct
@@ -837,6 +1124,8 @@ def build(key: KdaWideBuild):
 
     keyed = key_tuple(key, SOURCES)
     name = f"k3_mono_kda_wide_s{s}_l{L}_d{depth(key)}_g{int(key.debug)}_t{int(key.timeline)}"
+    if gemm:
+        name += "_gemm"
     if key.front:
         name += f"_f{key.nblocks}" + (f"w{key.write_idx}" if key.write_idx >= 0 else "")
 
@@ -884,6 +1173,7 @@ def build(key: KdaWideBuild):
         ares_nw: Int64,
         ares_qk: Int64,
         in_nw: Int64,
+        reqs: Int32,
     ):
         _ = keyed
         tid = fx.thread_idx.x
@@ -989,6 +1279,14 @@ def build(key: KdaWideBuild):
                 fc[region] = sreg(scratch, lay["f" + region][0], "f" + region)
             c["fc"] = fc
         stamp_begin(key.timeline, lds.tls.ptr, tid, TL_POINTS)
+        if const_expr(gemm):
+            c["R"] = reqs
+            c["RMAX"] = gemm_reqs(key)
+            c["NPASS"] = (nt + PASS_T - 1) // PASS_T
+            c["task_pre"] = task_pre(c)
+            for p in range_constexpr(c["NPASS"]):
+                gemm_pass(c, p)
+            gemm_tasks(c)
         if const_expr(key.front):
             if bid < NA:
                 front_slice(fc, bid)
@@ -998,19 +1296,20 @@ def build(key: KdaWideBuild):
                 stamp(key.timeline, lds.tls.ptr, tid, 11)
                 front_mix(fc, bid)
                 stamp(key.timeline, lds.tls.ptr, tid, 12)
-        # task t = (request, head), half hf on CTA TASK0 + 16 (t // 8) + 8 hf + t % 8,
-        # its inputs in flight under the emit
-        o = fx.max(bid - TASK0, 0)
-        hf = (o % 16) // 8
-        t = o // 16 * 8 + o % 8
-        has = (bid >= TASK0) & (t < ntasks)
-        tc = uniform(fx.min(t, ntasks - 1))
-        c["req"] = tc // NH
-        gemv_loop(c)
-        c["pre"] = lambda: kda_pre(c, tc // NH, tc % NH, hf, has, c["slot0"], c["w_row"])
-        gemv_emit(c)
-        if has:
-            kda_task(c, tc, tc // NH, tc % NH, hf, c["k"])
+        if const_expr(not gemm):
+            # task t = (request, head), half hf on CTA TASK0 + 16 (t // 8) + 8 hf + t % 8,
+            # its inputs in flight under the emit
+            o = fx.max(bid - TASK0, 0)
+            hf = (o % 16) // 8
+            t = o // 16 * 8 + o % 8
+            has = (bid >= TASK0) & (t < ntasks)
+            tc = uniform(fx.min(t, ntasks - 1))
+            c["req"] = tc // NH
+            gemv_loop(c)
+            c["pre"] = lambda: kda_pre(c, tc // NH, tc % NH, hf, has, c["slot0"], c["w_row"])
+            gemv_emit(c)
+            if has:
+                kda_task(c, tc, tc // NH, tc % NH, hf, c["k"])
         stamp_flush(key.timeline, lds.tls.ptr, tl, tid, bid, TL_POINTS)
 
     @flyc.jit
@@ -1057,6 +1356,7 @@ def build(key: KdaWideBuild):
         ares_nw: Int64,
         ares_qk: Int64,
         in_nw: Int64,
+        reqs: Int32,
         stream: fx.Stream = _STREAM,
     ):
         _ = keyed
@@ -1065,7 +1365,7 @@ def build(key: KdaWideBuild):
             win_row, conv_win, ring_k, ring_v, ring_g, ring_b, core_out, proj_dbg,
             o_dbg, cs_seq, cs_dim, cs_tok, rs_seq, cw_seq, cw_tok, cw_q, rk_seq,
             rv_seq, rg_seq, rb_seq, ring_len, scratch, layer, epoch, tl, prefix,
-            blocks, blk_sm, blk_sr, ares_nw, ares_qk, in_nw,
+            blocks, blk_sm, blk_sr, ares_nw, ares_qk, in_nw, reqs,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)  # fmt: skip
 
     _BUILDS[key] = launch
@@ -1120,7 +1420,8 @@ def kda_wide(
     ring_len, (128)]; ``scratch`` (``scratch_bytes``) zeroed once; ``epoch`` a
     device int32 bumped once a step, ``layer`` this launch's slot."""
     s, L = key.tokens, key.qlen
-    R = s // L
+    R = st_idx.numel()
+    assert R <= gemm_reqs(key) and (is_gemm(key) or R == s // L)
     assert x.shape == (16 * tiles(key), HIDDEN) and x.dtype == torch.bfloat16 and x.is_contiguous()
     assert w_in.shape == (NPROJ, HIDDEN) and w_in.is_contiguous()
     assert rstate.dtype == torch.float32 and rstate[0].numel() == NH * HD * HD
@@ -1137,7 +1438,7 @@ def kda_wide(
     for t in (rk, rv, rg):
         assert t.shape[1:] == (NH, ring_len, HD) and t[0].is_contiguous()
     assert rb.shape[1:] == (NH, ring_len) and rb[0].is_contiguous()
-    assert core_out.shape == (s, PROJ) and core_out.is_contiguous()
+    assert core_out.shape == (R * L, PROJ) and core_out.is_contiguous()
     assert key.debug == (proj_dbg is not None) == (o_dbg is not None)
     assert key.timeline == (tl is not None)
     blk_sm = blk_sr = 0
@@ -1194,5 +1495,6 @@ def kda_wide(
         ptr(ares_nw),
         ptr(ares_qk),
         ptr(in_nw),
+        R,
         stream=torch.cuda.current_stream(),
     )

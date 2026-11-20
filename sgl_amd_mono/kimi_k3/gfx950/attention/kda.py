@@ -176,21 +176,12 @@ def sigmoid(z):
 
 
 # ---------------------------------------------------------------- gemv CTAs
-# in_proj as ``kda_wide.pack_w_in`` lays it out: 1 KB pieces (group of 16 rows,
-# 32 K), a lane's 16 B at lane * 16 (row lane % 16, K 8 (lane // 16) ..), in the
-# order (set of W_G groups, K step of W_KSTEP within wave slice, wave slice,
-# group, K half)
-W_G = 3
-W_KSTEP = 64
-W_HSTEPS = HIDDEN // W_KSTEP // WAVES  # 14
-
-
+# in_proj as ``kda_wide.pack_w_in`` lays it out: AITER's 16x16 preshuffle, 1 KB
+# pieces (group of 16 rows, 32 K) in (group, K) order, a lane's 16 B at lane * 16
+# (row lane % 16, K 8 (lane // 16) ..)
 def w_piece(rg, k32):
     """Dword offset of in_proj's packed piece (group ``rg``, K 32 k32 ..)."""
-    step = k32 // 2
-    ws, hs = step // W_HSTEPS, step % W_HSTEPS
-    s, g = rg // W_G, rg % W_G
-    return ((((s * W_HSTEPS + hs) * WAVES + ws) * W_G + g) * 2 + k32 % 2) * 256
+    return (rg * (HIDDEN // 32) + k32) * 256
 
 
 def gemv_loads(c, rg, chunks):
