@@ -83,6 +83,7 @@ from sgl_amd_mono.common import guard
 from sgl_amd_mono.common.ops import load_ptr64
 from sgl_amd_mono.common.sync import Mailbox, sreg
 from sgl_amd_mono.kimi_k3.gfx950.attention import mla_combine as mc
+from sgl_amd_mono.kimi_k3.gfx950.attention.mla_combine import TL_CORE, TL_G, TL_RECORDS  # noqa: F401
 from sgl_amd_mono.kimi_k3.gfx950.attention.mla_pre import load_qlora, load_x
 from sgl_amd_mono.kimi_k3.gfx950.stages import gemv
 from sgl_amd_mono.kimi_k3.gfx950.stages.dims import COLS, HIDDEN, LDS_PAD, NA, ROWS
@@ -158,6 +159,8 @@ EMPTY_LSE = -1e30  # SGLang's LSE of a row with no key on this rank
 # attention done, W_UV partials seen, W_UV done, 4 attention block points,
 # combine g seen, combine records seen, core stored
 TL_POINTS = 17
+TL_START, TL_X, TL_STAGE1, TL_QLAT, TL_QB, TL_ABSORB, TL_ATT_Q, TL_ATT_DONE = range(8)
+TL_UV_SEEN, TL_UV_DONE, TL_BLK, TL_BLK_QK, TL_BLK_PV, TL_BLK_STORED = range(8, 14)
 
 assert S1_EXTRA <= NA - 1 and KV_CTA >= S1_EXTRA
 
