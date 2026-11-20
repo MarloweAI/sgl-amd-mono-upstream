@@ -19,7 +19,6 @@ from sgl_amd_mono.kimi_k3 import (
     K2_MAX_ROWS,
     LINEAR_ATTN_CONFIG,
     MAX_BLOCKS,
-    MAX_ROWS,
 )
 from sgl_amd_mono.kimi_k3 import spec as k3
 
@@ -76,13 +75,13 @@ def test_the_plugin_registers_the_spec():
     assert found is k3.SPEC, why
 
 
-def test_the_spec_is_tp8_and_at_most_eight_rows():
+def test_the_spec_is_tp8_and_at_most_k2_max_rows():
     limits = k3.SPEC.devices["gfx950"]
     assert limits.tp_sizes == (8,)
-    assert limits.widths == tuple(range(1, MAX_ROWS + 1))
-    # With DSpark the runtime serves only the widths that hold whole requests,
-    # so block size 7 (8 tokens a request) leaves batch size 1.
-    assert [w // 8 for w in limits.widths if w % 8 == 0] == [1]
+    assert limits.widths == tuple(range(1, K2_MAX_ROWS + 1))
+    # With DSpark the runtime serves only the widths that hold whole requests:
+    # block size 5 (6 rows a request) leaves batch sizes 1 .. 3.
+    assert [w // 6 for w in limits.widths if w % 6 == 0] == [1, 2, 3]
 
 
 def test_the_shapes_are_checked_on_the_text_config():
@@ -197,11 +196,11 @@ def test_the_guard_flags_sit_past_every_width(monkeypatch):
     from sgl_amd_mono.kimi_k3.gfx950.stages import moe
 
     off = layer.flags_offset()
-    for width in range(1, MAX_ROWS + 1):
+    for width in range(1, K2_MAX_ROWS + 1):
         assert layer.peer_bytes(width) <= off, width
         assert moe.peer_bytes(width) <= off, width
     # the widest launch ends exactly there: a larger offset wastes a peer page
-    assert off == max(layer.peer_bytes(MAX_ROWS), moe.peer_bytes(MAX_ROWS))
+    assert off == max(layer.peer_bytes(K2_MAX_ROWS), moe.peer_bytes(K2_MAX_ROWS))
 
 
 @pytest.mark.parametrize(
