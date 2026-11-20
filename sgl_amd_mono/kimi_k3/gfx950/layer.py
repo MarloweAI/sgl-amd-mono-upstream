@@ -704,10 +704,10 @@ def k2_body(key: K2Build, k2_lds: K2Lds, scratch_base, args: dict) -> None:
             stamp(on, tls, tid, 3)
             k2b.run_down_wide(c, nu)
             stamp(on, tls, tid, 16)
+            # the shared down while the last down tasks land
+            k2b.run_sdown_wide(c, bid, w_sd)
             if bid < k2b.DOWN_TASKS:
                 k2b.fold_wide(c, bid)
-            # the shared down past the fold: lnorm waits on LATR, up on SHRDY
-            k2b.run_sdown_wide(c, bid, w_sd)
         else:
             stamp(on, tls, tid, 3)
             if bid < k2b.DOWN_TASKS:

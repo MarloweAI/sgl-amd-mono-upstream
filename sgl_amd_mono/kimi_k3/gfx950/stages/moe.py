@@ -2111,7 +2111,7 @@ def run_sdown_first(c, bid, w_sd):
 
 @flyc.jit
 def run_sdown_wide(c, bid, w_sd):
-    """A wide step's shared down, after down and the fold on every CTA: tasks
+    """A wide step's shared down, after down on every CTA: tasks
     k = bid, bid + BLOCKS (row group (k + 56 rank) % 448; up's 56 are k < 56,
     on CTAs 0 .. 55), both tasks' weights in flight before H is polled. The
     same tasks and arithmetic as ``run_sdown``: placement only."""
