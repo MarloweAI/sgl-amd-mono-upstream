@@ -178,19 +178,17 @@ W13_STEPS = W13_K // 128  # 28
 W2_STEPS = RI // 128  # 3
 DOWN_TASKS = LAT // ROWS  # 224
 DOWN_BATCH = 5  # a wave's experts whose w2 is in flight together
-# the x rows' LDS (bf16 words) and the shared gate/up's K segments, by width:
-# up to 8 rows hold a whole 7168-wide row; wider, a 3584 + pad row (the latent
-# up's input), and sgu stages its K three rounds of chunks at a time
-NARROW = 8
+# the wide shared gate/up stages its K three rounds of chunks at a time
 SGU_SEGMENTS = ((0, 3), (3, 6), (6, 7))
 
 
-WIDE_ABOVE = ROWS  # wider steps take the wide form (``wide``)
+WIDE_ABOVE = 8  # wider steps take the wide form (``wide``)
 
 
 def wide(s):
-    """Whether an s-row step takes the wide form: GEMVs a 16-row token tile at a
-    time, the latent and INTER from L2, the route table in units."""
+    """Whether an s-row step takes the wide form (two DSpark requests on): GEMVs
+    a 16-row token tile at a time, the latent and INTER from L2, the route table
+    in units."""
     return s > WIDE_ABOVE
 
 
@@ -200,11 +198,11 @@ def max_u(s):
 
 
 def xl_words(s):
-    """The x rows' LDS: up to 8 rows whole, to 16 a 3584 + pad row each, wider
-    a 16-row tile of those (or every row of the shared h)."""
+    """The x rows' LDS: a narrow step's whole rows; a wide step's 16-row tile
+    of 3584 + pad (or every row of the shared h)."""
     if wide(s):
         return max(ROWS * (LAT + gemv.LDS_PAD), s * (SI + gemv.LDS_PAD)) // 2
-    return s * ((HIDDEN if s <= NARROW else LAT) + gemv.LDS_PAD) // 2
+    return s * (HIDDEN + gemv.LDS_PAD) // 2
 
 
 TL_POINTS = 8  # start, early, sdown, ug, down, lnorm, up, reduce
@@ -624,26 +622,9 @@ def _early_narrow(c, kind, i, q, ops):
         gpu.barrier()
         if const_expr(kind == 0):
             stamp(c["tl_on"], c["tls"], c["tid"], 20)  # router: x published
-        if const_expr(kind == 2 and s > NARROW):
-            # the shared gate/up's full K does not fit: its rounds a segment at
-            # a time, the same MFMAs in the same order
-            acc = fx.Vector.filled(4, 0.0, fx.Float32)
-            for si in range_constexpr(len(SGU_SEGMENTS)):
-                r0, r1 = SGU_SEGMENTS[si]
-                k0, k1 = r0 * WAVES * gemv.KCH, r1 * WAVES * gemv.KCH
-                srow = k1 - k0 + gemv.LDS_PAD
-                gemv.rows_to_lds(
-                    tid, c["xbuf"], k1 - k0, s, c["xl"], srow, CM_DEV, ldk=HIDDEN,
-                    k0=k0,
-                )  # fmt: skip
-                acc = gemv.mfmas_rounds(
-                    lane, wave, c["xl"], srow, k0, s, ops, acc, r0, r1
-                )
-                gpu.barrier()
-        else:
-            gemv.rows_to_lds(
-                tid, c["xbuf"], klen, s, c["xl"], xrow, CM_DEV, ldk=HIDDEN, k0=q * klen
-            )
+        gemv.rows_to_lds(
+            tid, c["xbuf"], klen, s, c["xl"], xrow, CM_DEV, ldk=HIDDEN, k0=q * klen
+        )
     else:
         gemv.rows_to_lds(
             tid, c["args"]["x"], klen, s, c["xl"], xrow, ldk=HIDDEN, k0=q * klen
@@ -655,8 +636,7 @@ def _early_narrow(c, kind, i, q, ops):
         if const_expr(kind == 0):
             gpu.barrier()
             stamp(c["tl_on"], c["tls"], c["tid"], 21)  # router: x in LDS
-        if const_expr(not (kind == 2 and s > NARROW and c.get("xflags") is not None)):
-            acc = gemv.mfmas(lane, wave, c["xl"], xrow, klen, s, ops)
+        acc = gemv.mfmas(lane, wave, c["xl"], xrow, klen, s, ops)
         fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
         gpu.barrier()
         if const_expr(kind == 0):
@@ -2202,7 +2182,7 @@ def build(key: MoeBuild):
     if key in _BUILDS:
         return _BUILDS[key]
     s = key.tokens
-    assert 1 <= s <= NARROW
+    assert not wide(s)  # the standalone MoE launch is narrow only
     lay = scratch_layout(key)
     play = peer_layout(s)
     half = peer_bytes(s) // 2
