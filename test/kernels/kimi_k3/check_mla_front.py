@@ -229,6 +229,18 @@ def batch_stream(ids, seed, device):
 QG_PAR = [0]
 
 
+def new_epoch(device, seconds=30.0):
+    """A launch's epoch buffer: epoch 0 and every wait's deadline."""
+    from sgl_amd_mono.common import guard
+
+    epoch = torch.zeros(8, dtype=torch.int32, device=device)
+    ticks = guard.deadline_ticks(seconds)
+    lo = ticks & 0xFFFFFFFF
+    epoch[guard.GUARD_DEADLINE] = lo - (1 << 32) if lo >= 1 << 31 else lo
+    epoch[guard.GUARD_DEADLINE + 1] = ticks >> 32
+    return epoch
+
+
 def front_key(w, s, timeline=False):
     from sgl_amd_mono.kimi_k3.gfx950.attention import mla_front as mf
 
@@ -843,7 +855,7 @@ def main():
             fails.append("frontier")
     w = layer_weights(args, device)
     if args.invariance or args.time_wide:
-        epoch = torch.zeros(8, dtype=torch.int32, device=device)
+        epoch = new_epoch(device)
         if args.time_wide:
             time_wide(w, args, device, epoch)
         else:
@@ -854,7 +866,7 @@ def main():
     xr = seam_x(st, w)
     key = mf.MlaFrontBuild(tokens=G, nblocks=NVB, scale=w["scale"])
     scratch = PeerBuffer(mf.scratch_bytes(key), None, 0, 1, device).bytes
-    epoch = torch.zeros(8, dtype=torch.int32, device=device)
+    epoch = new_epoch(device)
     for p in args.ctx:
         if args.time:
             keys = make_keys(w, p, args.seed + p, device, args.temp[0])

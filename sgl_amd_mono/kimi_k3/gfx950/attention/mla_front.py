@@ -72,6 +72,7 @@ from sgl_amd_mono.common.ops import (
     global_load,
     hw_exp2,
     hw_rsq,
+    load_ptr64,
     row_sum,
     rsrc,
     sfresh64,
@@ -87,6 +88,7 @@ from sgl_amd_mono.common.plan import (
     key_tuple,
     pair_layout,
 )
+from sgl_amd_mono.common import guard
 from sgl_amd_mono.common.sync import Addr, Mailbox, Space, sreg
 from sgl_amd_mono.kimi_k3.gfx950.attention.mla_pre import load_qlora, load_x
 from sgl_amd_mono.kimi_k3.gfx950.stages import gemv
@@ -211,6 +213,13 @@ def qg_offset() -> int:
     from sgl_amd_mono.kimi_k3.gfx950 import layer
 
     return -(-layer.peer_alloc_bytes() // 4096) * 4096 + QG_RESERVE
+
+
+def _flags_offset() -> int:
+    """Where every launch reads the guard flags in a rank's peer buffer (K2's)."""
+    from sgl_amd_mono.kimi_k3.gfx950 import layer
+
+    return layer.flags_offset()
 
 
 def peer_end() -> int:
@@ -1868,133 +1877,141 @@ def build(key: MlaFrontBuild):
         scratch: Int64, peers: Int64, rank: Int32, layer: Int32, epoch: Int64, tl: Int64,
     ):  # fmt: skip
         _ = keyed
-        tid = fx.thread_idx.x
-        bid = fx.block_idx.x
-        alloc = fx.SharedAllocator()
-        lds = alloc.allocate(Smem).peek()
-        role = alloc.allocate(RoleLds)
-        al, gl = role.attn.peek(), role.gemv.peek()
-        abl, cl, ul = role.absorb.peek(), role.core.peek(), role.uv.peek()
-        mb = Mailbox(step_tag(epoch, layer) - 1)
-        c = {
-            "S": s, "NS": ns, "NB": key.nblocks, "tid": tid, "bid": bid,
-            "lane": tid % 64, "wave": tid // 64, "delta": False, "debug": False,
-            "eps": key.eps, "out_eps": key.out_eps, "q_eps": key.q_eps,
-            "kv_eps": key.kv_eps, "write_idx": key.write_idx, "gate_local": not wd,
-            "vals_bf16": wd, "NREQ": nreq, "HQ": hq, "NCT": nct, "NHG": nhg,
-            "qlora_out": False, "qn": False, "put": mb.put, "poll": mb.poll,
-            # every role but the attention's starts with the same red (offset 0)
-            "red": al.red.ptr, "vals": al.vals.ptr, "xl": gl.xl.ptr,
-            "scale": key.scale, "rank": rank, "loc_words": 2,
-            "qg_off": fx.Int64(qg_offset() + key.qg_par * QG_COPY),
-            "xbuf": scratch + fx.Int64(lay["x"][0]),
-            "lat": scratch + fx.Int64(lay["lat"][0]),
-            "qb": scratch + fx.Int64(lay["qb"][0]),
-            "q8": scratch + fx.Int64(lay["q8"][0]),
-            "newkv": scratch + fx.Int64(lay["newkv"][0]),
-            "pv": scratch + fx.Int64(lay["pv"][0]),
-            "ml": scratch + fx.Int64(lay["ml"][0]),
-            "kvl": cl.kv.ptr, "pl": cl.p.ptr, "al": cl.alpha.ptr, "mll": cl.ml.ptr,
-            "qll": cl.q.ptr if nreq == 1 else None, "vt": cl.vt.ptr if nreq > 1 else None,
-            "args": {
-                "prefix": prefix, "delta": 0, "blocks": blocks, "blk_sm": blk_sm,
-                "blk_sr": blk_sr, "ares_nw": ares_nw, "ares_qk": ares_qk, "in_nw": in_nw,
-                "x_dbg": 0, "w_qkv": w_qkv, "w_g": w_g, "q_nw": q_nw, "kv_nw": kv_nw,
-                "w_qb": w_qb, "w_kc": w_kc, "w_vc": w_vc, "kv": kv, "kv_idx": kv_idx,
-                "kv_ptr": kv_ptr, "g_kv_ptr": g_kv_ptr, "loc": loc, "gate": gate,
-                "send": send, "q_lora": 0, "peers": peers,
-            },
-        }  # fmt: skip
-        for region in ("part", "wgt", "msq", "xrdy", "ss", "qrdy", "absrdy", "kvrdy", "itrdy"):
-            c[region] = sreg(scratch, lay[region][0], region)
-        on, tls = key.timeline, lds.tls.ptr
-        c["on"], c["tls"] = on, tls
-        stamp_begin(on, tls, tid, TL_POINTS)
-        if bid < NA:
-            stage_slice(c, bid)
-            if const_expr(wd):
-                if bid < s:
-                    stage_gate(c, bid)
-            stage_mix(c, bid)
-            if bid == KV_CTA:
-                stage_kv(c)
-        if (bid >= QKV0) & (bid < GP0):
-            # fused_qkv_a: the q path's first weights, at launch
-            ops = s1_loads(c, bid - QKV0)
-            if const_expr(wd):
-                x_seen(c)
-                stage1_wide(c, bid - QKV0, ops)
-            else:
-                load_x(c)
-                stage1(c, bid - QKV0, ops)
-        if bid >= GP0:
-            # g_proj, read only after the launch
-            ops = s1_loads(c, S1_GATE0 + bid - GP0)
-            if const_expr(wd):
-                x_seen(c)
-                stage1_wide(c, S1_GATE0 + bid - GP0, ops)
-            else:
-                load_x(c)
-                stage1(c, S1_GATE0 + bid - GP0, ops)
-            if bid < GP0 + GP2:
-                ops2 = s1_loads(c, S1_GATE0 + BLOCKS - GP0 + bid - GP0)
+        # Every wait of this launch runs under the guard: one past its deadline
+        # flags every peer, and the launch stops on all of them.
+        with guard.scope(
+            guard.Guard(
+                epoch, own=load_ptr64(peers, rank), peers=peers, rank=rank, npes=DCP,
+                flags_offset=_flags_offset(),
+            )
+        ):  # fmt: skip
+            tid = fx.thread_idx.x
+            bid = fx.block_idx.x
+            alloc = fx.SharedAllocator()
+            lds = alloc.allocate(Smem).peek()
+            role = alloc.allocate(RoleLds)
+            al, gl = role.attn.peek(), role.gemv.peek()
+            abl, cl, ul = role.absorb.peek(), role.core.peek(), role.uv.peek()
+            mb = Mailbox(step_tag(epoch, layer) - 1)
+            c = {
+                "S": s, "NS": ns, "NB": key.nblocks, "tid": tid, "bid": bid,
+                "lane": tid % 64, "wave": tid // 64, "delta": False, "debug": False,
+                "eps": key.eps, "out_eps": key.out_eps, "q_eps": key.q_eps,
+                "kv_eps": key.kv_eps, "write_idx": key.write_idx, "gate_local": not wd,
+                "vals_bf16": wd, "NREQ": nreq, "HQ": hq, "NCT": nct, "NHG": nhg,
+                "qlora_out": False, "qn": False, "put": mb.put, "poll": mb.poll,
+                # every role but the attention's starts with the same red (offset 0)
+                "red": al.red.ptr, "vals": al.vals.ptr, "xl": gl.xl.ptr,
+                "scale": key.scale, "rank": rank, "loc_words": 2,
+                "qg_off": fx.Int64(qg_offset() + key.qg_par * QG_COPY),
+                "xbuf": scratch + fx.Int64(lay["x"][0]),
+                "lat": scratch + fx.Int64(lay["lat"][0]),
+                "qb": scratch + fx.Int64(lay["qb"][0]),
+                "q8": scratch + fx.Int64(lay["q8"][0]),
+                "newkv": scratch + fx.Int64(lay["newkv"][0]),
+                "pv": scratch + fx.Int64(lay["pv"][0]),
+                "ml": scratch + fx.Int64(lay["ml"][0]),
+                "kvl": cl.kv.ptr, "pl": cl.p.ptr, "al": cl.alpha.ptr, "mll": cl.ml.ptr,
+                "qll": cl.q.ptr if nreq == 1 else None, "vt": cl.vt.ptr if nreq > 1 else None,
+                "args": {
+                    "prefix": prefix, "delta": 0, "blocks": blocks, "blk_sm": blk_sm,
+                    "blk_sr": blk_sr, "ares_nw": ares_nw, "ares_qk": ares_qk, "in_nw": in_nw,
+                    "x_dbg": 0, "w_qkv": w_qkv, "w_g": w_g, "q_nw": q_nw, "kv_nw": kv_nw,
+                    "w_qb": w_qb, "w_kc": w_kc, "w_vc": w_vc, "kv": kv, "kv_idx": kv_idx,
+                    "kv_ptr": kv_ptr, "g_kv_ptr": g_kv_ptr, "loc": loc, "gate": gate,
+                    "send": send, "q_lora": 0, "peers": peers,
+                },
+            }  # fmt: skip
+            for region in ("part", "wgt", "msq", "xrdy", "ss", "qrdy", "absrdy", "kvrdy", "itrdy"):
+                c[region] = sreg(scratch, lay[region][0], region)
+            on, tls = key.timeline, lds.tls.ptr
+            c["on"], c["tls"] = on, tls
+            stamp_begin(on, tls, tid, TL_POINTS)
+            if bid < NA:
+                stage_slice(c, bid)
                 if const_expr(wd):
-                    stage1_wide(c, S1_GATE0 + BLOCKS - GP0 + bid - GP0, ops2)
+                    if bid < s:
+                        stage_gate(c, bid)
+                stage_mix(c, bid)
+                if bid == KV_CTA:
+                    stage_kv(c)
+            if (bid >= QKV0) & (bid < GP0):
+                # fused_qkv_a: the q path's first weights, at launch
+                ops = s1_loads(c, bid - QKV0)
+                if const_expr(wd):
+                    x_seen(c)
+                    stage1_wide(c, bid - QKV0, ops)
                 else:
-                    stage1(c, S1_GATE0 + BLOCKS - GP0 + bid - GP0, ops2)
-        stamp(on, tls, tid, 2)
-        # stage 2: this rank's 144 q_b groups, one a CTA on CTAs 0 .. 143 (a
-        # group index past them loads nothing)
-        qbg = QBG_L * rank + bid
-        live_qb = bid < QBG_L
-        ops = s2_loads(c, live_qb.select(qbg, fx.Int32(QBG)))
-        # stage 3's tile (the absorb CTAs) in flight meanwhile
-        lo_abs = (bid >= ABS0) & (bid < ABS0 + ABS_N0)
-        hi_abs = (bid >= ABS1) & (bid < ABS1 + ABS_L - ABS_N0)
-        task = ABS_L * rank + lo_abs.select(bid - ABS0, bid - ABS1 + ABS_N0)
-        live_abs = lo_abs | hi_abs
-        w3 = s3_loads(c, live_abs.select(task, fx.Int32(0)))
-        if live_qb:
-            if const_expr(wd):
-                load_qlora_wide(c)
+                    load_x(c)
+                    stage1(c, bid - QKV0, ops)
+            if bid >= GP0:
+                # g_proj, read only after the launch
+                ops = s1_loads(c, S1_GATE0 + bid - GP0)
+                if const_expr(wd):
+                    x_seen(c)
+                    stage1_wide(c, S1_GATE0 + bid - GP0, ops)
+                else:
+                    load_x(c)
+                    stage1(c, S1_GATE0 + bid - GP0, ops)
+                if bid < GP0 + GP2:
+                    ops2 = s1_loads(c, S1_GATE0 + BLOCKS - GP0 + bid - GP0)
+                    if const_expr(wd):
+                        stage1_wide(c, S1_GATE0 + BLOCKS - GP0 + bid - GP0, ops2)
+                    else:
+                        stage1(c, S1_GATE0 + BLOCKS - GP0 + bid - GP0, ops2)
+            stamp(on, tls, tid, 2)
+            # stage 2: this rank's 144 q_b groups, one a CTA on CTAs 0 .. 143 (a
+            # group index past them loads nothing)
+            qbg = QBG_L * rank + bid
+            live_qb = bid < QBG_L
+            ops = s2_loads(c, live_qb.select(qbg, fx.Int32(QBG)))
+            # stage 3's tile (the absorb CTAs) in flight meanwhile
+            lo_abs = (bid >= ABS0) & (bid < ABS0 + ABS_N0)
+            hi_abs = (bid >= ABS1) & (bid < ABS1 + ABS_L - ABS_N0)
+            task = ABS_L * rank + lo_abs.select(bid - ABS0, bid - ABS1 + ABS_N0)
+            live_abs = lo_abs | hi_abs
+            w3 = s3_loads(c, live_abs.select(task, fx.Int32(0)))
+            if live_qb:
+                if const_expr(wd):
+                    load_qlora_wide(c)
+                else:
+                    load_qlora(c)
+            stamp(on, tls, tid, 3)
+            if live_qb:
+                stage2(c, qbg, ops)
+                stage2_flag(c, qbg, 0)
+            _bar()
+            stamp(on, tls, tid, 4)
+            # stage 3: this rank's 48 absorb tasks, one a CTA; then the q flags
+            c["xl"], c["wl"] = abl.xl.ptr, abl.wl.ptr
+            if live_abs:
+                stage3(c, task, w3)
+            if bid == QG_FLAG_CTA:
+                qg_flags(c)
+            stamp(on, tls, tid, 5)
+            if const_expr(nreq == 1):
+                _, _, _, n, _ = request(c)
+                if bid < nhg * n:
+                    attention1(c, 0, bid // n, bid % n, bid % n + 1)
             else:
-                load_qlora(c)
-        stamp(on, tls, tid, 3)
-        if live_qb:
-            stage2(c, qbg, ops)
-            stage2_flag(c, qbg, 0)
-        _bar()
-        stamp(on, tls, tid, 4)
-        # stage 3: this rank's 48 absorb tasks, one a CTA; then the q flags
-        c["xl"], c["wl"] = abl.xl.ptr, abl.wl.ptr
-        if live_abs:
-            stage3(c, task, w3)
-        if bid == QG_FLAG_CTA:
-            qg_flags(c)
-        stamp(on, tls, tid, 5)
-        if const_expr(nreq == 1):
-            _, _, _, n, _ = request(c)
-            if bid < nhg * n:
-                attention1(c, 0, bid // n, bid % n, bid % n + 1)
-        else:
-            # runs of one (request, head group)'s consecutive splits
-            k0, k1, bases = cta_items(c, bid)
-            g0 = group_of(bases, k0, nhg)
-            nruns = (k1 > k0).select(group_of(bases, k1 - 1, nhg) - g0 + 1, fx.Int32(0))
-            for gi in range(nruns):
-                grp = g0 + gi
-                rq = grp // nhg
-                hg = grp % nhg
-                gfirst = pick([f for f, _ in bases], rq) + hg * pick([n for _, n in bases], rq)
-                sa = fx.max(k0 - gfirst, fx.Int32(0))
-                sb = fx.min(k1 - gfirst, pick([n for _, n in bases], rq))
-                if sb > sa:
-                    attention(c, rq, hg, sa, sb)
-        c["xl"], c["wl"] = ul.xl.ptr, ul.wl.ptr
-        if bid < UV_CTAS:
-            stage_uv(c, bid)
-        stamp(on, tls, tid, 9)
-        stamp_flush(on, tls, tl, tid, bid, TL_POINTS)
+                # runs of one (request, head group)'s consecutive splits
+                k0, k1, bases = cta_items(c, bid)
+                g0 = group_of(bases, k0, nhg)
+                nruns = (k1 > k0).select(group_of(bases, k1 - 1, nhg) - g0 + 1, fx.Int32(0))
+                for gi in range(nruns):
+                    grp = g0 + gi
+                    rq = grp // nhg
+                    hg = grp % nhg
+                    gfirst = pick([f for f, _ in bases], rq) + hg * pick([n for _, n in bases], rq)
+                    sa = fx.max(k0 - gfirst, fx.Int32(0))
+                    sb = fx.min(k1 - gfirst, pick([n for _, n in bases], rq))
+                    if sb > sa:
+                        attention(c, rq, hg, sa, sb)
+            c["xl"], c["wl"] = ul.xl.ptr, ul.wl.ptr
+            if bid < UV_CTAS:
+                stage_uv(c, bid)
+            stamp(on, tls, tid, 9)
+            stamp_flush(on, tls, tl, tid, bid, TL_POINTS)
 
     @flyc.jit
     def launch(

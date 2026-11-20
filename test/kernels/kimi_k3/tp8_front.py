@@ -37,6 +37,7 @@ from check_mla_front import (
     front_key,
     layer_weights,
     make_keys,
+    new_epoch,
     rank_weights,
     scratch_for,
 )
@@ -79,15 +80,6 @@ def graph_time(fn, group, sets, reps, warmup):
     return out[len(out) // 2]
 
 
-def set_deadline(epoch, seconds=30.0):
-    from sgl_amd_mono.common import guard
-
-    ticks = guard.deadline_ticks(seconds)
-    lo = ticks & 0xFFFFFFFF
-    epoch[guard.GUARD_DEADLINE] = lo - (1 << 32) if lo >= 1 << 31 else lo
-    epoch[guard.GUARD_DEADLINE + 1] = ticks >> 32
-
-
 def phase(rank, what):
     """A progress line, and every thread's stack on this rank if the phase is still running in 5 minutes."""
     print(f"PHASE {time.strftime('%H:%M:%S')} rank {rank} {what}", file=sys.stderr, flush=True)
@@ -118,8 +110,7 @@ def main():
     gathered = "peers" in inspect.signature(mf.mla_front_launch).parameters
     w = layer_weights(args, device)
     wr = rank_weights(w, rank) if gathered else w
-    epoch = torch.zeros(8, dtype=torch.int32, device=device)
-    set_deadline(epoch)
+    epoch = new_epoch(device)
     extra = {}
     if gathered:
         peers = PeerBuffer(mf.peer_end(), cpu, rank, DCP, device)
