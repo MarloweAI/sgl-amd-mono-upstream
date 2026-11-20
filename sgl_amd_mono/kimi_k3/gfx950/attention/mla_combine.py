@@ -41,7 +41,7 @@ from flydsl.expr import gpu, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
-from sgl_amd_mono.common.ops import CM_DEV, CM_SYS, bf16_pair, bf_hi, bf_lo, rsrc
+from sgl_amd_mono.common.ops import CM_DEV, CM_SYS, bf16_pair, bf_hi, bf_lo, rsrc, sfresh64, sload64
 from sgl_amd_mono.common.sync import SENT, sent_word
 from sgl_amd_mono.kimi_k3.gfx950.stamps import stamp
 
@@ -98,10 +98,17 @@ def combine_tasks(s: int) -> int:
     return (s // REQ_ROWS) * NHL
 
 
-def peer_regions(bases, own, par):
-    """The A2A copy of MLA parity ``par``: (every rank's, this rank's) bases."""
-    off = fx.Int64(peer_offset()) + fx.Int64(par) * fx.Int64(a2a_copy_bytes())
-    return [b + off for b in bases], own + off
+class PeerRegions:
+    """Every rank's A2A copy of MLA parity ``par``, indexed by rank: each base is
+    loaded (a scalar load of the ``peers`` table) where it is used, so no rank's
+    base stays in SGPRs across the launch."""
+
+    def __init__(self, peers, par):
+        self.peers = peers
+        self.off = fx.Int64(peer_offset()) + fx.Int64(par) * fx.Int64(a2a_copy_bytes())
+
+    def __getitem__(self, rank):
+        return sload64(sfresh64(self.peers) + fx.Int64(rank) * fx.Int64(8)) + self.off
 
 
 # ---------------------------------------------------------------- the push
@@ -120,20 +127,22 @@ def push_values(c, owner, hl, t, col, vals):
     """Eight bf16 values of (row t, head 12 owner + hl) from value column ``col``
     (a multiple of 8): two cells of the owner's region, this rank's records."""
     words = fx.Vector.from_elements(_cell_words(vals), fx.Int32)
+    peer = c["a2a_peer"]
     at = a2a_cell(c["rank"], t, hl, col // CELL_VALUES, c["S"])
     for p in range_constexpr(DCP):
         if owner == p:
-            put_cells(c["a2a_peer"][p], at, words)
+            put_cells(peer[p], at, words)
 
 
 @flyc.jit
 def push_lse(c, owner, hl, t, lse):
     """The (row t, head 12 owner + hl) natural-log LSE: the record's LSE cell."""
     words = fx.Vector.from_elements([sent_word(lse), fx.Int32(0)], fx.Int32)
+    peer = c["a2a_peer"]
     at = a2a_cell(c["rank"], t, hl, LSE_CELL, c["S"])
     for p in range_constexpr(DCP):
         if owner == p:
-            put_cells(c["a2a_peer"][p], at, words)
+            put_cells(peer[p], at, words)
 
 
 def put_cells(base, cell, words):
@@ -228,9 +237,12 @@ def _rearm(own, cells):
 @flyc.jit
 def stage_combine(c, task):
     """Task (request task // 12, local head task % 12): the 8 sources' records of
-    the request's rows -> gated ``core`` rows (thread: row t, values 4 u ..)."""
+    the request's rows -> gated ``core`` rows. A thread a (row, source) polls the
+    LSE cells first (into LDS); then a thread a (row t, values 4 u ..) polls its
+    8 value cells, so the wait polls 48 words, not every record."""
     s, tid = c["S"], c["tid"]
     a = c["args"]
+    red = c["red"]
     b = task // NHL
     hl = task % NHL
     gpr = VD // 16  # g_proj groups a local head
@@ -239,25 +251,29 @@ def stage_combine(c, task):
         c["poll"]([(c["grdy"], hl * gpr + tid, 1)])
     gpu.barrier()
     stamp(c["on"], c["tls"], tid, TL_G)
+    own = c["a2a_peer"][c["rank"]]
+    lt = b * REQ_ROWS + fx.min(tid // DCP, REQ_ROWS - 1)
+    lcell = a2a_cell(tid % DCP, lt, hl, LSE_CELL, s)
+    if tid < REQ_ROWS * DCP:
+        lw = _spin_cells(own, [lcell])
+        _rearm(own, [lcell])
+        fx.ptr_store(fx.Int32(lw[0][0]).bitcast(fx.Float32), red + tid)
+    gpu.barrier()
     live = tid < REQ_ROWS * VAL_CELLS
-    t = b * REQ_ROWS + fx.min(tid // VAL_CELLS, REQ_ROWS - 1)
+    tr = fx.min(tid // VAL_CELLS, REQ_ROWS - 1)
+    t = b * REQ_ROWS + tr
     u = tid % VAL_CELLS
     col = hl * VD + CELL_VALUES * u
     gw = fx.Vector(
         bo.buffer_load(rsrc(c["gbuf"]), (t * GATE + col) // 2, vec_width=2, dtype=T.i32, cache_modifier=CM_DEV)
     )
-    own = c["a2a_own"]
     vcells = [a2a_cell(src, t, hl, u, s) for src in range(DCP)]
-    lcells = [a2a_cell(src, t, hl, LSE_CELL, s) for src in range(DCP)]
     if live:
-        got = _spin_cells(own, vcells + lcells)
+        got = _spin_cells(own, vcells)
         stamp(c["on"], c["tls"], tid, TL_RECORDS)
         _rearm(own, vcells)
-        ow = combine4(got[:DCP], [got[DCP + src][0] for src in range(DCP)], gw)
+        lws = [fx.Int32(fx.ptr_load(red + (tr * DCP + src)).bitcast(fx.Int32)) for src in range(DCP)]
+        ow = combine4(got, lws, gw)
         bo.buffer_store(ow, rsrc(a["core"]), (t * GATE + col) // 2)
-    # every row's threads have read its LSE cells: then the row's u = 0 thread
-    # re-arms them
     gpu.barrier()
     stamp(c["on"], c["tls"], tid, TL_CORE)
-    if live & (u == 0):
-        _rearm(own, lcells)

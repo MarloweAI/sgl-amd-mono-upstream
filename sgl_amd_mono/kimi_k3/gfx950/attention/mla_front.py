@@ -80,7 +80,7 @@ from sgl_amd_mono.common.plan import (
     pair_layout,
 )
 from sgl_amd_mono.common import guard
-from sgl_amd_mono.common.ops import load_ptr64, peer_bases
+from sgl_amd_mono.common.ops import load_ptr64
 from sgl_amd_mono.common.sync import Mailbox, sreg
 from sgl_amd_mono.kimi_k3.gfx950.attention import mla_combine as mc
 from sgl_amd_mono.kimi_k3.gfx950.attention.mla_pre import load_qlora, load_x
@@ -119,7 +119,7 @@ GATE = 1536  # g_proj's rows a rank (12 heads x 128)
 NHA = 96  # heads every rank attends
 NHL = NHA // DCP  # 12: heads a rank owns after the all-to-all
 QHD, QN, VD = 192, 128, 128  # a head's q_b rows, its nope part, v_head_dim
-REC = NHL * VD + 2  # 130: bf16 a send record (128 values, the fp32 LSE)
+REC = VD + 2  # 130: bf16 a send record (128 values, the fp32 LSE)
 G_LAT = LATW // ROWS  # 132
 G_Q = QL // ROWS  # 96
 G_KV = KV // ROWS  # 32
@@ -949,7 +949,8 @@ def stage_uv(c, task, wt):
     """Head task // 2's split partials (its group's items) merged in split order
     -> the bf16 latent output in LDS and the head's LSE; then W_UV for value
     columns 64 (task % 2) ..: the values, and with the first half the LSE, pushed
-    to the head's owner rank."""
+    to the head's owner rank (no system-scope store before the GEMV: a barrier
+    would wait for it)."""
     s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
     a = c["args"]
     h = task // 2
@@ -997,9 +998,8 @@ def stage_uv(c, task, wt):
                 (mx + fx.Float32(fmath.log2(lsum))) * fx.Float32(LN2),
                 fx.Float32(EMPTY_LSE),
             )
-            mc.push_lse(c, owner, hl, t, lse)
-            if const_expr(c["records"]):
-                bo.buffer_store(lse, rsrc(a["send"]), ((owner * s + t) * NHL + hl) * (REC // 2) + VD // 2)
+            # in the row's pad: pushed with the values, after the GEMV
+            fx.ptr_store(lse.bitcast(fx.Int32), xl + (t * OL_ROW + KV) // 2)
     for i in range_constexpr(8):
         p = tid + THREADS * i
         k = p // 8
@@ -1024,6 +1024,11 @@ def stage_uv(c, task, wt):
                 vals[2 * i + dt] = tot
         col = half * UV_HALF + 32 * wave + 8 * g
         mc.push_values(c, owner, hl, r16, col, vals)
+        if (wave == 0) & (g == 0) & (half == 0):
+            lse = fx.Int32(fx.ptr_load(xl + (r16 * OL_ROW + KV) // 2)).bitcast(fx.Float32)
+            mc.push_lse(c, owner, hl, r16, lse)
+            if const_expr(c["records"]):
+                bo.buffer_store(lse, rsrc(a["send"]), ((owner * s + r16) * NHL + hl) * (REC // 2) + VD // 2)
         if const_expr(c["records"]):
             ob = fx.Vector.from_elements(vals, fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)
             bo.buffer_store(ob, rsrc(a["send"]), (((owner * s + r16) * NHL + hl) * REC + col) // 2)
@@ -1109,8 +1114,6 @@ def build(key: MlaFrontBuild):
         al, gl = role.attn.peek(), role.gemv.peek()
         abl, cl, ul = role.absorb.peek(), role.core.peek(), role.uv.peek()
         mb = Mailbox(step_tag(epoch, layer) - 1)
-        own = load_ptr64(peers, rank)
-        a2a_peer, a2a_own = mc.peer_regions(peer_bases(peers, DCP), own, a2a_par)
         gbuf = scratch + fx.Int64(lay["g"][0])
         c = {
             "S": s, "NS": ns, "NB": key.nblocks, "tid": tid, "bid": bid,
@@ -1130,7 +1133,7 @@ def build(key: MlaFrontBuild):
             "kvl": cl.kv.ptr, "pl": cl.p.ptr, "al": cl.alpha.ptr, "mll": cl.ml.ptr,
             "kil": cl.kidx.ptr, "qll": cl.q.ptr,
             "records": key.records, "gate0": S1_GATE0, "gbuf": gbuf,
-            "a2a_peer": a2a_peer, "a2a_own": a2a_own,
+            "a2a_peer": mc.PeerRegions(peers, a2a_par),
             "args": {
                 "prefix": prefix, "delta": 0, "blocks": blocks, "blk_sm": blk_sm,
                 "blk_sr": blk_sr, "ares_nw": ares_nw, "ares_qk": ares_qk, "in_nw": in_nw,
@@ -1198,6 +1201,7 @@ def build(key: MlaFrontBuild):
             stage_uv(c, bid, uv_loads(c, bid))
         stamp(on, tls, tid, 9)
         # the wait on the other ranks' records runs under the launch's guard
+        own = load_ptr64(peers, rank)
         with guard.scope(
             guard.Guard(epoch, own=own, peers=peers, rank=rank, npes=DCP, flags_offset=flags_off)
         ):
