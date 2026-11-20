@@ -157,9 +157,24 @@ def put_word(a, i, ws, tag):
     )
 
 
-def poll_words(a, idxs, tag):
+def poll_words(a, idxs, tag, first=None):
     """Words ``idxs`` of region ``a`` once each carries ``tag`` (a 16-B load sees
-    a word whole); their three payload words each."""
+    a word whole); their three payload words each. ``first``: the first load
+    (``load_words``), issued already."""
+    load_all = load_words(a, idxs)
+
+    def pending(v):
+        bad = v[3] != tag
+        for e in range_constexpr(7, 4 * len(idxs), 4):
+            bad = bad | (v[e] != tag)
+        return bad
+
+    v = _spin(load_all, pending, first=first)
+    return [[v[4 * k + e] for e in range(3)] for k in range(len(idxs))]
+
+
+def load_words(a, idxs):
+    """The 16-B loads of words ``idxs`` of region ``a`` (one vector)."""
     cm = _SCOPE_CM[a.space]
 
     def load_all():
@@ -173,14 +188,7 @@ def poll_words(a, idxs, tag):
             ws += [v[e] for e in range(4)]
         return fx.Vector.from_elements(ws, fx.Int32)
 
-    def pending(v):
-        bad = v[3] != tag
-        for e in range_constexpr(7, 4 * len(idxs), 4):
-            bad = bad | (v[e] != tag)
-        return bad
-
-    v = _spin(load_all, pending)
-    return [[v[4 * k + e] for e in range(3)] for k in range(len(idxs))]
+    return load_all
 
 
 def bf16_words(word3):
@@ -373,6 +381,14 @@ def gemv_emit(c):
         gs, r, q = cs[it]
         return [piece_sum(slot, gs, r, q * L + j) for j in range(L)] + [fx.Float32(0.0)] * (WT - L)
 
+    # the head's first poll of the set's later pieces goes out before the
+    # task's inputs (loads return in order)
+    ph = crosses.select(pa + 1, pa)
+    nb1, nb2 = fx.min(bid + 1, BLOCKS - 1), fx.min(bid + 2, BLOCKS - 1)
+    two = (bid + 2 < BLOCKS) & (_u0(bid + 2) < (ph + 1) * HSTEPS)
+    nb2 = two.select(nb2, nb1)
+    pidx = [(nb * n + e) * 2 + hh for nb in (nb1, nb2) for e in es for hh in (0, 1)]
+    first = load_words(c["part"], pidx)()
     # a piece that is not its set's head: published for the head's CTA
     pub_slot = crosses.select(0, 1)
     if crosses | (hsa != 0):
@@ -388,13 +404,9 @@ def gemv_emit(c):
     # the task's inputs go out once the piece is published
     c["k"] = c["pre"]()
     # the head this CTA owns (the last piece), and its set's later pieces
-    ph = crosses.select(pa + 1, pa)
     if crosses | (hsa == 0):
-        nb1, nb2 = fx.min(bid + 1, BLOCKS - 1), fx.min(bid + 2, BLOCKS - 1)
-        two = (bid + 2 < BLOCKS) & (_u0(bid + 2) < (ph + 1) * HSTEPS)
-        nb2 = two.select(nb2, nb1)
-        got1 = poll_words(c["part"], [(nb1 * n + e) * 2 + hh for e in es for hh in (0, 1)], tag)
-        got2 = poll_words(c["part"], [(nb2 * n + e) * 2 + hh for e in es for hh in (0, 1)], tag)
+        got = poll_words(c["part"], pidx, tag, first)
+        got1, got2 = got[: 2 * per], got[2 * per :]
         for it in range_constexpr(per):
             own = pieces(1, it)
             g1 = [f32_of(w) for w in got1[2 * it] + got1[2 * it + 1]]
