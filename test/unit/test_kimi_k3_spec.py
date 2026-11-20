@@ -196,11 +196,11 @@ def test_the_guard_flags_sit_past_every_width(monkeypatch):
     from sgl_amd_mono.kimi_k3.gfx950.stages import moe
 
     off = layer.flags_offset()
-    for width in range(1, MAX_ROWS + 1):
+    for width in range(1, K2_MAX_ROWS + 1):
         assert layer.peer_bytes(width) <= off, width
         assert moe.peer_bytes(width) <= off, width
     # the widest launch ends exactly there: a larger offset wastes a peer page
-    assert off == max(layer.peer_bytes(MAX_ROWS), moe.peer_bytes(MAX_ROWS))
+    assert off == max(layer.peer_bytes(K2_MAX_ROWS), moe.peer_bytes(K2_MAX_ROWS))
 
 
 # A TP8 + DCP8 DSpark server on the ReplaySSM ring, as SGLang's feature probes
