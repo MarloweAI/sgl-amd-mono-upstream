@@ -75,7 +75,7 @@ def unpack_x(xp, nt):
 class Front:
     """The front build on the same weights and pools as ``kc.Wide``."""
 
-    def __init__(self, w, sw, S, nb, write_idx, device, layer=1):
+    def __init__(self, w, sw, S, nb, write_idx, device, layer=1, timeline=False):
         from sgl_amd_mono.common.peer import PeerBuffer
         from sgl_amd_mono.kimi_k3.gfx950.attention import kda_wide as kw
 
@@ -84,7 +84,13 @@ class Front:
         self.key = kw.KdaWideBuild(
             tokens=S, qlen=kc.L, onorm_eps=kc.EPS, lower_bound=kc.LB,
             front=True, nblocks=nb, eps=kc.EPS, out_eps=kc.EPS, write_idx=write_idx,
+            timeline=timeline,
         )  # fmt: skip
+        self.tl = (
+            torch.zeros(kw.BLOCKS, kw.TL_POINTS, dtype=torch.int64, device=device)
+            if timeline
+            else None
+        )
         self.nt = kw.tiles(self.key)
         self._scratch = PeerBuffer(kw.scratch_bytes(self.key), None, 0, 1, device)
         self.scratch = self._scratch.bytes
@@ -99,7 +105,7 @@ class Front:
             on_w=w["on_w"], rstate=pools.temporal, st_idx=pools.slots,
             conv_win=pools.window, win_row=pools.rows, ring=pools.ring, core_out=core,
             scratch=self.scratch, layer=self.layer, epoch=epoch, prefix=prefix,
-            blocks=blocks, **self.sw,
+            blocks=blocks, tl=self.tl, **self.sw,
         )  # fmt: skip
 
     def x_rows(self, S):

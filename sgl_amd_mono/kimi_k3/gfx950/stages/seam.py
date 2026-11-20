@@ -309,26 +309,16 @@ def stage_gate_local(c):
     gpu.barrier()
 
 
-def x_packed_word(t, col, tiles):
-    """The word of element (t, col) of x (col a multiple of 2) in the wide KDA
-    launch's ``pack_x`` layout over ``tiles`` 16-row tiles: K step of 64, token
-    tile, K half, K group of 8, row, 8 K."""
-    i = (((((col // 64) * tiles + t // 16) * 2 + (col % 64) // 32) * 4 + (col % 32) // 8) * 16 + t % 16) * 8
-    return (i + col % 8) // 2
-
-
 @flyc.jit
 def stage_mix(c, task):
     """Columns 128 task ..: the softmax mix of ``vals`` (4 columns a thread), its
     sum of squares (MSQ), every slice's -> rstd, then bf16 x = mixed rstd w ->
-    the plain x rows (``x_tiles``: in ``pack_x``'s layout), and the slice's XRDY
-    flag."""
+    the plain x rows, and the slice's XRDY flag."""
     s, ns, tid, lane, red = c["S"], c["NS"], c["tid"], c["lane"], c["red"]
     a = c["args"]
     # read before the traced branches (a dict lookup inside one is carried state)
     tag_x = c.get("tag_x", False)
     vals_bf16 = c.get("vals_bf16", False)
-    x_tiles = c.get("x_tiles", 0)
     c0 = task * COLS
     nw = s * (ns + 1)
     if const_expr(c.get("gate_local", False)):
@@ -392,11 +382,178 @@ def stage_mix(c, task):
             if const_expr(tag_x):
                 # also as tagged pairs: the router and latent GEMVs poll these, not XRDY
                 c["put_words"](c["xt"], at, [xw[0], xw[1]])
-            xat = at
-            if const_expr(x_tiles):
-                xat = x_packed_word(t, c0 + cc, x_tiles)
-            bo.buffer_store(xw, rsrc(c["xbuf"]), xat, cache_modifier=CM_DEV)
+            bo.buffer_store(xw, rsrc(c["xbuf"]), at, cache_modifier=CM_DEV)
             if const_expr(c["debug"]):
                 bo.buffer_store(xw, rsrc(a["x_dbg"]), at)
+    publish(c["put"], c["xrdy"], task, fx.Int32(1), tid == 0)
+    gpu.barrier()
+
+
+# ------------------------------------------- the wide KDA launch's attention seam
+# The same seam, shaped for up to 48 rows and one hand-off fewer: a thread a
+# (token, 4 columns) loads every source of its row at once, and the slices'
+# partials carry the sources' Gram terms, so the gate CTA also gives each token
+# the input_layernorm rstd (sum of squares of the mix = w^T G w / den^2) and the
+# mix needs no MSQ round. The PART sums of squares and qk dots, the gate's
+# weights and the mix are those of the stages above, bit for bit; the rstd is
+# summed in another order.
+def front_pairs(ns):
+    """(s, s2) with s < s2: the Gram cross terms, in PART order past the 2 ns
+    sums of squares and qk dots."""
+    return [(a, b) for a in range(ns) for b in range(a + 1, ns)]
+
+
+def front_nq(ns):
+    """PART values a (slice, token)."""
+    return 2 * ns + len(front_pairs(ns))
+
+
+def x_packed_word(t, col, tiles):
+    """The word of element (t, col) of x (col a multiple of 2) in the wide KDA
+    launch's ``pack_x`` layout over ``tiles`` 16-row tiles: K step of 64, token
+    tile, K half, K group of 8, row, 8 K."""
+    i = (((((col // 64) * tiles + t // 16) * 2 + (col % 64) // 32) * 4 + (col % 32) // 8) * 16 + t % 16) * 8
+    return (i + col % 8) // 2
+
+
+@flyc.jit
+def front_slice(c, task):
+    """Columns 128 task ..: every source of a (token, 4 columns) loaded at once
+    into LDS ``vals`` (packed bf16 pairs), per-(token, source) sum of squares and
+    qk dot and per-(token, source pair) dot -> PART; a block-write layer's prefix
+    stored at block ``write_idx``."""
+    s, ns, nb, tid, lane = c["S"], c["NS"], c["NB"], c["tid"], c["lane"]
+    a = c["args"]
+    nq = front_nq(ns)
+    pairs = front_pairs(ns)
+    write_idx = c["write_idx"]
+    cc = (tid % QC) * 4
+    col = task * COLS + cc
+    w = ld_bf4(a["ares_nw"], col)
+    q = ld_bf4(a["ares_qk"], col)
+    wq = [w[j] * q[j] for j in range(4)]
+    for i in range_constexpr((s * QC + THREADS - 1) // THREADS):
+        tt = i * (THREADS // QC) + tid // QC
+        live = tt < s
+        t = fx.min(tt, s - 1)
+        raw = [
+            _raw4(a["blocks"], t * a["blk_sm"] + src * a["blk_sr"] + col) for src in range(nb)
+        ] + [_raw4(a["prefix"], t * HIDDEN + col)]
+        if const_expr(write_idx >= 0):  # noqa: SIM102
+            if live:
+                bo.buffer_store(
+                    raw[nb], rsrc(a["blocks"]), (t * a["blk_sm"] + write_idx * a["blk_sr"] + col) // 2
+                )
+        vs = [_f4(r) for r in raw]
+        if live:
+            for src in range_constexpr(ns):
+                fx.ptr_store(raw[src], c["vals"] + ((t * ns + src) * COLS + cc) // 2)
+        sums = []
+        for src in range_constexpr(ns):
+            v = vs[src]
+            sums.append(v[0] * v[0] + v[1] * v[1] + v[2] * v[2] + v[3] * v[3])
+            sums.append(v[0] * wq[0] + v[1] * wq[1] + v[2] * wq[2] + v[3] * wq[3])
+        for x, y in pairs:
+            u, v = vs[x], vs[y]
+            sums.append(u[0] * v[0] + u[1] * v[1] + u[2] * v[2] + u[3] * v[3])
+        sums = [butterfly(x, (16, 8, 4, 2, 1)) for x in sums]
+        if live & (lane % 32 == 0):
+            at = (task * s + t) * nq
+            for k in range_constexpr(nq):
+                c["put"](c["part"], at + k, sums[k])
+    gpu.barrier()
+
+
+EX_OFF = 1024  # red words of front_gate's source weights
+
+
+@flyc.jit
+def front_gate(c, t):
+    """Token t: the 56 slices' partials -> source weights e_s, their sum, and
+    the input_layernorm rstd of the mix -> WGT (ns + 2 values)."""
+    s, ns, tid, lane, wave, red = c["S"], c["NS"], c["tid"], c["lane"], c["wave"], c["red"]
+    nq = front_nq(ns)
+    pairs = front_pairs(ns)
+    if tid < 8 * nq:
+        g = tid // nq
+        q = tid % nq
+        vals = c["poll"]([(c["part"], ((g * GSL + k) * s + t) * nq + q, 1) for k in range(GSL)])
+        fx.ptr_store(sum_polled(vals), red + (g * nq + q))
+    gpu.barrier()
+    if wave == 0:
+        src = fx.min(lane, ns - 1)
+        sq = fx.ptr_load(red + src * 2)
+        dt = fx.ptr_load(red + src * 2 + 1)
+        for g in range_constexpr(1, 8):
+            sq = sq + fx.ptr_load(red + (g * nq + src * 2))
+            dt = dt + fx.ptr_load(red + (g * nq + src * 2 + 1))
+        rstd = hw_rsq(sq * fx.Float32(1.0 / HIDDEN) + fx.Float32(c["eps"]))
+        logit = dt * rstd * fx.Float32(LOG2E)
+        logit = (lane < ns).select(logit, fx.Float32(-3.0e38))
+        m = wave_max(logit)
+        ex = (lane < ns).select(hw_exp2(logit - m), fx.Float32(0.0))
+        den = butterfly(ex, (32, 16, 8, 4, 2, 1))
+        if lane < ns:
+            fx.ptr_store(ex, red + (EX_OFF + lane))
+        # lane p: Gram entry p (the diagonal, then the pairs), weighted by its sources
+        diag = [(x, x, 2 * x, 1.0) for x in range(ns)]
+        cross = [(x, y, 2 * ns + k, 2.0) for k, (x, y) in enumerate(pairs)]
+        sa, sb, gi, mult = fx.Int32(0), fx.Int32(0), fx.Int32(0), fx.Float32(0.0)
+        for p, (x, y, k, f) in enumerate(diag + cross):
+            hit = lane == p
+            sa, sb = hit.select(fx.Int32(x), sa), hit.select(fx.Int32(y), sb)
+            gi, mult = hit.select(fx.Int32(k), gi), hit.select(fx.Float32(f), mult)
+        gsum = fx.ptr_load(red + gi)
+        for g in range_constexpr(1, 8):
+            gsum = gsum + fx.ptr_load(red + (g * nq + gi))
+        term = mult * fx.ptr_load(red + (EX_OFF + sa)) * fx.ptr_load(red + (EX_OFF + sb)) * gsum
+        tot = butterfly(term, (32, 16, 8, 4, 2, 1))
+        r = hw_rsq(tot / (den * den) * fx.Float32(1.0 / HIDDEN) + fx.Float32(c["out_eps"]))
+        if lane < ns:
+            c["put"](c["wgt"], t * (ns + 2) + lane, ex)
+        if lane == 0:
+            c["put"](c["wgt"], t * (ns + 2) + ns, den)
+            c["put"](c["wgt"], t * (ns + 2) + ns + 1, r)
+    gpu.barrier()
+
+
+@flyc.jit
+def front_mix(c, task):
+    """Columns 128 task ..: every token's softmax mix of ``vals`` (4 columns a
+    thread, ``stage_mix``'s sums), times its rstd and the norm weight -> bf16 x
+    in ``pack_x``'s layout over ``x_tiles`` tiles, then the slice's XRDY flag."""
+    s, ns, tid, red = c["S"], c["NS"], c["tid"], c["red"]
+    a = c["args"]
+    tiles = c["x_tiles"]
+    c0 = task * COLS
+    cc = (tid % QC) * 4
+    nw = s * (ns + 2)
+    # issued before the poll: it waits on nothing in this launch
+    wn = ld_bf4(a["in_nw"], c0 + cc)
+    for k in range_constexpr((nw + THREADS - 1) // THREADS):
+        e = tid + THREADS * k
+        if e < nw:
+            v = c["poll"]([(c["wgt"], e, 1)])[0][0]
+            fx.ptr_store(f32_of(v), red + e)
+    gpu.barrier()
+    for gi in range_constexpr((s * QC + THREADS - 1) // THREADS):
+        tt = gi * (THREADS // QC) + tid // QC
+        mine = tt < s
+        t = fx.min(tt, s - 1)
+        base = t * (ns + 2)
+        vs = [
+            _f4(lds_words2(c["vals"], ((t * ns + src) * COLS + cc) // 2))
+            for src in range(ns)
+        ]
+        r = fx.ptr_load(red + (base + ns + 1))
+        mixed = []
+        for j in range_constexpr(4):
+            acc = fx.Float32(0.0)
+            for src in range_constexpr(ns):
+                acc = acc + fx.ptr_load(red + (base + src)) * vs[src][j]
+            mixed.append(acc / fx.ptr_load(red + (base + ns)))
+        xw = bf4_words([mixed[j] * r * wn[j] for j in range(4)])
+        if mine:
+            bo.buffer_store(xw, rsrc(c["xbuf"]), x_packed_word(t, c0 + cc, tiles), cache_modifier=CM_DEV)
     publish(c["put"], c["xrdy"], task, fx.Int32(1), tid == 0)
     gpu.barrier()

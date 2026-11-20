@@ -85,12 +85,29 @@ def width(R, base_w, args, device):
             st.proj(x)
 
     gs, gw, ge, gg = graph(run_stock), graph(run_wide), graph(run_epoch), graph(run_gemm)
-    arms = {"stock": [], "wide": []}
+    graphs = {"stock": gs, "wide": gw}
+    if args.front:
+        # the front build: the seam and input_layernorm in front, from a bank of
+        # --front blocks
+        import check_kda_layer as ckl
+
+        fsets = []
+        for i, (w, x, _, pw) in enumerate(sets):
+            sw = ckl.seam_weights(args.copy, args.layer, device, gen)
+            prefix, blocks = ckl.inputs(S, args.front, gen, device)
+            fsets.append((ckl.Front(w, sw, S, args.front, -1, device, layer=1 + i), prefix, blocks, pw))
+
+        def run_front():
+            epoch.add_(1)
+            for (fr, prefix, blocks, pw), core in zip(fsets, cores):
+                fr(prefix, blocks, pw, epoch, core)
+
+        graphs["front"] = graph(run_front)
+    arms = {k: [] for k in graphs}
     for k in range(args.arms):
-        order = ("stock", "wide") if k % 2 == 0 else ("wide", "stock")
+        order = list(graphs) if k % 2 == 0 else list(graphs)[::-1]
         for side in order:
-            g = gs if side == "stock" else gw
-            arms[side].append(time_graph(g, args.warmup, args.reps) / args.sets)
+            arms[side].append(time_graph(graphs[side], args.warmup, args.reps) / args.sets)
     t_epoch = time_graph(ge, args.warmup, args.reps)
     t_gemm = time_graph(gg, args.warmup, args.reps) / args.sets
     floor = kc.floor_bytes(R) / (args.bw * 1e6)
@@ -101,7 +118,7 @@ def width(R, base_w, args, device):
         out[side] = {"us": round(statistics.median(v), 2), "arms": [round(a, 2) for a in v],
                      "aa_spread": round(max(v) - min(v), 2)}
     out["speedup"] = round(out["stock"]["us"] / out["wide"]["us"], 3)
-    del gs, gw, ge, gg
+    del gs, gw, ge, gg, graphs
     return out
 
 
@@ -115,6 +132,7 @@ def main():
     ap.add_argument("--reps", type=int, default=40)
     ap.add_argument("--arms", type=int, default=4)
     ap.add_argument("--depth", type=int, default=0)
+    ap.add_argument("--front", type=int, default=0, help="also the front build at this bank depth")
     ap.add_argument("--bw", type=float, default=7.4, help="TB/s of the paper floor")
     ap.add_argument("--out", default="")
     args = ap.parse_args()

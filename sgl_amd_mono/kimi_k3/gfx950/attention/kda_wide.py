@@ -80,9 +80,10 @@ from sgl_amd_mono.kimi_k3.gfx950.stages.dims import COLS, HD, HIDDEN, LOG2E, NA,
 from sgl_amd_mono.kimi_k3.gfx950.stages.seam import (
     bf16r,
     f32_of,
-    stage_gate,
-    stage_mix,
-    stage_slice,
+    front_gate,
+    front_mix,
+    front_nq,
+    front_slice,
 )
 from sgl_amd_mono.kimi_k3.gfx950.stamps import stamp, stamp_begin, stamp_flush
 from sgl_amd_mono.kimi_k3.gfx950.tag import step_tag
@@ -103,8 +104,8 @@ OXW = WT * HALF // 3  # 16-B words of a half's outputs
 SCALE = HD**-0.5
 # timeline points: start, gemv MFMAs done (every wave), gemv emitted, task inputs issued,
 # conv inputs polled, conv done, gates + l2norm done, recurrence done, norm done, the run's
-# non-head piece published (thread 0)
-TL_POINTS = 10
+# non-head piece published (thread 0); the front's slice, gate and mix done, x ready
+TL_POINTS = 14
 
 # a set spans at most 3 CTAs; a run at most 2 sets
 assert GROUPS * ROWS == NPROJ and SETS * G == GROUPS
@@ -158,7 +159,7 @@ def scratch_layout(key: KdaWideBuild) -> dict:
     r = key.tokens // key.qlen
     s, ns = key.tokens, key.nblocks + 1
     front = (
-        [("fpart", NA * s * ns * 2), ("fwgt", s * (ns + 1)), ("fmsq", NA * s), ("fxrdy", NA)]
+        [("fpart", NA * s * front_nq(ns)), ("fwgt", s * (ns + 2)), ("fxrdy", NA)]
         if key.front
         else []
     )
@@ -367,6 +368,7 @@ def gemv_loop(c):
         # the first steps' weights go out before x is ready, their x after
         ws0 = [_wloads(c, *unit(i)) for i in range(min(d, NMAX))]
         wait_x(c)
+        stamp(c["on"], c["tls"], c["tid"], 13)
         for i in range_constexpr(min(d, NMAX)):
             _, hs, live = unit(i)
             pend[i] = (ws0[i], _xloads(c, hs, live))
@@ -964,8 +966,6 @@ def build(key: KdaWideBuild):
                 "eps": key.eps,
                 "out_eps": key.out_eps,
                 "write_idx": key.write_idx,
-                "gate_local": False,
-                "vals_bf16": True,
                 "x_tiles": nt,
                 "put": mb.put,
                 "poll": mb.poll,
@@ -982,16 +982,19 @@ def build(key: KdaWideBuild):
                     "in_nw": in_nw,
                 },
             }
-            for region in ("part", "wgt", "msq", "xrdy"):
+            for region in ("part", "wgt", "xrdy"):
                 fc[region] = sreg(scratch, lay["f" + region][0], "f" + region)
             c["fc"] = fc
         stamp_begin(key.timeline, lds.tls.ptr, tid, TL_POINTS)
         if const_expr(key.front):
             if bid < NA:
-                stage_slice(fc, bid)
+                front_slice(fc, bid)
+                stamp(key.timeline, lds.tls.ptr, tid, 10)
                 if bid < s:
-                    stage_gate(fc, bid)
-                stage_mix(fc, bid)
+                    front_gate(fc, bid)
+                stamp(key.timeline, lds.tls.ptr, tid, 11)
+                front_mix(fc, bid)
+                stamp(key.timeline, lds.tls.ptr, tid, 12)
         # task t = (request, head), half hf on CTA TASK0 + 16 (t // 8) + 8 hf + t % 8,
         # its inputs in flight under the emit
         o = fx.max(bid - TASK0, 0)
