@@ -31,6 +31,15 @@ indexes the recurrent state with, and that number is a row of SGLang's scratch,
 not of this buffer. The buffer is expanded to a zero slot stride so every such
 number folds onto its single row. That is what makes one request work and what
 makes two impossible, so ``covered()`` refuses a batch above one.
+
+**The wide form** (``attention/kda_wide.py`` with its seam front) takes 1 to 8
+requests of the step's L verify rows, by the width rule ``wide_takes``. It runs
+on the ReplaySSM ring only and reads SGLang's state where SGLang's own verify
+does: the committed state and conv state (read only), the verify windows and
+the ring (written). So it stages no conv buffer and hands nothing back at
+``finish``. It reads in_proj in its own stream order, packed once at build
+(``kda_wide.pack_w_in``: a copy of the weight, 90 MB a layer a rank), and x
+from a buffer of the width that its front writes in ``pack_x``'s layout.
 """
 
 from __future__ import annotations
@@ -44,7 +53,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sgl_amd_mono.kimi_k3 import MAX_BLOCKS, MAX_ROWS
+from sgl_amd_mono.kimi_k3 import K1_MAX_ROWS, MAX_BLOCKS, MAX_ROWS
 from sgl_amd_mono.kimi_k3.gfx950.stages.dims import HIDDEN
 
 logger = logging.getLogger(__name__)
@@ -137,7 +146,9 @@ SGLANG_READS = {
         "replayssm_g",
         "replayssm_beta",
     ),
-    "srt/runtime_context.py": ("get_exec",),
+    "srt/runtime_context.py": ("get_exec", "get_spec"),
+    # the f32 conv weights SGLang's verify kernel reads (the wide form's too)
+    "srt/layers/radix_linear_attention.py": ("conv_weights",),
     "srt/layers/attention/mamba/mamba2_metadata.py": ("mamba_cache_indices",),
     # the kernel writes the bank row; this is the count that goes with it
     "srt/layers/attn_residual.py": ("_count_write", "num_valid_blocks"),
@@ -168,6 +179,7 @@ class K1Layer(msgspec.Struct):
     on_w: Any  # o_norm's weight as the kernel reads it, cast once
     conv: Any  # a row of K1Batch.conv, not an allocation of its own
     mamba_idx: int  # this layer's index into the KDA state pools
+    w_in: Any = None  # the wide form's in_proj, packed once (``pack_w_in``)
 
 
 class K1Batch(msgspec.Struct):
@@ -181,7 +193,8 @@ class K1Batch(msgspec.Struct):
     """
 
     layers: Any  # the K1Layer list, in layer order
-    conv: Any  # [n, 3 * PROJ, state_len], one row a layer
+    conv: Any  # [n, 3 * PROJ, state_len], one row a layer (None: the wide form)
+    x: Any = None  # the wide form's x, ``pack_x``'s layout, one buffer the width
     idx: Any = None  # int64 [n]: those layers' indices into the state pools
     where: Any = None  # int64: the rows that engage, None when every one does
     where_key: Any = None  # the engaged layer ids `where` was built for
@@ -226,6 +239,96 @@ def _unsupported_reasons(layer) -> list[str]:
     return reasons
 
 
+# The width rule: the wide form takes a step of R requests x L rows for
+# WIDE_FROM_REQS <= R <= WIDE_MAX_REQS; the one-request form keeps R = 1 below
+# it. At 6 rows (one request) the wide form is the faster on tier 0.
+WIDE_FROM_REQS = 1
+WIDE_MAX_REQS = 8
+
+
+def is_wide(packed) -> bool:
+    """Whether a K1Layer is the wide form."""
+    return packed.w_in is not None
+
+
+def _draft_tokens() -> int:
+    """L, the verify rows a request (DSpark's draft tokens), or 0 without a
+    speculative algorithm."""
+    from sglang.srt.runtime_context import get_spec
+
+    spec = get_spec()
+    if spec.speculative_algorithm is None:
+        return 0
+    return int(spec.speculative_num_draft_tokens or 0)
+
+
+def wide_takes(rows: int, qlen: int) -> bool:
+    """Whether the wide form takes a launch of ``rows`` rows at ``qlen`` a request."""
+    from sgl_amd_mono.kimi_k3.gfx950.attention import kda_wide as kw
+
+    return (
+        0 < qlen <= kw.WT
+        and rows % qlen == 0
+        and WIDE_FROM_REQS <= rows // qlen <= WIDE_MAX_REQS
+        and rows <= K1_MAX_ROWS
+    )
+
+
+# in_proj in the wide form's stream order, one copy a layer for every width
+_PACKED: dict[int, torch.Tensor] = {}
+
+
+def _packed_w_in(weight):
+    from sgl_amd_mono.kimi_k3.gfx950.attention import kda_wide as kw
+
+    key = weight.data_ptr()
+    if key not in _PACKED:
+        _PACKED[key] = kw.pack_w_in(weight)
+    return _PACKED[key]
+
+
+def _wide_reasons(layer) -> list[str]:
+    """Why the wide form cannot take this layer: the tensors it reads as raw
+    addresses, by the dtype and shape it reads them at."""
+    from sgl_amd_mono.kimi_k3.gfx950.attention import kda, kda_wide as kw
+
+    attn = layer.self_attn
+    inner = getattr(attn, "attn", None)
+    checks = (
+        (_ring_mode(), "needs the ReplaySSM ring (--enable-linear-replayssm-spec)"),
+        (
+            tuple(attn._qkvgbfa_layer.weight.shape) == (kda.NPROJ, HIDDEN)
+            and attn._qkvgbfa_layer.weight.dtype == torch.bfloat16
+            and attn._qkvgbfa_layer.weight.is_contiguous(),
+            "the merged in-projection is not a contiguous bf16 [6288, 7168]",
+        ),
+        (
+            isinstance(getattr(inner, "conv_weights", None), torch.Tensor)
+            and inner.conv_weights.dtype == torch.float32
+            and tuple(inner.conv_weights.shape) == (3 * kda.PROJ, kda.CONV_W)
+            and inner.conv_weights.is_contiguous(),
+            "the conv weights are not a contiguous f32 [4608, 4]",
+        ),
+        (
+            attn.A_log.dtype == torch.float32 and attn.A_log.numel() == kw.NH,
+            "A_log is not 12 f32",
+        ),
+        (
+            attn.dt_bias.dtype == torch.float32
+            and tuple(attn.dt_bias.shape) == (kda.PROJ,)
+            and attn.dt_bias.is_contiguous(),
+            "dt_bias is not a contiguous f32 [1536]",
+        ),
+        (
+            attn.f_b_proj.weight.dtype == torch.bfloat16
+            and tuple(attn.f_b_proj.weight.shape) == (kda.PROJ, kda.HD)
+            and attn.f_b_proj.weight.is_contiguous(),
+            "f_b is not a contiguous bf16 [1536, 128]",
+        ),
+    )
+    return [why for ok, why in checks if not ok]
+
+
 def _ring_mode() -> bool:
     """Whether the KDA spec state is the ReplaySSM ring rather than per-token
     snapshots (``--enable-linear-replayssm-spec``); fixed for the server's life."""
@@ -249,6 +352,11 @@ def build(layer, i: int, rows: int) -> Optional[K1Layer]:
         _say(f"not built for the KDA layers: {'; '.join(reasons)}")
         return None
     attn = layer.self_attn
+    qlen = _draft_tokens()
+    if wide_takes(rows, qlen):
+        return _build_wide(layer, i, rows, qlen)
+    if rows > MAX_ROWS:
+        return None  # SGLang's attention, then K2
     return K1Layer(
         i=i,
         key=kda.KdaPreBuild(
@@ -276,6 +384,35 @@ def build(layer, i: int, rows: int) -> Optional[K1Layer]:
     )
 
 
+def _build_wide(layer, i: int, rows: int, qlen: int) -> Optional[K1Layer]:
+    from sgl_amd_mono.kimi_k3.gfx950.attention import kda_wide as kw
+
+    reasons = _wide_reasons(layer)
+    if reasons:
+        _say(f"the wide form not built for the KDA layers: {'; '.join(reasons)}")
+        return None
+    attn = layer.self_attn
+    return K1Layer(
+        i=i,
+        key=kw.KdaWideBuild(
+            tokens=rows,
+            qlen=qlen,
+            onorm_eps=float(attn.o_norm.eps),
+            lower_bound=float(attn.attn.lower_bound),
+            front=True,
+            nblocks=layer.prev_valid_blocks,
+            eps=layer.self_attention_res_norm.variance_epsilon,
+            out_eps=layer.input_layernorm.variance_epsilon,
+            write_idx=(layer.prev_valid_blocks if layer.is_block_write_layer else -1),
+        ),
+        module=layer,
+        on_w=attn.o_norm.weight.data.to(torch.bfloat16).contiguous(),
+        conv=None,
+        mamba_idx=-1,  # prepare's first call
+        w_in=_packed_w_in(attn._qkvgbfa_layer.weight),
+    )
+
+
 def build_batch(packed_layers, device) -> Optional[K1Batch]:
     """Every K1 layer of one width in one block, after the per-layer builds.
 
@@ -293,6 +430,14 @@ def build_batch(packed_layers, device) -> Optional[K1Batch]:
     if not ks:
         return None
     ks.sort(key=lambda k: k.i)
+    if is_wide(ks[0]):
+        from sgl_amd_mono.kimi_k3.gfx950.attention import kda_wide as kw
+
+        assert all(is_wide(k) for k in ks), "a width's K1 layers are of one form"
+        nt = kw.tiles(ks[0].key)
+        # rows past the width stay zero; the front writes the width's rows
+        x = torch.zeros(16 * nt, HIDDEN, dtype=torch.bfloat16, device=device)
+        return K1Batch(layers=ks, conv=None, x=x)
     sl = ks[0].key.state_len
     assert all(k.key.state_len == sl for k in ks), "the K1 layers disagree on state_len"
     buf = torch.empty(len(ks), 3 * kda.PROJ, sl, dtype=torch.bfloat16, device=device)
@@ -302,23 +447,33 @@ def build_batch(packed_layers, device) -> Optional[K1Batch]:
 
 
 def scratch_bytes(rows: int) -> int:
-    """What one K1 launch needs, for the runner's shared scratch.
+    """What one K1 launch of at most ``rows`` rows needs, for the runner's
+    shared scratch.
 
     The layout grows with the layer's bank depth, so it is sized for the
     deepest layer a launch is built for: a deeper layer's tail would land in
-    whatever the allocator placed after the scratch.
+    whatever the allocator placed after the scratch. The wide form's is sized
+    for its most requests.
     """
-    from sgl_amd_mono.kimi_k3.gfx950.attention import kda
+    from sgl_amd_mono.kimi_k3.gfx950.attention import kda, kda_wide as kw
 
-    return kda.scratch_bytes(
+    narrow = min(rows, MAX_ROWS)
+    need = kda.scratch_bytes(
         kda.KdaPreBuild(
-            tokens=rows,
-            qlen=rows,
+            tokens=narrow,
+            qlen=narrow,
             nblocks=MAX_BLOCKS,
             delta=False,
-            state_len=rows + kda.CONV_W - 1,
+            state_len=narrow + kda.CONV_W - 1,
         )
     )
+    if rows < kw.WT:
+        return need
+    # most requests at the most rows a request: every region at its largest
+    wide = kw.KdaWideBuild(
+        tokens=WIDE_MAX_REQS * kw.WT, qlen=kw.WT, front=True, nblocks=MAX_BLOCKS
+    )
+    return max(need, kw.scratch_bytes(wide))
 
 
 def _weight_args(packed: K1Layer) -> dict:
@@ -353,6 +508,9 @@ def warmup(runner, packed: K1Layer, prefix, blocks) -> None:
     """
     from sgl_amd_mono.kimi_k3.gfx950.attention import kda
 
+    if is_wide(packed):
+        _warmup_wide(runner, packed, prefix, blocks)
+        return
     need = kda.scratch_bytes(packed.key)
     assert need <= runner.scratch.numel(), (
         f"K1 layer {packed.i} needs {need} B of scratch, the runner has "
@@ -410,6 +568,67 @@ def warmup(runner, packed: K1Layer, prefix, blocks) -> None:
         scratch=runner.scratch,
         epoch=runner.epoch,
         layer=packed.i,
+    )
+
+
+def _wide_args(packed: K1Layer) -> dict:
+    """The tensors the wide form reads in place (in_proj its packed copy)."""
+    m = packed.module
+    attn = m.self_attn
+    return {
+        "w_in": packed.w_in,
+        "w_fb": attn.f_b_proj.weight,
+        "conv_w": attn.attn.conv_weights,
+        "a_log": attn.A_log.detach().reshape(-1),
+        "dt_bias": attn.dt_bias,
+        "on_w": packed.on_w,
+        "ares_nw": m.self_attention_res_norm.weight,
+        "ares_qk": m.self_attention_res_proj.weight.view(HIDDEN),
+        "in_nw": m.input_layernorm.weight,
+    }
+
+
+def _warmup_wide(runner, packed: K1Layer, prefix, blocks) -> None:
+    """The wide form's warmup launch: stand-in state of one slot (every request
+    reads and writes slot 0), throwaway outputs."""
+    from sgl_amd_mono.kimi_k3.gfx950.attention import kda, kda_wide as kw
+
+    key, device = packed.key, runner.device
+    need = kw.scratch_bytes(key)
+    assert need <= runner.scratch.numel(), (
+        f"K1 layer {packed.i} needs {need} B of scratch, the runner has "
+        f"{runner.scratch.numel()}"
+    )
+    assert key.write_idx < blocks.shape[1]
+    rows, L = key.tokens, key.qlen
+    reqs = rows // L
+    f32, bf16 = torch.float32, torch.bfloat16
+    chans = 3 * kda.PROJ
+
+    def z(*shape, dt=bf16):
+        return torch.zeros(*shape, dtype=dt, device=device)
+
+    kw.kda_wide(
+        key,
+        x=z(16 * kw.tiles(key), HIDDEN),
+        **_wide_args(packed),
+        conv_state=z(1, kda.CONV_W - 1, chans).mT,
+        rstate=z(1, kda.NH, kda.HD, kda.HD, dt=f32),
+        st_idx=z(reqs, dt=torch.int32),
+        conv_win=z(1, L, kda.CONV_W - 1, chans),
+        win_row=z(reqs, dt=torch.int32),
+        ring=(
+            z(1, kda.NH, L, kda.HD),
+            z(1, kda.NH, L, kda.HD),
+            z(1, kda.NH, L, kda.HD, dt=f32),
+            z(1, kda.NH, L, dt=f32),
+        ),
+        core_out=z(rows, kda.PROJ),
+        scratch=runner.scratch,
+        layer=packed.i,
+        epoch=runner.epoch,
+        prefix=prefix,
+        blocks=blocks,
     )
 
 
@@ -488,6 +707,14 @@ def prepare(batch: Optional[K1Batch], forward_batch) -> Optional[dict]:
     }
     if not _step_shapes_ok(batch, st):
         return None
+    if batch.conv is None:
+        # the wide form: every request's slot and verify-window row, as int32
+        reqs = batch.layers[0].key.tokens // batch.layers[0].key.qlen
+        st["wide_slots"] = slots[:reqs].to(torch.int32)
+        st["wide_rows"] = rows[:reqs].to(torch.int32)
+        st["reqs"] = num_reqs
+        st["wide_x"] = batch.x
+        return st
     # One request a launch, so one slot and one state row for the whole step.
     slot = slots[:1].long()
     row = rows[:1].long()
@@ -546,6 +773,7 @@ def _step_shapes_ok(batch: K1Batch, st: dict) -> bool:
 
     qlen = st["num_draft"]
     key = batch.layers[0].key
+    key_ring = True if batch.conv is None else key.ring  # the wide form: the ring only
     ring = st["ring"]
     if ring is None:
         state_ok = (
@@ -567,8 +795,8 @@ def _step_shapes_ok(batch: K1Batch, st: dict) -> bool:
         (0 < qlen <= MAX_ROWS, f"{qlen} drafted tokens is not 1 .. {MAX_ROWS}"),
         (qlen == key.qlen, f"{qlen} drafted tokens, built for {key.qlen}"),
         (
-            key.ring == (ring is not None),
-            f"built for the {'ring' if key.ring else 'snapshots'}, the pool has the other",
+            key_ring == (ring is not None),
+            f"built for the {'ring' if key_ring else 'snapshots'}, the pool has the other",
         ),
         state_ok,
         (
@@ -605,8 +833,8 @@ def finish(batch: Optional[K1Batch], st: Optional[dict], engaged: list) -> None:
     Masked to the engaged layers: a layer that declined ran SGLang's attention,
     which wrote this itself.
     """
-    if batch is None or st is None or not engaged:
-        return
+    if batch is None or st is None or not engaged or batch.conv is None:
+        return  # the wide form wrote SGLang's windows itself
     qlen = st["num_draft"]
     win = batch.conv.shape[-1] - qlen
     row, idx = st["row"], st["idx"]
@@ -708,8 +936,13 @@ def covered(packed: K1Layer, prefix, attn_res, state) -> bool:
     qlen = state["num_draft"]
     bank = attn_res.block_residual
     # The step-wide shapes were taken in prepare(); these are this layer's.
+    rows = packed.key.tokens if is_wide(packed) else qlen
     refusals = [
-        (prefix.size(0) == qlen, f"{prefix.size(0)} rows for {qlen} tokens"),
+        (prefix.size(0) == rows, f"{prefix.size(0)} rows, built for {rows}"),
+        (
+            not is_wide(packed) or state.get("reqs") == rows // qlen,
+            f"{state.get('reqs')} requests, built for {rows // qlen}",
+        ),
         (prefix.size(1) == HIDDEN, f"the prefix is {prefix.size(1)} wide"),
         (prefix.dtype == torch.bfloat16, f"the prefix is {prefix.dtype}"),
         (prefix.is_contiguous(), "the prefix is not contiguous"),
@@ -740,6 +973,8 @@ def launch(runner, packed: K1Layer, prefix, attn_res, state) -> torch.Tensor:
     """
     from sgl_amd_mono.kimi_k3.gfx950.attention import kda
 
+    if is_wide(packed):
+        return _launch_wide(runner, packed, prefix, attn_res, state)
     qlen = packed.key.qlen
     device = prefix.device
     # prepare() filled the conv window for every layer, and the SSM scratch
@@ -792,4 +1027,35 @@ def launch(runner, packed: K1Layer, prefix, attn_res, state) -> torch.Tensor:
         # host-side bookkeeping, and K1 replaced the boundary. K2 reads the
         # count to size its own seam. It refuses a bank it did not expect.
         attn_res._count_write(None)
+    return core
+
+
+def _launch_wide(runner, packed: K1Layer, prefix, attn_res, state) -> torch.Tensor:
+    """The wide form on this layer's state; returns the gated core output."""
+    from sgl_amd_mono.kimi_k3.gfx950.attention import kda, kda_wide as kw
+
+    mi = packed.mamba_idx
+    core = torch.empty(
+        packed.key.tokens, kda.PROJ, dtype=torch.bfloat16, device=prefix.device
+    )
+    kw.kda_wide(
+        packed.key,
+        x=state["wide_x"],
+        **_wide_args(packed),
+        conv_state=state["committed_conv"][mi].mT,
+        rstate=state["committed_ssm"][mi],
+        st_idx=state["wide_slots"],
+        conv_win=state["inter_window"][mi],
+        win_row=state["wide_rows"],
+        ring=tuple(t[mi] for t in state["ring"]),
+        core_out=core,
+        scratch=runner.scratch,
+        # K2 takes slot 128 + i (see launch())
+        layer=packed.i,
+        epoch=runner.epoch,
+        prefix=prefix,
+        blocks=attn_res.block_residual,
+    )
+    if packed.key.write_idx >= 0:
+        attn_res._count_write(None)  # the front wrote the bank row
     return core

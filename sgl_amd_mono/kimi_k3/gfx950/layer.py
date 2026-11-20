@@ -208,14 +208,14 @@ def tag_offset() -> int:
     """Where the tagged x rows (OPT_TAG_X) start in the scratch: past every
     launch's layout at its widest, so no other launch's plain word sits where
     these keep tags."""
-    from sgl_amd_mono.kimi_k3 import MAX_BLOCKS
+    from sgl_amd_mono.kimi_k3 import K1_MAX_ROWS, MAX_BLOCKS
     from sgl_amd_mono.kimi_k3.gfx950 import k1
     from sgl_amd_mono.kimi_k3.gfx950.attention import mla_pre
 
     end = max(
         k2b.scratch_bytes(k2b.MoeBuild(tokens=MAX_ROWS)),
         scratch_bytes(K2Build(tokens=K2_MAX_ROWS, nblocks=MAX_BLOCKS)),
-        k1.scratch_bytes(MAX_ROWS),
+        k1.scratch_bytes(K1_MAX_ROWS),
         mla_pre.scratch_bytes(mla_pre.MlaPreBuild(tokens=MAX_ROWS, nblocks=MAX_BLOCKS)),
     )
     return -(-end // 4096) * 4096

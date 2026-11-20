@@ -24,12 +24,13 @@ HF_CONFIG = dict(
 # from is sized by them.
 LINEAR_ATTN_CONFIG = dict(head_dim=128, num_heads=96, short_conv_kernel_size=4)
 
-# One launch's token rows at most: the x rows fit one CTA's LDS. K1 and the MLA
-# front take MAX_ROWS; the layer launch (K2) takes K2_MAX_ROWS (8 DSpark
-# requests), its GEMVs a 16-row token tile at a time.
+# One launch's token rows at most: the x rows fit one CTA's LDS. The MLA front
+# and K1's one-request form take MAX_ROWS; K1's wide form (1 to 8 DSpark
+# requests, x read from L2) and the layer launch (K2, its GEMVs a 16-row token
+# tile at a time) take up to K2_MAX_ROWS.
 MAX_ROWS = 8
-K1_MAX_ROWS = MAX_ROWS
 K2_MAX_ROWS = 48
+K1_MAX_ROWS = K2_MAX_ROWS
 # The attention's TP-local output per rank at TP8: 12 heads of 128. o_proj's
 # input, which is where the launch starts.
 CORE = 1536

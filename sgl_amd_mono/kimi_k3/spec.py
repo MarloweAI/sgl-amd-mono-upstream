@@ -111,6 +111,8 @@ SGLANG_READS = {
         "BumpAllocator",
         "get_bool_env_var",
     ),
+    # the ring's indexing: by mamba slot unless host-only checkpoints are on
+    "srt/mem_cache/kv_cache_configurator.py": ("host_only_mamba_checkpoint",),
     # mlp-sync padding, which the launch has no handling for
     "srt/layers/dp_attention.py": ("require_mlp_sync",),
     # the model's own forward, which _Built reproduces for a routed step
@@ -178,6 +180,7 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
     from sglang.srt.layers.quantization.mxfp4 import (
         _aiter_situ_uses_gu_interleaved_weights,
     )
+    from sglang.srt.mem_cache.kv_cache_configurator import host_only_mamba_checkpoint
     from sglang.srt.utils.common import get_bool_env_var
 
     t = _text_config(hf_config)
@@ -222,6 +225,15 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
     ):
         # CONTEXT_PARALLEL is accepted for DCP; attention CP reshapes the decode rows
         reasons.append("attention context parallel is on; only --dcp-size is accepted")
+    if not getattr(cfg, "enable_linear_replayssm_spec", False):
+        # K1's wide form keeps the verify state in SGLang's ReplaySSM ring
+        reasons.append("needs --enable-linear-replayssm-spec (the KDA verify ring)")
+    elif host_only_mamba_checkpoint():
+        # a request-scoped ring: its rows are not the mamba slots K1 indexes it by
+        reasons.append(
+            "SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT indexes the ReplaySSM ring by "
+            "request; K1 indexes it by mamba slot"
+        )
     if (getattr(cfg, "kda_dwdp_size", None) or 1) > 1:
         # DWDP shards the KDA in-projection, o_proj and shared experts per rank
         # and gathers them in layer hooks; the launches read them whole
@@ -520,11 +532,12 @@ def _weights(layer, i: int, rows: int, runner, mla: bool) -> _Layer:
     from sgl_amd_mono.kimi_k3.gfx950.layer import K2Build
 
     moe = layer.mlp
-    # K1 and the MLA front take up to MAX_ROWS rows; a wider step keeps
-    # SGLang's attention and enters the layer launch at o_proj's input
+    # K1 decides its own widths (k1.build); the MLA front takes up to MAX_ROWS
+    # rows. A step a front does not take keeps SGLang's attention and enters the
+    # layer launch at o_proj's input.
     front = rows <= MAX_ROWS
     return _Layer(
-        k1=k1_mod.build(layer, i, rows) if K1 and front else None,
+        k1=k1_mod.build(layer, i, rows) if K1 else None,
         mla=_mla_build(layer, rows) if mla and front else None,
         i=i,
         key=K2Build(
@@ -930,7 +943,9 @@ class _Built:
             )
         if packed.k1 is not None and k1_mod.covered(packed.k1, hidden, bank, state):
             ref = None
-            if self._check:
+            # the check scores K1's one-request form only
+            check = self._check and not k1_mod.is_wide(packed.k1)
+            if check:
                 from sgl_amd_mono.kimi_k3 import check as check_mod
 
                 # Before K1, on the same input and the caches as they were.
@@ -940,7 +955,7 @@ class _Built:
             set_written(hidden, forward_batch)
             self._k1_engaged.append(packed.i)
             core = k1_mod.launch(self.runner, packed.k1, hidden, bank, state)
-            if self._check:
+            if check:
                 from sgl_amd_mono.kimi_k3 import check as check_mod
 
                 check_mod.compare(self, packed.i, core, ref, bank)
