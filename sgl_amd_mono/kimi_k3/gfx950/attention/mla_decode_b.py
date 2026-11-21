@@ -50,7 +50,7 @@ from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import Int32, Int64, T, as_ir_value
 
-from sgl_amd_mono.common.ops import ballot, hw_exp2, read_lane_i32, rsrc, uniform, xred
+from sgl_amd_mono.common.ops import ballot, hw_exp2, popcount, read_lane_i32, rsrc, uniform, xred
 from sgl_amd_mono.common.plan import BLOCKS, kernel_sources, key_tuple
 from sgl_amd_mono.kimi_k3.gfx950.attention import mla_decode as md
 
@@ -64,8 +64,6 @@ ROWW = (DQK // 16 + 1) * 4  # 148 words a key row in LDS: 36 pieces of 16 bytes,
 SLOT_W = BK * ROWW
 NSLOT = 2
 PIECES = DQK // 16  # 36 pieces a key
-DMA_N = BK * (PIECES + 1) // 64  # 37 wave-wide 1 KB LDS DMAs a block (a padded row a key)
-DMA_W = -(-DMA_N // 4)  # 10 a wave at most
 LD_N = BK * PIECES // THREADS  # 9 pieces a thread a block
 HG = 16  # heads an item
 NG = NHA // HG  # 6 items a split
@@ -81,17 +79,13 @@ MAX_REQS = md.MAX_REQS
 MAX_SPLITS = md.MAX_SPLITS
 W_NUM, W_DEN = 11, 10  # a split: W_NUM / W_DEN of a CTA's share of the batch's work
 TBL, TBL_WORDS = md.TBL, md.TBL_WORDS
-T_R, T_KIND, T_N, T_NB, T_WR, T_IPRE, T_L, T_P, T_PB = range(9)
+T_R, T_KIND, T_N, T_NB, T_WR, T_IPRE, T_L, T_P, T_PB, T_KVP = range(10)
 DecodeBuffers = md.DecodeBuffers
 
 
 @dataclass(frozen=True)
 class MlaDecodeBuild:
     scale: float  # the softmax scale
-    # block b + 1's QK and softmax under block b's P V (three ring slots, two P buffers)
-    ovl: bool = False
-    # the KV blocks by async LDS DMA (spread among P V's MFMAs) instead of register-staged loads
-    kvdma: bool = False
     # timing probes only (checks): parts of a block's work left out
     probe: str = ""
 
@@ -102,15 +96,6 @@ _STREAM = fx.Stream(None)
 _ld, _ld4, _lds16, _tr8, _cat8, _e4m3x4, _memtime, _realtime, _bar, _wave_sum = (
     md._ld, md._ld4, md._lds16, md._tr8, md._cat8, md._e4m3x4, md._memtime, md._realtime, md._bar, md._wave_sum,
 )  # fmt: skip
-
-
-SG_VALU, SG_MFMA, SG_VMEM_R, SG_DS_R, SG_DS_W = 0x2, 0x8, 0x20, 0x100, 0x200
-
-
-def _pipeline(pattern):
-    """The scheduling region's issue order as (mask, count) groups (llvm.amdgcn.sched.group.barrier)."""
-    for mask, cnt in pattern:
-        rocdl.sched_group_barrier(mask, cnt, 0)
 
 
 def _st16(ptr, v):
@@ -226,6 +211,7 @@ def plan(c, tbl, kv_ptr, g_ptr, nreq, indptr, fmap, pmap, bid, tid):
 
         n_c, nb_c, wr_c, rho_c = gather(n), gather(nb), gather(wr), gather(rho)
         L_c, P_c, pb_c = gather(L), gather(P), gather(pbase)
+        kvp_c = gather(_ld(kv_ptr, r))
         cnt = (kind == 0).select(NG * (n_c - 1), fx.Int32(NG))
         cnt = clive.select(cnt, fx.Int32(0))
         cost = (cnt > 0).select((kind == 0).select(wr_c, rho_c), fx.Int32(-1))
@@ -242,7 +228,7 @@ def plan(c, tbl, kv_ptr, g_ptr, nreq, indptr, fmap, pmap, bid, tid):
             row = tbl + rk * TBL
             for f, v in (
                 (T_R, cr), (T_KIND, kind), (T_N, n_c), (T_NB, nb_c), (T_WR, wr_c), (T_IPRE, ipre),
-                (T_L, L_c), (T_P, P_c), (T_PB, G * pb_c),
+                (T_L, L_c), (T_P, P_c), (T_PB, G * pb_c), (T_KVP, kvp_c),
             ):  # fmt: skip
                 fx.ptr_store(fx.Int32(v), row + f)
         if lane == 0:
@@ -257,19 +243,14 @@ def build(key: MlaDecodeBuild):
     keyed = key_tuple(key, SOURCES)
     qk_c = key.scale * LOG2E
     probe = key.probe
-    ovl = key.ovl
-    kvdma = key.kvdma
-    assert not (ovl and kvdma)
-    nslot = 3 if (ovl or kvdma) else NSLOT
-    npb = 2 if ovl else 1
     PBW = COLS * PROW
 
     @fx.struct
     class Smem:
-        kv: fx.Array[fx.Int32, nslot * SLOT_W, 16]
-        p: fx.Array[fx.Int32, npb * PBW, 16]
+        kv: fx.Array[fx.Int32, NSLOT * SLOT_W, 16]
+        p: fx.Array[fx.Int32, PBW, 16]
         red: fx.Array[fx.Float32, 2 * COLS, 16]  # the key halves' column maxes
-        alpha: fx.Array[fx.Float32, npb * COLS, 16]
+        alpha: fx.Array[fx.Float32, COLS, 16]
         lsum: fx.Array[fx.Float32, 2 * COLS, 16]
         mfin: fx.Array[fx.Float32, COLS, 16]
         tbl: fx.Array[fx.Int32, TBL_WORDS, 16]
@@ -285,7 +266,7 @@ def build(key: MlaDecodeBuild):
         tk0 = _memtime() if const_expr(tlon) else z
         rk0 = _realtime() if const_expr(tlon) else z
         t_set, t_loop, t_epi, n_it, n_bl = z, z, z, z, z
-        phon = "ph" in probe  # the base schedule's block phases (with "tl")
+        phon = "ph" in probe  # a block's phases (with "tl")
         ph = [z] * 6
         tb = z
         bid, tid = fx.block_idx.x, fx.thread_idx.x
@@ -301,7 +282,6 @@ def build(key: MlaDecodeBuild):
         ring, pbuf, red, alph, lsum, mfin, tbl = (
             lds.kv.ptr, lds.p.ptr, lds.red.ptr, lds.alpha.ptr, lds.lsum.ptr, lds.mfin.ptr, lds.tbl.ptr,
         )  # fmt: skip
-        zero4 = fx.Vector.filled(4, 0, fx.Int32)
 
         def kop(kbp, u):
             """QK MFMA u's A operand (K step u / 2, key tile u % 2) from the slot at ``kbp``."""
@@ -319,19 +299,6 @@ def build(key: MlaDecodeBuild):
                 byte = key * (ROWW * 4) + 128 * wave + 32 * d + 16 * ((lane // 16) % 2) + 8 * (grp % 2)
                 vs.append(_tr8(kbp + byte // 4))
             return fx.Vector.from_elements([vs[r_][w_] for r_ in range(4) for w_ in range(2)], fx.Int32)
-
-        def dma_voffs(rows):
-            """This wave's DMAs d = wave + 4 j of a block: lane l's source byte offset (key
-            (64 d + l) / 37's piece (64 d + l) % 37; the pad piece reads offset 0)."""
-            rv = (rows[1] != 0).select(rows[0], fx.Int32(0))
-            out = []
-            for j in range_constexpr(DMA_W):
-                pc = (wave + 4 * j) * 64 + lane
-                kq = fx.min(pc // (PIECES + 1), BK - 1)
-                part = pc % (PIECES + 1)
-                off = fx.Int32(rocdl.ds_bpermute(T.i32, kq * 4, rv))
-                out.append((part < PIECES).select(off * DQK + part * 16, fx.Int32(0)))
-            return out
 
         def pops_of(pbp):
             """P V's B operands (P^T, columns 32 ct + n32, keys 32 hb ..) from the P buffer at ``pbp``."""
@@ -389,12 +356,6 @@ def build(key: MlaDecodeBuild):
             w_ = tid + THREADS * k_
             if w_ < TBL_WORDS:
                 fx.ptr_store(_ld(ptbl, w_), tbl + w_)
-        if const_expr(ovl):
-            # slot 2 finite before any item's first P V (of a zero P)
-            for k_ in range_constexpr(-(-SLOT_W // (4 * THREADS))):
-                w_ = 4 * (tid + THREADS * k_)
-                if w_ < SLOT_W:
-                    _st16(ring + 2 * SLOT_W + w_, zero4)
         _bar()
         nitems = fx.Int32(fx.ptr_load(tbl + 2 * MAX_REQS * TBL))
         t_plan = (_memtime() - tk0) if const_expr(tlon) else z
@@ -406,9 +367,9 @@ def build(key: MlaDecodeBuild):
         for rnd in range(nrounds):
             ta = _memtime() if const_expr(tlon) else z
             k = rnd * BLOCKS + (rnd % 2 == 0).select(place, BLOCKS - 1 - place)
-            rk = fx.Int32(0)
-            for r2 in range(2 * nreq):
-                rk = (fx.Int32(fx.ptr_load(tbl + r2 * TBL + T_IPRE)) <= k).select(r2, rk)
+            # the item's class: the last table row whose first item is <= k (rows ascend; lane r: row r)
+            ip = (lane < 2 * nreq).select(fx.Int32(fx.ptr_load(tbl + fx.min(lane, 2 * MAX_REQS - 1) * TBL + T_IPRE)), fx.Int32(1 << 30))
+            rk = uniform(popcount(ballot(ip <= k)) - 1)
             row = tbl + rk * TBL
             rq = uniform(fx.ptr_load(row + T_R))
             kind = uniform(fx.ptr_load(row + T_KIND))
@@ -424,7 +385,7 @@ def build(key: MlaDecodeBuild):
             b0 = sp * wr
             b1 = fx.min(b0 + wr, nb)
             nblk = b1 - b0
-            kvp = _ld(kv_ptr, rq)
+            kvp = uniform(fx.ptr_load(row + T_KVP))
             sc = {"b0": b0, "b1": b1, "L": L, "kvp": kvp, "kv_idx": kv_idx, "r_kv": r_kv, "ring": ring,
                   "lane": lane, "tid": tid}  # fmt: skip
             # keys visible to the wave's QK rows 3 ch + ct (local key index bound)
@@ -436,30 +397,8 @@ def build(key: MlaDecodeBuild):
             # every wave done with the ring and the item before's buffers
             _bar()
             noload = "noload" in probe
-            if const_expr(kvdma):
-                for b_ in range_constexpr(2):
-                    vo = dma_voffs(_rows(sc, fx.Int32(b_)))
-                    for j in range_constexpr(DMA_W):
-                        if const_expr(j < DMA_W - 1):
-                            md._dma1(r_kv, ring + b_ * SLOT_W + (wave + 4 * j) * 256, vo[j])
-                        else:
-                            if wave + 4 * j < DMA_N:
-                                md._dma1(r_kv, ring + b_ * SLOT_W + (wave + 4 * j) * 256, vo[j])
-                rocdl.asyncmark()
-                rocdl.wait_asyncmark(0)
-            stg = _load(sc, _rows(sc, fx.Int32(0)))
-            if const_expr(not noload and not kvdma):
-                _store(sc, stg, fx.Int32(0))
-            stg = _load(sc, _rows(sc, fx.Int32(1)))
-            if const_expr(ovl):
-                if const_expr(not noload):
-                    _store(sc, stg, fx.Int32(1))
-                stg = _load(sc, _rows(sc, fx.Int32(2)))
-                # a zero P for block -1 (the loop's first P V)
-                for k_ in range_constexpr(-(-PBW // (4 * THREADS))):
-                    w_ = 4 * (tid + THREADS * k_)
-                    if w_ < PBW:
-                        _st16(pbuf + PBW + w_, zero4)
+            rows0 = _rows(sc, fx.Int32(0))
+            rows1 = _rows(sc, fx.Int32(1))
             # the wave's q: 3 column tiles (rows 3 ch + ct, heads 16 hg + c16) x 5 K steps
             qops = []
             for ct in range_constexpr(3):
@@ -470,6 +409,11 @@ def build(key: MlaDecodeBuild):
                     if const_expr(s == KSTEPS - 1):
                         v = fx.Vector.from_elements([(g < 2).select(fx.Int32(v[e]), fx.Int32(0)) for e in range(8)], fx.Int32)
                     qops.append(v)
+            # block 0 into slot 0, block 1 into registers
+            stg0 = _load(sc, rows0)
+            stg = _load(sc, rows1)
+            if const_expr(not noload):
+                _store(sc, stg0, fx.Int32(0))
             acc = [fx.Vector.filled(16, 0.0, fx.Float32) for _ in range(12)]  # acc[3 d + ct]
             ms = [fx.Float32(NEG)] * 3
             ls = [fx.Float32(0.0)] * 3
@@ -480,215 +424,75 @@ def build(key: MlaDecodeBuild):
                 t_set = t_set + (tb - ta)
                 n_it = n_it + 1
                 n_bl = n_bl + fx.Int64(nblk)
-            if const_expr(ovl):
-                # QK of block 0; then a step i: O rescale by alpha(i - 1), P V(i - 1) with softmax 1 of
-                # block i; barrier A; QK(i + 1) with softmax 2 of block i and block i + 2 into slot
-                # (i + 2) % 3 (block i - 1's, read before barrier A); barrier B
+            for i in range(nblk):
+                p0 = _memtime() if const_expr(phon) else z
+                # block i + 2's rows, used before barrier B (no load result crosses the loop's back edge)
+                ridx = _rows(sc, i + 2)
+                kb = ring + (i % NSLOT) * SLOT_W
+                # QK: sacc[3 kt + ct], element e = key 32 kh + 16 kt + 4 g + e, column 48 ch + 16 ct + c16
                 sacc = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(6)]
-                aop = kop(ring, 0)
-                for u in range_constexpr(2 * KSTEPS):
-                    cur = aop
-                    if const_expr(u + 1 < 2 * KSTEPS):
-                        aop = kop(ring, u + 1)
-                    for ct in range_constexpr(3):
-                        sacc[3 * (u % 2) + ct] = _mfma16(cur, qops[KSTEPS * ct + u // 2], sacc[3 * (u % 2) + ct])
-                for i in range(nblk):
-                    # block i + 3's rows, used before barrier B (no load result crosses the loop's back edge)
-                    p0 = _memtime() if const_expr(phon) else z
-                    ridx = _rows(sc, i + 3)
-                    kbp = ring + ((i + 2) % 3) * SLOT_W
-                    kbn = ring + ((i + 1) % 3) * SLOT_W
-                    pbp = pbuf + ((i + 1) % 2) * PBW
-                    pbc = pbuf + (i % 2) * PBW
-                    alp = alph + ((i + 1) % 2) * COLS
-                    alc = alph + (i % 2) * COLS
-                    als = [fx.Float32(fx.ptr_load(alp + 32 * ct + n32)) for ct in range(3)]
-                    resc = ballot((als[0] != one) | (als[1] != one) | (als[2] != one)) != fx.Int64(0)
-                    if resc:
-                        acc = [
-                            fx.Vector.from_elements([fx.Float32(acc[t][e]) * als[t % 3] for e in range(16)], fx.Float32)
-                            for t in range(12)
-                        ]
-                    p1 = _memtime() if const_expr(phon) else z
-                    pops = pops_of(pbp)
-                    vt = vop(kbp, 0)
-                    xs, mx = [], []
-                    for d in range_constexpr(4):
-                        cur = vt
-                        if const_expr(d + 1 < 4):
-                            vt = vop(kbp, d + 1)
-                        for ct in range_constexpr(3):
-                            if const_expr("nopv" not in probe):
-                                acc[3 * d + ct] = _mfma32(cur, pops[ct], acc[3 * d + ct])
-                        if const_expr(d < 3):
-                            xc, mb = soft1(sacc, i, lims, d)
-                            xs.append(xc)
-                            mx.append(mb)
-                    if const_expr("nosg" not in probe):
-                        # P V's 12 MFMAs with softmax 1's VALU between them, their operand reads ahead
-                        pat = [(SG_DS_R, 10)]
-                        for t in range_constexpr(12):
-                            pat += [(SG_MFMA, 1), (SG_VALU, 9)]
-                            if t % 3 == 0 and t < 9:
-                                pat += [(SG_DS_R, 4)]
-                        _pipeline(pat)
-                    p2 = _memtime() if const_expr(phon) else z
-                    _bar()
-                    p3 = _memtime() if const_expr(phon) else z
-                    sn = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(6)]
-                    kvb = _row_of(sc, ridx)
-                    aop = kop(kbn, 0)
+                if const_expr("noqk" not in probe):
+                    aop = kop(kb, 0)
                     for u in range_constexpr(2 * KSTEPS):
                         cur = aop
                         if const_expr(u + 1 < 2 * KSTEPS):
-                            aop = kop(kbn, u + 1)
+                            aop = kop(kb, u + 1)
                         for ct in range_constexpr(3):
-                            if const_expr("noqk" not in probe):
-                                sn[3 * (u % 2) + ct] = _mfma16(cur, qops[KSTEPS * ct + u // 2], sn[3 * (u % 2) + ct])
-                        if const_expr(u % 3 == 1):
-                            c2 = u // 3
-                            mn, l2 = soft2(xs[c2], mx[c2], ms[c2], ls[c2], c2, pbc, alc)
-                            ms[c2] = mn
-                            ls[c2] = l2
-                        if const_expr(u < LD_N and not noload):
-                            # block i + 2's piece u into slot (i + 2) % 3, block i + 3's into its register
-                            _store1(sc, stg[u], (i + 2) % 3, u)
-                            stg[u] = _load1(sc, kvb, u)
-                    if const_expr("nosg" not in probe):
-                        # QK's 30 MFMAs with softmax 2's VALU, the K operand reads a step ahead, a KV piece a step
-                        pat = [(SG_DS_R, 2 + 3)]
-                        for u in range_constexpr(2 * KSTEPS):
-                            pat += [(SG_DS_R, 2), (SG_MFMA, 1), (SG_VALU, 4), (SG_MFMA, 1), (SG_VALU, 4), (SG_MFMA, 1), (SG_VALU, 4)]
-                            if u < LD_N:
-                                pat += [(SG_DS_W, 1), (SG_VMEM_R, 1)]
-                        _pipeline(pat)
-                    p4 = _memtime() if const_expr(phon) else z
-                    _bar()
-                    if const_expr(phon):
-                        p5 = _memtime()
-                        ph = [ph[0] + (p1 - p0), ph[1] + (p2 - p1), ph[2] + (p3 - p2), ph[3] + (p4 - p3), ph[4] + (p5 - p4), ph[5]]
-                    sacc = sn
-                # P V of the last block
-                kbp = ring + ((nblk + 2) % 3) * SLOT_W
-                pbp = pbuf + ((nblk + 1) % 2) * PBW
-                alp = alph + ((nblk + 1) % 2) * COLS
-                als = [fx.Float32(fx.ptr_load(alp + 32 * ct + n32)) for ct in range(3)]
+                            rocdl.sched_barrier(0)
+                            sacc[3 * (u % 2) + ct] = _mfma16(cur, qops[KSTEPS * ct + u // 2], sacc[3 * (u % 2) + ct])
+                            rocdl.sched_barrier(0)
+                # the mask only where a row's visible keys end inside the block (wave-uniform)
+                xs = [[fx.Float32(0.0)] * 8 for _ in range(3)]
+                mx = [fx.Float32(0.0)] * 3
+                if (i + 1) * BK <= lmin:
+                    for ct in range_constexpr(3):
+                        xc, mb = soft1(sacc, i, lims, ct, False)
+                        xs[ct] = xc
+                        mx[ct] = mb
+                else:
+                    for ct in range_constexpr(3):
+                        xc, mb = soft1(sacc, i, lims, ct)
+                        xs[ct] = xc
+                        mx[ct] = mb
+                p1 = _memtime() if const_expr(phon) else z
+                _bar()
+                p2 = _memtime() if const_expr(phon) else z
+                # softmax 2, and block i + 1 into the other slot (its readers, block i - 1, are past
+                # barrier A) with block i + 2's loads, three pieces after each column tile
+                kvb = _row_of(sc, ridx)
+                for ct in range_constexpr(3):
+                    mn, l2 = soft2(xs[ct], mx[ct], ms[ct], ls[ct], ct, pbuf, alph)
+                    ms[ct] = mn
+                    ls[ct] = l2
+                    if const_expr(not noload):
+                        for k in range_constexpr(3 * ct, 3 * ct + 3):
+                            _store1(sc, stg[k], (i + 1) % 2, k)
+                            stg[k] = _load1(sc, kvb, k)
+                p3 = _memtime() if const_expr(phon) else z
+                _bar()
+                p4 = _memtime() if const_expr(phon) else z
+                # PV: this wave's dims 128 wave + 32 d + .., columns 32 ct + n32
+                als = [fx.Float32(fx.ptr_load(alph + 32 * ct + n32)) for ct in range(3)]
                 resc = ballot((als[0] != one) | (als[1] != one) | (als[2] != one)) != fx.Int64(0)
                 if resc:
                     acc = [
                         fx.Vector.from_elements([fx.Float32(acc[t][e]) * als[t % 3] for e in range(16)], fx.Float32)
                         for t in range(12)
                     ]
-                pops = pops_of(pbp)
-                vt = vop(kbp, 0)
-                for d in range_constexpr(4):
-                    cur = vt
-                    if const_expr(d + 1 < 4):
-                        vt = vop(kbp, d + 1)
-                    for ct in range_constexpr(3):
-                        if const_expr("nopv" not in probe):
+                if const_expr("nopv" not in probe):
+                    pops = pops_of(pbuf)
+                    vt = vop(kb, 0)
+                    for d in range_constexpr(4):
+                        cur = vt
+                        if const_expr(d + 1 < 4):
+                            vt = vop(kb, d + 1)
+                        for ct in range_constexpr(3):
+                            rocdl.sched_barrier(0)
                             acc[3 * d + ct] = _mfma32(cur, pops[ct], acc[3 * d + ct])
-            else:
-                for i in range(nblk):
-                    p0 = _memtime() if const_expr(phon) else z
-                    # block i + 2's rows, used before barrier B (no load result crosses the loop's back edge)
-                    ridx = _rows(sc, i + 2)
-                    kb = ring + (i % nslot) * SLOT_W
-                    # QK: sacc[3 kt + ct], element e = key 32 kh + 16 kt + 4 g + e, column 48 ch + 16 ct + c16
-                    sacc = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(6)]
-                    if const_expr("noqk" not in probe):
-                        aop = kop(kb, 0)
-                        for u in range_constexpr(2 * KSTEPS):
-                            cur = aop
-                            if const_expr(u + 1 < 2 * KSTEPS):
-                                aop = kop(kb, u + 1)
-                            for ct in range_constexpr(3):
-                                rocdl.sched_barrier(0)
-                                sacc[3 * (u % 2) + ct] = _mfma16(cur, qops[KSTEPS * ct + u // 2], sacc[3 * (u % 2) + ct])
-                                rocdl.sched_barrier(0)
-                    # the mask only where a row's visible keys end inside the block (wave-uniform)
-                    xs = [[fx.Float32(0.0)] * 8 for _ in range(3)]
-                    mx = [fx.Float32(0.0)] * 3
-                    if (i + 1) * BK <= lmin:
-                        for ct in range_constexpr(3):
-                            xc, mb = soft1(sacc, i, lims, ct, False)
-                            xs[ct] = xc
-                            mx[ct] = mb
-                    else:
-                        for ct in range_constexpr(3):
-                            xc, mb = soft1(sacc, i, lims, ct)
-                            xs[ct] = xc
-                            mx[ct] = mb
-                    p1 = _memtime() if const_expr(phon) else z
-                    _bar()
-                    p2 = _memtime() if const_expr(phon) else z
-                    # softmax 2, and block i + 1 into the other slot (its readers, block i - 1, are past
-                    # barrier A) with block i + 2's loads, three pieces after each column tile
-                    kvb = _row_of(sc, ridx)
-                    for ct in range_constexpr(3):
-                        mn, l2 = soft2(xs[ct], mx[ct], ms[ct], ls[ct], ct, pbuf, alph)
-                        ms[ct] = mn
-                        ls[ct] = l2
-                        if const_expr(not noload and not kvdma):
-                            for k in range_constexpr(3 * ct, 3 * ct + 3):
-                                _store1(sc, stg[k], (i + 1) % 2, k)
-                                stg[k] = _load1(sc, kvb, k)
-                    if const_expr(kvdma):
-                        # block i + 1's DMAs (issued under P V of block i - 1) landed
-                        rocdl.wait_asyncmark(0)
-                    p3 = _memtime() if const_expr(phon) else z
-                    p4 = p3
-                    _bar()
-                    p5 = _memtime() if const_expr(phon) else z
-                    # PV: this wave's dims 128 wave + 32 d + .., columns 32 ct + n32
-                    als = [fx.Float32(fx.ptr_load(alph + 32 * ct + n32)) for ct in range(3)]
-                    resc = ballot((als[0] != one) | (als[1] != one) | (als[2] != one)) != fx.Int64(0)
-                    if resc:
-                        acc = [
-                            fx.Vector.from_elements([fx.Float32(acc[t][e]) * als[t % 3] for e in range(16)], fx.Float32)
-                            for t in range(12)
-                        ]
-                    if const_expr(kvdma):
-                        # block i + 2 into slot (i + 2) % 3 (block i - 1's, read before barrier A), a DMA
-                        # after each of the first 10 P V MFMAs
-                        vo = dma_voffs(ridx)
-                        dslot = ring + ((i + 2) % 3) * SLOT_W
-                        pops = pops_of(pbuf)
-                        vt = vop(kb, 0)
-                        for d in range_constexpr(4):
-                            cur = vt
-                            if const_expr(d + 1 < 4):
-                                vt = vop(kb, d + 1)
-                            for ct in range_constexpr(3):
-                                t = 3 * d + ct
-                                if const_expr("nopv" not in probe):
-                                    acc[t] = _mfma32(cur, pops[ct], acc[t])
-                                if const_expr(t < DMA_W - 1 and not noload):
-                                    md._dma1(r_kv, dslot + (wave + 4 * t) * 256, vo[t])
-                                if const_expr(t == DMA_W - 1 and not noload):
-                                    if wave + 4 * t < DMA_N:
-                                        md._dma1(r_kv, dslot + (wave + 4 * t) * 256, vo[t])
-                        rocdl.asyncmark()
-                    elif const_expr("nopv" not in probe):
-                        pops = pops_of(pbuf)
-                        if const_expr("pvpre" in probe):
-                            vts = [vop(kb, d) for d in range(4)]
-                            for d in range_constexpr(4):
-                                for ct in range_constexpr(3):
-                                    acc[3 * d + ct] = _mfma32(vts[d], pops[ct], acc[3 * d + ct])
-                        else:
-                            vt = vop(kb, 0)
-                            for d in range_constexpr(4):
-                                cur = vt
-                                if const_expr(d + 1 < 4):
-                                    vt = vop(kb, d + 1)
-                                for ct in range_constexpr(3):
-                                    rocdl.sched_barrier(0)
-                                    acc[3 * d + ct] = _mfma32(cur, pops[ct], acc[3 * d + ct])
-                                    rocdl.sched_barrier(0)
-                    if const_expr(phon):
-                        p6 = _memtime()
-                        ph = [ph[0] + (p1 - p0), ph[1] + (p2 - p1), ph[2] + (p3 - p2), ph[3] + (p4 - p3), ph[4] + (p5 - p4), ph[5] + (p6 - p5)]
+                            rocdl.sched_barrier(0)
+                if const_expr(phon):
+                    p5 = _memtime()
+                    ph = [ph[0] + (p1 - p0), ph[1] + (p2 - p1), ph[2] + (p3 - p2), ph[3] + (p4 - p3), ph[4] + (p5 - p4), ph[5]]
             tc = _memtime() if const_expr(tlon) else z
             # the split's output: both key halves' row sums, O / l
             for ct in range_constexpr(3):

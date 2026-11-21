@@ -129,9 +129,7 @@ def timeline(q8, b, bufs, probe="tl"):
     t = tl.view(256, 8).double().cpu()
     names = ["plan", "setup", "steps", "epilogue", "total", "real100MHz", "items", "nsteps"]
     if "ph" in probe.split(","):  # design b's block phases
-        names = ["qk+soft1", "barrierA", "soft2", "kv store+issue", "barrierB", "pv", "items", "nsteps"]
-        if BUILD_KW.get("ovl"):
-            names = ["rescale", "pv+soft1", "barrierA", "qk+soft2+kv", "barrierB", "-", "items", "nsteps"]
+        names = ["qk+soft1", "barrierA", "soft2+kv", "barrierB", "pv", "-", "items", "nsteps"]
     tot = t[:, 1] + t[:, 2] + t[:, 3]
     i = int(tot.argmax())
     if "ph" not in probe.split(","):
@@ -141,7 +139,6 @@ def timeline(q8, b, bufs, probe="tl"):
 
 
 DESIGN = "a"
-BUILD_KW = {}  # design b's schedule flags (``mla_decode_b.MlaDecodeBuild``)
 
 
 def decode_module():
@@ -164,7 +161,7 @@ def run_ours(q8, b, bufs, probe="", tl=None):
 
     def go():
         md.mla_decode_launch(
-            md.MlaDecodeBuild(scale=SCALE, probe=probe, **BUILD_KW), q8=q8, kv=b.pool, kv_idx=b.kv_idx, kv_ptr=b.kv_ptr,
+            md.MlaDecodeBuild(scale=SCALE, probe=probe), q8=q8, kv=b.pool, kv_idx=b.kv_idx, kv_ptr=b.kv_ptr,
             g_ptr=b.g_kv_ptr, rank=b.r, o=o, lse=lse, bufs=bufs, tl=tl,
         )  # fmt: skip
 
@@ -287,19 +284,13 @@ def main():
     ap.add_argument("--compile", action="store_true", help="compile-only build (no GPU)")
     ap.add_argument("--launches", type=int, default=0, help="only launch the decode this many times (profilers)")
     ap.add_argument("--design", default="a", choices=["a", "b"], help="a: mla_decode, b: mla_decode_b")
-    ap.add_argument("--ovl", action="store_true", help="design b: QK and softmax of block b + 1 under P V of block b")
-    ap.add_argument("--kvdma", action="store_true", help="design b: the KV blocks by async LDS DMA")
     args = ap.parse_args()
     global DESIGN
     DESIGN = args.design
-    if args.ovl:
-        BUILD_KW["ovl"] = True
-    if args.kvdma:
-        BUILD_KW["kvdma"] = True
     if args.compile:
         md = decode_module()
 
-        md.build(md.MlaDecodeBuild(scale=SCALE, **BUILD_KW))(*([0] * 13), stream=0)
+        md.build(md.MlaDecodeBuild(scale=SCALE))(*([0] * 13), stream=0)
         md.build_plan()(*([0] * 7), stream=0)
         print("COMPILE_OK", flush=True)
         return
