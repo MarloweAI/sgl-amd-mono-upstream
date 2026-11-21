@@ -7,6 +7,9 @@ run (``ROWS``):
   SGLang's K3 decoder layer offers its FFN read to it (a ReadoutFusion that also reads).
 * ``MoeAr``: the latent MoE's flat [latent | shared] all-reduce with the latent's RMSNorm in one
   launch, reading the partials where the MoE wrote them (``gfx950/stages/ar_norm.py``).
+* ``SharedPushAr``: the same reduce with the shared half pushed one-shot to every rank right after the
+  shared down projection (``push``), so only the latent half's all-reduce follows the routed experts;
+  its launch sums the pushed shared partials in rank order (``gfx950/stages/shared_push.py``).
 
 A width outside ``ROWS`` keeps SGLang's all-reduce and glue.
 """
@@ -104,6 +107,56 @@ class MoeAr:
         if layer == self.first:
             self.epoch[0:1].add_(1)
         self.launch(
+            _p(latent), _p(shared), _p(w), _p(out_l), _p(out_s), _p(out_n), m, _p(self.peer.addresses),
+            self.rank, _p(self.epoch), layer, stream=torch.cuda.current_stream(),
+        )  # fmt: skip
+        return out_l, out_s, out_n
+
+
+class SharedPushAr:
+    """One rank's split MoE all-reduce: ``push`` the shared partial to every rank once it is final, then
+    ``reduce`` the latent half with its RMSNorm and sum the pushed shared partials. Its peer buffer, step
+    epoch (bumped by the first MoE layer's push) and launches; built like ``MoeAr``."""
+
+    def __init__(self, cpu_group, rank: int, device, layers, eps: float, deadline_s: float = 20.0):
+        from sgl_amd_mono.common import guard
+        from sgl_amd_mono.common.peer import PeerBuffer
+        from sgl_amd_mono.kimi_k3.gfx950.stages import shared_push as S
+
+        dev = torch.device(device)
+        self.rank = rank
+        self.first = min(layers)
+        self.epoch = torch.zeros(guard.GUARD_WORDS, dtype=torch.int32, device=dev)
+        ticks = guard.deadline_ticks(deadline_s)
+        lo = ticks & 0xFFFFFFFF
+        self.epoch[guard.GUARD_DEADLINE] = lo - (1 << 32) if lo >= 1 << 31 else lo
+        self.epoch[guard.GUARD_DEADLINE + 1] = ticks >> 32
+        self.peer = PeerBuffer(S.peer_bytes(), cpu_group, rank, K.TP, dev, init=S.arm)
+        launches = max(layers) + 1
+        self.push_launch = S.build_push(launches)
+        self.split_launch = S.build_split(float(eps), launches)
+
+    def covers(self, rows: int) -> bool:
+        return rows in ROWS
+
+    def push(self, layer: int, shared):
+        """Sends this rank's shared partial [m, 7168] (bf16, contiguous rows, left in place until
+        ``reduce``) to every rank."""
+        assert shared.is_contiguous()
+        if layer == self.first:
+            self.epoch[0:1].add_(1)
+        self.push_launch(
+            _p(shared), shared.shape[0], _p(self.peer.addresses), self.rank, _p(self.epoch), layer,
+            stream=torch.cuda.current_stream(),
+        )  # fmt: skip
+
+    def reduce(self, layer: int, latent, shared, w):
+        """``MoeAr.reduce``'s (latent sum, shared sum, RMSNorm of the latent sum) after ``push(layer,
+        shared)``."""
+        m = latent.shape[0]
+        assert latent.is_contiguous() and shared.is_contiguous() and shared.shape[0] == m
+        out_l, out_n, out_s = torch.empty_like(latent), torch.empty_like(latent), torch.empty_like(shared)
+        self.split_launch(
             _p(latent), _p(shared), _p(w), _p(out_l), _p(out_s), _p(out_n), m, _p(self.peer.addresses),
             self.rank, _p(self.epoch), layer, stream=torch.cuda.current_stream(),
         )  # fmt: skip
