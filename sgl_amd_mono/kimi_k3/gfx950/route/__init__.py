@@ -18,6 +18,11 @@ import torch
 _HERE = Path(__file__).resolve().parent
 E, TOPK, LAT, BM = 896, 16, 3584, 16
 MIN_ROWS, MAX_ROWS = 48, 180
+# The rows the MoE's fused shared chain runs at (route_sort_shared, then moe_persist.stage1_shared), and those of
+# them at which its shared tiles push the shared partial for the split MoE all-reduce (ar_read.SharedPushAr):
+# above the KDA and MLA layer launches' row caps. The one definition both sides read.
+FUSED_SHARED_ROWS = range(MIN_ROWS, MAX_ROWS + 1)
+SHARED_PUSH_ROWS = range(49, MAX_ROWS + 1)
 # aiter's _aux_uses_opus at block_m 16: Opus once 3 x rows x 16 >= 4 x 896
 OPUS_FROM_ROWS = 75
 

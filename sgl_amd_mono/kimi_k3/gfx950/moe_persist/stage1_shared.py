@@ -188,15 +188,12 @@ def compile_stage1_shared(*, s1_use_nt, s1_prefetch_hidden, s1_xcd_swizzle, situ
         in_dtype_id=hg.GEMM_A16W16_DTYPE_BF16, out_dtype_id=hg.GEMM_A16W16_DTYPE_BF16, block_m=sh_block_m,
         block_n=sh_block_n, block_k=sh_block_k, stages=sh_stages, split_k=1, m_waves=sh_m_waves,
         n_waves=sh_n_waves, k_waves=1, group_m=0, a_is_transposed=False, b_is_transposed=True)
-    assert hparam.block_threads == 256, hparam.block_threads
     st, bm, bn, bk = sh_stages, sh_block_m, sh_block_n, sh_block_k
     tag = (f"h{hidden}_i{inter}_g1{'nt' if s1_use_nt else 'c'}{'_hpf' if s1_prefetch_hidden else ''}"
            f"_xcd{s1_xcd_swizzle}_sh{bm}x{bn}x{bk}x{st}w{sh_m_waves}x{sh_n_waves}{'_last' if sh_last else ''}"
            f"{'' if push is None else f'_push{push}'}")
     if push is not None:
         from sgl_amd_mono.kimi_k3.gfx950.stages import shared_push as S
-
-        assert (bm, bn) == (S.TM, S.TN), "the push's tiles are the shared tiles"
 
     @fx.struct
     class SharedAB:
@@ -379,7 +376,8 @@ def compile_stage1_shared(*, s1_use_nt, s1_prefetch_hidden, s1_xcd_swizzle, situ
     return launch, hparam
 
 
-# the shared tile a stock bucket (get_padded_M 64 / 128 / 256): LDS <= 40 KB keeps stage 1's 4 workgroups a CU.
+# the shared tile a stock bucket (get_padded_M 64 / 128 / 256): LDS <= 40 KB keeps stage 1's 4 workgroups a CU;
+# 64 x 64 is the C18 push's tile (shared_push.TM / TN), 4 waves the launch's 256 threads.
 # block_k 64 keeps the K order of SGLang's own hgemm (bit for bit); block_k 32 does not.
 SHARED_CONFIGS = {
     b: dict(sh_block_m=64, sh_block_n=64, sh_block_k=64, sh_stages=2, sh_m_waves=1, sh_n_waves=4)
@@ -388,30 +386,26 @@ SHARED_CONFIGS = {
 
 
 def stage1_shared(g1: dict, act, w_down, shared_out, overrides: tuple = (), push=None) -> None:
-    """aiter's stage 1 of one MoE call (``g1``: the keyword arguments fused_moe passes to flydsl_mxfp4_gemm1) and
-    shared_out [M, 7168] bf16 = act [M, 768] bf16 @ w_down [7168, 768]^T in one launch. ``push``: None, or
-    (launches, peers, rank, epoch, slot) of the shared partial's C18 push (``SharedPushAr.slots`` and
-    ``SharedPushAr.push_args(layer)``): its tiles also go to the other ranks' slots."""
+    """aiter's stage 1 of one MoE call (``g1``: the keyword arguments fused_moe passes to flydsl_mxfp4_gemm1, its
+    a8w4 BM16 stage 1; the launch takes that stage 1's own flags) and shared_out [M, 7168] bf16 = act [M, 768] bf16
+    @ w_down [7168, 768]^T in one launch. ``push``: None, or (launches, peers, rank, epoch, slot) of the shared
+    partial's C18 push (``SharedPushAr.launches`` and ``SharedPushAr.push_args(layer)``): its tiles also go to
+    the other ranks' slots."""
     import torch
     from aiter.ops.flydsl.kernels.mxfp4_gemm1 import gemm1_grid
 
-    from . import _STOCK, bucket, check_g1
+    from . import bucket
 
-    b = check_g1(g1)
-    st = _STOCK[b]["g1"]
-    cf = dict(SHARED_CONFIGS[b])
+    m = g1["n_tokens"]
+    cf = dict(SHARED_CONFIGS[bucket(m)])
     cf.update(dict(overrides))
     launch, hparam = compile_stage1_shared(
-        s1_use_nt=st["use_nt"], s1_prefetch_hidden=st["prefetch_hidden"], s1_xcd_swizzle=st["xcd_swizzle"],
-        situ_beta=float(g1["situ_beta"]), situ_linear_beta=float(g1["situ_linear_beta"]),
-        push=None if push is None else int(push[0]), **cf)
+        s1_use_nt=bool(g1["use_nt"]), s1_prefetch_hidden=bool(g1["prefetch_hidden"]),
+        s1_xcd_swizzle=int(g1["xcd_swizzle"]), situ_beta=float(g1["situ_beta"]),
+        situ_linear_beta=float(g1["situ_linear_beta"]), push=None if push is None else int(push[0]), **cf)
     ptr = lambda v: v if isinstance(v, int) else v.data_ptr()
     pa = (0, 0, 0, 0, 0) if push is None else (shared_out.data_ptr(), ptr(push[1]), int(push[2]), ptr(push[3]),
                                                int(push[4]))
-    m = g1["n_tokens"]
-    assert act.shape == (m, 768) and act.is_contiguous() and act.dtype == torch.bfloat16
-    assert w_down.shape == (7168, 768) and w_down.is_contiguous()
-    assert shared_out.shape == (m, 7168) and shared_out.is_contiguous()
     u8 = lambda t: t.view(torch.uint8) if t.dtype != torch.uint8 else t
     args = (
         hg._dynamic_tensor_arg(shared_out, 1),
@@ -463,13 +457,11 @@ def _install_hook():
 @contextlib.contextmanager
 def shared_down_in_stage1(act, w_down, shared_out, push=None):
     """The next aiter MoE call on this thread runs its stage 1 as ``stage1_shared`` with this shared down
-    (shared_out = act @ w_down^T) and ``push``. Raises if the call took no stage 1 (the shared output would be
-    missing)."""
+    (shared_out = act @ w_down^T) and ``push``. For a call whose stage 1 is aiter's a8w4 BM16 flydsl stage 1:
+    route_sort_shared's presort at ``route.FUSED_SHARED_ROWS``."""
     _install_hook()
     _PENDING.held = (act, w_down, shared_out, push)
     try:
         yield
-        if getattr(_PENDING, "held", None) is not None:
-            raise RuntimeError("the MoE call ran no aiter stage 1: the shared down was not computed")
     finally:
         _PENDING.held = None

@@ -16,12 +16,13 @@ A width outside ``ROWS`` keeps SGLang's all-reduce and glue.
 
 import torch
 
+from sgl_amd_mono.kimi_k3.gfx950.route import SHARED_PUSH_ROWS
 from sgl_amd_mono.kimi_k3.gfx950.stages import ar_read as K
 
 # Above the row caps of the KDA and MLA layer launches, up to the widest graphed verify.
 ROWS = range(49, K.MAX_ROWS + 1)
-# SharedPushAr's: ROWS within the routed experts' stage-1 launch (``moe_persist``, 48-180 rows), which pushes.
-PUSH_ROWS = range(49, 181)
+# SharedPushAr's: the rows the fused shared chain pushes the shared partial at (its one definition).
+PUSH_ROWS = SHARED_PUSH_ROWS
 
 
 def _p(t) -> int:
