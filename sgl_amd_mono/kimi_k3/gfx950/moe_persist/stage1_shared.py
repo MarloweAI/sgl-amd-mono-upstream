@@ -14,7 +14,9 @@ Device code:
   output matches SGLang's own hgemm launch bit for bit at a tile shape whose LDS fits stage 1's occupancy.
 """
 
+import contextlib
 import functools
+import threading
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -390,3 +392,41 @@ def stage1_shared(g1: dict, act, w_down, shared_out, overrides: tuple = ()) -> N
     from aiter.ops.flydsl.kernels.kernels_common import run_cached
 
     run_cached(launch, *args, constexpr_param=hparam, compiler=flyc.compile, dispatch_args=args)
+
+
+_PENDING = threading.local()
+
+
+def _install_hook():
+    """Once: aiter's flydsl_mxfp4_gemm1 (looked up by fused_moe at call time) runs stage1_shared when a shared
+    down is registered for this thread's next MoE call, else itself."""
+    import aiter.ops.flydsl.mxfp4_gemm1_kernels as g1m
+
+    if getattr(g1m.flydsl_mxfp4_gemm1, "_k3_stage1_shared", False):
+        return
+    orig = g1m.flydsl_mxfp4_gemm1
+
+    def flydsl_mxfp4_gemm1(**kw):
+        held = getattr(_PENDING, "held", None)
+        if held is None:
+            return orig(**kw)
+        _PENDING.held = None
+        stage1_shared(kw, *held)
+        return None
+
+    flydsl_mxfp4_gemm1._k3_stage1_shared = True
+    g1m.flydsl_mxfp4_gemm1 = flydsl_mxfp4_gemm1
+
+
+@contextlib.contextmanager
+def shared_down_in_stage1(act, w_down, shared_out):
+    """The next aiter MoE call on this thread runs its stage 1 as ``stage1_shared`` with this shared down
+    (shared_out = act @ w_down^T). Raises if the call took no stage 1 (the shared output would be missing)."""
+    _install_hook()
+    _PENDING.held = (act, w_down, shared_out)
+    try:
+        yield
+        if getattr(_PENDING, "held", None) is not None:
+            raise RuntimeError("the MoE call ran no aiter stage 1: the shared down was not computed")
+    finally:
+        _PENDING.held = None
