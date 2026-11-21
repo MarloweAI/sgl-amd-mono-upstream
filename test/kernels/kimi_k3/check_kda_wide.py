@@ -14,8 +14,17 @@ Per width, three comparisons:
 * in_proj alone: the launch's bf16 rows against SGLang's GEMM.
 
 The committed state and conv state must be left as they were, and a request's
-outputs must not depend on the width or its neighbours (``run_invariance``). Prints one JSON
-line a width and exits non-zero when a bitwise expectation fails.
+outputs must not depend on the width or its neighbours (``run_invariance``).
+
+A padded graph batch (``run_padded``, 4 / 8 requests and the GEMM form's 10 / 30):
+its last request has no slot (-1, as SGLang's graph padding gives it) and NaN
+x. Its core rows must be exactly zero, no pool entry but the real requests'
+ring rows and windows may change, and the real requests' outputs must be the
+bits of the same requests with a real slot in the padding's place and of the
+real requests alone. ``--pad-save`` / ``--pad-against`` keep the real requests'
+outputs across two builds.
+
+Prints one JSON line a case and exits non-zero when a bitwise expectation fails.
 """
 
 import argparse
@@ -137,6 +146,78 @@ def run_invariance(w, device, reqs=(1, 2, 4, 8)):
     return res
 
 
+PADDED = "4:1,8:1,10:1,30:1"  # requests : padded tail (24, 48, 60 and 180 rows)
+
+
+def _launch(w, x, pools, device, epoch):
+    core = torch.full((x.shape[0], kc.PROJ), float("nan"), dtype=kc.BF, device=device)
+    kc.Wide(w, x.shape[0], device)(x, pools, torch.full((1,), epoch, dtype=torch.int32, device=device), core)
+    torch.cuda.synchronize()
+    return core
+
+
+def _real(pools, core, n):
+    """The first n requests' core rows, ring rows and windows."""
+    L = kc.L
+    s, r = pools.slots[:n].long(), pools.rows[:n].long()
+    out = {"core": core[: n * L]}
+    for name, t in zip(("ring_k", "ring_v", "ring_g", "ring_b"), pools.ring):
+        out[name] = t[s, :, :L]
+    out["window"] = pools.window[r]
+    return {k: v.clone() for k, v in out.items()}
+
+
+def run_padded(R, npad, w, device, against=None):
+    L, n = kc.L, R - npad
+    S = R * L
+    gen = torch.Generator(device=device).manual_seed(3000 + R)
+    x = torch.randn(S, kc.H, generator=gen, device=device).to(kc.BF)
+    base = kc.Pools(R, gen, device)
+    # padded: the tail has no slot and NaN x; its window rows stay real row indices
+    pad = base.clone()
+    pad.slots = base.slots.clone()
+    pad.slots[n:] = -1
+    xp = x.clone()
+    xp[n * L :] = float("nan")
+    core_p = _launch(w, xp, pad, device, 1)
+    # the same requests with a real slot and finite x in the padding's place
+    full = base.clone()
+    core_f = _launch(w, x, full, device, 2)
+    # the real requests alone
+    alone = base.clone()
+    alone.slots, alone.rows = base.slots[:n].clone(), base.rows[:n].clone()
+    core_a = _launch(w, x[: n * L].clone(), alone, device, 3)
+
+    got = _real(pad, core_p, n)
+    out = {"R": R, "padded": npad, "rows": S}
+    tail = core_p[n * L :]
+    out["pad_zero"] = bool(torch.equal(tail, torch.zeros_like(tail)))
+    out["pad_finite"] = bool(torch.isfinite(tail.float()).all())
+    out["real_vs_full"] = {k: bool(torch.equal(got[k], ref)) for k, ref in _real(full, core_f, n).items()}
+    out["real_vs_alone"] = {k: bool(torch.equal(got[k], ref)) for k, ref in _real(alone, core_a, n).items()}
+    # every pool entry the real requests do not own is as it was
+    own_s = torch.zeros(base.temporal.shape[0], dtype=torch.bool, device=device)
+    own_s[base.slots[:n].long()] = True
+    own_r = torch.zeros(base.window.shape[0], dtype=torch.bool, device=device)
+    own_r[base.rows[:n].long()] = True
+    out["state_untouched"] = bool(torch.equal(pad.temporal, base.temporal) and torch.equal(pad.conv, base.conv))
+    out["other_slots_untouched"] = all(bool(torch.equal(a[~own_s], b[~own_s])) for a, b in zip(pad.ring, base.ring))
+    out["other_rows_untouched"] = bool(torch.equal(pad.window[~own_r], base.window[~own_r]))
+    if against is not None:
+        prev = against[f"{R}:{npad}"]
+        out["real_vs_against"] = {k: bool(torch.equal(got[k].cpu(), prev[k])) for k in prev}
+    out["ok"] = (
+        out["pad_zero"]
+        and out["state_untouched"]
+        and out["other_slots_untouched"]
+        and out["other_rows_untouched"]
+        and all(out["real_vs_full"].values())
+        and all(out["real_vs_alone"].values())
+        and all(out.get("real_vs_against", {}).values())
+    )
+    return out, {k: v.cpu() for k, v in got.items()}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--copy", default="")
@@ -144,6 +225,10 @@ def main():
     ap.add_argument("--reqs", default="1,2,3,4,5,6,7,8")
     ap.add_argument("--x-scale", type=float, default=1.0)
     ap.add_argument("--out", default="")
+    ap.add_argument("--padded", default=PADDED, help="requests:padded tail cases ('' for none)")
+    ap.add_argument("--pad-save", default="", help="save the padded cases' real outputs here")
+    ap.add_argument("--pad-against", default="", help="their real outputs must equal these")
+    ap.add_argument("--only-padded", action="store_true")
     args = ap.parse_args()
     device = torch.device("cuda", 0)
     torch.cuda.set_device(device)
@@ -152,6 +237,19 @@ def main():
     else:
         w = kc.random_layer(torch.Generator(device=device).manual_seed(0), device)
     res, bad = [], 0
+    against = torch.load(args.pad_against) if args.pad_against else None
+    saved = {}
+    for case in filter(None, args.padded.split(",")):
+        R, npad = map(int, case.split(":"))
+        r, real = run_padded(R, npad, w, device, against)
+        saved[case] = real
+        bad += not r["ok"]
+        print("KDA_WIDE_PADDED", json.dumps(r), flush=True)
+    if args.pad_save:
+        torch.save(saved, args.pad_save)
+    if args.only_padded:
+        print("KDA_WIDE_CHECK_DONE", "fail" if bad else "pass", flush=True)
+        sys.exit(1 if bad else 0)
     for R in map(int, args.reqs.split(",")):
         r = run_width(R, w, args, device)
         res.append(r)

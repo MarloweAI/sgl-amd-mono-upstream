@@ -9,7 +9,8 @@ gate -> mix) is still settling: the CTAs that will run the router, latent and
 shared gate/up GEMVs issue their weights before they first wait.
 
     CTAs 0 .. 55     K2a's reduce + AttnRes (slice, gate, mix -> x rows + XRDY);
-                     then route (0 .. S-1) and the shared SiTU (8 .. 8+S-1)
+                     then route (0 .. S-1) and the shared SiTU (8 .. 8+S-1;
+                     a wide step's after its ug tasks)
     every CTA        o_proj (448 x 16 rows: one task a CTA below 64, two
                      above) -> partials to every rank
     CTAs 56 .. 151   the shared gate/up (96 tasks, weights right after o_proj)
@@ -51,10 +52,11 @@ from sgl_amd_mono.kimi_k3.gfx950.stages import oproj as k2a
 from sgl_amd_mono.kimi_k3.gfx950.stages.dims import COLS, HIDDEN, NA
 from sgl_amd_mono.kimi_k3.gfx950.stages import seam as tail_seam
 from sgl_amd_mono.kimi_k3.gfx950.stages.seam import (
-    slice_loads,
+    slice_blocks,
+    slice_prefix,
+    split_slice_loads,
     stage_gate,
     stage_mix,
-    stage_slice,
 )
 from sgl_amd_mono.kimi_k3.gfx950.stamps import (
     stamp,
@@ -76,7 +78,7 @@ SD0 = k2b.DOWN_TASKS  # 224: the shared down's CTAs
 # timeline points: 0 start, 1 o_proj done / AR reduced, 2 early done / slice,
 # 3 ug, 4 down/sdown, 5 lnorm, 6 up, 7 reduce, 8 gate, 9 mix (x published),
 # 10 route, 11 route table, 12 latent quant, 13 route starts
-TL_POINTS = 33  # + 30 fold done, 31 lnorm sums in, 32 lnorm squares in; + 20-24 router: x / LDS / GEMV / parts / pushed; + 14 route logits in, 15 INTER loaded, 16 down done, 17-19 route keys / select / rank
+TL_POINTS = 36  # + 30 fold done, 31 lnorm sums in, 32 lnorm squares in, 33-35 latent: x tile 0 / LATQ pushed / copied; + 20-24 router: x / LDS / GEMV / parts / pushed; + 14 route logits in, 15 INTER loaded, 16 down done, 17-19 route keys / select / rank
 TL_OPROJ = (
     25  # o_proj CTAs: the last task's GEMV done, before its AR pushes (point 1: pushed)
 )
@@ -89,6 +91,9 @@ TL_TAIL_X = 29
 TL_FOLD = 30  # wide down CTAs: their latent rows folded, LATR pushed
 TL_LN_IN = 31  # lnorm CTAs: every rank's LATR summed
 TL_LN_SQ = 32  # lnorm CTAs: every task's sum of squares in
+TL_LAT_X = 33  # latent CTAs: x tile 0 polled
+TL_LAT_PUSHED = 34  # latent CTAs: every tile's parts summed, LATQ pushed
+TL_LQC = 35  # latent copy CTAs: their (token, quarter) units copied
 
 assert E0 + k2b.R_TASKS + k2b.L_TASKS <= BLOCKS and k2b.G_TASKS <= E0 - O0
 
@@ -105,7 +110,6 @@ REGIONS = (
 
 # K2 options (``K2Build.opt``), each bit for bit the launch without it:
 OPT_SENT = 1  # o_proj's all-reduce through a sentinel region (sync.put_sent)
-OPT_PRELOAD = 2  # the seam's block / prefix / norm loads before that poll
 OPT_TAG_X = 8  # x rows also as tagged pairs to the router / latent GEMVs: no XRDY
 OPT_SENT_LATR = 16  # the latent all-reduce through a sentinel region
 OPT_SENT_FINAL = 32  # the final all-reduce through a sentinel region
@@ -114,7 +118,7 @@ OPT_RLOG_PARTS = 256  # every router part pushes its partial: no part-0 sum hop
 OPT_BATCH = 512  # the route's, down's and up's polls in one batch each
 OPT_SENTS = OPT_SENT | OPT_SENT_LATR | OPT_SENT_FINAL
 K2_OPT = (
-    OPT_SENTS | OPT_PRELOAD | OPT_TAG_X | OPT_SDOWN_FIRST | OPT_RLOG_PARTS | OPT_BATCH
+    OPT_SENTS | OPT_TAG_X | OPT_SDOWN_FIRST | OPT_RLOG_PARTS | OPT_BATCH
 )
 NARROW_ROWS = (
     K2_MAX_ROWS  # this launch's widest step: the sentinel and tagged rows' size
@@ -442,13 +446,13 @@ def lds_types(key: K2Build) -> K2LdsTypes:
             scan: fx.Array[fx.Int32, WAVES, 16]
 
         @fx.struct
-        class UgLds:
-            latq: fx.Array[fx.Int32, gemv.ROWS * k2b.LQ_WORDS, 16]
+        class UgLds:  # a unit's rows, or every token's (``k2b.wave_ug``)
+            latq: fx.Array[fx.Int32, max(gemv.ROWS, s if k2b.wave_ug(s) else 0) * k2b.LQ_WORDS, 16]
             av: fx.Array[fx.Float32, THREADS, 16]
 
         @fx.struct
-        class DownLds:  # two units' INTER / ISC tiles
-            tile: fx.Array[fx.Int32, 2 * k2b.ROWS * k2b.TILE_W, 16]
+        class DownLds:  # a wide step's down reads INTER from scratch
+            pad: fx.Array[fx.Int32, 4, 16]
 
         @fx.struct
         class TableLds:  # the route table's build
@@ -561,6 +565,7 @@ def k2_body(key: K2Build, k2_lds: K2Lds, scratch_base, args: dict) -> None:
     tl = args["tl"]
     tail = args["tail"]
     s, ns = key.tokens, key.nblocks + 1
+    gate_local = s <= WAVES and tail_seam.GATE_OFF + 16 * s * ns <= WAVES * 64 * 4
     lay = scratch_layout(key)
     play = peer_layout(s)
     half = peer_bytes(s) // 2
@@ -623,7 +628,9 @@ def k2_body(key: K2Build, k2_lds: K2Lds, scratch_base, args: dict) -> None:
             # its producers and pushed to every rank
             "route_v": 2,
             "latq_push": True,
-            "gate_local": False,
+            # every CTA its own source weights (no gate CTA, no WGT hop) where
+            # a wave a token and the group sums fit ``red``
+            "gate_local": gate_local,
             "debug": False,
             "eps": key.eps,
             "out_eps": key.out_eps,
@@ -696,7 +703,6 @@ def k2_body(key: K2Build, k2_lds: K2Lds, scratch_base, args: dict) -> None:
             c["rt"]["sexp"] = tb.sexp.ptr
             c["lqc"] = scratch_base + fx.Int64(lay["lqc"][0])
             c["contrib"] = scratch_base + fx.Int64(lay["contrib"][0])
-            c["dtile"] = dl.tile.ptr
         else:
             c["contrib"] = dl.contrib.ptr
             c["rt"]["kof"] = rl.kof.ptr
@@ -784,15 +790,18 @@ def k2_body(key: K2Build, k2_lds: K2Lds, scratch_base, args: dict) -> None:
                 k2b.early_compute(c, 2, gi, 0, k2b.early_loads(c, 2, gi, 0))
         # ---- AttnRes: the reduced o_proj -> x; then route / SiTU
         if bid < NA:
-            # PRELOAD: the slice's loads in flight across the o_proj poll
-            sld = slice_loads(c, bid) if key.opt & OPT_PRELOAD else None
+            # the slice's block sources wait on nothing in this launch: done
+            # before the o_proj poll, the prefix source after it
+            sld = split_slice_loads(c, bid)
+            slice_blocks(c, bid, sld)
             stamp(on, tls, tid, TL_AR_WAIT)
             k2a.stage_reduce(c, bid)
             stamp(on, tls, tid, 1)
-            stage_slice(c, bid, sld)
+            slice_prefix(c, bid, sld)
             stamp(on, tls, tid, 2)
-            if bid < s:
-                stage_gate(c, bid)
+            if const_expr(not gate_local):
+                if bid < s:
+                    stage_gate(c, bid)
             stamp(on, tls, tid, 8)
             stage_mix(c, bid)
             if const_expr(key.opt & OPT_SENT):
@@ -803,8 +812,9 @@ def k2_body(key: K2Build, k2_lds: K2Lds, scratch_base, args: dict) -> None:
             if bid < s:
                 k2b.stage_route(c, bid)
             stamp(on, tls, tid, 10)
-            if (bid >= H0) & (bid < H0 + s):
-                k2b.stage_h(c, bid - H0)
+            if const_expr(not wide):  # noqa: SIM102 (traced: `and` does not combine traced values)
+                if (bid >= H0) & (bid < H0 + s):
+                    k2b.stage_h(c, bid - H0)
         if bid >= NA:
             stamp(on, tls, tid, 2)
         # ---- the routed experts
@@ -820,24 +830,17 @@ def k2_body(key: K2Build, k2_lds: K2Lds, scratch_base, args: dict) -> None:
             nu = k2b.load_route2(c)
             stamp(on, tls, tid, 11)
         total = nu * k2b.UG_GROUPS
-        last = total - 1
-        # reversed placement: the round's leftover tasks go to the high CTAs,
-        # whose early work ends first (the AttnRes / route CTAs start ug last)
         if const_expr(wide):
             k2b.run_ug_wide(c, total)
         else:
-            task = BLOCKS - 1 - bid
-            ops = k2b.ug_loads(c, fx.min(task, last))
-            while task < total:
-                nxt = task + BLOCKS
-                ops_n = k2b.ug_loads(c, fx.min(nxt, last))
-                k2b.stage_ug(c, task, ops)
-                task = nxt
-                ops = ops_n
+            k2b.run_ug_waves(c, total)
         if const_expr(wide):
+            if (bid >= H0) & (bid < H0 + s):
+                # the shared h after ug: its SGU lands after the route table
+                k2b.stage_h(c, bid - H0)
             k2b.ug_done(c)
             stamp(on, tls, tid, 3)
-            k2b.run_down_wide(c, nu)
+            k2b.run_down_waves(c, nu)
             stamp(on, tls, tid, 16)
             if bid < k2b.DOWN_TASKS:
                 k2b.fold_wide(c, bid)
@@ -846,10 +849,10 @@ def k2_body(key: K2Build, k2_lds: K2Lds, scratch_base, args: dict) -> None:
         else:
             stamp(on, tls, tid, 3)
             if bid < k2b.DOWN_TASKS:
-                dops = k2b.down_loads(c, bid, nu, fx.min(c["wave"], nu - 1))
+                ring = k2b.down_stream_start(c, bid, nu)
                 k2b.load_inter(c)
                 stamp(on, tls, tid, 15)
-                k2b.stage_down(c, bid, nu, dops)
+                k2b.stage_down_stream(c, bid, nu, ring)
                 stamp(on, tls, tid, 16)
             if const_expr(key.opt & OPT_SDOWN_FIRST):
                 k2b.run_sdown_first(c, bid, w_sd)
@@ -866,12 +869,20 @@ def k2_body(key: K2Build, k2_lds: K2Lds, scratch_base, args: dict) -> None:
         stamp(on, tls, tid, 6)
         if const_expr(key.reduce):  # noqa: SIM102 (traced: `and` does not combine traced values)
             if (bid >= k2b.RED0) & (bid < k2b.RED0 + k2b.RED_TASKS):
-                if const_expr(key.tail is not None):
-                    # the slice's bank and weight loads in flight across FINAL's poll
+                # the slice's bank and weight loads in flight across FINAL's
+                # poll where its rounds are whole (one, or 16 tokens each);
+                # a partial second round's step loads them after the reduce
+                # (else 18 rows spills VGPRs in ug)
+                early = key.tail is not None and (
+                    tail_seam.tail_rounds(s) == 1 or s % tail_seam.TAIL_SL == 0
+                )
+                if const_expr(early):
                     tld = tail_seam.tail_loads(tc, bid - k2b.RED0)
                 k2b.stage_reduce(c, bid - k2b.RED0)
                 if const_expr(key.tail is not None):
                     stamp(on, tls, tid, 7)
+                    if const_expr(not early):
+                        tld = tail_seam.tail_loads(tc, bid - k2b.RED0)
                     tail_seam.tail_slice(tc, bid - k2b.RED0, tld)
                     stamp(on, tls, tid, TL_TAIL_PART)
         if const_expr(key.tail is not None):
