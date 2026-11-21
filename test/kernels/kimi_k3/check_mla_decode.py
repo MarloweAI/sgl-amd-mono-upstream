@@ -291,7 +291,9 @@ def main():
     if args.compile:
         md = decode_module()
 
-        md.build(md.MlaDecodeBuild(scale=SCALE))(*([0] * (17 if DESIGN == "b" else 13)), stream=0)
+        md.build(md.MlaDecodeBuild(scale=SCALE))(*([0] * 13), stream=0)
+        if DESIGN == "b":
+            md.build_merge()(*([0] * 8), stream=0)
         md.build_plan()(*([0] * 7), stream=0)
         print("COMPILE_OK", flush=True)
         return
