@@ -1006,9 +1006,9 @@ class _SglTails:
     norms, q_b over all 96 heads, the absorb); then, in place of its core:
     ``mla_prologue`` (the decode's e4m3 q and this rank's KV records),
     ``mla_decode_b`` (its split plan once a step, from SGLang's DCP KV
-    indices), ``mla_tail`` on its split partials (the reduce, W_UV, the DCP
-    exchange, the LSE combine and the output gate), and SGLang's o_proj on
-    the gated core. Every other step of these layers is SGLang's own
+    indices; its splits merged in the launch), ``mla_tail`` on its rows with
+    no reduce (W_UV, the DCP exchange, the LSE combine and the output gate),
+    and SGLang's o_proj on the gated core. Every other step of these layers is SGLang's own
     forward. One static rule a width."""
 
     def __init__(self, runner, entries: list, rows: frozenset) -> None:
@@ -1021,8 +1021,10 @@ class _SglTails:
         self.q8 = {r: torch.empty(r, mt.NHA, mt.mf.DQK, dtype=_fp8_dtype(), device=dev) for r in rows}
         self.out = {r: torch.empty(r, mt.NHA, mt.KV, dtype=torch.bfloat16, device=dev) for r in rows}
         self.lse = {r: torch.empty(r, mt.NHA, dtype=torch.float32, device=dev) for r in rows}
-        # the decode's split partials and the reduce's maps, one set for every layer
+        # the decode's split partials and maps, one set for every layer
         self.bufs = mdb.DecodeBuffers(dev)
+        # the tail's reduce maps: none (the decode merges its own splits)
+        self.no_reduce = [torch.zeros(n, dtype=torch.int32, device=dev) for n in (2, 2, 1)]
         # the softmax scale of every MLA layer's gathered-head attention
         scales = {e.attn.attn_mqa_for_dcp_decode.scaling for e in entries}
         assert len(scales) == 1, scales
@@ -1247,8 +1249,8 @@ class _SglTails:
         attn._gate_hidden_states = None
         core = self.core[rows]
         mt.mla_tail_launch(
-            e.key, s=rows, logits=bufs.logits, plse=bufs.plse, indptr=bufs.indptr, fmap=bufs.fmap,
-            pmap=bufs.pmap, o=out, lse=lse, empty=fm.cprr_empty_rows, w_vc=e.w_vc,
+            e.key, s=rows, logits=bufs.logits, plse=bufs.plse, indptr=self.no_reduce[0], fmap=self.no_reduce[1],
+            pmap=self.no_reduce[2], o=out, lse=lse, empty=fm.cprr_empty_rows, w_vc=e.w_vc,
             gate=gate, core=core, scratch=scratch_region(self.runner.scratch, "mla_tail"),
             peers=self.runner.peer.addresses, rank=self.runner.dcp_rank, layer=e.i,
             epoch=self.runner.epoch,
