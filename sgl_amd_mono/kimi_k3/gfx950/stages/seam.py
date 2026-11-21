@@ -23,8 +23,10 @@ from sgl_amd_mono.common.ops import (
     hw_exp2,
     hw_rsq,
     load_ptr64,
+    permlane_swap,
     rsrc,
     wave_max,
+    xshfl,
 )
 from sgl_amd_mono.common.plan import THREADS
 from sgl_amd_mono.common.sync import publish
@@ -689,9 +691,10 @@ def front_mix(c, task):
 # ``pack_x``'s layout, which that layer's K1 (the wide form) reads with no
 # front. Bit for bit that front: the same sums, gate (``gate_sums``) and mix.
 TAIL_ROW0 = 84  # the row CTAs, past lnorm's: no K2 work after their down
-# The widest step that takes a tail: a reduce CTA's slice round holds 16
-# tokens (THREADS // QC), and the move is measured a gain at 12 rows only.
-TAIL_MAX_ROWS = 12
+# The widest step whose next KDA layer takes its seam from this tail: a reduce
+# CTA slices 16 tokens a round (THREADS // QC), two rounds past 16 rows.
+TAIL_MAX_ROWS = 24
+TAIL_SL = THREADS // QC  # tokens a reduce CTA's slice round
 ROW_SL = THREADS // QC  # slices a row CTA's round: 32 threads a slice
 ROW_ROUNDS = (NA + ROW_SL - 1) // ROW_SL
 WOFF = 1536  # red words of the row CTA's weights, their sum and the rstd
@@ -706,51 +709,101 @@ def tail_arg(c, name):
     return load_ptr64(c["tail_tab"], TAIL_ARGS.index(name))
 
 
-def tail_loads(c, task):
-    """A reduce CTA's loads for its slice that wait on nothing in this launch:
-    its tokens' bank blocks and the next layer's AttnRes norm / qk words,
-    issued before the final reduce's poll."""
+def tail_rounds(s):
+    """A reduce CTA's slice rounds at s rows."""
+    return (s + TAIL_SL - 1) // TAIL_SL
+
+
+def tail_round_loads(c, task, r):
+    """Slice round r's bank block words of this thread's token."""
     s, nb, tid = c["S"], c["NB"], c["tid"]
     a = c["args"]
-    assert s <= THREADS // QC, "a slice's tokens in one round"
     col = task * COLS + (tid % QC) * 4
-    t = fx.min(tid // QC, s - 1)
+    t = fx.min(r * TAIL_SL + tid // QC, s - 1)
+    return [_raw4(a["blocks"], t * a["blk_sm"] + src * a["blk_sr"] + col) for src in range(nb)]
+
+
+def tail_loads(c, task):
+    """A reduce CTA's loads for its slice that wait on nothing in this launch:
+    the first round's bank blocks and the next layer's AttnRes norm / qk
+    words, issued before the final reduce's poll (a later round's blocks are
+    issued a round ahead, in ``tail_slice``)."""
+    col = task * COLS + (c["tid"] % QC) * 4
     return {
-        "blk": [_raw4(a["blocks"], t * a["blk_sm"] + src * a["blk_sr"] + col) for src in range(nb)],
+        "blk": tail_round_loads(c, task, 0),
         "w": _raw4(tail_arg(c, "ares_nw"), col),
         "q": _raw4(tail_arg(c, "ares_qk"), col),
     }
+
+
+def _partner(v, off, hi):
+    """Lane ``lane ^ off``'s f32 v (``off`` <= 16); ``hi``: this lane's bit ``off``."""
+    if off < 16:
+        return xshfl(v, off)
+    x = v.bitcast(fx.Int32)
+    a, b = permlane_swap(off, x, x)
+    return hi.select(a, b).bitcast(fx.Float32)
+
+
+def scatter_sums(vals, lane, offsets=(16, 8, 4, 2, 1)):
+    """``butterfly(v, offsets)`` of every v in ``vals`` over a 32-lane group,
+    each sum left on part of the group instead of all of it: at each offset a
+    lane keeps half the values and adds its partner's copy of them, so every
+    sum is the butterfly's, bit for bit (the same pairs at each level, and a
+    pair's two operands commute). Returns (slots, base, count): this lane
+    holds sums base .. base + count - 1 in slots 0 .. count - 1."""
+    n = len(vals)
+    base, count = fx.Int32(0), fx.Int32(n)
+    for off in offsets:
+        m = len(vals)
+        h = (m + 1) // 2
+        lo_half = vals[:h]
+        hi_half = vals[h:] + [fx.Float32(0.0)] * (2 * h - m)
+        hi = (lane & off) != 0
+        kept = []
+        for i in range(h):
+            give = hi.select(lo_half[i], hi_half[i])
+            keep = hi.select(hi_half[i], lo_half[i])
+            kept.append(keep + _partner(give, off, hi))
+        vals = kept
+        base = hi.select(base + h, base)
+        count = hi.select(fx.max(count - h, fx.Int32(0)), fx.min(count, fx.Int32(h)))
+    return vals, base, count
 
 
 @flyc.jit
 def tail_slice(c, task, ld):
     """Columns 128 task ..: ``front_slice``'s per-(token, source) sums of squares
     and qk dots and per-(token, source pair) dots of the bank blocks and the
-    stream the reduce left in LDS ``tpre`` -> TPART."""
+    stream the reduce left in LDS ``tpre`` -> TPART, 16 tokens a round."""
     s, ns, tid, lane = c["S"], c["NS"], c["tid"], c["lane"]
     nq = front_nq(ns)
     gpu.barrier()  # the stream's LDS copy
     cc = (tid % QC) * 4
-    tt = tid // QC
-    live = tt < s
-    t = fx.min(tt, s - 1)
     w, q = _f4(ld["w"]), _f4(ld["q"])
     wq = [w[j] * q[j] for j in range(4)]
-    raw = ld["blk"] + [lds_words2(c["tpre"], (t * COLS + cc) // 2)]
-    vs = [_f4(r) for r in raw]
-    sums = []
-    for src in range_constexpr(ns):
-        v = vs[src]
-        sums.append(v[0] * v[0] + v[1] * v[1] + v[2] * v[2] + v[3] * v[3])
-        sums.append(v[0] * wq[0] + v[1] * wq[1] + v[2] * wq[2] + v[3] * wq[3])
-    for x, y in front_pairs(ns):
-        u, v = vs[x], vs[y]
-        sums.append(u[0] * v[0] + u[1] * v[1] + u[2] * v[2] + u[3] * v[3])
-    sums = [butterfly(x, (16, 8, 4, 2, 1)) for x in sums]
-    if live & (lane % 32 == 0):
+    blk = ld["blk"]
+    for r in range_constexpr(tail_rounds(s)):
+        nxt = tail_round_loads(c, task, r + 1) if r + 1 < tail_rounds(s) else None
+        tt = r * TAIL_SL + tid // QC
+        live = tt < s
+        t = fx.min(tt, s - 1)
+        raw = blk + [lds_words2(c["tpre"], (t * COLS + cc) // 2)]
+        vs = [_f4(x) for x in raw]
+        sums = []
+        for src in range_constexpr(ns):
+            v = vs[src]
+            sums.append(v[0] * v[0] + v[1] * v[1] + v[2] * v[2] + v[3] * v[3])
+            sums.append(v[0] * wq[0] + v[1] * wq[1] + v[2] * wq[2] + v[3] * wq[3])
+        for x, y in front_pairs(ns):
+            u, v = vs[x], vs[y]
+            sums.append(u[0] * v[0] + u[1] * v[1] + u[2] * v[2] + u[3] * v[3])
+        slots, base, count = scatter_sums(sums, lane)
         at = (task * s + t) * nq
-        for k in range_constexpr(nq):
-            c["put"](c["tpart"], at + k, sums[k])
+        for i in range_constexpr(len(slots)):
+            if live & (i < count):
+                c["put"](c["tpart"], at + base + i, slots[i])
+        blk = nxt
 
 
 def _row_col(c, r):
