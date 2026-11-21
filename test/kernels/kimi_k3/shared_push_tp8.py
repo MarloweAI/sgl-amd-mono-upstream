@@ -8,7 +8,9 @@ stage 1 with the shared down, stage 2) and then:
 * ``stock``: aiter's custom all-reduce of SGLang's flat [latent | shared] buffer and SGLang's RMSNorm of the latent;
 * ``flat``: C13's flat launch (``MoeAr.reduce``: both sums and the latent's norm);
 * ``push``: the call with ``SharedPushAr.push_args(layer)`` (its shared tiles push), then ``SharedPushAr.reduce``
-  (the latent half's all-reduce + norm + the pushed shared sum).
+  (the latent half's all-reduce + norm + the pushed shared sum);
+* ``push_flat``: the pushing call, then C13's flat launch (push - push_flat is the split's cost against the flat
+  launch, push_flat - flat the push's inside the fused call).
 
 Times: µs a layer, median and slowest rank. Check (every rank, all-reduced counts), on each layer of a replayed
 ``push`` graph: the three outputs against the rank-order f32 sum of the ranks' own partials, and against
@@ -125,9 +127,12 @@ def main():
             def body():
                 res = []
                 for i in range(nl):
-                    if name == "push":
+                    if name in ("push", "push_flat"):
                         latent, shared = run_case(case, push=(split.launches, *split.push_args(i)))
-                        res.append((latent, shared, *split.reduce(i, latent, shared, w)))
+                        if name == "push":
+                            res.append((latent, shared, *split.reduce(i, latent, shared, w)))
+                        else:
+                            flat.reduce(i, latent, shared, w)
                     else:
                         latent, shared = run_case(case)
                         if name == "flat":
@@ -135,13 +140,14 @@ def main():
                         else:
                             r = ca.custom_all_reduce(torch.cat([latent.reshape(-1), shared.reshape(-1)]))
                             norm(r[: m * LAT].view(m, LAT))
-                keep[name] = res
+                if name != "push_flat":
+                    keep[name] = res
 
             return body
 
         times = {}
         graphs = {}
-        for name in ("stock", "flat", "push"):
+        for name in ("stock", "flat", "push", "push_flat"):
             graphs[name] = capture(arm(name), ca.capture if name == "stock" else None)
             times[name] = across(graph_us(graphs[name], args.reps, nl), dev)
         # check: the last replay of the push graph, layer by layer
@@ -162,6 +168,8 @@ def main():
         t = {k: {"median": round(v[0], 2), "slowest": round(v[1], 2)} for k, v in times.items()}
         t["push_minus_flat"] = {k: round(times["push"][j] - times["flat"][j], 2)
                                 for j, k in ((0, "median"), (1, "slowest"))}  # fmt: skip
+        for a, b2 in (("push", "push_flat"), ("push_flat", "flat")):
+            t[f"{a}_minus_{b2}"] = {k: round(times[a][j] - times[b2][j], 2) for j, k in ((0, "median"), (1, "slowest"))}
         t["push_minus_stock"] = {k: round(times["push"][j] - times["stock"][j], 2)
                                  for j, k in ((0, "median"), (1, "slowest"))}  # fmt: skip
         out["time"].append({"m": m, **t})
