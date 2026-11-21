@@ -274,6 +274,13 @@ def across(v, dev):
     return (vals[(n - 1) // 2] + vals[n // 2]) / 2, vals[-1]
 
 
+def stage(rank, what):
+    """A per-rank progress marker, so a hang shows where each rank stopped."""
+    import time
+
+    print(f"STAGE r{rank} {time.strftime('%H:%M:%S')} {what}", flush=True)
+
+
 def tp8_main(args):
     from aiter.dist.device_communicators.custom_all_reduce import CustomAllreduce
 
@@ -283,9 +290,12 @@ def tp8_main(args):
 
     rank = int(os.environ["RANK"])
     torch.cuda.set_device(rank)
+    stage(rank, "init")
     dist.init_process_group("nccl")
     cpu = dist.new_group(backend="gloo")
     dev = torch.device("cuda", rank)
+    dist.barrier()
+    stage(rank, "process groups up")
     nl = 20
     if args.only_ag:
         out = {"rank": rank, "time": []}
@@ -294,12 +304,14 @@ def tp8_main(args):
         return True
     launch = K.build(args.eps, args.eps, nl)
     peer = PeerBuffer(K.peer_bytes(), cpu, rank, TP, dev, init=K.arm)
+    stage(rank, "peer buffer up")
     epoch = torch.zeros(guard.GUARD_WORDS, dtype=torch.int32, device=dev)
     ticks = guard.deadline_ticks(args.deadline)
     lo = ticks & 0xFFFFFFFF
     epoch[guard.GUARD_DEADLINE] = lo - (1 << 32) if lo >= 1 << 31 else lo
     epoch[guard.GUARD_DEADLINE + 1] = ticks >> 32
     ca = CustomAllreduce(cpu, dev)
+    stage(rank, "aiter custom all-reduce up")
     out = {"rank": rank, "check": [], "time": []}
 
     def fused_body(cur, m, nvb, has_res, cw, w_o, xs, pres, outs, gl):
@@ -334,6 +346,7 @@ def tp8_main(args):
                 body()
             return {"replay": g.replay, "out": lambda r, i: outs[i], "pre": lambda r, i: pres[i]}
 
+        stage(rank, f"check m={m} nvb={nvb} res={int(has_res)}")
         st = check_case(launch_one, m, nvb, has_res, dev, args.eps, [rank], 4)
         tot = torch.tensor([st["pre_bad"], st["out_bad"]], dtype=torch.int64, device=dev)
         dist.all_reduce(tot)
@@ -352,6 +365,7 @@ def tp8_main(args):
         record = recorder(out, dev, rank)
 
         for m in args.rows:
+            stage(rank, f"time o_proj m={m}")
             st = make_inputs(m, 0, dev)
             nvb = 8
             cur = {"res": st["res"], "bank": st["bank"]}
@@ -406,6 +420,7 @@ def tp8_main(args):
         for m in args.rows:
             sections.append((f"coll m={m}", lambda m=m: moe_and_coll(args, cpu, dev, rank, record, nl, m, ca, epoch)))
         for name, run in sections:
+            stage(rank, f"section {name}")
             try:
                 run()
             except Exception as e:  # noqa: BLE001
