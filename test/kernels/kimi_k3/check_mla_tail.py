@@ -520,6 +520,30 @@ def check_prologue(device, seed):
     return ["prologue"] if fails else []
 
 
+def check_qkv_g(device, seed):
+    """fused_qkv_a and g_proj as one GEMM on their concatenated weights
+    against SGLang's two GEMMs (bit for bit, or rel-L2 to fp32 against the
+    two's), graph-timed, at the wide widths."""
+    g = torch.Generator(device=device).manual_seed(seed + 41)
+    wq = (torch.randn(2112, 7168, generator=g, device=device) * 0.02).to(BF)
+    wg = (torch.randn(GATE, 7168, generator=g, device=device) * 0.02).to(BF)
+    cat = torch.cat([wq, wg]).contiguous()
+    for s in (36, 54, 72, 96, 120, 144, 180):
+        x = (torch.randn(s, 7168, generator=g, device=device) * 0.5).to(BF)
+        q2, g2 = cf._linear(x, wq), cf._linear(x, wg)
+        out = cf._linear(x, cat)
+        same = torch.equal(out[:, :2112], q2) and torch.equal(out[:, 2112:], g2)
+        ref = x.float() @ cat.float().t()
+        e1 = cf.rel(out, ref)
+        e2 = cf.rel(torch.cat([q2, g2], -1), ref)
+        t1 = graph_us(lambda: cf._linear(x, cat))
+        t2 = graph_us(lambda: (cf._linear(x, wq), cf._linear(x, wg)))
+        t3 = graph_us(lambda: torch.nn.functional.linear(x, cat))
+        e3 = cf.rel(torch.nn.functional.linear(x, cat), ref)
+        print(f"qkv+g {s} rows: bit for bit {same}, rel to fp32 one {e1:.2e} two {e2:.2e} torch {e3:.2e}; "
+              f"us one {t1:.1f} two {t2:.1f} torch {t3:.1f}")  # fmt: skip
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--reqs", type=int, nargs="+", default=[9])
@@ -528,6 +552,7 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--par", type=int, default=0, choices=(0, 1))
     ap.add_argument("--diag", action="store_true")
+    ap.add_argument("--qkv-g", action="store_true", help="the fused qkv_a + g_proj GEMM only")
     ap.add_argument("--time", action="store_true", help="time rank 0's tail against SGLang's chain")
     args = ap.parse_args()
     device = torch.device("cuda", 0)
@@ -536,6 +561,9 @@ def main():
     w_vc = (torch.randn(NHA, KV, VD, generator=g, device=device) * 0.045).to(BF)
     peers = TailPeers(device)
     epoch = cf.new_epoch(device)
+    if args.qkv_g:
+        check_qkv_g(device, args.seed)
+        return
     fails = check_prologue(device, args.seed)
     for n in args.reqs:
         ps = contexts(n, args.mode, args.ctx, args.seed)

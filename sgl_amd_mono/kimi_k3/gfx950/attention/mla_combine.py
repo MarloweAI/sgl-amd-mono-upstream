@@ -246,6 +246,7 @@ def stage_combine(c, task):
     red = c["red"]
     # read before the traced branches (a dict lookup inside one is carried state)
     box = c.get("core_box")
+    g_rs = c.get("g_rs", GATE)  # g's row stride (bf16)
     pre_wait = c.get("pre_wait")
     # the launch's stamp points (g seen, records seen, core stored), if any
     tlp = c.get("comb_tl")
@@ -276,7 +277,7 @@ def stage_combine(c, task):
     u = tid % VAL_CELLS
     col = hl * VD + CELL_VALUES * u
     gw = fx.Vector(
-        bo.buffer_load(rsrc(c["gbuf"]), (t * GATE + col) // 2, vec_width=2, dtype=T.i32, cache_modifier=CM_DEV)
+        bo.buffer_load(rsrc(c["gbuf"]), (t * g_rs + col) // 2, vec_width=2, dtype=T.i32, cache_modifier=CM_DEV)
     )
     vcells = [a2a_cell(src, t, hl, u, s) for src in range(DCP)]
     if live:

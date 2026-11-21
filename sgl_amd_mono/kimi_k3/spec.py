@@ -346,6 +346,8 @@ def _build(model, hf_config, ctx):
     runner = K3MonoRunner(p.tp_size, p.tp_rank, p.tp_group.cpu_group, device)
     runner.set_deadline(ctx.deadline_s)
     runner.dcp_rank = p.attn_dcp_rank if p.attn_dcp_size > 1 else 0
+    if p.attn_dcp_size > 1:
+        _fuse_qkv_g(backbone)
     mla_off = _mla_front_disable_reason(p)
     if mla_off is not None:
         logger.info("monokernel: no MLA projection front: %s", mla_off)
@@ -962,6 +964,10 @@ class _SglFronts:
 # The MLA layer whose decode a tail follows: aiter's split reduce dispatch
 # hands over its arguments (and does not run). None outside such a call.
 _TAIL_PENDING = None
+# The widest steps' fused_qkv_a and g_proj run as one GEMM on their
+# concatenated weights: from 24 requests it is faster than the two (5.6 us at
+# 144 rows, 8 at 180); below, the two separate tuned GEMMs are.
+QKV_G_MIN_ROWS = 144
 
 
 def _tail_hooks() -> None:
@@ -990,6 +996,25 @@ def _fp8_dtype():
     from sglang.srt.layers.attention import aiter_backend as ab
 
     return ab.fp8_dtype
+
+
+def _fuse_qkv_g(backbone) -> None:
+    """Each MLA layer's fused_qkv_a and g_proj weights (both on the layer's
+    input x, bf16) as row blocks of one [2112 + 1536, 7168] tensor, the
+    modules' weights views of it (``self_attn._qkv_g_weight``): the wide path
+    runs them as one GEMM. Every other reader sees the same weights."""
+    for layer in backbone.layers:
+        attn = getattr(layer, "self_attn", None)
+        fused = getattr(attn, "fused_qkv_a_proj_with_mqa", None)
+        g = getattr(attn, "g_proj", None)
+        if fused is None or g is None or hasattr(attn, "qkv_conv1d"):
+            continue
+        wq, wg = fused.weight, g.weight
+        if wq.dtype != torch.bfloat16 or wg.dtype != torch.bfloat16 or wq.shape[1] != wg.shape[1]:
+            continue
+        cat = torch.cat([wq.data, wg.data]).contiguous()
+        wq.data, wg.data = cat[: wq.shape[0]], cat[wq.shape[0] :]
+        attn._qkv_g_weight = cat
 
 
 class _SglTails:
@@ -1045,6 +1070,12 @@ class _SglTails:
         _tail_hooks()
         for e in entries:
             e.attn.forward_absorb_rocm_core = functools.partial(self.core_forward, e)
+            if getattr(e.attn, "_qkv_g_weight", None) is not None:
+                e.gate = None
+                e.qkvg = torch.nn.Module()
+                e.qkvg.weight = torch.nn.Parameter(e.attn._qkv_g_weight, requires_grad=False)
+                e.attn.prepare_qkv_latent = functools.partial(self.qkv_latent, e)
+                e.attn._compute_output_gate = functools.partial(self.output_gate, e)
         logger.info(
             "monokernel: MLA prologue and tail in SGLang's MLA attention at %d .. %d rows (%d layers)",
             min(rows), max(rows), len(entries),
@@ -1087,6 +1118,36 @@ class _SglTails:
                 layer=e.i, epoch=self.runner.epoch,
             )  # fmt: skip
         torch.cuda.synchronize()
+
+    def qkv_latent(self, e, hidden_states, forward_batch):
+        """``prepare_qkv_latent`` of layer ``e``: at a wide width's target
+        verify from QKV_G_MIN_ROWS rows, fused_qkv_a and g_proj as one GEMM (the
+        latent returned, g kept for ``output_gate``), else SGLang's."""
+        rows = hidden_states.shape[0]
+        attn = e.attn
+        if not (
+            forward_batch.forward_mode.is_target_verify() and rows in self.rows and rows >= QKV_G_MIN_ROWS
+        ):
+            return type(attn).prepare_qkv_latent(attn, hidden_states, forward_batch)
+        fused = attn.fused_qkv_a_proj_with_mqa
+        n = fused.weight.shape[0]
+        # fused_qkv_a's own linear method on the concatenated weight
+        out = fused.quant_method.apply(e.qkvg, hidden_states)
+        e.gate = out[:, n:]
+        return out[:, :n]
+
+    def output_gate(self, e, hidden_states):
+        """``_compute_output_gate`` of layer ``e``: g from the fused GEMM when
+        this step's latent came from it (its gate branch, if forked, joined),
+        else SGLang's."""
+        attn = e.attn
+        g, e.gate = e.gate, None
+        if g is None:
+            return type(attn)._compute_output_gate(attn, hidden_states)
+        alt, attn._gate_pending_stream = attn._gate_pending_stream, None
+        if alt is not None:
+            torch.cuda.current_stream().wait_stream(alt)
+        return g
 
     def core_forward(self, e, q_pe, k_pe, q_nope_out, k_nope, forward_batch, zero_allocator,
                      positions, topk_indices, llama_4_scaling, q_nope_unabsorbed=None):  # fmt: skip
