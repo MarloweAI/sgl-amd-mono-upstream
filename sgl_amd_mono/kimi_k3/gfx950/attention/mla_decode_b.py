@@ -50,7 +50,7 @@ from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import Int32, Int64, T, as_ir_value
 
-from sgl_amd_mono.common.ops import ballot, hw_exp2, popcount, read_lane_i32, rsrc, uniform, xred
+from sgl_amd_mono.common.ops import ballot, hw_exp2, popcount, rsrc, uniform, xred
 from sgl_amd_mono.common.plan import BLOCKS, kernel_sources, key_tuple
 from sgl_amd_mono.kimi_k3.gfx950.attention import mla_decode as md
 
@@ -95,14 +95,21 @@ class MlaDecodeBuild:
 _BUILDS: dict = {}
 _STREAM = fx.Stream(None)
 
-_ld, _ld4, _lds16, _tr8, _cat8, _e4m3x4, _memtime, _realtime, _bar, _wave_sum = (
-    md._ld, md._ld4, md._lds16, md._tr8, md._cat8, md._e4m3x4, md._memtime, md._realtime, md._bar, md._wave_sum,
+_ld, _ld4, _lds16, _tr8, _cat8, _e4m3x4, _memtime, _realtime, _bar = (
+    md._ld, md._ld4, md._lds16, md._tr8, md._cat8, md._e4m3x4, md._memtime, md._realtime, md._bar,
 )  # fmt: skip
+
+
+def _wave_sum(v):
+    """The wave's i32 sum (permlane swaps and DPP, no LDS)."""
+    for off in [32, 16, 8, 4, 2, 1]:
+        v = xred(fx.Int32(v), off, lambda x, y: x + y)
+    return v
 
 
 def _wave_max(v):
     for off in [32, 16, 8, 4, 2, 1]:
-        v = fx.max(v, v.shuffle_xor(fx.Int32(off), fx.Int32(64)))
+        v = xred(fx.Int32(v), off, fx.max)
     return v
 
 
@@ -167,69 +174,115 @@ def _store(c, stg, slot):
         _store1(c, stg[k], slot, k)
 
 
+PLAN_CANDS = ((1, True), (1, False), (2, True), (3, True), (4, True))  # (k, equal runs)
+PLAN_WAVES = len(PLAN_CANDS)
+PLAN_SCR = PLAN_WAVES * 768 + 8
+
+
+def _layout(nb, work, kk, equal):
+    """A request's split count and run (blocks) for candidate (kk, equal)."""
+    t = fx.max(fx.Int32(1), (work * W_NUM + BLOCKS * W_DEN * kk - 1) // (BLOCKS * W_DEN * kk))
+    nk = fx.min(fx.Int32(MAX_SPLITS), fx.max(fx.Int32(1), (nb + t - 1) // t))
+    if equal:
+        wk = fx.max(fx.Int32(1), (nb + nk - 1) // nk)
+    else:
+        wk = (nk >= MAX_SPLITS).select(fx.max(fx.Int32(1), (nb + MAX_SPLITS - 1) // MAX_SPLITS), t)
+    return fx.max(fx.Int32(1), (nb + wk - 1) // wk), wk
+
+
+def _estimate(nb, live, nk, wk, scr, lane):
+    """A lower bound of the snake deal's busiest CTA for a layout (lane r: request r; its items'
+    costs blocks + ITEM_OVH), or 2^26 past the partials' room."""
+    ca = wk + ITEM_OVH
+    cb = nb - (nk - 1) * wk + ITEM_OVH
+    na = live.select(NG * (nk - 1), fx.Int32(0))
+    nbb = live.select(fx.Int32(NG), fx.Int32(0))
+    parts = _wave_sum((live & (nk > 1)).select(nk, fx.Int32(0)))
+    total = _wave_sum(na * ca + nbb * cb)
+    est = fx.max((total + BLOCKS - 1) // BLOCKS, _wave_max(live.select(fx.max(ca, cb), fx.Int32(0))))
+    # each class's place in the costs sorted down: [items costlier, items at least as costly)
+    _st16(scr + 4 * lane, fx.Vector.from_elements([ca, na, cb, nbb], fx.Int32))
+    ea, eb, sa, sb = fx.Int32(0), fx.Int32(0), fx.Int32(0), fx.Int32(0)
+    for r2 in range(MAX_REQS):  # lanes past the batch count no items
+        v = _lds16(scr + 4 * r2)
+        ca2, na2, cb2, nb2 = fx.Int32(v[0]), fx.Int32(v[1]), fx.Int32(v[2]), fx.Int32(v[3])
+        ea = ea + (ca2 >= ca).select(na2, fx.Int32(0)) + (cb2 >= ca).select(nb2, fx.Int32(0))
+        eb = eb + (ca2 >= cb).select(na2, fx.Int32(0)) + (cb2 >= cb).select(nb2, fx.Int32(0))
+        sa = sa + (ca2 > ca).select(na2, fx.Int32(0)) + (cb2 > ca).select(nb2, fx.Int32(0))
+        sb = sb + (ca2 > cb).select(na2, fx.Int32(0)) + (cb2 > cb).select(nb2, fx.Int32(0))
+    ea, sa = (na > 0).select(ea, fx.Int32(0)), (na > 0).select(sa, fx.Int32(0))
+    eb, sb = (nbb > 0).select(eb, fx.Int32(0)), (nbb > 0).select(sb, fx.Int32(0))
+    # some CTA takes j + 1 of the 256 j + 1 costliest items: (j + 1) x the (256 j + 1)-th cost
+    for j in range(1, 4):
+        q = BLOCKS * j
+        cq = _wave_max(fx.max((ea > q).select(ca, fx.Int32(0)), (eb > q).select(cb, fx.Int32(0))))
+        est = fx.max(est, (j + 1) * cq)
+    # the snake's first two rounds give place p the items p and 511 - p: classes X (this lane's)
+    # and Y pair when some p < 256 in X has 511 - p in Y
+    _st16(scr + 256 + 8 * lane, fx.Vector.from_elements([ca, sa, ea, fx.Int32(0)], fx.Int32))
+    _st16(scr + 260 + 8 * lane, fx.Vector.from_elements([cb, sb, eb, fx.Int32(0)], fx.Int32))
+    t2 = fx.Int32(0)
+    for r2 in range(MAX_REQS):
+        for h in range(2):
+            v = _lds16(scr + 256 + 8 * r2 + 4 * h)
+            cy, sy, ey = fx.Int32(v[0]), fx.Int32(v[1]), fx.Int32(v[2])
+            for cx, sx, ex in ((ca, sa, ea), (cb, sb, eb)):
+                lo = fx.max(sx, 2 * BLOCKS - ey)
+                hi = fx.min(fx.min(ex, fx.Int32(BLOCKS)), 2 * BLOCKS - sy)
+                t2 = fx.max(t2, (lo < hi).select(cx + cy, fx.Int32(0)))
+    est = fx.max(est, _wave_max(t2))
+    return (parts <= MAX_PART).select(est, fx.Int32(1 << 26))
+
+
 @flyc.jit
-def plan(c, tbl, kv_ptr, g_ptr, nreq, indptr, fmap, pmap, bid, tid):
-    """The step's split plan in LDS ``tbl``, by wave 0. A request's splits are
-    equal runs of at most t blocks, t = 1.1 x the batch's work a CTA / k (at
-    most 64 splits), for the k in 1 .. 4 with the least estimated busiest CTA
-    (a lower bound of the deal's: the mean, the costliest item, and j + 1
-    times the (256 j + 1)-th costliest; an item's cost its blocks +
-    ITEM_OVH), a larger k only when 5% lower. Its items fall in
-    two classes: A, the 6 items of each whole run, cost wr; B, the last run's
-    6, cost the rest. The classes go to ``tbl`` a row each, longest first: the
+def plan(c, tbl, scr, kv_ptr, g_ptr, nreq, indptr, fmap, pmap, bid, tid):
+    """The step's split plan in LDS ``tbl``, by a CTA of 5 waves (``scr``:
+    PLAN_SCR words of LDS for broadcasts between lanes). A request's splits
+    are runs of at most t blocks, t = 1.1 x the batch's work a CTA / k (at
+    most 64 splits): equal runs for k = 1 .. 4, or (k = 1) runs of t and the
+    rest. Wave w estimates candidate w (``_estimate``); the least estimate
+    wins, a later candidate only when 5% lower. Its items fall in two
+    classes: A, the 6 items of each whole run, cost wr; B, the last run's 6,
+    cost the rest. The classes go to ``tbl`` a row each, longest first: the
     deal order. CTA 0 also writes the CSR maps. Returns the item count."""
     lane = tid % 64
+    wave = uniform(tid // 64)
+    # lane r: request r (every wave)
+    r = fx.min(lane, nreq - 1)
+    live = lane < nreq
+    L = live.select(_ld(kv_ptr, r + 1) - _ld(kv_ptr, r), fx.Int32(0))
+    P = _ld(g_ptr, r + 1) - _ld(g_ptr, r) - G
+    nb = (L + BK - 1) // BK
+    work = _wave_sum(NG * nb)
+    ests = scr + PLAN_WAVES * 768
+    for ci in range_constexpr(PLAN_WAVES):
+        if wave == ci:
+            nk, wk = _layout(nb, work, *PLAN_CANDS[ci])
+            est = _estimate(nb, live, nk, wk, scr + 768 * ci, lane)
+            if lane == 0:
+                fx.ptr_store(est, ests + ci)
+    _bar()
+    best = fx.Int32(1 << 26)
+    n = fx.Int32(1)
+    wr = fx.Int32(1)
+    for ci in range_constexpr(PLAN_WAVES):
+        nk, wk = _layout(nb, work, *PLAN_CANDS[ci])
+        est = fx.Int32(fx.ptr_load(ests + ci))
+        better = est * 20 < best * 19
+        best = better.select(est, best)
+        n = better.select(nk, n)
+        wr = better.select(wk, wr)
     if tid < 64:
-        # lane r: request r
-        r = fx.min(lane, nreq - 1)
-        live = lane < nreq
-        L = live.select(_ld(kv_ptr, r + 1) - _ld(kv_ptr, r), fx.Int32(0))
-        P = _ld(g_ptr, r + 1) - _ld(g_ptr, r) - G
-        nb = (L + BK - 1) // BK
-        work = _wave_sum(NG * nb)
-        best = fx.Int32(1 << 26)
-        n = fx.Int32(1)
-        wr = fx.Int32(1)
-        for kk in range_constexpr(1, 5):
-            t = fx.max(fx.Int32(1), (work * W_NUM + BLOCKS * W_DEN * kk - 1) // (BLOCKS * W_DEN * kk))
-            nk = fx.min(fx.Int32(MAX_SPLITS), fx.max(fx.Int32(1), (nb + t - 1) // t))
-            wk = fx.max(fx.Int32(1), (nb + nk - 1) // nk)
-            nk = fx.max(fx.Int32(1), (nb + wk - 1) // wk)
-            # the items' costs (blocks + ITEM_OVH): class A (nk - 1 whole runs) and B (the last run), 6 a run
-            ca = wk + ITEM_OVH
-            cb = nb - (nk - 1) * wk + ITEM_OVH
-            na = live.select(NG * (nk - 1), fx.Int32(0))
-            nbb = live.select(fx.Int32(NG), fx.Int32(0))
-            parts = _wave_sum((live & (nk > 1)).select(nk, fx.Int32(0)))
-            total = _wave_sum(na * ca + nbb * cb)
-            est = fx.max((total + BLOCKS - 1) // BLOCKS, _wave_max(live.select(fx.max(ca, cb), fx.Int32(0))))
-            # some CTA takes j + 1 of the 256 j + 1 costliest items: (j + 1) x the (256 j + 1)-th cost
-            ga = fx.Int32(0)
-            gb = fx.Int32(0)
-            for r2 in range_constexpr(MAX_REQS):  # lanes past the batch count no items
-                ca2, na2 = read_lane_i32(ca, r2), read_lane_i32(na, r2)
-                cb2, nb2 = read_lane_i32(cb, r2), read_lane_i32(nbb, r2)
-                ga = ga + (ca2 >= ca).select(na2, fx.Int32(0)) + (cb2 >= ca).select(nb2, fx.Int32(0))
-                gb = gb + (ca2 >= cb).select(na2, fx.Int32(0)) + (cb2 >= cb).select(nb2, fx.Int32(0))
-            for j in range_constexpr(1, 4):
-                q = BLOCKS * j
-                cq = _wave_max(fx.max(((na > 0) & (ga > q)).select(ca, fx.Int32(0)), ((nbb > 0) & (gb > q)).select(cb, fx.Int32(0))))
-                est = fx.max(est, (j + 1) * cq)
-            est = (parts <= MAX_PART).select(est, fx.Int32(1 << 26))
-            # a larger k only for a 5% lower estimate (it costs more partials)
-            better = est * 20 < best * 19
-            best = better.select(est, best)
-            n = better.select(nk, n)
-            wr = better.select(wk, wr)
         rho = nb - (n - 1) * wr
         multi = live & (n > 1)
         msplits = multi.select(n, fx.Int32(0))
         pbase = fx.Int32(0)
         tile = fx.Int32(0)
-        for r2 in range(nreq):
-            m2 = read_lane_i32(msplits, r2)
-            pbase = (r2 < r).select(pbase + m2, pbase)
-            tile = ((r2 < r) & (m2 > 0)).select(tile + 1, tile)
+        fx.ptr_store(msplits, scr + lane)
+        for r2 in range_constexpr(MAX_REQS):
+            m2 = fx.Int32(fx.ptr_load(scr + r2))
+            pbase = (fx.Int32(r2) < r).select(pbase + m2, pbase)
+            tile = ((fx.Int32(r2) < r) & (m2 > 0)).select(tile + 1, tile)
         if bid == 0:
             nsplit = _wave_sum(msplits)
             ntile = _wave_sum(multi.select(fx.Int32(1), fx.Int32(0)))
@@ -258,10 +311,12 @@ def plan(c, tbl, kv_ptr, g_ptr, nreq, indptr, fmap, pmap, bid, tid):
         cost = (cnt > 0).select((kind == 0).select(wr_c, rho_c), fx.Int32(-1))
         rk = fx.Int32(0)
         ipre = fx.Int32(0)
-        for c2 in range(2 * nreq):
-            k2 = read_lane_i32(cost, c2)
-            i2 = read_lane_i32(cnt, c2)
-            before = (k2 > cost) | ((k2 == cost) & (c2 < lane))
+        fx.ptr_store(cost, scr + 64 + 2 * lane)
+        fx.ptr_store(cnt, scr + 65 + 2 * lane)
+        for c2 in range_constexpr(2 * MAX_REQS):  # classes past the batch: cost -1, no items
+            k2 = fx.Int32(fx.ptr_load(scr + 64 + 2 * c2))
+            i2 = fx.Int32(fx.ptr_load(scr + 65 + 2 * c2))
+            before = (k2 > cost) | ((k2 == cost) & (fx.Int32(c2) < lane))
             rk = before.select(rk + 1, rk)
             ipre = before.select(ipre + i2, ipre)
         total = _wave_sum(cnt)
@@ -611,7 +666,7 @@ def build(key: MlaDecodeBuild):
 
 
 def build_plan():
-    """The plan kernel: one CTA, the step's split plan to ``ptbl`` and the CSR
+    """The plan kernel: one CTA of 5 waves, the step's split plan to ``ptbl`` and the CSR
     maps of the split reduce (one launch a step: every MLA layer's decode
     reads the same plan)."""
     if "plan" in _BUILDS:
@@ -621,15 +676,17 @@ def build_plan():
     @fx.struct
     class Smem:
         tbl: fx.Array[fx.Int32, TBL_WORDS, 16]
+        scr: fx.Array[fx.Int32, PLAN_SCR, 16]
 
-    @flyc.kernel(name="k3_mono_mla_decode_b_plan", known_block_size=[64, 1, 1])
+    @flyc.kernel(name="k3_mono_mla_decode_b_plan", known_block_size=[64 * PLAN_WAVES, 1, 1])
     def mla_decode_b_plan(kv_ptr: Int64, g_ptr: Int64, nreq: Int32, indptr: Int64, fmap: Int64, pmap: Int64, ptbl: Int64):
         _ = keyed
         tid = fx.thread_idx.x
-        tbl = fx.SharedAllocator().allocate(Smem).peek().tbl.ptr
-        plan(None, tbl, kv_ptr, g_ptr, nreq, indptr, fmap, pmap, fx.Int32(0), tid)
-        for k_ in range_constexpr(-(-TBL_WORDS // 64)):
-            w_ = tid + 64 * k_
+        lds = fx.SharedAllocator().allocate(Smem).peek()
+        tbl = lds.tbl.ptr
+        plan(None, tbl, lds.scr.ptr, kv_ptr, g_ptr, nreq, indptr, fmap, pmap, fx.Int32(0), tid)
+        for k_ in range_constexpr(-(-TBL_WORDS // (64 * PLAN_WAVES))):
+            w_ = tid + 64 * PLAN_WAVES * k_
             if w_ < TBL_WORDS:
                 bo.buffer_store(fx.Int32(fx.ptr_load(tbl + w_)), rsrc(ptbl), w_)
 
@@ -637,7 +694,7 @@ def build_plan():
     def launch(kv_ptr: Int64, g_ptr: Int64, nreq: Int32, indptr: Int64, fmap: Int64, pmap: Int64, ptbl: Int64,
                stream: fx.Stream = _STREAM):  # fmt: skip
         _ = keyed
-        mla_decode_b_plan(kv_ptr, g_ptr, nreq, indptr, fmap, pmap, ptbl).launch(grid=(1,), block=(64,), stream=stream)
+        mla_decode_b_plan(kv_ptr, g_ptr, nreq, indptr, fmap, pmap, ptbl).launch(grid=(1,), block=(64 * PLAN_WAVES,), stream=stream)
 
     _BUILDS["plan"] = launch
     return launch
