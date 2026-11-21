@@ -419,7 +419,7 @@ def _tails(packed_layers: dict, batch, device) -> None:
     by layer position: the previous layer is covered (its K2 is this package's
     layer launch at every routed width, a KDA layer's and an MLA layer's alike:
     the MLA front is a launch of its own that ends at the core), this layer's
-    K1 is the wide form at a width the tail takes (``TAIL_MAX_ROWS``: 12
+    K1 is the wide form at a width the tail takes (``TAIL_MAX_ROWS``: 24
     rows), and it is not a block-write layer (whose front writes a bank row
     its own K2 then reads).
     Every other layer keeps the seam in its own front: layer 1 (the dense

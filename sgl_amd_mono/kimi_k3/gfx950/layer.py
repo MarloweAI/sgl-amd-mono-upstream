@@ -869,12 +869,20 @@ def k2_body(key: K2Build, k2_lds: K2Lds, scratch_base, args: dict) -> None:
         stamp(on, tls, tid, 6)
         if const_expr(key.reduce):  # noqa: SIM102 (traced: `and` does not combine traced values)
             if (bid >= k2b.RED0) & (bid < k2b.RED0 + k2b.RED_TASKS):
-                if const_expr(key.tail is not None):
-                    # the slice's bank and weight loads in flight across FINAL's poll
+                # the slice's bank and weight loads in flight across FINAL's
+                # poll where its rounds are whole (one, or 16 tokens each);
+                # a partial second round's step loads them after the reduce
+                # (else 18 rows spills VGPRs in ug)
+                early = key.tail is not None and (
+                    tail_seam.tail_rounds(s) == 1 or s % tail_seam.TAIL_SL == 0
+                )
+                if const_expr(early):
                     tld = tail_seam.tail_loads(tc, bid - k2b.RED0)
                 k2b.stage_reduce(c, bid - k2b.RED0)
                 if const_expr(key.tail is not None):
                     stamp(on, tls, tid, 7)
+                    if const_expr(not early):
+                        tld = tail_seam.tail_loads(tc, bid - k2b.RED0)
                     tail_seam.tail_slice(tc, bid - k2b.RED0, tld)
                     stamp(on, tls, tid, TL_TAIL_PART)
         if const_expr(key.tail is not None):
