@@ -342,12 +342,11 @@ def compile_stage1_shared(*, s1_use_nt, s1_prefetch_hidden, s1_xcd_swizzle, situ
     return launch, hparam
 
 
-# the shared tile a stock bucket (get_padded_M 64 / 128 / 256): one M tile covers the bucket's rows (the 11 MB of
-# W_down read once), LDS <= 40 KB keeps stage 1's 4 workgroups a CU
+# the shared tile a stock bucket (get_padded_M 64 / 128 / 256): LDS <= 40 KB keeps stage 1's 4 workgroups a CU.
+# block_k 64 keeps the K order of SGLang's own hgemm (bit for bit); block_k 32 does not.
 SHARED_CONFIGS = {
-    64: dict(sh_block_m=64, sh_block_n=64, sh_block_k=64, sh_stages=2, sh_m_waves=1, sh_n_waves=4),
-    128: dict(sh_block_m=128, sh_block_n=64, sh_block_k=32, sh_stages=2, sh_m_waves=1, sh_n_waves=4),
-    256: dict(sh_block_m=192, sh_block_n=64, sh_block_k=32, sh_stages=2, sh_m_waves=1, sh_n_waves=4),
+    b: dict(sh_block_m=64, sh_block_n=64, sh_block_k=64, sh_stages=2, sh_m_waves=1, sh_n_waves=4)
+    for b in (64, 128, 256)
 }
 
 
