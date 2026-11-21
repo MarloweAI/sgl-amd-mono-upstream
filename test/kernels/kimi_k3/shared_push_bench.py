@@ -227,7 +227,7 @@ def push_sweep(args, emu, dev):
                            stream=torch.cuda.current_stream())  # fmt: skip
 
             us = graph_us(body, nl)
-            gbs = TP * (TP - 1) * m * SHR * 2 / us / 1e3
+            gbs = (TP - 1) * m * SHR * 2 / us / 1e3  # every rank sends 7 of its 8 column slices
             print("PUSH", json.dumps({"blocks": blocks, "m": m, "us": round(us, 2), "GBps_total": round(gbs, 1),
                                       "GBps_cta": round(gbs / (TP * blocks), 2)}), flush=True)  # fmt: skip
 

@@ -174,7 +174,7 @@ def compile_stage1_shared(*, s1_use_nt, s1_prefetch_hidden, s1_xcd_swizzle, situ
     """(launcher, shared tile param) of one static configuration (``SHARED_CONFIGS``).
 
     ``push``: None, or the number of MoE layers a step (``launches``) of the shared partial's C18 push: every
-    shared workgroup then pushes its 64 x 64 tile into its slot on the other ranks and flags it
+    shared workgroup then pushes its 64 x 64 tile to the tile's column owner and flags it
     (``stages.shared_push``) once the tile is in memory, while the stage-1 workgroups run. The launch's push
     arguments are (shared_out address, peer table address, rank, epoch buffer address, layer slot)."""
     N_OUT = 2 * inter
@@ -256,19 +256,14 @@ def compile_stage1_shared(*, s1_use_nt, s1_prefetch_hidden, s1_xcd_swizzle, situ
             _shared_tile(sh_out, sh_a, sh_b, sh_m, sh_n, sh_k, sh_a_ld, sh_b_ld, tiled_mma, param, bid_m, bid_n,
                          storage.ab.a.peek().ptr, storage.ab.b.peek().ptr, storage.c.peek().ptr, tid)
             if const_expr(push is not None):
-                # the tile's stores in memory, then its data into each other rank's slot (a wave a peer, peers w
-                # and w + 4), drained, then the flags
+                # the tile's stores in memory, then its data to the tile's column owner, drained, then its flag
                 c = S.context(push_peers, push_rank, push_epoch, push_slot, tid, bx, push)
-                wave = rocdl.readfirstlane(T.i32, tid // 64)
-                lane = tid % 64
                 rocdl.s_waitcnt(vmcnt=0)
                 gpu.barrier()
-                for j in range_constexpr(2):
-                    S.push_tile(c, push_xs, hidden * 2, bid_m, bid_n, sh_m, wave + fx.Int32(4 * j), lane, S.MAX_ROWS)
+                S.push_tile(c, push_xs, hidden * 2, bid_m, bid_n, sh_m, tid, 256, S.MAX_ROWS)
                 rocdl.s_waitcnt(vmcnt=0)
                 gpu.barrier()
-                for j in range_constexpr(2):
-                    S.flag_tile(c, bid_m, bid_n, wave + fx.Int32(4 * j), lane)
+                S.flag_tile(c, bid_m, bid_n, tid)
         else:
             lane = tid % 64
             wave = rocdl.readfirstlane(T.i32, tid // 64)

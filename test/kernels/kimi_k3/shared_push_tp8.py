@@ -5,7 +5,6 @@ split all-reduce (the shared partial pushed by the stage-1 launch's shared tiles
 Per width, a CUDA graph of ``--layers`` MoE layers, each ``check_stage1_shared.run_case`` (routing, the fused
 stage 1 with the shared down, stage 2) and then:
 
-* ``stock``: aiter's custom all-reduce of SGLang's flat [latent | shared] buffer and SGLang's RMSNorm of the latent;
 * ``flat``: C13's flat launch (``MoeAr.reduce``: both sums and the latent's norm);
 * ``push``: the call with ``SharedPushAr.push_args(layer)`` (its shared tiles push), then ``SharedPushAr.reduce``
   (the latent half's all-reduce + norm + the pushed shared sum);
@@ -57,17 +56,12 @@ def gathered(x):
     return every
 
 
-def capture(body, ctx=None):
+def capture(body):
     body()
     torch.cuda.synchronize()
     g = torch.cuda.CUDAGraph()
-    if ctx is not None:
-        with ctx():
-            with torch.cuda.graph(g):
-                body()
-    else:
-        with torch.cuda.graph(g):
-            body()
+    with torch.cuda.graph(g):
+        body()
     return g
 
 
@@ -96,9 +90,7 @@ def main():
     rows = [int(r) for r in args.rows.split(",")]
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-    from aiter.dist.device_communicators.custom_all_reduce import CustomAllreduce
     from check_stage1_shared import make_case, run_case
-    from sglang.srt.layers.layernorm import RMSNorm
 
     from sgl_amd_mono.kimi_k3.ar_read import MoeAr, SharedPushAr
 
@@ -112,10 +104,7 @@ def main():
     eps = 1e-6
     split = SharedPushAr(cpu, rank, dev, range(nl), eps, deadline_s=args.deadline)
     flat = MoeAr(cpu, rank, dev, range(nl), eps, deadline_s=args.deadline)
-    ca = CustomAllreduce(cpu, dev)
     w = (1 + 0.1 * torch.randn(LAT, generator=torch.Generator(device=dev).manual_seed(5), device=dev)).to(BF)
-    norm = RMSNorm(LAT, eps=eps).to(dev)
-    norm.weight.data.copy_(w)
     out = {"rank": rank, "check": [], "time": []}
     ok = True
     for m in rows:
@@ -135,11 +124,7 @@ def main():
                             flat.reduce(i, latent, shared, w)
                     else:
                         latent, shared = run_case(case)
-                        if name == "flat":
-                            flat.reduce(i, latent, shared, w)
-                        else:
-                            r = ca.custom_all_reduce(torch.cat([latent.reshape(-1), shared.reshape(-1)]))
-                            norm(r[: m * LAT].view(m, LAT))
+                        flat.reduce(i, latent, shared, w)
                 if name != "push_flat":
                     keep[name] = res
 
@@ -147,8 +132,8 @@ def main():
 
         times = {}
         graphs = {}
-        for name in ("stock", "flat", "push", "push_flat"):
-            graphs[name] = capture(arm(name), ca.capture if name == "stock" else None)
+        for name in ("flat", "push", "push_flat"):
+            graphs[name] = capture(arm(name))
             times[name] = across(graph_us(graphs[name], args.reps, nl), dev)
         # check: the last replay of the push graph, layer by layer
         torch.cuda.synchronize()
@@ -170,8 +155,6 @@ def main():
                                 for j, k in ((0, "median"), (1, "slowest"))}  # fmt: skip
         for a, b2 in (("push", "push_flat"), ("push_flat", "flat")):
             t[f"{a}_minus_{b2}"] = {k: round(times[a][j] - times[b2][j], 2) for j, k in ((0, "median"), (1, "slowest"))}
-        t["push_minus_stock"] = {k: round(times["push"][j] - times["stock"][j], 2)
-                                 for j, k in ((0, "median"), (1, "slowest"))}  # fmt: skip
         out["time"].append({"m": m, **t})
         if rank == 0:
             print("TP8CHECK", json.dumps({"m": m, **b, "pass": passed}), flush=True)
