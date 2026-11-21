@@ -1017,6 +1017,12 @@ def _fuse_qkv_g(backbone) -> None:
         attn._qkv_g_weight = cat
 
 
+# The widths whose absorb runs in the prologue (SGLang's prepare stopped after
+# q_b): every wide width (tier 0: -6 to -11 us an MLA layer on the mixes,
+# -3 to -5 at 100K).
+ABSORB_MIN_ROWS = 36
+
+
 class _SglTails:
     """The MLA prologue, aiter's decode and the tail inside SGLang's own MLA
     attention at the verify widths past the front's, ``mla_tail.MIN_ROWS`` ..
@@ -1070,6 +1076,7 @@ class _SglTails:
         _tail_hooks()
         for e in entries:
             e.attn.forward_absorb_rocm_core = functools.partial(self.core_forward, e)
+            e.attn.forward_absorb_rocm_prepare = functools.partial(self.prepare, e)
             if getattr(e.attn, "_qkv_g_weight", None) is not None:
                 e.gate = None
                 e.qkvg = torch.nn.Module()
@@ -1093,14 +1100,21 @@ class _SglTails:
         f32, i32, bf = torch.float32, torch.int32, torch.bfloat16
         qb = torch.zeros(s, mt.NHA, mp.QHD, dtype=bf, device=dev)
         lat = torch.zeros(s, mt.mf.LATW, dtype=bf, device=dev)
-        mp.mla_prologue_launch(
-            mp.MlaPrologueBuild(), q_nope_out=torch.zeros(s, mt.NHA, mt.KV, dtype=bf, device=dev),
-            q_pe=qb[..., mp.QHD - mp.ROPE :], k_nope=lat[:, : mt.KV], k_pe=lat[:, mt.KV : mp.DQK],
-            # a slot of another rank: no record written
-            loc=torch.full((s,), self.runner.dcp_rank + 1, dtype=torch.int64, device=dev) % mt.DCP,
-            q8=self.q8[s], kv=torch.zeros(8, mp.DQK, dtype=torch.uint8, device=dev),
-            rank=self.runner.dcp_rank,
-        )  # fmt: skip
+        w_kc = self.entries[0].attn.w_kc_qrep
+        # the builds the widths take
+        for absorb in {r >= ABSORB_MIN_ROWS for r in self.rows}:
+            mp.mla_prologue_launch(
+                mp.MlaPrologueBuild(absorb=absorb), q_pe=qb[..., mp.QHD - mp.ROPE :],
+                k_nope=lat[:, : mt.KV], k_pe=lat[:, mt.KV : mp.DQK],
+                # a slot of another rank: no record written
+                loc=torch.full((s,), self.runner.dcp_rank + 1, dtype=torch.int64, device=dev) % mt.DCP,
+                q8=self.q8[s], kv=torch.zeros(8, mp.DQK, dtype=torch.uint8, device=dev),
+                rank=self.runner.dcp_rank,
+                **(
+                    dict(q_b=qb, w_kc=w_kc) if absorb
+                    else dict(q_nope_out=torch.zeros(s, mt.NHA, mt.KV, dtype=bf, device=dev))
+                ),
+            )  # fmt: skip
         self.runner.step_begin()
         for e in self.entries[:2]:
             mt.mla_tail_launch(
@@ -1118,6 +1132,42 @@ class _SglTails:
                 layer=e.i, epoch=self.runner.epoch,
             )  # fmt: skip
         torch.cuda.synchronize()
+
+    def prepare(self, e, positions, hidden_states, forward_batch, zero_allocator,
+                llama_4_scaling=None, prev_topk_indices=None):  # fmt: skip
+        """``forward_absorb_rocm_prepare`` of layer ``e``: at a wide width's
+        target verify from ABSORB_MIN_ROWS rows, SGLang's prepare up to q_b
+        (the latent, the fused q / kv norm, the replicated q_b), the absorb
+        left to the prologue (``q_nope_out`` None, q_b's output in its place);
+        else SGLang's."""
+        attn = e.attn
+        rows = hidden_states.shape[0]
+        if not (
+            forward_batch.forward_mode.is_target_verify() and rows in self.rows and rows >= ABSORB_MIN_ROWS
+        ):
+            return type(attn).forward_absorb_rocm_prepare(
+                attn, positions, hidden_states, forward_batch, zero_allocator,
+                llama_4_scaling, prev_topk_indices,
+            )  # fmt: skip
+        from sglang.srt.layers.layer_boundary import get_attn_tp_context
+        from sglang.srt.models.deepseek_common.attention_forward_methods import forward_mla_rocm as frm
+
+        assert attn.is_dcp_q_replicate_phase(forward_batch) and attn.q_b_proj_qrep_weight is not None
+        q, latent = get_attn_tp_context().fetch_qkv_latent().split(
+            [attn.q_lora_rank, attn.kv_lora_rank + attn.qk_rope_head_dim], dim=-1
+        )
+        k_nope = latent[..., : attn.kv_lora_rank]
+        q, k_nope = frm.fused_qk_rmsnorm_bf16(
+            q, attn.q_a_layernorm.weight, attn.q_a_layernorm.variance_epsilon,
+            k_nope, attn.kv_a_layernorm.weight, attn.kv_a_layernorm.variance_epsilon,
+        )  # fmt: skip
+        k_nope = k_nope.unsqueeze(1)
+        q = frm.a16w16_linear(q, attn.q_b_proj_qrep_weight).view(-1, attn.num_local_heads * attn.dcp_size, attn.qk_head_dim)
+        _, q_pe, k_pe = attn._split_q_nope_pe(q, latent)
+        return (
+            q_pe, k_pe, None, k_nope, forward_batch, zero_allocator, positions, None,
+            llama_4_scaling, q,
+        )  # fmt: skip
 
     def qkv_latent(self, e, hidden_states, forward_batch):
         """``prepare_qkv_latent`` of layer ``e``: at a wide width's target
@@ -1156,7 +1206,7 @@ class _SglTails:
         o_proj on the gated core."""
         global _TAIL_PENDING
         attn = e.attn
-        rows = q_nope_out.shape[0]
+        rows = q_pe.shape[0]
         if not (forward_batch.forward_mode.is_target_verify() and rows in self.rows):
             return type(attn).forward_absorb_rocm_core(
                 attn, q_pe, k_pe, q_nope_out, k_nope, forward_batch, zero_allocator,
@@ -1169,7 +1219,9 @@ class _SglTails:
         from sgl_amd_mono.kimi_k3.gfx950.attention import mla_tail as mt
         from sgl_amd_mono.kimi_k3.gfx950.layer import scratch_region
 
-        assert topk_indices is None and llama_4_scaling is None and q_nope_unabsorbed is None
+        absorb = rows >= ABSORB_MIN_ROWS
+        assert topk_indices is None and llama_4_scaling is None
+        assert (q_nope_out is None) == absorb and (q_nope_unabsorbed is not None) == absorb
         if e.first:
             # once a forward, before its first tail: the steps' mailbox tags
             self.runner.step_begin()
@@ -1183,9 +1235,10 @@ class _SglTails:
         kv = backend.kv_layers.read(layer.layer_id).key()
         q8 = self.q8[rows]
         mp.mla_prologue_launch(
-            mp.MlaPrologueBuild(), q_nope_out=q_nope_out, q_pe=q_pe, k_nope=k_nope,
-            k_pe=k_pe, loc=forward_batch.out_cache_loc, q8=q8,
+            mp.MlaPrologueBuild(absorb=absorb), q_nope_out=q_nope_out, q_pe=q_pe,
+            k_nope=k_nope, k_pe=k_pe, loc=forward_batch.out_cache_loc, q8=q8,
             kv=kv.view(torch.uint8).view(-1, mp.DQK), rank=self.runner.dcp_rank,
+            **(dict(q_b=q_nope_unabsorbed, w_kc=attn.w_kc_qrep) if absorb else {}),
         )  # fmt: skip
         out = self.out[rows]
         pend = {}
