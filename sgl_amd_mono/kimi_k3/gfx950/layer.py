@@ -451,8 +451,8 @@ def lds_types(key: K2Build) -> K2LdsTypes:
             av: fx.Array[fx.Float32, THREADS, 16]
 
         @fx.struct
-        class DownLds:  # two units' INTER / ISC tiles
-            tile: fx.Array[fx.Int32, 2 * k2b.ROWS * k2b.TILE_W, 16]
+        class DownLds:  # a wide step's down reads INTER from scratch
+            pad: fx.Array[fx.Int32, 4, 16]
 
         @fx.struct
         class TableLds:  # the route table's build
@@ -703,7 +703,6 @@ def k2_body(key: K2Build, k2_lds: K2Lds, scratch_base, args: dict) -> None:
             c["rt"]["sexp"] = tb.sexp.ptr
             c["lqc"] = scratch_base + fx.Int64(lay["lqc"][0])
             c["contrib"] = scratch_base + fx.Int64(lay["contrib"][0])
-            c["dtile"] = dl.tile.ptr
         else:
             c["contrib"] = dl.contrib.ptr
             c["rt"]["kof"] = rl.kof.ptr

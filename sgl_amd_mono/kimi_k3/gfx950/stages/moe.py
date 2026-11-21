@@ -2167,134 +2167,10 @@ def wait_ug(c):
     gpu.barrier()
 
 
-# down past one token tile: tasks (unit, 256 latent rows), unit-major, on
-# every CTA; a wave takes DOWN_NB 16-row blocks of the chunk. The unit's INTER
-# rows and ISC codes go through LDS once a task (every wave reads them), the
-# weights of DOWN_P tasks are in flight, and each pick's bf16(w acc) goes to
-# the CONTRIB scratch; ``fold_wide`` folds them once every down CTA is done.
-DOWN_NB = 2  # a wave's 16-row blocks a task
-DOWN_CHUNK = WAVES * DOWN_NB * ROWS  # 256 latent rows a task
-DOWN_CHUNKS = LAT // DOWN_CHUNK  # 14 tasks a unit
-DOWN_P = 4  # tasks in flight a CTA
-TILE_W = IW + UG_GROUPS  # a pick's tile row: INTER words, then ISC codes
-TILE_I = ROWS * (IW // 4)  # the INTER pieces of a tile (16 B a thread)
-TILE_C = ROWS * (UG_GROUPS // 4)  # the ISC pieces
-
-
-def down_task(c, d):
-    """Down task d: (unit, its first 16-row block for this wave)."""
-    u = d // DOWN_CHUNKS
-    rg0 = (d % DOWN_CHUNKS) * (WAVES * DOWN_NB) + c["wave"] * DOWN_NB
-    return u, rg0
-
-
-def down_w_loads(c, d, tile=True):
-    """Task d's w2 tiles and scale codes for this wave's blocks, then (``tile``)
-    ``down_tile_loads``: flat, ``stage_down_wide`` unpacks."""
-    lane = c["lane"]
-    u, rg0 = down_task(c, d)
-    e = uniform(fx.ptr_load(c["rt"]["expert"] + u))
-    r_w = rsrc(c["args"]["w2"])
-    av = [
-        fp4_tile_load(r_w, e * (LAT * RI // 8), rg0 + i, RI, st, lane * 4)
-        for i in range(DOWN_NB)
-        for st in range(W2_STEPS)
-    ]
-    sa = [
-        w2_scale(c, e, rg0 + i, st, lane)
-        for i in range(DOWN_NB)
-        for st in range(W2_STEPS)
-    ]
-    return av + sa + (down_tile_loads(c, d) if tile else [])
-
-
-def down_tile_loads(c, d):
-    """This thread's INTER / ISC piece of task d's unit tile (a pick past the
-    unit reads zeros without touching memory)."""
-    s, tid = c["S"], c["tid"]
-    st0, n = unit_of(c, down_task(c, d)[0])
-    nbi = s * TOPK * IW * 4
-    nbc = s * TOPK * UG_GROUPS * 4
-    ji, ri = tid // (IW // 4), tid % (IW // 4)
-    tc = tid - TILE_I
-    jc, rc = tc // (UG_GROUPS // 4), tc % (UG_GROUPS // 4)
-    pi = fx.ptr_load(c["rt"]["toks"] + (st0 + fx.min(ji, n - 1)))
-    pc = fx.ptr_load(c["rt"]["toks"] + (st0 + fx.max(fx.min(jc, n - 1), 0)))
-    oki = (tid < TILE_I) & (ji < n)
-    okc = (tid >= TILE_I) & (tc < TILE_C) & (jc < n)
-    at_i = oki.select(pi * IW + ri * 4, fx.Int32(nbi // 4))
-    at_c = okc.select(pc * UG_GROUPS + rc * 4, fx.Int32(nbc // 4))
-    vi = fx.Vector(
-        bo.buffer_load(
-            rsrc(c["inter"].value, nbi), at_i, vec_width=4, dtype=T.i32,
-            cache_modifier=CM_DEV,
-        )
-    )  # fmt: skip
-    vc = fx.Vector(
-        bo.buffer_load(
-            rsrc(c["isc"].value, nbc), at_c, vec_width=4, dtype=T.i32,
-            cache_modifier=CM_DEV,
-        )
-    )  # fmt: skip
-    return [vi, vc]
-
-
-@flyc.jit
-def stage_down_wide(c, d, ops, buf, live, nxt):
-    """Task d (``ops``: ``down_w_loads``): the unit's tile -> LDS ``buf``, this
-    wave's blocks of w2 against it (the narrow path's MFMAs and K order), the
-    next loads (``nxt``) issued behind the MFMAs, then bf16(w acc) a pick and
-    row -> CONTRIB. ``live``: d is a task (else nothing is stored). Returns the
-    next loads."""
-    s, tid, lane = c["S"], c["tid"], c["lane"]
-    nab = DOWN_NB * W2_STEPS
-    vi, vc = ops[2 * nab], ops[2 * nab + 1]
-    tile = c["dtile"] + buf * (ROWS * TILE_W)
-    tc = tid - TILE_I
-    if tid < TILE_I:
-        fx.ptr_store(vi, tile + ((tid // (IW // 4)) * TILE_W + (tid % (IW // 4)) * 4))
-    if (tid >= TILE_I) & (tc < TILE_C):
-        fx.ptr_store(
-            vc,
-            tile
-            + ((tc // (UG_GROUPS // 4)) * TILE_W + IW + (tc % (UG_GROUPS // 4)) * 4),
-        )
-    lds_barrier()
-    t = lane % 16
-    kb = lane // 16
-    accs = []
-    for i in range_constexpr(DOWN_NB):
-        acc = fx.Vector.filled(4, 0.0, fx.Float32)
-        for st in range_constexpr(W2_STEPS):
-            bw = fp8_operand(tile, t * TILE_W, st, kb)
-            sb = fx.ptr_load(tile + (t * TILE_W + IW + st * 4 + kb))
-            acc = mfma_scaled(
-                ops[i * W2_STEPS + st], bw, acc, ops[nab + i * W2_STEPS + st], sb,
-                FP4, FP8, 0, 0,
-            )  # fmt: skip
-        accs.append(acc)
-    out = down_w_loads(c, nxt)
-    u, rg0 = down_task(c, d)
-    st0, n = unit_of(c, u)
-    if live & (t < n):
-        p = fx.ptr_load(c["rt"]["toks"] + (st0 + t))
-        wt = fx.ptr_load(
-            c["rt"]["route"] + ((p // TOPK) * 2 * TOPK + TOPK + p % TOPK)
-        ).bitcast(fx.Float32)
-        r = rsrc(c["contrib"], s * TOPK * LAT * 2)
-        for i in range_constexpr(DOWN_NB):
-            a = accs[i]
-            at = (p * LAT + (rg0 + i) * ROWS + 4 * kb) // 2
-            for h in range_constexpr(2):
-                w = bf16_pair(a[2 * h] * wt, a[2 * h + 1] * wt)
-                bo.buffer_store(w, r, at + h, cache_modifier=CM_DEV)
-    return out
-
-
-# down a task a wave: task (unit, 128 latent rows), the eight 16-row blocks'
-# w2 against the unit's picks' INTER read straight from scratch, the same
-# MFMA chains (a block's three K steps) and bf16(w acc) -> CONTRIB as
-# ``stage_down_wide``.
+# a wide step's down, a task a wave: task (unit, 128 latent rows), the eight
+# 16-row blocks' w2 against the unit's picks' INTER read straight from
+# scratch; the narrow ``stage_down``'s chains (a block's three K steps) and
+# bf16(w acc) products, into CONTRIB for ``fold_wide``.
 DOWNW_NB = 8  # a wave task's 16-row blocks
 DOWNW_CHUNKS = LAT // (DOWNW_NB * ROWS)  # 28 tasks a unit
 
@@ -2401,37 +2277,6 @@ def run_down_waves(c, nu):
         d = d + BLOCKS * WAVES
         ops = downw_loads(c, fx.min(d, last))
     publish(c["put"], c["dnd"], c["bid"], fx.Int32(1), c["tid"] == 0)
-
-
-@flyc.jit
-def run_down_wide(c, nu):
-    """Down tasks bid, bid + BLOCKS, ... on every CTA: DOWN_P in flight (the
-    first ones' weights issued before INTER is waited for), then DND."""
-    bid = c["bid"]
-    dt = BLOCKS
-    total = nu * DOWN_CHUNKS
-    last = total - 1
-    d = bid
-    ds = [fx.min(d + j * dt, last) for j in range(DOWN_P)]
-    a0 = down_w_loads(c, ds[0], False)
-    a1 = down_w_loads(c, ds[1], False)
-    a2 = down_w_loads(c, ds[2], False)
-    a3 = down_w_loads(c, ds[3], False)
-    wait_ug(c)
-    a0 = a0 + down_tile_loads(c, ds[0])
-    a1 = a1 + down_tile_loads(c, ds[1])
-    a2 = a2 + down_tile_loads(c, ds[2])
-    a3 = a3 + down_tile_loads(c, ds[3])
-    stamp(c["tl_on"], c["tls"], c["tid"], 15)
-    while d < total:
-        d1, d2, d3 = d + dt, d + 2 * dt, d + 3 * dt
-        nx = [fx.min(x + DOWN_P * dt, last) for x in (d, d1, d2, d3)]
-        a0 = stage_down_wide(c, d, a0, 0, d < total, nx[0])
-        a1 = stage_down_wide(c, fx.min(d1, last), a1, 1, d1 < total, nx[1])
-        a2 = stage_down_wide(c, fx.min(d2, last), a2, 0, d2 < total, nx[2])
-        a3 = stage_down_wide(c, fx.min(d3, last), a3, 1, d3 < total, nx[3])
-        d = d + DOWN_P * dt
-    publish(c["put"], c["dnd"], bid, fx.Int32(1), c["tid"] == 0)
 
 
 @flyc.jit
