@@ -25,13 +25,9 @@
 #include <ATen/ATen.h>
 #include <ATen/hip/HIPContext.h>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
-#include <c10/hip/HIPException.h>
 #include <hip/hip_runtime.h>
 #include <torch/library.h>
 
-#ifndef C10_HIP_KERNEL_LAUNCH_CHECK
-#define C10_HIP_KERNEL_LAUNCH_CHECK() C10_CUDA_KERNEL_LAUNCH_CHECK()
-#endif
 
 // aiter's literal: the exponent is an fp64 product rounded once to f32
 #define C_LOG2E 1.44269504088896340736
@@ -495,35 +491,15 @@ __global__ __launch_bounds__(THREADS) void route_sort_kernel(Params p) {
     if (threadIdx.x == 0) __hip_atomic_store(p.counter, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 }
 
-void check(const at::Tensor &t, at::ScalarType dt, int64_t numel, const char *name) {
-    TORCH_CHECK(t.is_cuda() && t.scalar_type() == dt && t.is_contiguous() && t.numel() == numel, name,
-                ": a contiguous ", numel, "-element tensor of the right dtype on the GPU");
-}
-
-// logits [M, 896] f32 (row stride even, 8 B aligned), bias [896] f32; out [M, 3584] bf16 (zeroed)
+// The caller's contract (SGLang's static eligibility and route/__init__.py's allocations; not checked here):
+// logits [M <= 192, 896] f32 (unit column stride, even row stride, 8 B aligned), bias [896] f32, the outputs
+// contiguous of the sizes route/__init__.py allocates, out [M, 3584] bf16 16 B aligned (zeroed here), valid one
+// int32 on the GPU or none.
 Params make_params(const at::Tensor &logits, const at::Tensor &bias, double scale, at::Tensor &topk_ids,
                    at::Tensor &topk_w, at::Tensor &sorted_ids, at::Tensor &sorted_w, at::Tensor &sorted_eids,
                    at::Tensor &num_valid, at::Tensor &m_indices, at::Tensor &reverse, at::Tensor &out,
                    at::Tensor &counter, int64_t pad_id, const c10::optional<at::Tensor> &valid) {
     const int64_t M = logits.size(0);
-    TORCH_CHECK(logits.dim() == 2 && logits.size(1) == E && logits.stride(1) == 1 && logits.stride(0) % 2 == 0 &&
-                    logits.scalar_type() == at::kFloat && reinterpret_cast<uintptr_t>(logits.data_ptr()) % 8 == 0,
-                "logits: [M, 896] f32, unit column stride, even row stride, 8 B aligned");
-    TORCH_CHECK(M >= 1 && M <= MAX_ROWS, "1 to 192 rows");
-    check(bias, at::kFloat, E, "bias");
-    check(topk_ids, at::kInt, M * TOPK, "topk_ids");
-    check(topk_w, at::kFloat, M * TOPK, "topk_w");
-    const int64_t ms = sorted_ids.numel();
-    TORCH_CHECK(ms % BM == 0 && ms >= M * TOPK + std::min<int64_t>(E, M * TOPK) * (BM - 1), "sorted rows");
-    check(sorted_ids, at::kInt, ms, "sorted_ids");
-    check(sorted_w, at::kFloat, ms, "sorted_w");
-    check(m_indices, at::kInt, ms, "m_indices");
-    check(sorted_eids, at::kInt, ms / BM, "sorted_eids");
-    check(num_valid, at::kInt, 2, "num_valid");
-    check(reverse, at::kInt, M * TOPK, "reverse");
-    check(out, at::kBFloat16, M * LAT, "out");
-    check(counter, at::kInt, 1, "counter");
-    TORCH_CHECK(reinterpret_cast<uintptr_t>(out.data_ptr()) % 16 == 0, "out 16 B aligned");
     Params p{};
     p.logits      = logits.data_ptr<float>();
     p.stride      = logits.stride(0);
@@ -543,11 +519,7 @@ Params make_params(const at::Tensor &logits, const at::Tensor &bias, double scal
     p.M           = static_cast<int>(M);
     p.route_ctas  = static_cast<int>((M + RW - 1) / RW);
     p.pad_id      = static_cast<int>(pad_id);
-    if (valid.has_value()) {
-        TORCH_CHECK(valid->is_cuda() && valid->numel() == 1 && valid->scalar_type() == at::kInt,
-                    "valid: one int32 on the GPU");
-        p.valid = valid->data_ptr<int>();
-    }
+    if (valid.has_value()) p.valid = valid->data_ptr<int>();
     return p;
 }
 
@@ -555,7 +527,6 @@ void launch(const Params &p, const at::Tensor &logits) {
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA guard(logits.device());
     const hipStream_t stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA(logits.device().index()).stream();
     route_sort_kernel<<<p.route_ctas + ZERO_CTAS + p.aux_ctas, THREADS, 0, stream>>>(p);
-    C10_HIP_KERNEL_LAUNCH_CHECK();
 }
 
 void route_sort(const at::Tensor &logits, const at::Tensor &bias, double scale, at::Tensor &topk_ids,
@@ -569,6 +540,7 @@ void route_sort(const at::Tensor &logits, const at::Tensor &bias, double scale, 
 
 // route_sort, plus: gate_up [M, 1536] f32 (unit column stride, row stride a multiple of 4, 16 B aligned) -> act
 // [M, 768] bf16 (the shared experts' SiTU), routed_in [M, 3584] f32 (same alignment) -> routed_out [M, 3584] bf16
+// (contiguous; the caller's contract as route_sort's)
 void route_sort_shared(const at::Tensor &logits, const at::Tensor &bias, double scale, at::Tensor &topk_ids,
                        at::Tensor &topk_w, at::Tensor &sorted_ids, at::Tensor &sorted_w, at::Tensor &sorted_eids,
                        at::Tensor &num_valid, at::Tensor &m_indices, at::Tensor &reverse, at::Tensor &out,
@@ -577,17 +549,6 @@ void route_sort_shared(const at::Tensor &logits, const at::Tensor &bias, double 
                        at::Tensor &routed_out, double beta, double linear_beta) {
     Params p = make_params(logits, bias, scale, topk_ids, topk_w, sorted_ids, sorted_w, sorted_eids, num_valid,
                            m_indices, reverse, out, counter, pad_id, valid);
-    const int64_t M = logits.size(0);
-    auto strided = [&](const at::Tensor &t, int64_t cols, const char *name) {
-        TORCH_CHECK(t.is_cuda() && t.dim() == 2 && t.size(0) == M && t.size(1) == cols && t.stride(1) == 1 &&
-                        t.stride(0) % 4 == 0 && t.scalar_type() == at::kFloat &&
-                        reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0,
-                    name, ": [M, ", cols, "] f32, unit column stride, row stride a multiple of 4, 16 B aligned");
-    };
-    strided(gate_up, 2 * SH, "gate_up");
-    strided(routed_in, LAT, "routed_in");
-    check(act, at::kBFloat16, M * SH, "act");
-    check(routed_out, at::kBFloat16, M * LAT, "routed_out");
     p.gate_up    = gate_up.data_ptr<float>();
     p.gu_stride  = gate_up.stride(0);
     p.act        = reinterpret_cast<__hip_bfloat16 *>(act.data_ptr());
