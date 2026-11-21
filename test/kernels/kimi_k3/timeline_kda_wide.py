@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 import kda_wide_case as kc  # noqa: E402
 
 POINTS = ("start", "mfma", "emit", "issued", "polled", "conv", "gates", "recur", "norm", "pub",
-          "f.slice", "f.gate", "f.mix", "xready")
+          "f.slice", "f.gate", "f.mix", "xready", "g.parked", "g.stored", "g.wsum")
 
 
 def main():
@@ -75,7 +75,14 @@ def main():
                 v = (v[v > 0] - t0).double() / 100.0  # 100 MHz -> µs
                 rows[p].append((float(v.min()), float(v.median()), float(v.max())) if len(v) else None)
         out = {"R": R, "rows": S}
-        for p in POINTS:
+        if not args.front and S > 48:
+            # the GEMM form's points 10 .. 13 (no front)
+            for p, g in zip(POINTS[10:], ("g.sums", "g.pub", "g.hpoll", "t.round1")):
+                rows[g] = rows.pop(p)
+            names = POINTS[:10] + ("g.sums", "g.pub", "g.hpoll", "t.round1") + POINTS[14:]
+        else:
+            names = POINTS
+        for p in names:
             got = [r for r in rows[p][1:] if r is not None]
             if got:
                 out[p] = [round(statistics.median(r[k] for r in got), 2) for k in range(3)]

@@ -109,7 +109,10 @@ SCALE = HD**-0.5
 # timeline points: start, gemv MFMAs done (every wave), gemv emitted, task inputs issued,
 # conv inputs polled, conv done, gates + l2norm done, recurrence done, norm done, the run's
 # non-head piece published (thread 0); the front's slice, gate and mix done, x ready
-TL_POINTS = 14
+# (the GEMM form, which has no front: the last fold's sums in LDS, its pieces
+# published, the head's poll returned, the first task round done; the parked
+# piece folded, the last fold's partials in LDS, its wave sums loaded)
+TL_POINTS = 17
 
 # a set spans at most 3 CTAs; a run at most 2 sets
 assert GROUPS * ROWS == NPROJ and SETS * G == GROUPS
@@ -615,6 +618,7 @@ def gemm_pass(c, p):
     if const_expr(park):
         if (u1 - 1) // HSTEPS != u0 // HSTEPS:
             gemm_fold(c, None, p, False)
+        stamp(c["on"], c["tls"], c["tid"], 14)
     gemm_fold(c, acc, p, True)
     stamp(c["on"], c["tls"], c["tid"], 2)
 
@@ -663,6 +667,8 @@ def gemm_fold(c, acc, p, last):
                 # the first task round's inputs, in flight under the fold
                 c["nxt"] = c["task_pre"](0)
         lds_barrier()
+        if const_expr(last and t0 + ntc == npt):
+            stamp(c["on"], c["tls"], tid, 15)
         n1 = G * ntc * 64
         s1 = []
         for it in range_constexpr((n1 + THREADS - 1) // THREADS):
@@ -678,6 +684,8 @@ def gemm_fold(c, acc, p, last):
                     )
                 )
             s1.append((tot, blk, ln, tid + THREADS * it < n1))
+        if const_expr(last and t0 + ntc == npt):
+            stamp(c["on"], c["tls"], tid, 16)
         lds_barrier()
         for tot, blk, ln, live in s1:
             if live:
@@ -687,6 +695,8 @@ def gemm_fold(c, acc, p, last):
                         tot[k], red + ((gs * ROWS + 4 * (ln // 16) + k) * SP + 16 * tl + ln % 16)
                     )
         lds_barrier()
+        if const_expr(last and t0 + ntc == npt):
+            stamp(c["on"], c["tls"], tid, 10)
         items = G * ROWS * rqc
         for it in range_constexpr((items + THREADS - 1) // THREADS):
             e = fx.min(tid + THREADS * it, items - 1)
@@ -706,6 +716,7 @@ def gemm_fold(c, acc, p, last):
             held.append((v, ok, ge, gs, r, q))
     lds_barrier()
     if const_expr(last):
+        stamp(c["on"], c["tls"], tid, 11)
         gemm_head(c, held, head, crosses, pa, n)
 
 
@@ -721,6 +732,7 @@ def gemm_head(c, held, head, crosses, pa, n):
     if head:
         pidx = [(nb * n + h[2]) * 2 + hh for h in held for nb in (nb1, nb2) for hh in (0, 1)]
         got = poll_words(c["part"], pidx, tag)
+        stamp(c["on"], c["tls"], c["tid"], 12)
         for k in range_constexpr(len(held)):
             v, ok, ge, gs, r, q = held[k]
             g1 = [f32_of(w) for w in got[4 * k] + got[4 * k + 1]]
@@ -744,17 +756,33 @@ def gemm_head(c, held, head, crosses, pa, n):
                         )  # fmt: skip
 
 
+def task_rounds(rmax):
+    """The GEMM form's task rounds at ``rmax`` requests: (split, first task) a
+    round. Whole tasks, BLOCKS a round, while more than TASK_SLOTS are left; the
+    last round's TASK_SLOTS or fewer in halves (two CTAs a task, the same bits)."""
+    n = rmax * NH
+    if n <= TASK_SLOTS:
+        return [(True, 0)]
+    out = [(False, k * BLOCKS) for k in range(n // BLOCKS)]
+    left = n - len(out) * BLOCKS
+    if left:
+        out.append((left <= TASK_SLOTS, len(out) * BLOCKS))
+    return out
+
+
 def task_pre(c):
     """Round k's task inputs on this CTA (``kda_pre``): (has, task, request, inputs)."""
     bid, a = c["bid"], c["args"]
     ntasks = c["R"] * NH
-    if const_expr(c["SPLIT"]):
-        slot, hf, per = (bid // 16) * 8 + bid % 8, (bid % 16) // 8, TASK_SLOTS
-    else:
-        slot, hf, per = bid, fx.Int32(0) * bid, BLOCKS
+    plan = task_rounds(c["RMAX"])
 
     def pre(k):
-        t = k * per + slot
+        split, base = plan[k]
+        if const_expr(split):
+            slot, hf = (bid // 16) * 8 + bid % 8, (bid % 16) // 8
+        else:
+            slot, hf = bid, fx.Int32(0) * bid
+        t = base + slot
         has = t < ntasks
         tc = uniform(fx.min(t, ntasks - 1))
         req = tc // NH
@@ -762,7 +790,8 @@ def task_pre(c):
             uniform(fx.Int32(bo.buffer_load(rsrc(a[nm]), req, vec_width=1, dtype=T.i32)))
             for nm in ("st_idx", "win_row")
         ]
-        return has, tc, req, kda_pre(c, req, tc % NH, hf, has, idx[0], idx[1])
+        k_ = kda_pre(c, req, tc % NH, hf, has, idx[0], idx[1], split)
+        return has, tc, req, dict(k_, hf=hf, split=split)
 
     return pre
 
@@ -773,18 +802,18 @@ def gemm_tasks(c):
     16 holds 8 tasks), TASK_SLOTS a round, while that is one round; else whole
     tasks (the same bits), BLOCKS a round. The first round's inputs are issued in
     the last fold (``c["nxt"]``), each next round's under the round before."""
-    split = c["SPLIT"]
-    hf = (c["bid"] % 16) // 8 if split else fx.Int32(0) * c["bid"]
-    per = TASK_SLOTS if split else BLOCKS
-    rounds = (c["RMAX"] * NH + per - 1) // per
+    rounds = len(task_rounds(c["RMAX"]))
     pre = c["task_pre"]
     nxt = c["nxt"]
     for k in range_constexpr(rounds):
         has, tc, req, kk = nxt
+        hf = kk["hf"]
         if const_expr(k + 1 < rounds):
             nxt = pre(k + 1)
         if has:
             kda_task(c, tc, req, tc % NH, hf, kk)
+        if const_expr(k == 0):
+            stamp(c["on"], c["tls"], c["tid"], 13)
 
 
 # ---------------------------------------------------------------- kda
@@ -810,7 +839,7 @@ def group_sum(v, lanes):
     return _dpp_add(v, 0x140) if lanes == 16 else v
 
 
-def kda_pre(c, req, h, hf, has, slot0, w_row):
+def kda_pre(c, req, h, hf, has, slot0, w_row, split=True):
     """The (request, head) task's inputs that need no hand-off, issued under
     the CTA's in_proj emit and not waited on there: f_b rows, constants, the
     state, the conv window (the state and f_b with no memory read unless
@@ -840,7 +869,7 @@ def kda_pre(c, req, h, hf, has, slot0, w_row):
     a_log = ld_f32(a["a_log"], h)
     dtb = [ld_f32(a["dt_bias"], h * HD + wave * 16 + 4 * (lane // 16) + i) for i in range(4)]
     lpr = HD // kp  # lanes a state row
-    rpt = (HALF if c["SPLIT"] else HD) * HD // (THREADS * kp)  # state rows a thread
+    rpt = (HALF if split else HD) * HD // (THREADS * kp)  # state rows a thread
     grp, k0 = tid // lpr, (tid % lpr) * kp
     r0 = hf * HALF + grp * rpt  # the thread's first state row
     base0 = rsrc(
@@ -883,6 +912,7 @@ def kda_task(c, task, req, h, hf, k):
     """Half ``hf`` of the (request, head) task ``task``: state rows 64 hf .. 64 hf + 63
     (``c["SPLIT"]``), or the whole task (hf 0: every state row, no swap)."""
     L, tid, kp = c["L"], c["tid"], c["KPT"]
+    split = k.get("split", c["SPLIT"])
     lane, wave = tid % 64, tid // 64
     a = c["args"]
     # read before the traced branches (a dict lookup inside one is carried state)
@@ -897,13 +927,13 @@ def kda_task(c, task, req, h, hf, k):
     win = [fx.Float32(fx.BFloat16(v)) for v in k["win"]]
     on_w = [fx.Float32(fx.BFloat16(v)) for v in k["on_w"]]
     lpr = HD // kp  # lanes a state row
-    rpt = (HALF if c["SPLIT"] else HD) * HD // (THREADS * kp)  # state rows a thread
+    rpt = (HALF if split else HD) * HD // (THREADS * kp)  # state rows a thread
     grp, k0 = tid // lpr, (tid % lpr) * kp
     r0 = hf * HALF + grp * rpt  # the thread's first state row
     # the half's share of the global writes: q / k windows and ring k on half 0,
     # v windows and ring v of the half's rows, ring g and beta on half 0
     mine = ((part < 2) & (hf == 0)) | ((part == 2) & (d // HALF == hf))
-    if const_expr(not c["SPLIT"]):
+    if const_expr(not split):
         mine = part < 3
     first = hf == 0
 
@@ -1040,7 +1070,7 @@ def kda_task(c, task, req, h, hf, k):
     stamp(c["on"], c["tls"], tid, 7)
     # the other half's outputs: 16-B tagged words, three
     # f32 of the half's (token, row) a word
-    if const_expr(c["SPLIT"]):
+    if const_expr(split):
         if tid < OXW:
             fs = [3 * tid + e for e in range(3)]
             mine_o = [
@@ -1078,7 +1108,7 @@ def kda_task(c, task, req, h, hf, k):
     )
     for u, x in ((0, x0), (1, x1)):
         if const_expr(box is None):
-            own = (hf == u) if c["SPLIT"] else (wave >= 0)
+            own = (hf == u) if split else (wave >= 0)
         else:
             # half 0 stores both halves' channels (the same values), so one
             # CTA's stores precede the box
@@ -1309,8 +1339,6 @@ def kda_body(key: KdaWideBuild, smem, role, scratch, args: dict) -> None:
     if const_expr(gemm):
         c["R"] = reqs
         c["RMAX"] = gemm_reqs(key)
-        # whole tasks, BLOCKS a round, once halves need more than one round
-        c["SPLIT"] = gemm_reqs(key) * NH <= TASK_SLOTS
         c["NPASS"] = (nt + PASS_T - 1) // PASS_T
         c["task_pre"] = task_pre(c)
         for p in range_constexpr(c["NPASS"]):
