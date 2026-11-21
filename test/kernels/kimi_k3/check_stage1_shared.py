@@ -10,9 +10,10 @@ stage1_shared, on random weights and routes.
 - ``--push``: the C18 push from the shared tiles against shared_push's standalone push of the same shared output,
   into 8 emulated peer buffers on this GPU, every rank: slots and flags bit for bit.
 
-``run_case(case, push=None)`` is the entry point for a TP8 check: one MoE call on ``make_case(m, seed, device)``,
-``push`` = (launches, peers, rank, epoch, slot) as ``SharedPushAr.slots`` / ``push_args(layer)``; returns (latent,
-shared_out)."""
+Entry points for a TP8 check (each rank, its own GPU):
+- ``run_case(case, push=None)``: one MoE call on ``make_case(m, seed, device)``; ``push`` = (launches, peers, rank,
+  epoch, slot), i.e. (``SharedPushAr.launches``, ``*SharedPushAr.push_args(layer)``); returns (latent, shared_out);
+- ``bench_case(case, push=None)``: its per-call µs (a CUDA graph of 8 calls, median of 20 replays)."""
 
 import argparse
 import json
@@ -130,6 +131,52 @@ def check_push(case, launches=93, slot=5):
     return out
 
 
+def _graph_us(fn, reps=20, calls=8):
+    import statistics
+
+    for _ in range(3):
+        fn()
+    torch.cuda.synchronize()
+    gr = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(gr):
+        for _ in range(calls):
+            fn()
+    gr.replay()
+    torch.cuda.synchronize()
+    ts = []
+    for _ in range(reps):
+        e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        e0.record()
+        gr.replay()
+        e1.record()
+        torch.cuda.synchronize()
+        ts.append(e0.elapsed_time(e1) * 1000 / calls)
+    return round(statistics.median(ts), 2)
+
+
+def bench_case(case, push=None, reps=20):
+    """Per-call µs of ``run_case(case, push)`` in a CUDA graph."""
+    return _graph_us(lambda: run_case(case, push), reps=reps)
+
+
+def time_push(case, launches=93, slot=5):
+    """Per-call µs of the fused MoE call without and with the push (into emulated peers on this GPU: the peer
+    writes land in this GPU's HBM, not over XGMI)."""
+    from sgl_amd_mono.common import guard
+    from sgl_amd_mono.kimi_k3.gfx950.stages import shared_push as S
+
+    dev = case["front"].device
+    bufs = [torch.empty(S.peer_bytes(), dtype=torch.uint8, device=dev) for _ in range(S.TP)]
+    for b in bufs:
+        S.arm(b)
+    table = torch.tensor([b.data_ptr() for b in bufs], dtype=torch.int64, device=dev)
+    epoch = torch.zeros(guard.GUARD_WORDS, dtype=torch.int32, device=dev)
+    a = _graph_us(lambda: run_case(case))
+    b = _graph_us(lambda: run_case(case, push=(launches, table, 1, epoch, slot)))
+    a2 = _graph_us(lambda: run_case(case))
+    return dict(us_fused=a, us_fused_push=b, us_fused_aa=a2, d_push=round(b - (a + a2) / 2, 2))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("out")
@@ -154,6 +201,7 @@ def main():
                  out_rel=rl(l1, l0), out_rel_aa=rl(l0b, l0))
         if args.push:
             r["push_mismatched_bytes"] = check_push(case)
+            r.update(time_push(case))
         res[m] = r
         print("CHECK", m, json.dumps(r), flush=True)
     json.dump(res, open(args.out, "w"), indent=1)
