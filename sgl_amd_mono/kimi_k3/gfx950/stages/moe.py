@@ -990,11 +990,16 @@ def stage_route(c, t):
     route_v = c.get("route_v", 0)
     rlog_parts = c.get("rlog_parts", False)
     batch = c.get("batch", False)
+    per = E // 64
+    # the bias first: its loads land while the logits' parts are awaited
+    bias = []
+    for i in range_constexpr(per):
+        e = lane + 64 * i
+        bias.append(bo_ld_f32(a["bias"], e))
     if const_expr(rlog_parts):
         route_parts(c, t)
     if wave == 0:
         s = c["S"]
-        per = E // 64
         if const_expr(rlog_parts):
             # the parts summed in part order (``route_parts`` put them in LDS)
             lgs = []
@@ -1026,7 +1031,7 @@ def stage_route(c, t):
             e = lane + 64 * i
             lg = lgs[i]
             sg = hw_rcp(fx.Float32(1.0) + hw_exp2(lg * fx.Float32(-LOG2E)))
-            sc = sg + bo_ld_f32(a["bias"], e)
+            sc = sg + bias[i]
             # a NaN logit (a warmup's garbage row) ranks last
             keys.append(_okey((sc == sc).select(sc, fx.Float32(-3.0e38))))
             sigs.append((sg == sg).select(sg, fx.Float32(0.0)))

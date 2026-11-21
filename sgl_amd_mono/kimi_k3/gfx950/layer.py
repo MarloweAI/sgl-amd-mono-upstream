@@ -565,6 +565,7 @@ def k2_body(key: K2Build, k2_lds: K2Lds, scratch_base, args: dict) -> None:
     tl = args["tl"]
     tail = args["tail"]
     s, ns = key.tokens, key.nblocks + 1
+    gate_local = s <= WAVES and tail_seam.GATE_OFF + 16 * s * ns <= WAVES * 64 * 4
     lay = scratch_layout(key)
     play = peer_layout(s)
     half = peer_bytes(s) // 2
@@ -627,7 +628,9 @@ def k2_body(key: K2Build, k2_lds: K2Lds, scratch_base, args: dict) -> None:
             # its producers and pushed to every rank
             "route_v": 2,
             "latq_push": True,
-            "gate_local": False,
+            # every CTA its own source weights (no gate CTA, no WGT hop) where
+            # a wave a token and the group sums fit ``red``
+            "gate_local": gate_local,
             "debug": False,
             "eps": key.eps,
             "out_eps": key.out_eps,
@@ -797,8 +800,9 @@ def k2_body(key: K2Build, k2_lds: K2Lds, scratch_base, args: dict) -> None:
             stamp(on, tls, tid, 1)
             slice_prefix(c, bid, sld)
             stamp(on, tls, tid, 2)
-            if bid < s:
-                stage_gate(c, bid)
+            if const_expr(not gate_local):
+                if bid < s:
+                    stage_gate(c, bid)
             stamp(on, tls, tid, 8)
             stage_mix(c, bid)
             if const_expr(key.opt & OPT_SENT):
