@@ -961,34 +961,10 @@ class _SglFronts:
         return out
 
 
-# The MLA layer whose decode a tail follows: aiter's split reduce dispatch
-# hands over its arguments (and does not run). None outside such a call.
-_TAIL_PENDING = None
 # The widest steps' fused_qkv_a and g_proj run as one GEMM on their
 # concatenated weights: from 24 requests it is faster than the two (5.6 us at
 # 144 rows, 8 at 180); below, the two separate tuned GEMMs are.
 QKV_G_MIN_ROWS = 144
-
-
-def _tail_hooks() -> None:
-    """aiter's reduce dispatch, routed past its work while a tail's layer
-    runs its decode (``_TAIL_PENDING``); every other call, and every call
-    while another copy of this module is the loaded one, runs as aiter's."""
-    import sys
-
-    import aiter.mla as am
-
-    mod = sys.modules[__name__]
-    reduce = am._mla_decode_reduce_v1_dispatch
-
-    @functools.wraps(reduce)
-    def dispatch(*args):
-        pend = mod._TAIL_PENDING if sys.modules.get(__name__) is mod else None
-        if pend is None:
-            return reduce(*args)
-        pend["reduce"] = args
-
-    am._mla_decode_reduce_v1_dispatch = dispatch
 
 
 def _fp8_dtype():
@@ -1024,17 +1000,19 @@ ABSORB_MIN_ROWS = 36
 
 
 class _SglTails:
-    """The MLA prologue, aiter's decode and the tail inside SGLang's own MLA
+    """The MLA prologue, the decode and the tail inside SGLang's own MLA
     attention at the verify widths past the front's, ``mla_tail.MIN_ROWS`` ..
     ``MAX_ROWS``. SGLang's ROCm MLA prepare runs (fused_qkv_a, the q / kv
     norms, q_b over all 96 heads, the absorb); then, in place of its core:
-    ``mla_prologue`` (the decode's e4m3 q and this rank's KV records), aiter's
-    cp round-robin decode on SGLang's plan, ``mla_tail`` on its split partials
-    (the reduce, W_UV, the DCP exchange, the LSE combine and the output gate),
-    and SGLang's o_proj on the gated core. Every other step of these layers is
-    SGLang's own forward. One static rule a width."""
+    ``mla_prologue`` (the decode's e4m3 q and this rank's KV records),
+    ``mla_decode_b`` (its split plan once a step, from SGLang's DCP KV
+    indices), ``mla_tail`` on its split partials (the reduce, W_UV, the DCP
+    exchange, the LSE combine and the output gate), and SGLang's o_proj on
+    the gated core. Every other step of these layers is SGLang's own
+    forward. One static rule a width."""
 
     def __init__(self, runner, entries: list, rows: frozenset) -> None:
+        from sgl_amd_mono.kimi_k3.gfx950.attention import mla_decode_b as mdb
         from sgl_amd_mono.kimi_k3.gfx950.attention import mla_tail as mt
 
         dev = runner.device
@@ -1042,8 +1020,13 @@ class _SglTails:
         self.core = {r: _front_core_buffer(r, dev) for r in rows}
         self.q8 = {r: torch.empty(r, mt.NHA, mt.mf.DQK, dtype=_fp8_dtype(), device=dev) for r in rows}
         self.out = {r: torch.empty(r, mt.NHA, mt.KV, dtype=torch.bfloat16, device=dev) for r in rows}
-        # the decode's q and KV scales: SGLang's 1.0 (an e4m3 KV with no scale)
-        self.one = torch.ones((), dtype=torch.float32, device=dev)
+        self.lse = {r: torch.empty(r, mt.NHA, dtype=torch.float32, device=dev) for r in rows}
+        # the decode's split partials and the reduce's maps, one set for every layer
+        self.bufs = mdb.DecodeBuffers(dev)
+        # the softmax scale of every MLA layer's gathered-head attention
+        scales = {e.attn.attn_mqa_for_dcp_decode.scaling for e in entries}
+        assert len(scales) == 1, scales
+        self.dkey = mdb.MlaDecodeBuild(scale=scales.pop())
 
     @classmethod
     def install(cls, backbone, runner, vcs: dict, widths):
@@ -1073,7 +1056,6 @@ class _SglTails:
         ]  # fmt: skip
         self = cls(runner, entries, rows)
         self._warmup()
-        _tail_hooks()
         for e in entries:
             e.attn.forward_absorb_rocm_core = functools.partial(self.core_forward, e)
             e.attn.forward_absorb_rocm_prepare = functools.partial(self.prepare, e)
@@ -1090,8 +1072,10 @@ class _SglTails:
         return self
 
     def _warmup(self) -> None:
-        """Every build once: the prologue on no owned row, both A2A copies'
-        tails on no reduce tile and every row empty, in an epoch of their own."""
+        """Every build once: the prologue on no owned row, the decode's plan and
+        decode on requests with no key, both A2A copies' tails on no reduce
+        tile and every row empty, in an epoch of their own."""
+        from sgl_amd_mono.kimi_k3.gfx950.attention import mla_decode_b as mdb
         from sgl_amd_mono.kimi_k3.gfx950.attention import mla_prologue as mp
         from sgl_amd_mono.kimi_k3.gfx950.attention import mla_tail as mt
         from sgl_amd_mono.kimi_k3.gfx950.layer import scratch_region
@@ -1115,6 +1099,14 @@ class _SglTails:
                     else dict(q_nope_out=torch.zeros(s, mt.NHA, mt.KV, dtype=bf, device=dev))
                 ),
             )  # fmt: skip
+        nreq = s // mt.G_ROWS
+        ptr = torch.zeros(nreq + 1, dtype=i32, device=dev)
+        mdb.mla_decode_plan_launch(kv_ptr=ptr, g_ptr=ptr, nreq=nreq, bufs=self.bufs)
+        mdb.mla_decode_launch(
+            self.dkey, q8=self.q8[s], kv=torch.zeros(8, mp.DQK, dtype=torch.uint8, device=dev),
+            kv_idx=torch.zeros(1, dtype=i32, device=dev), kv_ptr=ptr, g_ptr=ptr, rank=self.runner.dcp_rank,
+            o=self.out[s], lse=self.lse[s], bufs=self.bufs,
+        )  # fmt: skip
         self.runner.step_begin()
         for e in self.entries[:2]:
             mt.mla_tail_launch(
@@ -1202,9 +1194,8 @@ class _SglTails:
     def core_forward(self, e, q_pe, k_pe, q_nope_out, k_nope, forward_batch, zero_allocator,
                      positions, topk_indices, llama_4_scaling, q_nope_unabsorbed=None):  # fmt: skip
         """``forward_absorb_rocm_core`` of layer ``e``: at a wide width's
-        target verify, the prologue, aiter's decode, the tail and SGLang's
-        o_proj on the gated core."""
-        global _TAIL_PENDING
+        target verify, the prologue, the decode (its plan before the first
+        layer's), the tail and SGLang's o_proj on the gated core."""
         attn = e.attn
         rows = q_pe.shape[0]
         if not (forward_batch.forward_mode.is_target_verify() and rows in self.rows):
@@ -1212,9 +1203,9 @@ class _SglTails:
                 attn, q_pe, k_pe, q_nope_out, k_nope, forward_batch, zero_allocator,
                 positions, topk_indices, llama_4_scaling, q_nope_unabsorbed,
             )  # fmt: skip
-        from sglang.srt.layers.attention import aiter_backend as ab
         from sglang.srt.model_executor.forward_context import get_attn_backend
 
+        from sgl_amd_mono.kimi_k3.gfx950.attention import mla_decode_b as mdb
         from sgl_amd_mono.kimi_k3.gfx950.attention import mla_prologue as mp
         from sgl_amd_mono.kimi_k3.gfx950.attention import mla_tail as mt
         from sgl_amd_mono.kimi_k3.gfx950.layer import scratch_region
@@ -1240,32 +1231,24 @@ class _SglTails:
             kv=kv.view(torch.uint8).view(-1, mp.DQK), rank=self.runner.dcp_rank,
             **(dict(q_b=q_nope_unabsorbed, w_kc=attn.w_kc_qrep) if absorb else {}),
         )  # fmt: skip
-        out = self.out[rows]
-        pend = {}
-        _TAIL_PENDING = pend
-        try:
-            _, lse = ab.mla_decode_fwd(
-                q8, kv.view(-1, 1, 1, mp.DQK), out, fm.qo_indptr, fm.cprr_kv_indptr,
-                fm.cprr_kv_indices, fm.kv_last_page_len, fm.max_q_len, sm_scale=layer.scaling,
-                work_meta_data=fm.work_metadata, work_indptr=fm.work_indptr,
-                work_info_set=fm.work_info_set, reduce_indptr=fm.reduce_indptr,
-                reduce_final_map=fm.reduce_final_map, reduce_partial_map=fm.reduce_partial_map,
-                q_scale=self.one, kv_scale=self.one,
-                intra_batch_mode=backend.cprr_intra_batch_mode,
-                num_kv_splits=backend._kernel_num_kv_splits(), return_lse=True,
-                g_kv_indptr=fm.global_kv_indptr, cp_world_size=backend.dcp_world_size,
-                cp_rank=self.runner.dcp_rank, causal=True,
+        out, lse, bufs = self.out[rows], self.lse[rows], self.bufs
+        assert layer.scaling == self.dkey.scale
+        if e.first:
+            # once a step: the split plan and the reduce's maps, from this rank's key counts
+            mdb.mla_decode_plan_launch(
+                kv_ptr=fm.cprr_kv_indptr, g_ptr=fm.global_kv_indptr, nreq=rows // mt.G_ROWS, bufs=bufs
             )  # fmt: skip
-        finally:
-            _TAIL_PENDING = None
-        logits, plse, indptr, fmap, pmap, _, _, o, red_lse = pend["reduce"]
-        assert o.data_ptr() == out.data_ptr()
+        mdb.mla_decode_launch(
+            self.dkey, q8=q8, kv=kv.view(torch.uint8).view(-1, mp.DQK), kv_idx=fm.cprr_kv_indices,
+            kv_ptr=fm.cprr_kv_indptr, g_ptr=fm.global_kv_indptr, rank=self.runner.dcp_rank,
+            o=out, lse=lse, bufs=bufs,
+        )  # fmt: skip
         gate = attn._compute_output_gate(attn._gate_hidden_states)
         attn._gate_hidden_states = None
         core = self.core[rows]
         mt.mla_tail_launch(
-            e.key, s=rows, logits=logits, plse=plse, indptr=indptr, fmap=fmap, pmap=pmap,
-            o=out, lse=red_lse.view(rows, mt.NHA), empty=fm.cprr_empty_rows, w_vc=e.w_vc,
+            e.key, s=rows, logits=bufs.logits, plse=bufs.plse, indptr=bufs.indptr, fmap=bufs.fmap,
+            pmap=bufs.pmap, o=out, lse=lse, empty=fm.cprr_empty_rows, w_vc=e.w_vc,
             gate=gate, core=core, scratch=scratch_region(self.runner.scratch, "mla_tail"),
             peers=self.runner.peer.addresses, rank=self.runner.dcp_rank, layer=e.i,
             epoch=self.runner.epoch,
