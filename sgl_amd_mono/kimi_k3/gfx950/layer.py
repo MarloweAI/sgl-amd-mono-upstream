@@ -265,8 +265,6 @@ def scratch_regions(
     - ``attn``: the one-launch KDA layer's attention, then its core;
     - ``tpart``, ``tstream``: K2's tail seam, its slices' partials and the
       stream rows it pushes (``tail_part_bytes``, ``tail_stream_bytes``).
-    - ``mla_tail``: the MLA tail past SGLang's decode at the wider verify
-      steps (``mla_tail.scratch_layout``, the same at every width).
 
     Every launch takes its offset from here, and the end sizes the runner's
     allocation (``scratch_alloc_bytes``)."""
@@ -274,7 +272,6 @@ def scratch_regions(
     from sgl_amd_mono.kimi_k3.gfx950.attention import kda_wide as kw
     from sgl_amd_mono.kimi_k3.gfx950.attention import mla_front as mf
     from sgl_amd_mono.kimi_k3.gfx950.attention import mla_pre
-    from sgl_amd_mono.kimi_k3.gfx950.attention import mla_tail
 
     widths = range(1, rows + 1)
     sizes = {
@@ -297,7 +294,6 @@ def scratch_regions(
         # K2's tail seam (``TailSeam``): the slices' partials and the stream rows
         "tpart": tail_part_bytes(rows),
         "tstream": tail_stream_bytes(rows),
-        "mla_tail": mla_tail.scratch_bytes(),
     }
     out, off = {}, 0
     for name, n in sizes.items():

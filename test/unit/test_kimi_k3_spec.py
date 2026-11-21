@@ -19,6 +19,7 @@ from sgl_amd_mono.kimi_k3 import (
     K2_MAX_ROWS,
     LINEAR_ATTN_CONFIG,
     MAX_BLOCKS,
+    MAX_ROWS,
 )
 from sgl_amd_mono.kimi_k3 import spec as k3
 
@@ -240,9 +241,6 @@ def test_the_scratch_regions_are_disjoint_at_every_width(rows, front_rows):
             for x_in in (False, True):
                 key = mf.MlaFrontBuild(tokens=s, nblocks=nb, scale=1.0, x_in=x_in)
                 assert mf.scratch_bytes(key) <= reg["front"][1], (s, nb, x_in)
-    from sgl_amd_mono.kimi_k3.gfx950.attention import mla_tail as mt
-
-    assert mt.scratch_bytes() <= reg["mla_tail"][1]
 
     for s in range(k1.WIDE_FROM_REQS * kw.WT, rows + 1, kw.WT):
         for nb in blocks:
