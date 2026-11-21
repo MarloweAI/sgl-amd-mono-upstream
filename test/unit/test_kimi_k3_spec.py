@@ -226,7 +226,7 @@ def test_the_scratch_regions_are_disjoint_at_every_width(rows, front_rows):
     assert all(o % 4096 == 0 for o, _ in spans)
     for (o0, n0), (o1, _) in zip(spans, spans[1:]):
         assert o0 + n0 <= o1, reg
-    blocks = range(1, MAX_BLOCKS + 1)
+    blocks = range(0, MAX_BLOCKS + 1)
     k2_end = max(
         layer.scratch_bytes(layer.K2Build(tokens=s, nblocks=nb, core_box=cb))
         for s in range(1, rows + 1) for nb in blocks for cb in (False, True)
