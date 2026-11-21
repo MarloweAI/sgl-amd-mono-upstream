@@ -118,7 +118,22 @@ def merged(out_o, out_lse, bufs, s):
     return o, lse
 
 
-def run_ours(q8, b, bufs):
+def timeline(q8, b, bufs):
+    """The "tl" probe's per-CTA clocks (s_memtime ticks; us at 100 MHz... ratio
+    to the shader clock printed): plan, item setup, step loops, epilogues,
+    barrier waits, DMA issue; items, steps."""
+    tl = torch.zeros(256 * 8, dtype=torch.int32, device=q8.device)
+    _, _, go = run_ours(q8, b, bufs, "tl", tl)
+    go()
+    torch.cuda.synchronize()
+    t = tl.view(256, 8).double().cpu()
+    names = ["plan", "setup", "steps", "epilogue", "barrier", "dma", "items", "nsteps"]
+    tot = t[:, 1] + t[:, 2] + t[:, 3]
+    i = int(tot.argmax())
+    print("  timeline (ticks): " + ", ".join(f"{n} mean {t[:, k].mean():.0f} busiest-CTA {t[i, k]:.0f}" for k, n in enumerate(names)))
+
+
+def run_ours(q8, b, bufs, probe="", tl=None):
     from sgl_amd_mono.kimi_k3.gfx950.attention import mla_decode as md
 
     s = q8.shape[0]
@@ -127,8 +142,8 @@ def run_ours(q8, b, bufs):
 
     def go():
         md.mla_decode_launch(
-            md.MlaDecodeBuild(scale=SCALE), q8=q8, kv=b.pool, kv_idx=b.kv_idx, kv_ptr=b.kv_ptr,
-            g_ptr=b.g_kv_ptr, rank=b.r, o=o, lse=lse, bufs=bufs,
+            md.MlaDecodeBuild(scale=SCALE, probe=probe), q8=q8, kv=b.pool, kv_idx=b.kv_idx, kv_ptr=b.kv_ptr,
+            g_ptr=b.g_kv_ptr, rank=b.r, o=o, lse=lse, bufs=bufs, tl=tl,
         )  # fmt: skip
 
     return o, lse, go
@@ -210,6 +225,11 @@ def case(ps, args, dev, bufs):
             print(f"  rank {r}: o rel-L2 to fp64 ours {e_ours:.3e} B300-numerics {e_b3:.3e} (ratio {ratio:.3f}); "
                   f"max |lse - ref| {e_lse:.2e}; splits with partials {nsp}", flush=True)  # fmt: skip
         if args.time and r == args.ranks[0]:
+            for pr in args.probes:
+                _, _, pgo = run_ours(q8, b, bufs, pr)
+                print(f"  probe {pr}: {ct.graph_us(pgo):.1f} us", flush=True)
+            if args.timeline:
+                timeline(q8, b, bufs)
             t_ours = ct.graph_us(go)
             ago, info = aiter_decode(q8, b)
             t_aiter = ct.graph_us(ago)
@@ -228,13 +248,15 @@ def main():
     ap.add_argument("--ranks", type=int, nargs="+", default=[0, 5])
     ap.add_argument("--qstd", type=float, default=0.5, help="q's std (4: a peaky softmax)")
     ap.add_argument("--check", action="store_true")
+    ap.add_argument("--timeline", action="store_true")
+    ap.add_argument("--probes", nargs="*", default=[], help="timing probes (mla_decode.MlaDecodeBuild.probe)")
     ap.add_argument("--time", action="store_true")
     ap.add_argument("--compile", action="store_true", help="compile-only build (no GPU)")
     args = ap.parse_args()
     if args.compile:
         from sgl_amd_mono.kimi_k3.gfx950.attention import mla_decode as md
 
-        md.build(md.MlaDecodeBuild(scale=SCALE))(*([0] * 14), stream=0)
+        md.build(md.MlaDecodeBuild(scale=SCALE))(*([0] * 15), stream=0)
         print("COMPILE_OK", flush=True)
         return
     from sgl_amd_mono.kimi_k3.gfx950.attention import mla_decode as md

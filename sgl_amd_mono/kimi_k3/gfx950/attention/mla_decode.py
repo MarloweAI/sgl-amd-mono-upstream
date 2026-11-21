@@ -50,7 +50,7 @@ import torch
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, range_constexpr, rocdl
-from flydsl.expr.typing import Int32, Int64, T
+from flydsl.expr.typing import Int32, Int64, T, as_ir_value
 
 from sgl_amd_mono.common.ops import ballot, hw_exp2, read_lane_i32, rsrc, uniform, xred
 from sgl_amd_mono.common.plan import BLOCKS, kernel_sources, key_tuple
@@ -79,11 +79,10 @@ PRE = 8.0
 NEG = -1e30
 LN2 = 0.6931471805599453
 LOG2E = 1.4426950408889634
-# a request's splits: its blocks over a run of at most CAP_NUM / CAP_DEN of a
-# CTA's share of the batch's work
-CAP_NUM, CAP_DEN = 1, 2
-TBL = 8  # plan table words a request
-T_R, T_N, T_NB, T_IPRE, T_L, T_P, T_PB, T_ITEMS = range(TBL)
+# a request's split: a run of W_NUM / W_DEN of a CTA's share of the batch's work
+W_NUM, W_DEN = 11, 10
+TBL = 10  # plan table words a class
+T_R, T_KIND, T_N, T_NB, T_WR, T_IPRE, T_L, T_P, T_PB = range(9)
 
 
 def partial_rows() -> int:
@@ -94,6 +93,8 @@ def partial_rows() -> int:
 @dataclass(frozen=True)
 class MlaDecodeBuild:
     scale: float  # the softmax scale
+    # timing probes only (checks): parts of a block's work left out
+    probe: str = ""
 
 
 _BUILDS: dict = {}
@@ -129,6 +130,17 @@ def _mfma(a, b, c):
 def _e4m3x4(v):
     lo = fx.Int32(rocdl.cvt_pk_fp8_f32(T.i32, v[0], v[1], fx.Int32(0), False))
     return fx.Int32(rocdl.cvt_pk_fp8_f32(T.i32, v[2], v[3], lo, True))
+
+
+def _dma1(rs, lds_ptr, voff):
+    """One wave-wide 16-byte-a-lane LDS DMA (lane i's 16 bytes at ``lds_ptr``
+    + 16 i), async: its LDS writes are waited for by ``wait_asyncmark`` only."""
+    z = as_ir_value(fx.Int32(0))
+    rocdl.raw_ptr_buffer_load_async_lds(rs, lds_ptr.llvm_ptr, as_ir_value(fx.Int32(16)), as_ir_value(fx.Int32(voff)), z, z)
+
+
+def _memtime():
+    return fx.Int64(llvm.call_intrinsic(T.i64, "llvm.amdgcn.s.memtime", [], [], []))
 
 
 def _bar():
@@ -190,6 +202,8 @@ def _rows(c, i):
         kk = blk * BK + lane
         ok = (blk < c["en"][sl]) & (kk < L)
         idx = _ld(c["kv_idx"], c["kvp"] + fx.max(fx.Int32(0), fx.min(kk, L - 1)))
+        if const_expr("l2" in c["probe"]):
+            idx = idx % BK
         out.append(ok.select(idx, fx.Int32(0)))
     return out
 
@@ -197,81 +211,108 @@ def _rows(c, i):
 @flyc.jit
 def _dma(c, i, rows):
     """Step i's slots straight into ring buffer i % 2, a padded 592-byte row a
-    key (``rows``: ``_rows`` of step i): wave w issues the DMAs w, w + 4 .."""
+    key (``rows``: ``_rows`` of step i): wave w issues the DMAs w, w + 4 ..
+    (DMA 36 on wave 0 only); a slot's row offsets gathered first, so one LDS
+    wait covers them."""
     lane, wave = c["lane"], c["wave"]
+    nd = -(-DMA_N // WAVES)
     for sl in range_constexpr(2):
         blk = c["st"][sl] + c["stride"] * i
         base = c["ring"] + ((i % 2) * 2 + sl) * SLOT_W
         if (i < c["nsteps"]) & (blk < c["en"][sl]):
-            for dj in range_constexpr(-(-DMA_N // WAVES)):
-                d = wave + WAVES * dj
-                pc = d * 64 + lane
+            voffs = []
+            for dj in range_constexpr(nd):
+                pc = (wave + WAVES * dj) * 64 + lane
                 kq = fx.min(pc // PIECES, BK - 1)
                 part = pc % PIECES
                 off = fx.Int32(rocdl.ds_bpermute(T.i32, kq * 4, rows[sl]))
-                voff = (part < PIECES - 1).select(off * DQK + part * 16, fx.Int32(0))
-                if d < DMA_N:
-                    rocdl.raw_ptr_buffer_load_lds(c["r_kv"], (base + d * 256).llvm_ptr, 16, voff, fx.Int32(0), 0, 0)
+                voffs.append((part < PIECES - 1).select(off * DQK + part * 16, fx.Int32(0)))
+            for dj in range_constexpr(nd):
+                d = wave + WAVES * dj
+                if const_expr(WAVES * (dj + 1) <= DMA_N):
+                    _dma1(c["r_kv"], (base + d * 256), voffs[dj])
+                else:
+                    if d < DMA_N:
+                        _dma1(c["r_kv"], (base + d * 256), voffs[dj])
 
 
 @flyc.jit
 def plan(c, tbl, kv_ptr, g_ptr, nreq, rank, indptr, fmap, pmap, bid, tid):
-    """The step's split plan in LDS ``tbl`` (a request a row, in deal order),
-    by wave 0 (a request a lane); CTA 0 also writes the CSR maps. Returns the
-    item count."""
+    """The step's split plan in LDS ``tbl``, by wave 0. A request's splits are
+    runs of ``w`` blocks (the batch's work a CTA, x 1.1), the last the rest (at
+    most 64 splits: then runs of ceil(blocks / 64)). Its items fall in two
+    classes: A, the full items of its whole runs and the pairs of the halves
+    of runs (2 p, 2 p + 1), cost w; B, the last run's full items (and its lone
+    half when the count is odd), cost the rest. The classes go to ``tbl`` a row
+    each, longest first: the deal order. CTA 0 also writes the CSR maps.
+    Returns the item count."""
     lane = tid % 64
     if tid < 64:
+        # lane r: request r
         r = fx.min(lane, nreq - 1)
         live = lane < nreq
-        k0 = _ld(kv_ptr, r)
-        L = live.select(_ld(kv_ptr, r + 1) - k0, fx.Int32(0))
+        L = live.select(_ld(kv_ptr, r + 1) - _ld(kv_ptr, r), fx.Int32(0))
         P = _ld(g_ptr, r + 1) - _ld(g_ptr, r) - G
         nb = (L + BK - 1) // BK
         w9 = _wave_sum(9 * nb)
-        cap = fx.max(fx.Int32(1), w9 * CAP_NUM // (2 * BLOCKS * CAP_DEN))
-        n = fx.min(fx.min(fx.Int32(MAX_SPLITS), fx.max(nb, fx.Int32(1))), (nb + cap - 1) // cap)
-        n = fx.max(n, fx.Int32(1))
-        # an even count past one split, where the blocks allow it: its half
-        # items pair up
-        odd = (n > 1) & (n % 2 == 1) & (n < fx.min(fx.Int32(MAX_SPLITS), nb))
-        n = odd.select(n + 1, n)
-        items = live.select(4 * n + (n + 1) // 2, fx.Int32(0))
-        cost = live.select((nb + n - 1) // n, fx.Int32(-1))
+        w = fx.max(fx.Int32(1), (w9 * W_NUM + 2 * BLOCKS * W_DEN - 1) // (2 * BLOCKS * W_DEN))
+        n = fx.max(fx.Int32(1), (nb + w - 1) // w)
+        wr = (n > MAX_SPLITS).select((nb + MAX_SPLITS - 1) // MAX_SPLITS, w)
+        n = fx.max(fx.Int32(1), (nb + wr - 1) // wr)
+        rho = nb - (n - 1) * wr
         multi = live & (n > 1)
-        rk = fx.Int32(0)
-        ipre = fx.Int32(0)
+        msplits = multi.select(n, fx.Int32(0))
         pbase = fx.Int32(0)
         tile = fx.Int32(0)
         for r2 in range(nreq):
-            c2 = read_lane_i32(cost, r2)
-            i2 = read_lane_i32(items, r2)
-            m2 = read_lane_i32(multi.select(n, fx.Int32(0)), r2)
-            before = (c2 > cost) | ((c2 == cost) & (r2 < r))
-            rk = before.select(rk + 1, rk)
-            ipre = before.select(ipre + i2, ipre)
+            m2 = read_lane_i32(msplits, r2)
             pbase = (r2 < r).select(pbase + m2, pbase)
             tile = ((r2 < r) & (m2 > 0)).select(tile + 1, tile)
-        total = _wave_sum(items)
-        if live:
-            row = tbl + rk * TBL
-            for f, v in ((T_R, r), (T_N, n), (T_NB, nb), (T_IPRE, ipre), (T_L, L), (T_P, P), (T_PB, G * pbase), (T_ITEMS, items)):
-                fx.ptr_store(fx.Int32(v), row + f)
         if bid == 0:
-            nsplit = _wave_sum(multi.select(n, fx.Int32(0)))
+            nsplit = _wave_sum(msplits)
             ntile = _wave_sum(multi.select(fx.Int32(1), fx.Int32(0)))
             if multi:
                 bo.buffer_store(pbase, rsrc(indptr), tile)
                 bo.buffer_store(fx.Int32(G) * r, rsrc(fmap), 2 * tile)
                 bo.buffer_store(fx.Int32(G) * r + G, rsrc(fmap), 2 * tile + 1)
-                for s in range(n):
-                    bo.buffer_store(G * (pbase + s), rsrc(pmap), pbase + s)
+                for sp in range(n):
+                    bo.buffer_store(G * (pbase + sp), rsrc(pmap), pbase + sp)
             if lane >= ntile:
                 if lane <= MAX_REQS:
                     bo.buffer_store(nsplit, rsrc(indptr), lane)
+        # lane c: class c % 2 of request c / 2
+        cr = fx.min(lane // 2, nreq - 1)
+        kind = lane % 2
+        clive = lane < 2 * nreq
+
+        def gather(v):
+            return fx.Int32(rocdl.ds_bpermute(T.i32, cr * 4, fx.Int32(v)))
+
+        n_c, nb_c, wr_c, rho_c = gather(n), gather(nb), gather(wr), gather(rho)
+        L_c, P_c, pb_c = gather(L), gather(P), gather(pbase)
+        cnt = (kind == 0).select(4 * (n_c - 1) + n_c // 2, 4 + n_c % 2)
+        cnt = clive.select(cnt, fx.Int32(0))
+        cost = (cnt > 0).select((kind == 0).select(wr_c, rho_c), fx.Int32(-1))
+        rk = fx.Int32(0)
+        ipre = fx.Int32(0)
+        for c2 in range(2 * nreq):
+            k2 = read_lane_i32(cost, c2)
+            i2 = read_lane_i32(cnt, c2)
+            before = (k2 > cost) | ((k2 == cost) & (c2 < lane))
+            rk = before.select(rk + 1, rk)
+            ipre = before.select(ipre + i2, ipre)
+        total = _wave_sum(cnt)
+        if clive:
+            row = tbl + rk * TBL
+            for f, v in (
+                (T_R, cr), (T_KIND, kind), (T_N, n_c), (T_NB, nb_c), (T_WR, wr_c), (T_IPRE, ipre),
+                (T_L, L_c), (T_P, P_c), (T_PB, G * pb_c),
+            ):  # fmt: skip
+                fx.ptr_store(fx.Int32(v), row + f)
         if lane == 0:
-            fx.ptr_store(total, tbl + MAX_REQS * TBL)
+            fx.ptr_store(total, tbl + 2 * MAX_REQS * TBL)
     _bar()
-    return fx.Int32(fx.ptr_load(tbl + MAX_REQS * TBL))
+    return fx.Int32(fx.ptr_load(tbl + 2 * MAX_REQS * TBL))
 
 
 def build(key: MlaDecodeBuild):
@@ -279,18 +320,24 @@ def build(key: MlaDecodeBuild):
         return _BUILDS[key]
     keyed = key_tuple(key, SOURCES)
     qk_c = key.scale * LOG2E
+    probe = key.probe
 
     @fx.struct
     class Smem:
         kv: fx.Array[fx.Int32, 4 * SLOT_W, 16]
-        tbl: fx.Array[fx.Int32, MAX_REQS * TBL + 4, 16]
+        tbl: fx.Array[fx.Int32, 2 * MAX_REQS * TBL + 4, 16]
 
     @flyc.kernel(name="k3_mono_mla_decode", known_block_size=[THREADS, 1, 1])
     def mla_decode(
         q8: Int64, kv: Int64, kv_idx: Int64, kv_ptr: Int64, g_ptr: Int64, nreq: Int32, rank: Int32,
         o: Int64, lse: Int64, logits: Int64, plse: Int64, indptr: Int64, fmap: Int64, pmap: Int64,
+        tl: Int64,
     ):  # fmt: skip
         _ = keyed
+        tlon = "tl" in probe
+        z = fx.Int64(0)
+        tk0 = _memtime() if const_expr(tlon) else z
+        t_set, t_loop, t_epi, t_bar, t_dma, n_it, n_st = z, z, z, z, z, z, z
         bid, tid = fx.block_idx.x, fx.thread_idx.x
         lane = tid % 64
         wave = uniform(tid // 64)
@@ -299,6 +346,7 @@ def build(key: MlaDecodeBuild):
         lds = fx.SharedAllocator().allocate(Smem).peek()
         ring, tbl = lds.kv.ptr, lds.tbl.ptr
         nitems = plan(None, tbl, kv_ptr, g_ptr, nreq, rank, indptr, fmap, pmap, bid, tid)
+        t_plan = (_memtime() - tk0) if const_expr(tlon) else z
         r_kv = rsrc(kv)
         # this CTA's place: XCD-major (CTA c runs on XCD c % 8)
         place = (bid % 8) * (BLOCKS // 8) + bid // 8
@@ -306,30 +354,33 @@ def build(key: MlaDecodeBuild):
         last_place = (full_rounds % 2 == 0).select(place, BLOCKS - 1 - place)
         nrounds = full_rounds + (last_place < nitems % BLOCKS).select(fx.Int32(1), fx.Int32(0))
         for rnd in range(nrounds):
+            ta = _memtime() if const_expr(tlon) else z
             k = rnd * BLOCKS + (rnd % 2 == 0).select(place, BLOCKS - 1 - place)
-            # the item's request: the last table row whose first item is <= k
+            # the item's class: the last table row whose first item is <= k
             rk = fx.Int32(0)
-            for r2 in range(nreq):
+            for r2 in range(2 * nreq):
                 rk = (fx.Int32(fx.ptr_load(tbl + r2 * TBL + T_IPRE)) <= k).select(r2, rk)
             row = tbl + rk * TBL
             rq = uniform(fx.ptr_load(row + T_R))
+            kind = uniform(fx.ptr_load(row + T_KIND))
             n = uniform(fx.ptr_load(row + T_N))
             nb = uniform(fx.ptr_load(row + T_NB))
+            wr = uniform(fx.ptr_load(row + T_WR))
             L = uniform(fx.ptr_load(row + T_L))
             P = uniform(fx.ptr_load(row + T_P))
             pb = uniform(fx.ptr_load(row + T_PB))
             q = k - uniform(fx.ptr_load(row + T_IPRE))
-            npair = n // 2
-            in_pairs = q < 9 * npair
-            w9 = q % 9
-            qq = q - 9 * npair
             # item kind and its splits: s_a (waves 0-1, every wave of a full
             # item), s_b (waves 2-3 of a pair)
-            full = in_pairs.select(w9 < 8, qq < 4)
-            lone = (~in_pairs) & (qq == 4)
-            s_a = in_pairs.select(2 * (q // 9) + (w9 < 8).select(w9 // 4, fx.Int32(0)), n - 1)
-            s_b = in_pairs.select(2 * (q // 9) + 1, n - 1)
-            g = in_pairs.select(w9 % 4, qq)
+            nf = 4 * (n - 1)
+            in_a = kind == 0
+            full = in_a.select(q < nf, q < 4)
+            pair = in_a & (q >= nf)
+            lone = (~in_a) & (q == 4)
+            s_a = in_a.select((q < nf).select(q // 4, 2 * (q - nf)), n - 1)
+            s_b = in_a.select(2 * (q - nf) + 1, n - 1)
+            g = q % 4
+            _ = pair
             # this wave's split, wave tile and slots
             mine_b = (~full) & (wave >= 2)
             s_w = mine_b.select(s_b, s_a)
@@ -340,8 +391,8 @@ def build(key: MlaDecodeBuild):
             j = wt // 3
             head = 32 * (wt % 3) + n32
             # the slots' blocks: slot 0 split s_a, slot 1 s_b (s_a of a full item)
-            a0, a1 = nb * s_a // n, nb * (s_a + 1) // n
-            b0, b1 = nb * s_b // n, nb * (s_b + 1) // n
+            a0, a1 = s_a * wr, fx.min((s_a + 1) * wr, nb)
+            b0, b1 = s_b * wr, fx.min((s_b + 1) * wr, nb)
             st0 = a0
             st1 = full.select(a0 + 1, b0)
             en0 = a1
@@ -351,16 +402,18 @@ def build(key: MlaDecodeBuild):
             kvp = _ld(kv_ptr, rq)
             # the keys this wave's row sees in its split
             vis = fx.max(fx.Int32(0), fx.min(L, (P + j - rank + 8 * DCP) // 8 - DCP + 1))
-            sw_end = nb * (s_w + 1) // n
+            sw_end = fx.min((s_w + 1) * wr, nb)
             lim = fx.min(vis, fx.min(L, sw_end * BK))
 
             sc = {
                 "st": (st0, st1), "en": (en0, en1), "stride": stride, "nsteps": nsteps, "L": L,
                 "kvp": kvp, "kv_idx": kv_idx, "r_kv": r_kv, "ring": ring, "wave": wave, "lane": lane,
+                "probe": probe,
             }  # fmt: skip
             # every wave done with the ring before this item's first DMA
             _bar()
             _dma(sc, fx.Int32(0), _rows(sc, fx.Int32(0)))
+            rocdl.asyncmark()
             nxt = _rows(sc, fx.Int32(1))
             # the wave's q: 9 K steps of 32 bytes a lane (dims 64 kc + 32 hb ..)
             qrow = ((G * rq + j) * NHA + head) * DQK
@@ -372,13 +425,26 @@ def build(key: MlaDecodeBuild):
             m = fx.Float32(NEG)
             l = fx.Float32(0.0)
             rocdl.s_waitcnt(vmcnt=0)
+            if const_expr(tlon):
+                tb = _memtime()
+                t_set = t_set + (tb - ta)
+                n_it = n_it + 1
+            # a step: its DMAs landed (every wave's), then the next step's DMAs
+            # out (every wave a share of both slots) under this step's blocks
+            nxt0, nxt1 = nxt[0], nxt[1]
             for i in range(nsteps):
-                # this step's DMAs landed (the next rows' loads may be in flight)
-                rocdl.s_waitcnt(vmcnt=2)
+                t0 = _memtime() if const_expr(tlon) else z
+                rocdl.wait_asyncmark(0)
                 _bar()
-                rows = nxt
-                _dma(sc, i + 1, rows)
-                nxt = _rows(sc, i + 2)
+                if const_expr(tlon):
+                    t1 = _memtime()
+                    t_bar = t_bar + (t1 - t0)
+                    n_st = n_st + 1
+                if const_expr("nodma" not in probe):
+                    _dma(sc, i + 1, [nxt0, nxt1])
+                rocdl.asyncmark()
+                r20 = _rows(sc, i + 2)
+                nxt0, nxt1 = r20[0], r20[1]
                 for sl in range(slo, shi):
                     blk = (sl == 0).select(st0, st1) + stride * i
                     en = (sl == 0).select(en0, en1)
@@ -394,7 +460,8 @@ def build(key: MlaDecodeBuild):
                             if const_expr(u + 1 < 2 * (DQK // 64)):
                                 kops = _k_op(kb, n32, hb, u + 1)
                             rocdl.sched_barrier(0)
-                            sacc[t] = _mfma(cur, qops[kc], sacc[t])
+                            if const_expr("noqk" not in probe):
+                                sacc[t] = _mfma(cur, qops[kc], sacc[t])
                             rocdl.sched_barrier(0)
                         lim_b = lim - blk * BK
                         xs = []
@@ -408,7 +475,10 @@ def build(key: MlaDecodeBuild):
                         mb = xred(fx.Float32(mb), 32, fx.max)
                         need = mb > m + TAU
                         started = m > fx.Float32(NEG * 0.5)
-                        if ballot(need & started) != fx.Int64(0):
+                        resc = ballot(need & started) != fx.Int64(0)
+                        if const_expr("noresc" in probe):
+                            resc = fx.Int32(0) != fx.Int32(0)
+                        if resc:
                             a = need.select(hw_exp2(m - mb), fx.Float32(1.0))
                             acc = [fx.Vector.from_elements([fx.Float32(v[e]) * a for e in range(16)], fx.Float32) for v in acc]
                             l = l * a
@@ -430,8 +500,10 @@ def build(key: MlaDecodeBuild):
                             if const_expr(d + 1 < KV // 32):
                                 vt = _v_op(kb, lane, hb, d + 1)
                             rocdl.sched_barrier(0)
-                            acc[d] = _mfma(cur, pw, acc[d])
+                            if const_expr("nopv" not in probe):
+                                acc[d] = _mfma(cur, pw, acc[d])
                             rocdl.sched_barrier(0)
+            tc = _memtime() if const_expr(tlon) else z
             # the split's output: the lane pair's sums, O / l
             lt = xred(fx.Float32(l), 32, lambda x, y: x + y)
             okl = lt > fx.Float32(0.0)
@@ -439,7 +511,14 @@ def build(key: MlaDecodeBuild):
             lval = okl.select((m - PRE + fx.Float32(rocdl.log(T.f32, fx.Float32(lt).ir_value()))) * LN2, fx.Float32(NEG))
             direct = n == 1
             prow = direct.select(G * rq + j, pb + G * s_w + j)
-            if active:
+            if const_expr("nostore" in probe):
+                ssum = lval
+                for d in range_constexpr(KV // 32):
+                    for e in range_constexpr(16):
+                        ssum = ssum + fx.Float32(acc[d][e])
+                if active:
+                    bo.buffer_store(ssum, rsrc(lse), (G * rq + j) * NHA + head)
+            if active & const_expr("nostore" not in probe):
                 for d in range_constexpr(KV // 32):
                     for qd in range_constexpr(4):
                         dim = 32 * d + 8 * qd + 4 * hb
@@ -454,15 +533,24 @@ def build(key: MlaDecodeBuild):
                         bo.buffer_store(lval, rsrc(lse), prow * NHA + head)
                     else:
                         bo.buffer_store(lval, rsrc(plse), prow * NHA + head)
+            if const_expr(tlon):
+                td = _memtime()
+                t_loop = t_loop + (tc - tb)
+                t_epi = t_epi + (td - tc)
+        if const_expr(tlon):
+            if tid == 0:
+                vals = [t_plan, t_set, t_loop, t_epi, t_bar, t_dma, n_it, n_st]
+                for f in range_constexpr(8):
+                    bo.buffer_store(fx.Int32(vals[f]), rsrc(tl), bid * 8 + f)
 
     @flyc.jit
     def launch(
         q8: Int64, kv: Int64, kv_idx: Int64, kv_ptr: Int64, g_ptr: Int64, nreq: Int32, rank: Int32,
         o: Int64, lse: Int64, logits: Int64, plse: Int64, indptr: Int64, fmap: Int64, pmap: Int64,
-        stream: fx.Stream = _STREAM,
+        tl: Int64, stream: fx.Stream = _STREAM,
     ):  # fmt: skip
         _ = keyed
-        mla_decode(q8, kv, kv_idx, kv_ptr, g_ptr, nreq, rank, o, lse, logits, plse, indptr, fmap, pmap).launch(
+        mla_decode(q8, kv, kv_idx, kv_ptr, g_ptr, nreq, rank, o, lse, logits, plse, indptr, fmap, pmap, tl).launch(
             grid=(BLOCKS,), block=(THREADS,), stream=stream
         )
 
@@ -483,7 +571,7 @@ class DecodeBuffers:
         self.pmap = torch.zeros(MAX_PART, dtype=i32, device=device)
 
 
-def mla_decode_launch(key: MlaDecodeBuild, *, q8, kv, kv_idx, kv_ptr, g_ptr, rank, o, lse, bufs):
+def mla_decode_launch(key: MlaDecodeBuild, *, q8, kv, kv_idx, kv_ptr, g_ptr, rank, o, lse, bufs, tl=None):
     """Host launcher. ``q8`` e4m3 [S, 96, 576] (S = 6 a request); ``kv`` this
     rank's pool rows [., 576] e4m3; ``kv_idx`` int32 the requests' local key
     rows, ``kv_ptr`` int32 [R + 1] their offsets; ``g_ptr`` int32 [R + 1] the
@@ -503,5 +591,6 @@ def mla_decode_launch(key: MlaDecodeBuild, *, q8, kv, kv_idx, kv_ptr, g_ptr, ran
     build(key)(
         q8.data_ptr(), kv.data_ptr(), kv_idx.data_ptr(), kv_ptr.data_ptr(), g_ptr.data_ptr(), nreq, rank,
         o.data_ptr(), lse.data_ptr(), bufs.logits.data_ptr(), bufs.plse.data_ptr(), bufs.indptr.data_ptr(),
-        bufs.fmap.data_ptr(), bufs.pmap.data_ptr(), stream=torch.cuda.current_stream(),
+        bufs.fmap.data_ptr(), bufs.pmap.data_ptr(), 0 if tl is None else tl.data_ptr(),
+        stream=torch.cuda.current_stream(),
     )  # fmt: skip
