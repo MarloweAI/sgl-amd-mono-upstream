@@ -86,6 +86,10 @@ TP_SIZE = 8
 # The decode context parallel sizes the launches run at. Under DCP the attention
 # hands o_proj the same TP-local 12-head core as without it.
 DCP_SIZES = (1, 8)
+# the DCP fronts 18 .. 30 rows wide run the decode core (mla_decode_c64) through
+# W_UV; narrower and wider steps their own attention (tier 0, 8K, a layer: the
+# core +4.1 us at 6 rows, +0.8 at 12, -14.9 at 18, -20.8 at 24)
+C64_ROWS = (18, 30)
 # K2's OPT_* bits (gfx950/layer.py: sentinel all-reduces, preloads, tagged x rows,
 # router partials, batched polls), each bit for bit the launch without it; unset
 # is layer.K2_OPT, all of them.
@@ -385,7 +389,8 @@ def _build(model, hf_config, ctx):
         fronts = [p for _, p in sorted(layers[rows].items()) if p.front is not None]
         for n, p in enumerate(fronts):
             key, w = p.front
-            p.front = (dataclasses.replace(key, qg_par=n % 2), w)
+            core = "c64" if C64_ROWS[0] <= rows <= C64_ROWS[1] else "f"
+            p.front = (dataclasses.replace(key, qg_par=n % 2, core=core, mla_ord=n), w)
         # FlyDSL compiles a launcher on its first call, and the first real call
         # is inside a CUDA graph capture, where compiling aborts the process.
         # A compile-only call cannot stand in: with zero arguments the buffer
@@ -973,7 +978,7 @@ def _front_warmup(runner, packed, rows: int, blocks) -> None:
         core=_front_core_buffer(rows, dev),
         scratch=scratch_region(runner.scratch, "front"),
         peers=runner.peer.addresses, rank=runner.dcp_rank, layer=packed.i,
-        epoch=runner.epoch,
+        epoch=runner.epoch, plan=True,
     )  # fmt: skip
 
 
@@ -1056,7 +1061,7 @@ class _SglFronts:
                 core=self.core[rows],
                 scratch=scratch_region(self.runner.scratch, "front"),
                 peers=self.runner.peer.addresses, rank=self.runner.dcp_rank,
-                layer=e.i, epoch=self.runner.epoch,
+                layer=e.i, epoch=self.runner.epoch, plan=True,
             )  # fmt: skip
         torch.cuda.synchronize()
 

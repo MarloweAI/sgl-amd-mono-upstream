@@ -274,6 +274,10 @@ class MlaFrontBuild:
     write_idx: int = -1  # a block-write layer's block: the updated prefix stored there
     # the QG copy: the parity of the layer's ordinal among the step's MLA fronts
     qg_par: int = 0
+    # the attention through W_UV: this kernel's own ("f") or the decode core's
+    # (``mla_decode_c64``, "c64"), whose counters a layer are the MLA ordinal's
+    core: str = "f"
+    mla_ord: int = 0
     timeline: bool = False
     # checks only: the W_UV records also to ``send`` in SGLang's all-to-all
     # layout [8, S, 12, 130]
@@ -921,6 +925,51 @@ def qg_wait(c, rq, h0, nh):
         src = (tid == 0).select(s0, s1)
         c["poll"]([(Addr("qgf", Space.PEER, qg_base(c, c["rank"]) + fx.Int64(QG_DATA)), src * MAX_REQS + rq, 1)])
 
+
+@flyc.jit
+def qg_wait_wave(c, rq, h0, nh):
+    """``qg_wait`` for the calling wave alone: its lanes 0 and 1 poll the
+    sources' flags, so the wave's later loads follow them and no barrier is
+    needed (the decode core's hooks run on some of a CTA's waves)."""
+    lane = c["tid"] % 64
+    s0 = h0 // NHL
+    s1 = (h0 + nh - 1) // NHL
+    if lane < 2:
+        src = (lane == 0).select(s0, s1)
+        c["poll"]([(Addr("qgf", Space.PEER, qg_base(c, c["rank"]) + fx.Int64(QG_DATA)), src * MAX_REQS + rq, 1)])
+
+
+@flyc.jit
+def kvrdy_wave(c, rq):
+    """Request rq's KVRDY for the calling wave alone (its lane 0 polls)."""
+    kvrdy = c["kvrdy"]
+    if c["tid"] % 64 == 0:
+        c["poll"]([(kvrdy, rq, 1)])
+
+
+def core_hooks(c):
+    """The decode core's hooks inside this launch (``mla_decode_c64``): q from
+    this rank's QG copy; at a piece's start the QG flags of its heads' sources;
+    before its request's last block KVRDY (``stage_kv`` wrote the new tokens'
+    pool rows); its records into the owners' all-to-all cells, rounded to bf16
+    there once (``mla_combine``). Every wait is the calling wave's own."""
+
+    def q_load(rq, head, t, byte):
+        return qg_load4(c, rq, head, t, byte)
+
+    def ready(rq, h0, nh):
+        qg_wait_wave(c, rq, h0, nh)
+
+    def kv_ready(rq):
+        kvrdy_wave(c, rq)
+
+    def emit_values(owner, hl, t, col, vals):
+        mc.push_values(c, owner, hl, t, col, vals)
+
+    def emit_lse(owner, hl, t, lse):
+        mc.push_lse(c, owner, hl, t, lse)
+
+    return {"q_load": q_load, "ready": ready, "kv_ready": kv_ready, "emit_values": emit_values, "emit_lse": emit_lse}
 
 def qg_load4(c, rq, head, t, byte):
     """16 bytes of row t's q of head ``head`` (request rq) from this rank's QG copy."""
@@ -2165,6 +2214,9 @@ ARGS = (
 def build(key: MlaFrontBuild):
     if key in _BUILDS:
         return _BUILDS[key]
+    # here, not at the top: the core's module imports mla_tail, which imports this one
+    from sgl_amd_mono.kimi_k3.gfx950.attention import mla_decode_c64 as mdc
+
     s = key.tokens
     nreq = reqs_of(s)
     wd = wide(s)
@@ -2222,13 +2274,24 @@ def build(key: MlaFrontBuild):
         xl: fx.Array[fx.Int32, s * OL_ROW // 2, 16]
         wl: fx.Array[fx.Int32, KV * UV_ROW // 2, 16]
 
-    @fx.union
-    class RoleLds:
-        attn: AttnLds
-        gemv: GemvLds
-        absorb: AbsLds
-        core: CoreLds
-        uv: UvLds
+    if key.core == "c64":
+
+        @fx.union
+        class RoleLds:
+            attn: AttnLds
+            gemv: GemvLds
+            absorb: AbsLds
+            dec: mdc.Smem  # the decode core's, the whole of it
+
+    else:
+
+        @fx.union
+        class RoleLds:
+            attn: AttnLds
+            gemv: GemvLds
+            absorb: AbsLds
+            core: CoreLds
+            uv: UvLds
 
     @fx.struct
     class Smem:
@@ -2249,6 +2312,8 @@ def build(key: MlaFrontBuild):
         kv_nw: Int64, w_qb: Int64, w_kc: Int64, w_vc: Int64, kv: Int64, kv_idx: Int64,
         kv_ptr: Int64, g_kv_ptr: Int64, loc: Int64, core: Int64, send: Int64,
         scratch: Int64, peers: Int64, rank: Int32, layer: Int32, epoch: Int64, tl: Int64,
+        dec_part: Int64, dec_plse: Int64, dec_wq: Int64, dec_cnt: Int64,
+        dec_o: Int64, dec_lse: Int64, dec_half: Int64,
     ):  # fmt: skip
         _ = keyed
         # Every wait of this launch runs under the guard: one past its deadline
@@ -2265,7 +2330,11 @@ def build(key: MlaFrontBuild):
             lds = alloc.allocate(Smem).peek()
             role = alloc.allocate(RoleLds)
             al, gl = role.attn.peek(), role.gemv.peek()
-            abl, cl, ul = role.absorb.peek(), role.core.peek(), role.uv.peek()
+            abl = role.absorb.peek()
+            if const_expr(key.core == "c64"):
+                dl = role.dec.peek()
+            else:
+                cl, ul = role.core.peek(), role.uv.peek()
             mb = Mailbox(step_tag(epoch, layer) - 1)
             gate = scratch + fx.Int64(lay["g"][0])
             c = {
@@ -2287,8 +2356,6 @@ def build(key: MlaFrontBuild):
                 "newkv": scratch + fx.Int64(lay["newkv"][0]),
                 "pv": scratch + fx.Int64(lay["pv"][0]),
                 "ml": scratch + fx.Int64(lay["ml"][0]),
-                "kvl": cl.kv.ptr, "pl": cl.p.ptr, "al": cl.alpha.ptr, "mll": cl.ml.ptr,
-                "qll": cl.q.ptr if nreq == 1 else None, "vt": cl.vt.ptr if nreq > 1 else None,
                 "records": key.records, "gate0": S1_GATE0, "gbuf": gate,
                 "a2a_peer": mc.PeerRegions(peers, key.qg_par),
                 "args": {
@@ -2300,6 +2367,11 @@ def build(key: MlaFrontBuild):
                     "send": send, "core": core, "q_lora": 0, "peers": peers,
                 },
             }  # fmt: skip
+            if const_expr(key.core != "c64"):
+                c.update({
+                    "kvl": cl.kv.ptr, "pl": cl.p.ptr, "al": cl.alpha.ptr, "mll": cl.ml.ptr,
+                    "qll": cl.q.ptr if nreq == 1 else None, "vt": cl.vt.ptr if nreq > 1 else None,
+                })  # fmt: skip
             for region in ("part", "wgt", "msq", "xrdy", "ss", "qrdy", "absrdy", "kvrdy", "itrdy", "grdy"):
                 c[region] = sreg(scratch, lay[region][0], region)
             if const_expr(wd):
@@ -2383,46 +2455,64 @@ def build(key: MlaFrontBuild):
             if bid == QG_FLAG_CTA:
                 qg_flags(c)
             stamp(on, tls, tid, 5)
-            if const_expr(nreq == 1):
-                _, _, _, n, _ = request(c)
-                if bid < nhg * n:
-                    attention1(c, 0, bid // n, bid % n, bid % n + 1)
-            else:
-                # the assignment with the smaller modelled busiest CTA (DEAL_CTA's
-                # choice; a function of the batch alone)
-                assert nhg == NHG_W
-                dealt = deal_read(c)
-                # contiguous ranges a run at a time, or the dealt items one at a
-                # time; the range kept in LDS, so nothing more stays live across
-                # the attention than the loop's count
-                rng = contig_runs(c, bid)
-                tot = fx.ptr_load(c["rqt"] + RQT_TOT)
-                count = dealt.select(dealt_count(tot, bid), rng[3])
-                if tid == 0:
-                    for f in range_constexpr(3):
-                        fx.ptr_store(rng[f], c["balw"] + (1 + f))
+            if const_expr(key.core == "c64"):
+                # the decode core through W_UV, its records into the owners'
+                # all-to-all cells; its LDS is the whole union
                 gpu.barrier()
-                for i in range(count):
-                    dealt = fx.ptr_load(c["balw"] + 0) != 0
-                    rng = tuple(fx.ptr_load(c["balw"] + (1 + f)) for f in range(3)) + (count,)
-                    rc, hc, sac, sbc = contig_run(c, rng, i)
-                    rd, hd, spd = dealt_item(c, dealt_place(bid, i))
-                    rq = dealt.select(rd, rc)
-                    hg = dealt.select(hd, hc)
-                    sa = dealt.select(spd, sac)
-                    sb = dealt.select(spd + 1, sbc)
-                    if sb > sa:
-                        attention(c, rq, hg, sa, sb)
-            c["xl"], c["wl"] = ul.xl.ptr, ul.wl.ptr
-            if const_expr(wd):
-                # every CTA's share of the (head, row) merges, then W_UV a (head, half)
-                stage_merge(c, bid)
-                if bid < UV_CTAS:
-                    stage_wuv(c, bid)
+                dec_a = {
+                    "kv": kv, "kv_idx": kv_idx, "kv_ptr": kv_ptr, "g_ptr": g_kv_ptr, "rank": rank,
+                    "o": dec_o, "lse": dec_lse, "part": dec_part, "plse": dec_plse, "wq": dec_wq,
+                    "cnt": dec_cnt, "layer": fx.Int32(key.mla_ord), "wuv": w_vc, "half": dec_half,
+                    "tl": fx.Int64(0),
+                }
+                hk = core_hooks(c)
+                mdc.decode_stage(
+                    mdc.MlaDecodeBuild(scale=key.scale), dl, bid, tid, dec_a, hk["q_load"], hk["ready"],
+                    hk["kv_ready"], hk["emit_values"], hk["emit_lse"],
+                )  # fmt: skip
+                # the combine's LDS (the attention role's) over the core's
+                gpu.barrier()
             else:
-                # one request: a (head, half) task merges its head's rows itself
-                if bid < UV_CTAS:
-                    stage_uv(c, bid)
+                if const_expr(nreq == 1):
+                    _, _, _, n, _ = request(c)
+                    if bid < nhg * n:
+                        attention1(c, 0, bid // n, bid % n, bid % n + 1)
+                else:
+                    # the assignment with the smaller modelled busiest CTA (DEAL_CTA's
+                    # choice; a function of the batch alone)
+                    assert nhg == NHG_W
+                    dealt = deal_read(c)
+                    # contiguous ranges a run at a time, or the dealt items one at a
+                    # time; the range kept in LDS, so nothing more stays live across
+                    # the attention than the loop's count
+                    rng = contig_runs(c, bid)
+                    tot = fx.ptr_load(c["rqt"] + RQT_TOT)
+                    count = dealt.select(dealt_count(tot, bid), rng[3])
+                    if tid == 0:
+                        for f in range_constexpr(3):
+                            fx.ptr_store(rng[f], c["balw"] + (1 + f))
+                    gpu.barrier()
+                    for i in range(count):
+                        dealt = fx.ptr_load(c["balw"] + 0) != 0
+                        rng = tuple(fx.ptr_load(c["balw"] + (1 + f)) for f in range(3)) + (count,)
+                        rc, hc, sac, sbc = contig_run(c, rng, i)
+                        rd, hd, spd = dealt_item(c, dealt_place(bid, i))
+                        rq = dealt.select(rd, rc)
+                        hg = dealt.select(hd, hc)
+                        sa = dealt.select(spd, sac)
+                        sb = dealt.select(spd + 1, sbc)
+                        if sb > sa:
+                            attention(c, rq, hg, sa, sb)
+                c["xl"], c["wl"] = ul.xl.ptr, ul.wl.ptr
+                if const_expr(wd):
+                    # every CTA's share of the (head, row) merges, then W_UV a (head, half)
+                    stage_merge(c, bid)
+                    if bid < UV_CTAS:
+                        stage_wuv(c, bid)
+                else:
+                    # one request: a (head, half) task merges its head's rows itself
+                    if bid < UV_CTAS:
+                        stage_uv(c, bid)
             stamp(on, tls, tid, 9)
             # the owner's combine and output gate, a (request, local head) a
             # task on the last CTAs
@@ -2438,15 +2528,23 @@ def build(key: MlaFrontBuild):
         kv_nw: Int64, w_qb: Int64, w_kc: Int64, w_vc: Int64, kv: Int64, kv_idx: Int64,
         kv_ptr: Int64, g_kv_ptr: Int64, loc: Int64, core: Int64, send: Int64,
         scratch: Int64, peers: Int64, rank: Int32, layer: Int32, epoch: Int64, tl: Int64,
+        dec_part: Int64, dec_plse: Int64, dec_wq: Int64, dec_cnt: Int64,
+        dec_o: Int64, dec_lse: Int64, dec_half: Int64,
         stream: fx.Stream = _STREAM,
     ):  # fmt: skip
         _ = keyed
         mla_front(
             prefix, blocks, blk_sm, blk_sr, ares_nw, ares_qk, in_nw, w_qkv, w_g, q_nw,
             kv_nw, w_qb, w_kc, w_vc, kv, kv_idx, kv_ptr, g_kv_ptr, loc, core, send,
-            scratch, peers, rank, layer, epoch, tl,
+            scratch, peers, rank, layer, epoch, tl, dec_part, dec_plse, dec_wq, dec_cnt,
+            dec_o, dec_lse, dec_half,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)  # fmt: skip
 
+    if key.core == "c64":
+        # the decode core's registers: no AGPRs, its accumulators in VGPRs; no
+        # packed fp32 (it serializes with the MFMAs) -- as its own launch
+        mdc._agpr_hint_lowering()
+        launch = flyc.compile[{"agpr_alloc": 0, "llvm_options": {"slp-threshold": 100000}}](launch)
     _BUILDS[key] = launch
     return launch
 
@@ -2474,7 +2572,7 @@ def weight_ok(name, t) -> bool:
 
 def mla_front_launch(
     key: MlaFrontBuild, *, prefix, blocks, w, kv, kv_idx, kv_ptr, g_kv_ptr, loc,
-    core, scratch, peers, rank, layer, epoch, send=None, tl=None,
+    core, scratch, peers, rank, layer, epoch, send=None, tl=None, plan=None,
 ):  # fmt: skip
     """Host launcher. ``w``: ares_nw, ares_qk, in_nw, q_nw, kv_nw and the
     ``WEIGHT_SHAPES`` weights (bf16, contiguous); ``kv``: this rank's e4m3 KV
@@ -2488,6 +2586,8 @@ def mla_front_launch(
     uses); ``send`` [8, S, 12, 130] bf16 out, a ``records`` build only;
     ``w_qb`` / ``w_kc`` this rank's 12 heads' shards. An ``x_in`` build takes
     the x rows [S, 7168] bf16 as ``prefix`` and no ``blocks`` (None)."""
+    from sgl_amd_mono.kimi_k3.gfx950.attention import mla_decode_c64 as mdc
+
     if key.x_in:
         assert blocks is None and key.write_idx < 0
         assert prefix.is_contiguous() and tuple(prefix.shape) == (key.tokens, HIDDEN)
@@ -2507,6 +2607,17 @@ def mla_front_launch(
     if send is not None:
         assert tuple(send.shape) == (DCP, key.tokens, NHL, REC) and send.dtype == torch.bfloat16
     assert tuple(core.shape) == (key.tokens, GATE) and core.dtype == torch.bfloat16 and core.is_contiguous()
+    dec = (0,) * 7
+    if key.core == "c64":
+        bufs = dec_buffers(core.device)
+        if key.mla_ord == 0 if plan is None else plan:
+            # the step's work list, once a step: its first front launches it
+            # (``plan``: a warmup of some of the layers launches it before each)
+            mdc.mla_decode_plan_launch(kv_ptr=kv_ptr, g_ptr=g_kv_ptr, nreq=nreq, bufs=bufs)
+        dec = (
+            bufs.part.data_ptr(), bufs.plse.data_ptr(), bufs.wq.data_ptr(), bufs.cnt.data_ptr(),
+            bufs.o.data_ptr(), bufs.lse.data_ptr(), bufs.half.data_ptr(),
+        )
     f = build(key)
     f(
         prefix.data_ptr(), *blk,
@@ -2515,9 +2626,26 @@ def mla_front_launch(
         w["kv_nw"].data_ptr(), w["w_qb"].data_ptr(), w["w_kc"].data_ptr(),
         w["w_vc"].data_ptr(), kv.data_ptr(), kv_idx.data_ptr(), kv_ptr.data_ptr(),
         g_kv_ptr.data_ptr(), loc.data_ptr(), core.data_ptr(), ptr(send),
-        scratch.data_ptr(), peers.data_ptr(), rank, layer, epoch.data_ptr(), ptr(tl),
+        scratch.data_ptr(), peers.data_ptr(), rank, layer, epoch.data_ptr(), ptr(tl), *dec,
         stream=torch.cuda.current_stream(),
     )  # fmt: skip
+
+
+_DEC = {}
+
+
+def dec_buffers(device):
+    """The decode core's work list, counters and split partials, one set a
+    device: the layers run in turn, so they share it."""
+    from sgl_amd_mono.kimi_k3.gfx950.attention import mla_decode_c64 as mdc
+
+    if device not in _DEC:
+        b = mdc.DecodeBuffers(device)
+        # the merged o and LSE between the core's pieces and its W_UV units
+        b.o = torch.zeros(MAX_REQS * G_ROWS * NHA * KV, dtype=torch.bfloat16, device=device)
+        b.lse = torch.zeros(MAX_REQS * G_ROWS * NHA, dtype=torch.float32, device=device)
+        _DEC[device] = b
+    return _DEC[device]
 
 
 def scratch_view(key: MlaFrontBuild, scratch, name: str, dtype, shape):
