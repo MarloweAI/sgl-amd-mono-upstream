@@ -77,6 +77,19 @@ def _sync(device: torch.device) -> torch.Tensor:
     return s
 
 
+def check_g1(g1: dict) -> int:
+    """The bucket of this stage-1 call; AssertionError if its stock kernel is not the bucket's."""
+    rows = g1["n_tokens"]
+    assert MIN_ROWS <= rows <= MAX_ROWS, rows
+    b = bucket(rows)
+    want1 = dict(BM=BM, BN=128, BK=256, inline_quant=True, interleave=True, native_scale_layout=True, a_dtype="fp8",
+                 out_dtype="fp8", act="situv2", num_waves=4, k_wave=1, NE=EXPERTS, D_HIDDEN=HIDDEN, D_INTER=INTER,
+                 topk=TOPK, **_STOCK[b]["g1"])
+    got1 = {k: g1.get(k) for k in want1}
+    assert got1 == want1 and g1.get("bias") is None, (got1, want1)
+    return b
+
+
 def check(g1: dict, g2: dict) -> int:
     """The bucket of this call; AssertionError if its stock kernels are not the bucket's."""
     rows = g1["n_tokens"]

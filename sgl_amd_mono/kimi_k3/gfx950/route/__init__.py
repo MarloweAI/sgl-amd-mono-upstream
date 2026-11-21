@@ -106,3 +106,77 @@ def route_sort(
         moe_buf_ptr=out.data_ptr(),
     )
     return w, ids, aux
+
+
+SH = 768  # the shared experts' intermediate a rank
+
+
+def route_sort_shared(
+    logits: torch.Tensor,
+    bias: torch.Tensor,
+    out: torch.Tensor,
+    gate_up: torch.Tensor,
+    routed_in: torch.Tensor,
+    beta: float,
+    linear_beta: float,
+    scale: float = 1.0,
+    valid: torch.Tensor | None = None,
+    act: torch.Tensor | None = None,
+    routed: torch.Tensor | None = None,
+):
+    """``route_sort`` plus, on its own CTAs, the shared experts' SiTU of ``gate_up`` [m, 1536] f32 (the front's
+    gate | up columns) into ``act`` [m, 768] bf16, and ``routed_in`` [m, 3584] f32 cast to bf16: SGLang's
+    situ_and_mul launch with its cast, bit for bit. Returns (topk_weights, topk_ids, presort dict, act, routed
+    bf16; ``act`` / ``routed`` when given)."""
+    m = logits.shape[0]
+    dev = logits.device
+    ms = sorted_rows(m)
+    i32 = torch.int32
+    ids = torch.empty(m, TOPK, dtype=i32, device=dev)
+    w = torch.empty(m, TOPK, dtype=torch.float32, device=dev)
+    if act is None:
+        act = torch.empty(m, SH, dtype=torch.bfloat16, device=dev)
+    if routed is None:
+        routed = torch.empty(m, LAT, dtype=torch.bfloat16, device=dev)
+    aux = dict(
+        sorted_token_ids=torch.empty(ms, dtype=i32, device=dev),
+        sorted_weights=torch.empty(ms, dtype=torch.float32, device=dev),
+        sorted_expert_ids=torch.empty(ms // BM, dtype=i32, device=dev),
+        num_valid_ids=torch.empty(2, dtype=i32, device=dev),
+        m_indices=torch.empty(ms, dtype=i32, device=dev),
+        reverse_sorted=torch.empty(m * TOPK, dtype=i32, device=dev),
+    )
+    ops().route_sort_shared(
+        logits,
+        bias,
+        float(scale),
+        ids,
+        w,
+        aux["sorted_token_ids"],
+        aux["sorted_weights"],
+        aux["sorted_expert_ids"],
+        aux["num_valid_ids"],
+        aux["m_indices"],
+        aux["reverse_sorted"],
+        out,
+        _counter(dev),
+        pad_id(m),
+        valid,
+        gate_up,
+        act,
+        routed_in,
+        routed,
+        float(beta),
+        float(linear_beta),
+    )
+    aux.update(
+        topk_ids_ptr=ids.data_ptr(),
+        topk_weights_ptr=w.data_ptr(),
+        M=m,
+        block_m=BM,
+        num_experts=E,
+        topk=TOPK,
+        moe_buf_zeroed=True,
+        moe_buf_ptr=out.data_ptr(),
+    )
+    return w, ids, aux, act, routed

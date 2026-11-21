@@ -15,7 +15,12 @@
 //
 // One launch, no wait on another CTA: route CTAs (8 rows each, a wave a row) write their routes, count themselves
 // done, and the last one to finish sorts all of them; the zero CTAs clear the stage-2 output meanwhile.
+//
+// route_sort_shared also runs, on its own CTAs, what SGLang's situ_and_mul launch does for the shared experts: their
+// SiTU of the front's fp32 gate_up into the bf16 shared-down input, and the fp32 routed input's bf16 cast (bit for
+// bit: sgl_kernel's ROCm sigmoid __frcp_rn(1 + exp2(-log2e x)), tanhf, __float2bfloat16).
 #include <cstdint>
+#include <hip/hip_bf16.h>
 
 #include <ATen/ATen.h>
 #include <ATen/hip/HIPContext.h>
@@ -49,6 +54,8 @@ constexpr int PR         = MAX_PAIRS / THREADS; // routes a sorting thread
 constexpr int MAX_SORTED = (MAX_PAIRS + E * BM - TOPK + BM - 1) / BM * BM;
 constexpr int MAX_BLOCKS = MAX_SORTED / BM;
 constexpr int ZERO_CTAS  = 32;
+constexpr int AUX_CTAS   = 32;  // route_sort_shared: SiTU + routed cast
+constexpr int SH         = 768; // the shared experts' intermediate a rank
 
 struct Params {
     const float *logits; // [M, E] f32, row stride `stride`
@@ -68,6 +75,15 @@ struct Params {
     unsigned    *counter;     // route CTAs done; 0 between launches
     const int   *valid;       // or null: rows from *valid on are padding (ids -1, weights 0, no route)
     int          M, route_ctas, pad_id;
+    // route_sort_shared only (aux_ctas > 0)
+    const float   *gate_up;    // [M, 2 x SH] f32 (gate | up), row stride gu_stride
+    int64_t        gu_stride;
+    __hip_bfloat16 *act;       // [M, SH] bf16
+    const float   *routed_in;  // [M, LAT] f32, row stride ri_stride
+    int64_t        ri_stride;
+    __hip_bfloat16 *routed_out; // [M, LAT] bf16
+    float          beta, inv_beta, lbeta, inv_lbeta;
+    int            aux_ctas;
 };
 
 __device__ __forceinline__ uint32_t float_order_key(float v) {
@@ -401,6 +417,44 @@ __device__ void sort_routes(const Params &p, SortLds &s) {
     }
 }
 
+__device__ __forceinline__ float situ_sigmoid(float x) {
+    return __frcp_rn(1.0f + __builtin_amdgcn_exp2f(x * -1.44269504088896340736f));
+}
+
+// SiTU (8 outputs an item) then the routed cast (8 an item), over the aux CTAs
+__device__ void aux_items(const Params &p, int cta) {
+    const int64_t span  = int64_t(p.aux_ctas) * THREADS;
+    const int64_t n_act = int64_t(p.M) * (SH / 8);
+    const int64_t n_all = n_act + int64_t(p.M) * (LAT / 8);
+    for (int64_t i = int64_t(cta) * THREADS + threadIdx.x; i < n_all; i += span) {
+        if (i < n_act) {
+            const int64_t r = i / (SH / 8), c = (i % (SH / 8)) * 8;
+            const float *g = p.gate_up + r * p.gu_stride + c;
+            const float4 g0 = *reinterpret_cast<const float4 *>(g), g1 = *reinterpret_cast<const float4 *>(g + 4);
+            const float4 u0 = *reinterpret_cast<const float4 *>(g + SH), u1 = *reinterpret_cast<const float4 *>(g + SH + 4);
+            const float gv[8] = {g0.x, g0.y, g0.z, g0.w, g1.x, g1.y, g1.z, g1.w};
+            const float uv[8] = {u0.x, u0.y, u0.z, u0.w, u1.x, u1.y, u1.z, u1.w};
+            __hip_bfloat16 o[8];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const float gate_out = p.beta * tanhf(gv[j] * p.inv_beta) * situ_sigmoid(gv[j]);
+                const float up_out   = p.lbeta * tanhf(uv[j] * p.inv_lbeta);
+                o[j] = __float2bfloat16(gate_out * up_out);
+            }
+            *reinterpret_cast<uint4 *>(p.act + r * SH + c) = *reinterpret_cast<const uint4 *>(o);
+        } else {
+            const int64_t k = i - n_act, r = k / (LAT / 8), c = (k % (LAT / 8)) * 8;
+            const float *x = p.routed_in + r * p.ri_stride + c;
+            const float4 x0 = *reinterpret_cast<const float4 *>(x), x1 = *reinterpret_cast<const float4 *>(x + 4);
+            const float xv[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
+            __hip_bfloat16 o[8];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) o[j] = __float2bfloat16(xv[j]);
+            *reinterpret_cast<uint4 *>(p.routed_out + r * LAT + c) = *reinterpret_cast<const uint4 *>(o);
+        }
+    }
+}
+
 __global__ __launch_bounds__(THREADS) void route_sort_kernel(Params p) {
     // the route rows' scratch, then (the last route CTA only) the sort's
     __shared__ union {
@@ -408,6 +462,10 @@ __global__ __launch_bounds__(THREADS) void route_sort_kernel(Params p) {
         SortLds sl;
     } lds;
     __shared__ int last;
+    if (int(blockIdx.x) >= p.route_ctas + ZERO_CTAS) {
+        aux_items(p, int(blockIdx.x) - p.route_ctas - ZERO_CTAS);
+        return;
+    }
     if (int(blockIdx.x) >= p.route_ctas) {
         const int64_t span = int64_t(ZERO_CTAS) * THREADS;
         for (int64_t i = int64_t(blockIdx.x - p.route_ctas) * THREADS + threadIdx.x; i < p.zero_vecs; i += span)
@@ -443,10 +501,10 @@ void check(const at::Tensor &t, at::ScalarType dt, int64_t numel, const char *na
 }
 
 // logits [M, 896] f32 (row stride even, 8 B aligned), bias [896] f32; out [M, 3584] bf16 (zeroed)
-void route_sort(const at::Tensor &logits, const at::Tensor &bias, double scale, at::Tensor &topk_ids,
-                at::Tensor &topk_w, at::Tensor &sorted_ids, at::Tensor &sorted_w, at::Tensor &sorted_eids,
-                at::Tensor &num_valid, at::Tensor &m_indices, at::Tensor &reverse, at::Tensor &out,
-                at::Tensor &counter, int64_t pad_id, const c10::optional<at::Tensor> &valid) {
+Params make_params(const at::Tensor &logits, const at::Tensor &bias, double scale, at::Tensor &topk_ids,
+                   at::Tensor &topk_w, at::Tensor &sorted_ids, at::Tensor &sorted_w, at::Tensor &sorted_eids,
+                   at::Tensor &num_valid, at::Tensor &m_indices, at::Tensor &reverse, at::Tensor &out,
+                   at::Tensor &counter, int64_t pad_id, const c10::optional<at::Tensor> &valid) {
     const int64_t M = logits.size(0);
     TORCH_CHECK(logits.dim() == 2 && logits.size(1) == E && logits.stride(1) == 1 && logits.stride(0) % 2 == 0 &&
                     logits.scalar_type() == at::kFloat && reinterpret_cast<uintptr_t>(logits.data_ptr()) % 8 == 0,
@@ -490,10 +548,56 @@ void route_sort(const at::Tensor &logits, const at::Tensor &bias, double scale, 
                     "valid: one int32 on the GPU");
         p.valid = valid->data_ptr<int>();
     }
+    return p;
+}
+
+void launch(const Params &p, const at::Tensor &logits) {
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA guard(logits.device());
     const hipStream_t stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA(logits.device().index()).stream();
-    route_sort_kernel<<<p.route_ctas + ZERO_CTAS, THREADS, 0, stream>>>(p);
+    route_sort_kernel<<<p.route_ctas + ZERO_CTAS + p.aux_ctas, THREADS, 0, stream>>>(p);
     C10_HIP_KERNEL_LAUNCH_CHECK();
+}
+
+void route_sort(const at::Tensor &logits, const at::Tensor &bias, double scale, at::Tensor &topk_ids,
+                at::Tensor &topk_w, at::Tensor &sorted_ids, at::Tensor &sorted_w, at::Tensor &sorted_eids,
+                at::Tensor &num_valid, at::Tensor &m_indices, at::Tensor &reverse, at::Tensor &out,
+                at::Tensor &counter, int64_t pad_id, const c10::optional<at::Tensor> &valid) {
+    launch(make_params(logits, bias, scale, topk_ids, topk_w, sorted_ids, sorted_w, sorted_eids, num_valid,
+                       m_indices, reverse, out, counter, pad_id, valid),
+           logits);
+}
+
+// route_sort, plus: gate_up [M, 1536] f32 (unit column stride, row stride a multiple of 4, 16 B aligned) -> act
+// [M, 768] bf16 (the shared experts' SiTU), routed_in [M, 3584] f32 (same alignment) -> routed_out [M, 3584] bf16
+void route_sort_shared(const at::Tensor &logits, const at::Tensor &bias, double scale, at::Tensor &topk_ids,
+                       at::Tensor &topk_w, at::Tensor &sorted_ids, at::Tensor &sorted_w, at::Tensor &sorted_eids,
+                       at::Tensor &num_valid, at::Tensor &m_indices, at::Tensor &reverse, at::Tensor &out,
+                       at::Tensor &counter, int64_t pad_id, const c10::optional<at::Tensor> &valid,
+                       const at::Tensor &gate_up, at::Tensor &act, const at::Tensor &routed_in,
+                       at::Tensor &routed_out, double beta, double linear_beta) {
+    Params p = make_params(logits, bias, scale, topk_ids, topk_w, sorted_ids, sorted_w, sorted_eids, num_valid,
+                           m_indices, reverse, out, counter, pad_id, valid);
+    const int64_t M = logits.size(0);
+    auto strided = [&](const at::Tensor &t, int64_t cols, const char *name) {
+        TORCH_CHECK(t.is_cuda() && t.dim() == 2 && t.size(0) == M && t.size(1) == cols && t.stride(1) == 1 &&
+                        t.stride(0) % 4 == 0 && t.scalar_type() == at::kFloat &&
+                        reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0,
+                    name, ": [M, ", cols, "] f32, unit column stride, row stride a multiple of 4, 16 B aligned");
+    };
+    strided(gate_up, 2 * SH, "gate_up");
+    strided(routed_in, LAT, "routed_in");
+    check(act, at::kBFloat16, M * SH, "act");
+    check(routed_out, at::kBFloat16, M * LAT, "routed_out");
+    p.gate_up    = gate_up.data_ptr<float>();
+    p.gu_stride  = gate_up.stride(0);
+    p.act        = reinterpret_cast<__hip_bfloat16 *>(act.data_ptr());
+    p.routed_in  = routed_in.data_ptr<float>();
+    p.ri_stride  = routed_in.stride(0);
+    p.routed_out = reinterpret_cast<__hip_bfloat16 *>(routed_out.data_ptr());
+    const float b = static_cast<float>(beta), lb = static_cast<float>(linear_beta);
+    p.beta = b, p.inv_beta = 1.0f / b, p.lbeta = lb, p.inv_lbeta = 1.0f / lb;  // as situ_and_mul's host
+    p.aux_ctas = AUX_CTAS;
+    launch(p, logits);
 }
 
 } // namespace
@@ -508,4 +612,10 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
           "Tensor(g!) m_indices, Tensor(h!) reverse, Tensor(i!) out, Tensor(j!) counter, int pad_id, "
           "Tensor? valid=None) -> ()");
     m.impl("route_sort", at::kCUDA, &route_sort);
+    m.def("route_sort_shared(Tensor logits, Tensor bias, float scale, Tensor(a!) topk_ids, Tensor(b!) topk_w, "
+          "Tensor(c!) sorted_ids, Tensor(d!) sorted_w, Tensor(e!) sorted_eids, Tensor(f!) num_valid, "
+          "Tensor(g!) m_indices, Tensor(h!) reverse, Tensor(i!) out, Tensor(j!) counter, int pad_id, "
+          "Tensor? valid, Tensor gate_up, Tensor(k!) act, Tensor routed_in, Tensor(l!) routed_out, float beta, "
+          "float linear_beta) -> ()");
+    m.impl("route_sort_shared", at::kCUDA, &route_sort_shared);
 }
