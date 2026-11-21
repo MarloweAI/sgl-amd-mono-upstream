@@ -267,10 +267,11 @@ def graph_time(body, reps, per):
 def across(v, dev):
     """(median, max) of a per-rank float over the TP ranks."""
     t = torch.tensor([v], dtype=torch.float64, device=dev)
-    every = [torch.empty_like(t) for _ in range(TP)]
+    n = dist.get_world_size()
+    every = [torch.empty_like(t) for _ in range(n)]
     dist.all_gather(every, t)
     vals = sorted(float(e.item()) for e in every)
-    return (vals[TP // 2 - 1] + vals[TP // 2]) / 2, vals[-1]
+    return (vals[(n - 1) // 2] + vals[n // 2]) / 2, vals[-1]
 
 
 def tp8_main(args):
@@ -286,6 +287,11 @@ def tp8_main(args):
     cpu = dist.new_group(backend="gloo")
     dev = torch.device("cuda", rank)
     nl = 20
+    if args.only_ag:
+        out = {"rank": rank, "time": []}
+        time_fp32_ag(args, cpu, dev, rank, recorder(out, dev, rank), nl)
+        dist.destroy_process_group()
+        return True
     launch = K.build(args.eps, args.eps, nl)
     peer = PeerBuffer(K.peer_bytes(), cpu, rank, TP, dev, init=K.arm)
     epoch = torch.zeros(guard.GUARD_WORDS, dtype=torch.int32, device=dev)
@@ -343,11 +349,7 @@ def tp8_main(args):
     if args.time:
         cw, w_o = make_weights(dev)
 
-        def record(name, m, us):
-            med, mx = across(us, dev)
-            out["time"].append({"name": name, "m": m, "us_rank": us, "us_med": med, "us_max": mx})
-            if rank == 0:
-                print(f"TIME {name:24s} m={m:3d} med {med:7.2f} us  slowest {mx:7.2f} us", flush=True)
+        record = recorder(out, dev, rank)
 
         for m in args.rows:
             st = make_inputs(m, 0, dev)
@@ -397,6 +399,8 @@ def tp8_main(args):
         sections = []
         if args.gather_rows:
             sections.append(("gather", lambda: time_gather(args, cpu, dev, rank, record, nl)))
+        if args.ag_rows:
+            sections.append(("fp32 ag", lambda: time_fp32_ag(args, cpu, dev, rank, record, nl)))
         for m in args.rows:
             sections.append((f"moe m={m}", lambda m=m: moe_halves(args, cpu, dev, rank, record, nl, m, ca, out)))
         for m in args.rows:
@@ -614,6 +618,79 @@ def moe_halves(args, cpu, dev, rank, record, nl, m, ca, out):
     peer.close()
 
 
+def recorder(out, dev, rank):
+    def record(name, m, us):
+        med, mx = across(us, dev)
+        out["time"].append({"name": name, "m": m, "us_rank": us, "us_med": med, "us_max": mx})
+        if rank == 0:
+            print(f"TIME {name:24s} m={m:3d} med {med:7.2f} us  slowest {mx:7.2f} us", flush=True)
+
+    return record
+
+
+AG_COLS = 560  # a rank's slice of a sharded MoE front's [router 896 | latent-down 3584] fp32 columns
+
+
+def time_fp32_ag(args, cpu, dev, rank, record, nl):
+    """The fp32 all-gather a column-sharded MoE front needs: every rank's [rows, 560] block -> [rows, 4480]
+    (RCCL through SGLang's PyNcclCommunicator, gathering [8 rows, 560] blocks in rank order, i.e. dim 0; aiter's
+    custom all-gather along the last dim, [rows, 4480] directly). CUDA graphs of nl calls, as the other timings."""
+    from aiter.dist.device_communicators.custom_all_reduce import CustomAllreduce
+    from sglang.srt.distributed.device_communicators.pynccl import PyNcclCommunicator
+
+    world = dist.get_world_size()
+    pyn = PyNcclCommunicator(cpu, dev)
+    ca = CustomAllreduce(cpu, dev) if world > 1 else None
+    for m in args.ag_rows:
+        ins = [torch.randn(m, AG_COLS, device=dev) for _ in range(nl)]
+        outs = [torch.empty(world * m, AG_COLS, device=dev) for _ in range(nl)]
+        if pyn.available:
+
+            def rccl():
+                for i in range(nl):
+                    pyn.all_gather(outs[i], ins[i])
+
+            with pyn.change_state(enable=True):
+                us = graph_time(rccl, args.reps, nl)
+                want = torch.cat([torch.full((m, AG_COLS), float(r), device=dev) for r in range(world)])
+                ins[0].fill_(float(rank))
+                pyn.all_gather(outs[0], ins[0])
+                torch.cuda.synchronize()
+                ok = bool(torch.equal(outs[0], want))
+            record(f"fp32_ag_rccl_dim0{'' if ok else '_WRONG'}", m, us)
+        if ca is not None and ca.should_custom_ag(ins[0]):
+
+            def custom():
+                for i in range(nl):
+                    ca.custom_all_gather(ins[i], dim=-1)
+
+            custom()
+            torch.cuda.synchronize()
+            g = torch.cuda.CUDAGraph()
+            with ca.capture():
+                with torch.cuda.graph(g):
+                    custom()
+            for _ in range(3):
+                g.replay()
+            torch.cuda.synchronize()
+            dist.barrier()
+            e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            e0.record()
+            for _ in range(args.reps):
+                g.replay()
+            e1.record()
+            torch.cuda.synchronize()
+            us = e0.elapsed_time(e1) * 1000 / (args.reps * nl)
+            ins[0].fill_(float(rank))
+            got = ca.custom_all_gather(ins[0], dim=-1)
+            torch.cuda.synchronize()
+            want = torch.cat([torch.full((m, AG_COLS), float(r), device=dev) for r in range(world)], dim=1)
+            ok = got is not None and bool(torch.equal(got, want))
+            record(f"fp32_ag_aiter_lastdim{'' if ok else '_WRONG'}", m, us)
+        elif rank == 0:
+            print(f"TIME fp32 ag m={m}: aiter custom all-gather does not take [{m}, {AG_COLS}] fp32", flush=True)
+
+
 def time_gather(args, cpu, dev, rank, record, nl):
     """The column tail's LL gather + next attention read (SGLang's gather_tail_attn_res_read) at
     rows above its 64-row cap: partials mode (as with _COLUMN_TAIL_PARTIALS_MAX_TOKENS raised) and
@@ -658,6 +735,8 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--rows", default="54,96,168", type=lambda s: [int(v) for v in s.split(",")])
     p.add_argument("--gather-rows", default="", type=lambda s: [int(v) for v in s.split(",") if v])
+    p.add_argument("--ag-rows", default="", type=lambda s: [int(v) for v in s.split(",") if v])
+    p.add_argument("--only-ag", action="store_true", help="only the fp32 all-gather timing")
     p.add_argument("--emulate", action="store_true")
     p.add_argument("--time", action="store_true")
     p.add_argument("--reps", type=int, default=20)
