@@ -148,6 +148,30 @@ def layout_kernel():
     return launch
 
 
+def mfma16(a, b, c):
+    one = fx.Int32(127)
+    return fx.Vector(rocdl.mfma_scale_f32_16x16x128_f8f6f4(T.vec(4, T.f32), [a, b, c, 0, 0, 0, one, 0, one]))
+
+
+def layout16_kernel():
+    if "layout16" in _K:
+        return _K["layout16"]
+
+    @flyc.kernel(name="ub_layout16", known_block_size=[64, 1, 1])
+    def ub(a: Int64, b: Int64, out: Int64):
+        lane = fx.thread_idx.x
+        d = mfma16(_ld8(a, lane * 8), _ld8(b, lane * 8), fx.Vector.filled(4, 0.0, fx.Float32))
+        for i in range_constexpr(4):
+            bo.buffer_store(fx.Float32(d[i]), rsrc(out), lane * 4 + i)
+
+    @flyc.jit
+    def launch(a: Int64, b: Int64, out: Int64, stream: fx.Stream = fx.Stream(None)):
+        ub(a, b, out).launch(grid=(1,), block=(64,), stream=stream)
+
+    _K["layout16"] = launch
+    return launch
+
+
 def tr8_kernel():
     if "tr8" in _K:
         return _K["tr8"]
@@ -268,6 +292,26 @@ def check_layout(dev):
     print(f"layout same-bytes pairing: max |D - ref| {(o - exp).abs().max().item():.3g}", flush=True)
 
 
+def check_layout16(dev):
+    """16x16x128: D lane l element i = (row 4 (l / 16) + i, col l % 16), A and B paired by (lane group, byte)."""
+    g = torch.Generator().manual_seed(1)
+    ab = torch.randint(-3, 4, (64, 32), generator=g).float()
+    bb = torch.randint(-3, 4, (64, 32), generator=g).float()
+    a8 = ab.to(F8).view(torch.uint8).contiguous().to(dev)
+    b8 = bb.to(F8).view(torch.uint8).contiguous().to(dev)
+    out = torch.zeros(64, 4, device=dev)
+    layout16_kernel()(a8.data_ptr(), b8.data_ptr(), out.data_ptr())
+    torch.cuda.synchronize()
+    o = out.cpu()
+    exp = torch.zeros(64, 4)
+    for l in range(64):
+        n = l % 16
+        for i in range(4):
+            m = 4 * (l // 16) + i
+            exp[l, i] = sum((ab[16 * gg + m] * bb[16 * gg + n]).sum() for gg in range(4))
+    print(f"layout16 same-bytes pairing: max |D - ref| {(o - exp).abs().max().item():.3g}", flush=True)
+
+
 def check_tr8(dev):
     src = torch.arange(4096, dtype=torch.int32) % 256
     src = src.to(torch.uint8).view(torch.int32).to(dev)  # byte b holds b % 256
@@ -294,6 +338,7 @@ def compile_all():
         lds_kernel(threads, reads)(0, 1, 1, stream=0)
     layout_kernel()(0, 0, 0, stream=0)
     tr8_kernel()(0, 0, 0, stream=0)
+    layout16_kernel()(0, 0, 0, stream=0)
     print("COMPILE_OK", flush=True)
 
 
@@ -305,7 +350,7 @@ def main():
         return compile_all()
     dev = torch.device("cuda")
     for w in args.what:
-        {"mfma": bench_mfma, "lds": bench_lds, "layout": check_layout, "tr8": check_tr8}[w](dev)
+        {"mfma": bench_mfma, "lds": bench_lds, "layout": check_layout, "layout16": check_layout16, "tr8": check_tr8}[w](dev)
 
 
 if __name__ == "__main__":
