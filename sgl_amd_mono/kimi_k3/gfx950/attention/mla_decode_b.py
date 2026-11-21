@@ -196,9 +196,8 @@ def _kdim(s, g):
 
 @flyc.jit
 def _rows(c, bi):
-    """Lane l's key of the item's block bi: its record's row and whether it is
-    a key of the split (``_load`` takes row 0 for the others, so this load's
-    wait stays at its use, a block later)."""
+    """Lane l's key of the item's block bi: its record's row (a key past the
+    request, its last key's) and whether it is a key of the split."""
     blk = c["b0"] + bi
     kk = blk * BK + c["lane"]
     ok = (blk < c["b1"]) & (kk < c["L"])
@@ -208,9 +207,10 @@ def _rows(c, bi):
 
 def _row_of(c, rows):
     """This thread's key row of a block (``rows``: ``_rows`` of it): thread t takes key t / 4's
-    16-byte pieces t % 4 + 4 k; a key past the split reads row 0."""
-    rv = (rows[1] != 0).select(rows[0], fx.Int32(0))
-    row = fx.Int32(rocdl.ds_bpermute(T.i32, (c["tid"] // 4) * 4, rv))
+    16-byte pieces t % 4 + 4 k. A key past the split reads a key of the request (its own,
+    or past the request its last), never another row: its weight is 0, and 0 x a record
+    outside the request (the padding slot's, say) could be NaN."""
+    row = fx.Int32(rocdl.ds_bpermute(T.i32, (c["tid"] // 4) * 4, rows[0]))
     return row * (DQK // 4) + (c["tid"] % 4) * 4
 
 
