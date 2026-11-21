@@ -25,7 +25,7 @@ class K3MonoRunner:
 
     def __init__(self, tp: int, rank: int, group, device) -> None:
         from sgl_amd_mono.kimi_k3.gfx950 import layer
-        from sgl_amd_mono.kimi_k3.gfx950.attention import mla_combine, mla_front, mla_tail
+        from sgl_amd_mono.kimi_k3.gfx950.attention import mla_combine, mla_front
         from sgl_amd_mono.kimi_k3.gfx950.stages import moe
 
         self.tp, self.rank, self.device = tp, rank, device
@@ -51,15 +51,11 @@ class K3MonoRunner:
         # sentinel regions. The kernel reads them at the same offsets, from the
         # same functions.
         # ... and the DCP front's q all-gather (QG) copies past them
-        # ... and the MLA tail's A2A copies past those
-        self.peer = PeerBuffer(
-            max(layer.peer_alloc_bytes(), mla_front.peer_end(), mla_tail.peer_end()), group, rank, tp, device
-        )
+        self.peer = PeerBuffer(max(layer.peer_alloc_bytes(), mla_front.peer_end()), group, rank, tp, device)
         layer.init_peer(self.peer.bytes[: layer.peer_alloc_bytes()])
         self.peer.bytes[layer.peer_alloc_bytes() :].zero_()
         # ... and the front's all-to-all (A2A) cells before them, armed
         mla_combine.init_peer(self.peer.bytes)
-        mla_tail.init_peer(self.peer.bytes)
         # One prefix buffer, not one a layer: the layers run in sequence.
         self.prefix = torch.empty(
             K2_MAX_ROWS, layer.HIDDEN, dtype=torch.bfloat16, device=device
