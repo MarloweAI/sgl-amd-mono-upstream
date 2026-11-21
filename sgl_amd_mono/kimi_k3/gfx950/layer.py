@@ -841,7 +841,7 @@ def k2_body(key: K2Build, k2_lds: K2Lds, scratch_base, args: dict) -> None:
                 k2b.stage_h(c, bid - H0)
             k2b.ug_done(c)
             stamp(on, tls, tid, 3)
-            k2b.run_down_wide(c, nu)
+            k2b.run_down_waves(c, nu)
             stamp(on, tls, tid, 16)
             if bid < k2b.DOWN_TASKS:
                 k2b.fold_wide(c, bid)
