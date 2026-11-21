@@ -346,6 +346,22 @@ def sent_item(idx, s):
     return r // 8, g * 8 + r % 8
 
 
+def sent_sums(own, items, s, width, tp, lives):
+    """``sent_sum`` of every (col pair, t) in ``items`` from one poll (a dead
+    item, ``lives`` false, is not waited for), not re-armed."""
+    idxs = [sent_ix(src, col, t, s, width) for col, t in items for src in range(tp)]
+    ws = poll_sent(own, idxs, [lv for lv in lives for _ in range(tp)], rearm=False)
+    out = []
+    for k in range_constexpr(len(items)):
+        acc0, acc1 = bf2_f32(ws[k * tp])
+        for src in range_constexpr(1, tp):
+            lo, hi = bf2_f32(ws[k * tp + src])
+            acc0 = acc0 + lo
+            acc1 = acc1 + hi
+        out.append((acc0, acc1))
+    return out
+
+
 def sent_sum(own, col, t, s, width, tp, rearm=True):
     """The ``tp`` ranks' words of (col pair, t) in sentinel region ``own``,
     summed in fp32 in rank order (as ``ops.sum_partials``)."""
