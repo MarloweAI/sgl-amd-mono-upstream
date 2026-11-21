@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Kimi-K3's MoE routing in one launch at 48-180 rows (TP8, gfx950): the top-16 of 896 sigmoid + bias scores of each
+// Kimi-K3's MoE routing in one launch at 25-180 rows (TP8, gfx950): the top-16 of 896 sigmoid + bias scores of each
 // row (noaux_tc, renormalized), aiter's BM = 16 aux sort of the routes for the a4w4-port stage 1 / stage 2, and the
 // zeroed stage-2 output. Replaces aiter's topk_reg_kernel and its moe sort (the one-CTA sort_quant_kernel_impl below
 // 75 rows, the two Opus multi-phase launches from 75).

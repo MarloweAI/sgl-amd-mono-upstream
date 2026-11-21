@@ -2,7 +2,7 @@
 """Kimi-K3's one-launch routing (``kimi_k3.gfx950.route``) against what it replaces, on one GPU: aiter's top-k
 (``biased_grouped_topk``) and the BM = 16 aux sort aiter's fused_moe runs on its routes, on the same logits.
 
-    python3 check_route.py OUT.json [--logits DUMP.pt] [--moe] [--time]
+    python3 check_route.py OUT.json [--logits DUMP.pt] [--moe] [--time] [--widths 25,30,48]
 
 - bits: top-k ids / weights bit for bit; the sort's num_valid and expert ids bit for bit, its rows bit for bit from
   75 rows (Opus places an expert's routes in token order) and as a set an expert below (aiter's one-CTA sort places
@@ -26,7 +26,7 @@ import torch
 from sgl_amd_mono.kimi_k3.gfx950 import route
 
 E, K, LAT = route.E, route.TOPK, route.LAT
-WIDTHS = [48, 54, 60, 66, 72, 78, 96, 120, 144, 168, 174, 180]
+WIDTHS = [25, 30, 32, 36, 42, 47, 48, 54, 60, 66, 72, 78, 96, 120, 144, 168, 174, 180]
 
 
 def stock(logits, bias, out, valid=None):
@@ -118,7 +118,7 @@ def cases(gen, dev, m):
 def check_bits(args, dev):
     gen = torch.Generator(device=dev).manual_seed(0)
     res = []
-    for m in WIDTHS:
+    for m in args.widths or WIDTHS:
         for seed in range(args.seeds):
             bias = torch.randn(E, generator=gen, device=dev) * 0.05
             for name, lg in cases(gen, dev, m):
@@ -210,7 +210,7 @@ def check_moe(args, dev):
     gen = torch.Generator(device=dev).manual_seed(1)
     w = moe_weights(gen, dev)
     res = []
-    for m in [48, 72, 96, 120, 168, 180]:
+    for m in args.widths or [25, 32, 42, 48, 72, 96, 120, 168, 180]:
         x = (torch.randn(m, LAT, generator=gen, device=dev) * 0.5).to(torch.bfloat16)
         logits = torch.randn(m, E, generator=gen, device=dev) * 2.0
         bias = torch.randn(E, generator=gen, device=dev) * 0.05
@@ -273,10 +273,10 @@ def graph_us(fn, reps=200, inner=20):
     return ts[len(ts) // 2]
 
 
-def check_time(dev):
+def check_time(args, dev):
     gen = torch.Generator(device=dev).manual_seed(2)
     res = []
-    for m in [48, 60, 72, 96, 120, 144, 168, 180]:
+    for m in args.widths or [25, 30, 36, 42, 48, 60, 72, 96, 120, 144, 168, 180]:
         full = torch.randn(m, 6016, generator=gen, device=dev) * 2.0
         lg = full[:, 1536 : 1536 + E]
         bias = torch.randn(E, generator=gen, device=dev) * 0.05
@@ -300,6 +300,7 @@ def main():
     ap.add_argument("--seeds", type=int, default=2)
     ap.add_argument("--moe", action="store_true")
     ap.add_argument("--time", action="store_true")
+    ap.add_argument("--widths", type=lambda v: [int(x) for x in v.split(",")], help="rows, comma separated")
     args = ap.parse_args()
     dev = torch.device("cuda", 0)
     t0 = time.time()
@@ -315,7 +316,7 @@ def main():
         for r in res["moe"]:
             print("MOE", json.dumps(r), flush=True)
     if args.time:
-        res["time"] = check_time(dev)
+        res["time"] = check_time(args, dev)
     json.dump(res, open(args.out, "w"), indent=1)
     print("ROUTE_CHECK_DONE", "PASS" if not fails else "FAIL", flush=True)
 

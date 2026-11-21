@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Kimi-K3's MoE with the shared chain fused (48-180 rows, 1 GPU): route_sort_shared + aiter's fused_moe with
+"""Kimi-K3's MoE with the shared chain fused (25-180 rows, 1 GPU): route_sort_shared + aiter's fused_moe with
 stage1_shared, on random weights and routes.
 
     python3 check_stage1_shared.py OUT.json [--widths 48,96,168] [--push]
@@ -180,7 +180,7 @@ def time_push(case, launches=93, slot=5):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("out")
-    ap.add_argument("--widths", default="48,60,72,96,120,144,168,180")
+    ap.add_argument("--widths", default="25,30,32,36,42,47,48,60,72,96,120,144,168,180")
     ap.add_argument("--push", action="store_true")
     args = ap.parse_args()
     dev = torch.device("cuda", 0)

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Kimi-K3's routed stage 1 and the shared experts' down GEMM in one launch (48-180 rows, a8w4 stage 1).
+"""Kimi-K3's routed stage 1 and the shared experts' down GEMM in one launch (25-180 rows, a8w4 stage 1).
 
 The grid's first ``S`` workgroups each compute one [bm, bn] tile of shared_out [M, 7168] = act [M, 768] @
 W_down[7168, 768]^T (bf16 in and out, fp32 accumulation); the rest are aiter's stage-1 workgroups, with stock's tile
