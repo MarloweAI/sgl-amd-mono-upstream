@@ -819,12 +819,12 @@ def k2_body(key: K2Build, k2_lds: K2Lds, scratch_base, args: dict) -> None:
             nu = k2b.load_route_w(c)
             stamp(on, tls, tid, 11)
         else:
-            # the latent (ready ~10 us before the route) quantized first
-            k2b.load_latq(c)
-            stamp(on, tls, tid, 12)
-            # the route table from a bitmask's wave scan
+            # the route table from a bitmask's wave scan, then the latent (it
+            # lands about when the route does: polled first, it held the table back)
             nu = k2b.load_route2(c)
             stamp(on, tls, tid, 11)
+            k2b.load_latq(c)
+            stamp(on, tls, tid, 12)
         total = nu * k2b.UG_GROUPS
         if const_expr(wide):
             k2b.run_ug_wide(c, total)
