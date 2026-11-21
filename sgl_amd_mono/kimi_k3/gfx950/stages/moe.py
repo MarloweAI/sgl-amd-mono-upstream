@@ -207,6 +207,13 @@ def xl_words(s):
     return s * (HIDDEN + gemv.LDS_PAD) // 2
 
 
+def x_rows_at_once(s, xrow):
+    """Whether a wide step's router / latent task polls every row of its x
+    slice (``xrow`` bf16 a row) into LDS at once: they fit ``xl`` (to 30 rows
+    at a quarter of K). Past that, a 16-row tile at a time."""
+    return s * xrow <= 2 * xl_words(s)
+
+
 TL_POINTS = 8  # start, early, sdown, ug, down, lnorm, up, reduce
 
 _STREAM = fx.Stream(None)
@@ -541,12 +548,19 @@ def early_lq_wide(c, i, q, ops):
     tiles = gemv.tiles(s)
     at = lambda qq, t, h, r: ((i * LQ_PARTS + qq) * s + t) * 2 * ROWS + h * ROWS + r  # noqa: E731
     own = []
+    at_once = x_rows_at_once(s, xrow)
+    if const_expr(at_once):
+        # every tile's x rows in one poll round, at their own LDS rows
+        poll_rows_to_lds(c, c["xt"], klen, s, c["xl"], xrow, HIDDEN, q * klen)
+        stamp(c["tl_on"], c["tls"], c["tid"], 33)  # latent: x tile 0 in
     for ti in range_constexpr(len(tiles)):
         t0, sj = tiles[ti]
-        poll_rows_to_lds(c, c["xt"], klen, sj, c["xl"], xrow, HIDDEN, q * klen, t0)
-        if const_expr(t0 == 0):
-            stamp(c["tl_on"], c["tls"], c["tid"], 33)  # latent: x tile 0 in
-        accs = [gemv.mfmas(lane, wave, c["xl"], xrow, klen, sj, o) for o in ops]
+        if const_expr(not at_once):
+            poll_rows_to_lds(c, c["xt"], klen, sj, c["xl"], xrow, HIDDEN, q * klen, t0)
+            if const_expr(t0 == 0):
+                stamp(c["tl_on"], c["tls"], c["tid"], 33)  # latent: x tile 0 in
+        lt0 = t0 if at_once else 0
+        accs = [gemv.mfmas(lane, wave, c["xl"], xrow, klen, sj, o, lt0) for o in ops]
         for h in range_constexpr(2):
             fx.ptr_store(accs[h], red + (wave * 64 + lane) * 4)
             lds_barrier()
@@ -657,10 +671,16 @@ def _early_wide_gemv(c, kind, i, q, ops):
     s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
     klen, _ = early_shape(kind)
     xrow = klen + gemv.LDS_PAD
+    at_once = kind != 2 and x_rows_at_once(s, xrow)
     if const_expr(kind == 2):
         if tid < c["xflags"]:
             c["poll"]([(c["xrdy"], tid, 1)])
         gpu.barrier()
+    if const_expr(at_once):
+        # every tile's x rows in one poll round, at their own LDS rows
+        poll_rows_to_lds(c, c["xt"], klen, s, c["xl"], xrow, HIDDEN, q * klen)
+        if const_expr(kind == 0):
+            stamp(c["tl_on"], c["tls"], c["tid"], 20)  # router: x published
     tiles = gemv.tiles(s)
     for ti in range_constexpr(len(tiles)):
         t0, sj = tiles[ti]
@@ -678,12 +698,12 @@ def _early_wide_gemv(c, kind, i, q, ops):
                     lane, wave, c["xl"], srow, k0, sj, ops, acc, r0, r1
                 )
                 gpu.barrier()
-        else:
+        elif const_expr(not at_once):
             poll_rows_to_lds(c, c["xt"], klen, sj, c["xl"], xrow, HIDDEN, q * klen, t0)
             if const_expr(kind == 0 and t0 == 0):
                 stamp(c["tl_on"], c["tls"], c["tid"], 20)  # router: x published
         if const_expr(kind != 2):
-            acc = gemv.mfmas(lane, wave, c["xl"], xrow, klen, sj, ops)
+            acc = gemv.mfmas(lane, wave, c["xl"], xrow, klen, sj, ops, t0 if at_once else 0)
         fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
         gpu.barrier()
         early_out(c, kind, i, q, red, t0, sj)
