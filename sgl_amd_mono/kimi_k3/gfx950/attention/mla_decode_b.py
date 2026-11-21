@@ -77,7 +77,9 @@ LN2 = 0.6931471805599453
 LOG2E = 1.4426950408889634
 MAX_REQS = md.MAX_REQS
 MAX_SPLITS = md.MAX_SPLITS
-W_NUM, W_DEN = 11, 10  # a split: W_NUM / W_DEN of a CTA's share of the batch's work
+W_NUM, W_DEN = 11, 10  # a split: W_NUM / W_DEN of a CTA's share of the batch's work (/ k)
+ITEM_OVH = 5  # an item's setup and partial stores, in blocks (measured ~12 us an item at ~2.4 us a block)
+MAX_PART = md.MAX_PART
 TBL, TBL_WORDS = md.TBL, md.TBL_WORDS
 T_R, T_KIND, T_N, T_NB, T_WR, T_IPRE, T_L, T_P, T_PB, T_KVP = range(10)
 DecodeBuffers = md.DecodeBuffers
@@ -96,6 +98,12 @@ _STREAM = fx.Stream(None)
 _ld, _ld4, _lds16, _tr8, _cat8, _e4m3x4, _memtime, _realtime, _bar, _wave_sum = (
     md._ld, md._ld4, md._lds16, md._tr8, md._cat8, md._e4m3x4, md._memtime, md._realtime, md._bar, md._wave_sum,
 )  # fmt: skip
+
+
+def _wave_max(v):
+    for off in [32, 16, 8, 4, 2, 1]:
+        v = fx.max(v, v.shuffle_xor(fx.Int32(off), fx.Int32(64)))
+    return v
 
 
 def _st16(ptr, v):
@@ -162,10 +170,13 @@ def _store(c, stg, slot):
 @flyc.jit
 def plan(c, tbl, kv_ptr, g_ptr, nreq, indptr, fmap, pmap, bid, tid):
     """The step's split plan in LDS ``tbl``, by wave 0. A request's splits are
-    runs of ``w`` blocks (the batch's work a CTA, x 1.1), the last the rest (at
-    most 64 splits: then runs of ceil(blocks / 64)). Its items fall in two
-    classes: A, the 6 items of each whole run, cost w; B, the last run's 6,
-    cost the rest. The classes go to ``tbl`` a row each, longest first: the
+    equal runs of at most t blocks, t = 1.1 x the batch's work a CTA / k (at
+    most 64 splits), for the k in 1 .. 4 with the least estimated busiest CTA
+    (a lower bound of the deal's: the mean, the costliest item, and j + 1
+    times the (256 j + 1)-th costliest; an item's cost its blocks +
+    ITEM_OVH), a larger k only when 5% lower. Its items fall in
+    two classes: A, the 6 items of each whole run, cost wr; B, the last run's
+    6, cost the rest. The classes go to ``tbl`` a row each, longest first: the
     deal order. CTA 0 also writes the CSR maps. Returns the item count."""
     lane = tid % 64
     if tid < 64:
@@ -176,10 +187,40 @@ def plan(c, tbl, kv_ptr, g_ptr, nreq, indptr, fmap, pmap, bid, tid):
         P = _ld(g_ptr, r + 1) - _ld(g_ptr, r) - G
         nb = (L + BK - 1) // BK
         work = _wave_sum(NG * nb)
-        w = fx.max(fx.Int32(1), (work * W_NUM + BLOCKS * W_DEN - 1) // (BLOCKS * W_DEN))
-        n = fx.max(fx.Int32(1), (nb + w - 1) // w)
-        wr = (n > MAX_SPLITS).select((nb + MAX_SPLITS - 1) // MAX_SPLITS, w)
-        n = fx.max(fx.Int32(1), (nb + wr - 1) // wr)
+        best = fx.Int32(1 << 26)
+        n = fx.Int32(1)
+        wr = fx.Int32(1)
+        for kk in range_constexpr(1, 5):
+            t = fx.max(fx.Int32(1), (work * W_NUM + BLOCKS * W_DEN * kk - 1) // (BLOCKS * W_DEN * kk))
+            nk = fx.min(fx.Int32(MAX_SPLITS), fx.max(fx.Int32(1), (nb + t - 1) // t))
+            wk = fx.max(fx.Int32(1), (nb + nk - 1) // nk)
+            nk = fx.max(fx.Int32(1), (nb + wk - 1) // wk)
+            # the items' costs (blocks + ITEM_OVH): class A (nk - 1 whole runs) and B (the last run), 6 a run
+            ca = wk + ITEM_OVH
+            cb = nb - (nk - 1) * wk + ITEM_OVH
+            na = live.select(NG * (nk - 1), fx.Int32(0))
+            nbb = live.select(fx.Int32(NG), fx.Int32(0))
+            parts = _wave_sum((live & (nk > 1)).select(nk, fx.Int32(0)))
+            total = _wave_sum(na * ca + nbb * cb)
+            est = fx.max((total + BLOCKS - 1) // BLOCKS, _wave_max(live.select(fx.max(ca, cb), fx.Int32(0))))
+            # some CTA takes j + 1 of the 256 j + 1 costliest items: (j + 1) x the (256 j + 1)-th cost
+            ga = fx.Int32(0)
+            gb = fx.Int32(0)
+            for r2 in range_constexpr(MAX_REQS):  # lanes past the batch count no items
+                ca2, na2 = read_lane_i32(ca, r2), read_lane_i32(na, r2)
+                cb2, nb2 = read_lane_i32(cb, r2), read_lane_i32(nbb, r2)
+                ga = ga + (ca2 >= ca).select(na2, fx.Int32(0)) + (cb2 >= ca).select(nb2, fx.Int32(0))
+                gb = gb + (ca2 >= cb).select(na2, fx.Int32(0)) + (cb2 >= cb).select(nb2, fx.Int32(0))
+            for j in range_constexpr(1, 4):
+                q = BLOCKS * j
+                cq = _wave_max(fx.max(((na > 0) & (ga > q)).select(ca, fx.Int32(0)), ((nbb > 0) & (gb > q)).select(cb, fx.Int32(0))))
+                est = fx.max(est, (j + 1) * cq)
+            est = (parts <= MAX_PART).select(est, fx.Int32(1 << 26))
+            # a larger k only for a 5% lower estimate (it costs more partials)
+            better = est * 20 < best * 19
+            best = better.select(est, best)
+            n = better.select(nk, n)
+            wr = better.select(wk, wr)
         rho = nb - (n - 1) * wr
         multi = live & (n > 1)
         msplits = multi.select(n, fx.Int32(0))
