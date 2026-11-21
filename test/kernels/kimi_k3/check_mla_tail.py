@@ -483,7 +483,7 @@ def time_case(caps, w_vc, gates, s, peers, epoch, par):
 
 def check_prologue(device, seed):
     """``mla_prologue`` against SGLang's bytes at every tail width: the
-    decode's q (torch's e4m3 cast of cat(q_nope_out, q_pe)) and the KV records
+    decode's q (torch's e4m3 cast of cat(q_nope_out, q_pe), within +-448) and the KV records
     of the rows this rank owns (cast of cat(k_nope, k_pe) at local row loc / 8),
     every other pool row untouched."""
     from sgl_amd_mono.kimi_k3.gfx950.attention import mla_prologue as mp
@@ -496,6 +496,13 @@ def check_prologue(device, seed):
             qn = (torch.randn(s, NHA, KV, generator=g, device=device) * 3).to(BF)
             qb = (torch.randn(s, NHA, mp.QHD, generator=g, device=device) * 3).to(BF)
             lat = (torch.randn(s, 2112, generator=g, device=device) * 3).to(BF)
+            # past e4m3's range (saturated), at the edges of it, and inf
+            for x in (qn, qb, lat):
+                v = x.view(-1)
+                v[::997] = 1000.0
+                v[1::997] = -470.0
+                v[2::997] = 452.0
+                v[3::1999] = float("inf")
             kn, kp = lat[:, 1536 : 1536 + KV], lat[:, 1536 + KV :]
             nloc = 4 * s
             slots = torch.randperm(nloc * DCP, generator=torch.Generator().manual_seed(s + rank))[:s]
@@ -505,7 +512,7 @@ def check_prologue(device, seed):
             pool = torch.randint(0, 255, (nloc, DQK), generator=g, device=device, dtype=torch.int32).to(torch.uint8)
             want = pool.clone()
             own = ((loc % DCP) == rank) & (loc != 0)
-            rec = torch.cat([kn, kp], -1).to(F8).view(torch.uint8)
+            rec = torch.cat([kn, kp], -1).float().clamp(-448, 448).to(F8).view(torch.uint8)
             want[loc[own] // DCP] = rec[own]
             q8 = torch.empty(s, NHA, DQK, dtype=F8, device=device)
             mp.mla_prologue_launch(
@@ -513,7 +520,7 @@ def check_prologue(device, seed):
                 k_nope=kn, k_pe=kp, loc=loc, q8=q8, kv=pool, rank=rank,
             )  # fmt: skip
             torch.cuda.synchronize()
-            wq = torch.cat([qn, qb[..., mp.QHD - mp.ROPE :]], -1).to(F8)
+            wq = torch.cat([qn, qb[..., mp.QHD - mp.ROPE :]], -1).float().clamp(-448, 448).to(F8)
             ok = torch.equal(q8.view(torch.uint8), wq.view(torch.uint8)) and torch.equal(pool, want)
             if not ok:
                 fails.append((s, rank))

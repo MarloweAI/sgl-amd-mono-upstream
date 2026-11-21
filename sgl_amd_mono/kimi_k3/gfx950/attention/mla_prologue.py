@@ -12,8 +12,8 @@ casts, the KV record write and the window concatenation:
          slot ``loc`` = local row x 8 + rank, but the reserved padding slot 0): the normed latent k_nope [t,
          0 .. 511], then the rope part k_pe [t, 0 .. 63], at local row loc / 8
 
-Every cast is torch's bf16 -> float8_e4m3fn (round to nearest even, no
-saturation: v_cvt_pk_fp8_f32 on the exact fp32 value), so both outputs are
+Every cast is bf16 -> float8_e4m3fn, saturating (``mla_front.e4m3x2``: round to
+nearest even within +-448, as B300's cvt.rn.satfinite), so both outputs are
 SGLang's bytes. A thread takes 16 output bytes at a time, grid-strided.
 
 An ``absorb`` build takes q_b's output itself and runs the absorb q_nope @
