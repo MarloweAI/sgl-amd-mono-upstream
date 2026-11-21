@@ -185,8 +185,12 @@ class Wide:
         self.kw = kw
         self.w = w
         self.w_in = kw.pack_w_in(w["w_in"])
-        self.key = kw.KdaWideBuild(
-            tokens=S, qlen=L, onorm_eps=EPS, lower_bound=LB, debug=debug, depth=depth, timeline=timeline
+        opts = dict(onorm_eps=EPS, lower_bound=LB, debug=debug, depth=depth, timeline=timeline)
+        # past 8 requests the GEMM form, at the width SGLang's path builds (inproj.layer_entry)
+        self.key = (
+            kw.KdaWideBuild(tokens=S, qlen=L, **opts)
+            if S <= kw.WIDE_REQS * L
+            else kw.gemm_key(S // L, L, **opts)
         )
         self.tl = (
             torch.zeros(kw.BLOCKS, kw.TL_POINTS, dtype=torch.int64, device=device) if timeline else None
