@@ -1116,6 +1116,8 @@ def kda_task(c, task, req, h, hf, k):
         if (wave < L) & own:
             e = lane + 64 * u
             y = x * rr * on_w[u] * sigmoid(fx.ptr_load(c["g2l"] + (jn * HD + e)))
+            # a padded request (no slot): zeros, whatever its x held
+            y = live.select(y, fx.Float32(0.0))
             bo.buffer_store(
                 y.to(fx.BFloat16),
                 rsrc(a["core_out"]),
@@ -1554,7 +1556,8 @@ def launch_values(
     ``w_in`` in_proj as ``pack_w_in`` lays it out;
     ``conv_state`` [slot, channel, entry] by its strides (SGLang's conv cache
     [slot, CONV_W - 1, C] is its ``.mT``), read only; ``rstate`` [slots, 12, 128,
-    128] fp32, read only; ``st_idx`` int32 [R]: each request's slot (< 0: none);
+    128] fp32, read only; ``st_idx`` int32 [R]: each request's slot (< 0: a padded
+    request: zero core rows, no ring or window writes);
     ``conv_win`` [row, >= L, CONV_W - 1, C] gets request r's verify windows at
     ``win_row[r]`` (int32 [R], < 0: none); ``ring`` = (k, v, g, beta) [slots, 12,
     ring_len, (128)]; ``scratch`` (``scratch_bytes``) zeroed once; ``epoch`` a
