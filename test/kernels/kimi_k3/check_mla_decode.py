@@ -118,19 +118,21 @@ def merged(out_o, out_lse, bufs, s):
     return o, lse
 
 
-def timeline(q8, b, bufs):
+def timeline(q8, b, bufs, probe="tl"):
     """The "tl" probe's per-CTA clocks (s_memtime ticks; us at 100 MHz... ratio
     to the shader clock printed): plan, item setup, step loops, epilogues,
     barrier waits, DMA issue; items, steps."""
     tl = torch.zeros(256 * 8, dtype=torch.int32, device=q8.device)
-    _, _, go = run_ours(q8, b, bufs, "tl", tl)
+    _, _, go = run_ours(q8, b, bufs, probe, tl)
     go()
     torch.cuda.synchronize()
     t = tl.view(256, 8).double().cpu()
-    names = ["plan", "setup", "steps", "epilogue", "barrier", "dma", "items", "nsteps"]
+    names = ["plan", "setup", "steps", "epilogue", "total", "real100MHz", "items", "nsteps"]
     tot = t[:, 1] + t[:, 2] + t[:, 3]
     i = int(tot.argmax())
-    print("  timeline (ticks): " + ", ".join(f"{n} mean {t[:, k].mean():.0f} busiest-CTA {t[i, k]:.0f}" for k, n in enumerate(names)))
+    mhz = (t[:, 4] / t[:, 5].clamp_min(1)).mean().item() * 100
+    print(f"  shader clock {mhz:.0f} MHz (s_memtime / s_memrealtime)")
+    print(f"  timeline {probe} (ticks): " + ", ".join(f"{n} mean {t[:, k].mean():.0f} busiest-CTA {t[i, k]:.0f}" for k, n in enumerate(names)))
 
 
 def run_ours(q8, b, bufs, probe="", tl=None):
@@ -139,6 +141,8 @@ def run_ours(q8, b, bufs, probe="", tl=None):
     s = q8.shape[0]
     o = torch.zeros(s, NHA, KV, dtype=BF, device=q8.device)
     lse = torch.zeros(s, NHA, dtype=torch.float32, device=q8.device)
+
+    md.mla_decode_plan_launch(kv_ptr=b.kv_ptr, g_ptr=b.g_kv_ptr, nreq=len(b.reqs), bufs=bufs)
 
     def go():
         md.mla_decode_launch(
@@ -201,6 +205,8 @@ def aiter_decode(q8, b):
 
 
 def case(ps, args, dev, bufs):
+    from sgl_amd_mono.kimi_k3.gfx950.attention import mla_decode as md
+
     s = G * len(ps)
     reqs = [ct.Req(p, args.seed * 1000 + 7 * i, dev) for i, p in enumerate(ps)]
     g = torch.Generator(device=dev).manual_seed(args.seed + 5)
@@ -213,6 +219,11 @@ def case(ps, args, dev, bufs):
         o, lse, go = run_ours(q8, b, bufs)
         go()
         torch.cuda.synchronize()
+        if args.launches:
+            for _ in range(args.launches):
+                go()
+            torch.cuda.synchronize()
+            return 0.0, out
         if args.check:
             mo, ml = merged(o, lse, bufs, s)
             o64, l64, ob3 = refs(q8, b)
@@ -230,7 +241,11 @@ def case(ps, args, dev, bufs):
                 print(f"  probe {pr}: {ct.graph_us(pgo):.1f} us", flush=True)
             if args.timeline:
                 timeline(q8, b, bufs)
+                for pr in args.probes:
+                    timeline(q8, b, bufs, "tl," + pr)
             t_ours = ct.graph_us(go)
+            t_plan = ct.graph_us(lambda: md.mla_decode_plan_launch(kv_ptr=b.kv_ptr, g_ptr=b.g_kv_ptr, nreq=len(b.reqs), bufs=bufs))
+            print(f"  plan kernel {t_plan:.1f} us (once a step)", flush=True)
             ago, info = aiter_decode(q8, b)
             t_aiter = ct.graph_us(ago)
             out["time"] = (t_ours, t_aiter)
@@ -252,11 +267,13 @@ def main():
     ap.add_argument("--probes", nargs="*", default=[], help="timing probes (mla_decode.MlaDecodeBuild.probe)")
     ap.add_argument("--time", action="store_true")
     ap.add_argument("--compile", action="store_true", help="compile-only build (no GPU)")
+    ap.add_argument("--launches", type=int, default=0, help="only launch the decode this many times (profilers)")
     args = ap.parse_args()
     if args.compile:
         from sgl_amd_mono.kimi_k3.gfx950.attention import mla_decode as md
 
-        md.build(md.MlaDecodeBuild(scale=SCALE))(*([0] * 15), stream=0)
+        md.build(md.MlaDecodeBuild(scale=SCALE))(*([0] * 13), stream=0)
+        md.build_plan()(*([0] * 7), stream=0)
         print("COMPILE_OK", flush=True)
         return
     from sgl_amd_mono.kimi_k3.gfx950.attention import mla_decode as md

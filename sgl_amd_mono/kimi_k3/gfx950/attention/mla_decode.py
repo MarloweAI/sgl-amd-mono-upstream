@@ -82,6 +82,7 @@ LOG2E = 1.4426950408889634
 # a request's split: a run of W_NUM / W_DEN of a CTA's share of the batch's work
 W_NUM, W_DEN = 11, 10
 TBL = 10  # plan table words a class
+TBL_WORDS = 2 * MAX_REQS * TBL + 4  # the table, then the item count
 T_R, T_KIND, T_N, T_NB, T_WR, T_IPRE, T_L, T_P, T_PB = range(9)
 
 
@@ -141,6 +142,10 @@ def _dma1(rs, lds_ptr, voff):
 
 def _memtime():
     return fx.Int64(llvm.call_intrinsic(T.i64, "llvm.amdgcn.s.memtime", [], [], []))
+
+
+def _realtime():
+    return fx.Int64(llvm.call_intrinsic(T.i64, "llvm.amdgcn.s.memrealtime", [], [], []))
 
 
 def _bar():
@@ -325,18 +330,18 @@ def build(key: MlaDecodeBuild):
     @fx.struct
     class Smem:
         kv: fx.Array[fx.Int32, 4 * SLOT_W, 16]
-        tbl: fx.Array[fx.Int32, 2 * MAX_REQS * TBL + 4, 16]
+        tbl: fx.Array[fx.Int32, TBL_WORDS, 16]
 
     @flyc.kernel(name="k3_mono_mla_decode", known_block_size=[THREADS, 1, 1])
     def mla_decode(
         q8: Int64, kv: Int64, kv_idx: Int64, kv_ptr: Int64, g_ptr: Int64, nreq: Int32, rank: Int32,
-        o: Int64, lse: Int64, logits: Int64, plse: Int64, indptr: Int64, fmap: Int64, pmap: Int64,
-        tl: Int64,
+        o: Int64, lse: Int64, logits: Int64, plse: Int64, ptbl: Int64, tl: Int64,
     ):  # fmt: skip
         _ = keyed
         tlon = "tl" in probe
         z = fx.Int64(0)
         tk0 = _memtime() if const_expr(tlon) else z
+        rk0 = _realtime() if const_expr(tlon) else z
         t_set, t_loop, t_epi, t_bar, t_dma, n_it, n_st = z, z, z, z, z, z, z
         bid, tid = fx.block_idx.x, fx.thread_idx.x
         lane = tid % 64
@@ -345,7 +350,13 @@ def build(key: MlaDecodeBuild):
         hb = lane // 32
         lds = fx.SharedAllocator().allocate(Smem).peek()
         ring, tbl = lds.kv.ptr, lds.tbl.ptr
-        nitems = plan(None, tbl, kv_ptr, g_ptr, nreq, rank, indptr, fmap, pmap, bid, tid)
+        # the step's plan (``mla_decode_plan``, once a step for every layer)
+        for k_ in range_constexpr(-(-TBL_WORDS // THREADS)):
+            w_ = tid + THREADS * k_
+            if w_ < TBL_WORDS:
+                fx.ptr_store(_ld(ptbl, w_), tbl + w_)
+        _bar()
+        nitems = fx.Int32(fx.ptr_load(tbl + 2 * MAX_REQS * TBL))
         t_plan = (_memtime() - tk0) if const_expr(tlon) else z
         r_kv = rsrc(kv)
         # this CTA's place: XCD-major (CTA c runs on XCD c % 8)
@@ -539,22 +550,55 @@ def build(key: MlaDecodeBuild):
                 t_epi = t_epi + (td - tc)
         if const_expr(tlon):
             if tid == 0:
-                vals = [t_plan, t_set, t_loop, t_epi, t_bar, t_dma, n_it, n_st]
+                vals = [t_plan, t_set, t_loop, t_epi, _memtime() - tk0, _realtime() - rk0, n_it, n_st]
                 for f in range_constexpr(8):
                     bo.buffer_store(fx.Int32(vals[f]), rsrc(tl), bid * 8 + f)
 
     @flyc.jit
     def launch(
         q8: Int64, kv: Int64, kv_idx: Int64, kv_ptr: Int64, g_ptr: Int64, nreq: Int32, rank: Int32,
-        o: Int64, lse: Int64, logits: Int64, plse: Int64, indptr: Int64, fmap: Int64, pmap: Int64,
-        tl: Int64, stream: fx.Stream = _STREAM,
+        o: Int64, lse: Int64, logits: Int64, plse: Int64, ptbl: Int64, tl: Int64,
+        stream: fx.Stream = _STREAM,
     ):  # fmt: skip
         _ = keyed
-        mla_decode(q8, kv, kv_idx, kv_ptr, g_ptr, nreq, rank, o, lse, logits, plse, indptr, fmap, pmap, tl).launch(
+        mla_decode(q8, kv, kv_idx, kv_ptr, g_ptr, nreq, rank, o, lse, logits, plse, ptbl, tl).launch(
             grid=(BLOCKS,), block=(THREADS,), stream=stream
         )
 
     _BUILDS[key] = launch
+    return launch
+
+
+def build_plan():
+    """The plan kernel: one CTA, the step's split plan to ``ptbl`` and the CSR
+    maps of the split reduce (one launch a step: every MLA layer's decode
+    reads the same plan)."""
+    if "plan" in _BUILDS:
+        return _BUILDS["plan"]
+    keyed = key_tuple({"plan": 1}, SOURCES)
+
+    @fx.struct
+    class Smem:
+        tbl: fx.Array[fx.Int32, TBL_WORDS, 16]
+
+    @flyc.kernel(name="k3_mono_mla_decode_plan", known_block_size=[64, 1, 1])
+    def mla_decode_plan(kv_ptr: Int64, g_ptr: Int64, nreq: Int32, indptr: Int64, fmap: Int64, pmap: Int64, ptbl: Int64):
+        _ = keyed
+        tid = fx.thread_idx.x
+        tbl = fx.SharedAllocator().allocate(Smem).peek().tbl.ptr
+        plan(None, tbl, kv_ptr, g_ptr, nreq, fx.Int32(0), indptr, fmap, pmap, fx.Int32(0), tid)
+        for k_ in range_constexpr(-(-TBL_WORDS // 64)):
+            w_ = tid + 64 * k_
+            if w_ < TBL_WORDS:
+                bo.buffer_store(fx.Int32(fx.ptr_load(tbl + w_)), rsrc(ptbl), w_)
+
+    @flyc.jit
+    def launch(kv_ptr: Int64, g_ptr: Int64, nreq: Int32, indptr: Int64, fmap: Int64, pmap: Int64, ptbl: Int64,
+               stream: fx.Stream = _STREAM):  # fmt: skip
+        _ = keyed
+        mla_decode_plan(kv_ptr, g_ptr, nreq, indptr, fmap, pmap, ptbl).launch(grid=(1,), block=(64,), stream=stream)
+
+    _BUILDS["plan"] = launch
     return launch
 
 
@@ -569,6 +613,16 @@ class DecodeBuffers:
         self.indptr = torch.zeros(MAX_REQS + 1, dtype=i32, device=device)
         self.fmap = torch.zeros(2 * MAX_REQS, dtype=i32, device=device)
         self.pmap = torch.zeros(MAX_PART, dtype=i32, device=device)
+        self.tbl = torch.zeros(TBL_WORDS, dtype=i32, device=device)
+
+
+def mla_decode_plan_launch(*, kv_ptr, g_ptr, nreq, bufs):
+    """The step's plan (``build_plan``): once a step, before its layers' decodes."""
+    assert 1 <= nreq <= MAX_REQS and kv_ptr.dtype == g_ptr.dtype == torch.int32
+    build_plan()(
+        kv_ptr.data_ptr(), g_ptr.data_ptr(), nreq, bufs.indptr.data_ptr(), bufs.fmap.data_ptr(),
+        bufs.pmap.data_ptr(), bufs.tbl.data_ptr(), stream=torch.cuda.current_stream(),
+    )  # fmt: skip
 
 
 def mla_decode_launch(key: MlaDecodeBuild, *, q8, kv, kv_idx, kv_ptr, g_ptr, rank, o, lse, bufs, tl=None):
@@ -590,7 +644,7 @@ def mla_decode_launch(key: MlaDecodeBuild, *, q8, kv, kv_idx, kv_ptr, g_ptr, ran
     assert lse.dtype == torch.float32 and lse.is_contiguous() and lse.numel() == s * NHA
     build(key)(
         q8.data_ptr(), kv.data_ptr(), kv_idx.data_ptr(), kv_ptr.data_ptr(), g_ptr.data_ptr(), nreq, rank,
-        o.data_ptr(), lse.data_ptr(), bufs.logits.data_ptr(), bufs.plse.data_ptr(), bufs.indptr.data_ptr(),
-        bufs.fmap.data_ptr(), bufs.pmap.data_ptr(), 0 if tl is None else tl.data_ptr(),
+        o.data_ptr(), lse.data_ptr(), bufs.logits.data_ptr(), bufs.plse.data_ptr(), bufs.tbl.data_ptr(),
+        0 if tl is None else tl.data_ptr(),
         stream=torch.cuda.current_stream(),
     )  # fmt: skip
