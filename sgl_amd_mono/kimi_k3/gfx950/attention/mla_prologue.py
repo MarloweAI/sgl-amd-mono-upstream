@@ -9,7 +9,7 @@ casts, the KV record write and the window concatenation:
          [t, h, 0 .. 511], then q_b's rope columns q_pe [t, h, 0 .. 63] (q_b
          [t, h, 128 .. 191])
     KV   e4m3 [pool rows, 576]: the record of each row this rank owns (its KV
-         slot ``loc`` = local row x 8 + rank): the normed latent k_nope [t,
+         slot ``loc`` = local row x 8 + rank, but the reserved padding slot 0): the normed latent k_nope [t,
          0 .. 511], then the rope part k_pe [t, 0 .. 63], at local row loc / 8
 
 Every cast is torch's bf16 -> float8_e4m3fn (round to nearest even, no
@@ -207,7 +207,9 @@ def build(key: MlaPrologueBuild):
             t = pc // K_PIECES
             j = pc % K_PIECES
             slot = fx.Int64(bo.buffer_load(rsrc(loc), t * 2, vec_width=1, dtype=T.i32))
-            owned = (p < nk) & ((slot & fx.Int64(DCP - 1)) == fx.Int64(rank))
+            # slot 0 is SGLang's reserved padding slot (padded rows' loc): never written, as
+            # set_mla_kv_buffer's reserved_skip_index; real requests' reads may touch it
+            owned = (p < nk) & (slot != fx.Int64(0)) & ((slot & fx.Int64(DCP - 1)) == fx.Int64(rank))
             nope = j < KV // PIECE
             a = _bf16x8(kn, t * kn_rs + fx.min(j, KV // PIECE - 1) * PIECE)
             b = _bf16x8(kn, t * kn_rs + fx.min(j, KV // PIECE - 1) * PIECE + 8)

@@ -499,10 +499,12 @@ def check_prologue(device, seed):
             kn, kp = lat[:, 1536 : 1536 + KV], lat[:, 1536 + KV :]
             nloc = 4 * s
             slots = torch.randperm(nloc * DCP, generator=torch.Generator().manual_seed(s + rank))[:s]
+            # padded rows: SGLang's reserved slot 0, never written
+            slots[-G:] = 0
             loc = slots.to(device=device, dtype=torch.int64)
             pool = torch.randint(0, 255, (nloc, DQK), generator=g, device=device, dtype=torch.int32).to(torch.uint8)
             want = pool.clone()
-            own = (loc % DCP) == rank
+            own = ((loc % DCP) == rank) & (loc != 0)
             rec = torch.cat([kn, kp], -1).to(F8).view(torch.uint8)
             want[loc[own] // DCP] = rec[own]
             q8 = torch.empty(s, NHA, DQK, dtype=F8, device=device)
