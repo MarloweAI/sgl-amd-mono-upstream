@@ -850,10 +850,10 @@ def k2_body(key: K2Build, k2_lds: K2Lds, scratch_base, args: dict) -> None:
         else:
             stamp(on, tls, tid, 3)
             if bid < k2b.DOWN_TASKS:
-                dops = k2b.down_loads(c, bid, nu, fx.min(c["wave"], nu - 1))
+                ring = k2b.down_stream_start(c, bid, nu)
                 k2b.load_inter(c)
                 stamp(on, tls, tid, 15)
-                k2b.stage_down(c, bid, nu, dops)
+                k2b.stage_down_stream(c, bid, nu, ring)
                 stamp(on, tls, tid, 16)
             if const_expr(key.opt & OPT_SDOWN_FIRST):
                 k2b.run_sdown_first(c, bid, w_sd)

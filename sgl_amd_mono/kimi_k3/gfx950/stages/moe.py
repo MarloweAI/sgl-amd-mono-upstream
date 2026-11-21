@@ -1541,6 +1541,83 @@ def fold_latr(c, rgd, sent_latr):
     gpu.barrier()
 
 
+# a narrow step's down as one stream a wave: the wave's slots (w, w + 8, ...,
+# up to max_u / 8, past |U| the last slot again) one 1 KB w2 tile and its code
+# word a load, DOWN_RING ahead; the same chains, products and fold as
+# ``stage_down``.
+DOWN_RING = 9  # three slots' tiles in flight a wave
+
+
+def down_slots(s):
+    """A wave's slots at most (a narrow step)."""
+    return (max_u(s) + WAVES - 1) // WAVES
+
+
+def down_item(c, rgd, nu, i):
+    """Stream item i of this wave: (slot i / 3's w2 tile at K step i % 3, its
+    code word)."""
+    lane = c["lane"]
+    sl = fx.min(c["wave"] + WAVES * (i // W2_STEPS), nu - 1)
+    e = uniform(fx.ptr_load(c["rt"]["expert"] + sl))
+    st = i % W2_STEPS
+    a = fp4_tile_load(rsrc(c["args"]["w2"]), e * (LAT * RI // 8), rgd, RI, st, lane * 4)
+    return a, w2_word(c, e, rgd, st, lane)
+
+
+def down_stream_start(c, rgd, nu):
+    """The stream's first DOWN_RING items (issued before INTER is waited for)."""
+    return [down_item(c, rgd, nu, i) for i in range(DOWN_RING)]
+
+
+@flyc.jit
+def stage_down_stream(c, rgd, nu, ring):
+    """Latent rows 16 rgd ..: this wave's slots' w2 against their picks (``ring``:
+    ``down_stream_start``) -> bf16(w acc) a (token, k) in LDS -> folded in top-k
+    order with a bf16 rounding an add -> every rank's LATR."""
+    sent_latr = c.get("sent_latr", False)
+    s, lane, wave = c["S"], c["lane"], c["wave"]
+    rt = c["rt"]
+    t = fx.min(lane % 16, s - 1)
+    kb = lane // 16
+    n_items = down_slots(s) * W2_STEPS
+    held = {}
+    for i in range_constexpr(n_items):
+        held[i % W2_STEPS] = ring[i % DOWN_RING]
+        if i + DOWN_RING < n_items:
+            ring[i % DOWN_RING] = down_item(c, rgd, nu, i + DOWN_RING)
+        if i % W2_STEPS == W2_STEPS - 1:
+            j = i // W2_STEPS
+            sl = wave + WAVES * j
+            if sl < nu:
+                k = fx.ptr_load(rt["kof"] + (sl * s + t))
+                picked = (k >= 0) & (lane % 16 < s)
+                pick = t * TOPK + fx.max(k, 0)
+                acc = fx.Vector.filled(4, 0.0, fx.Float32)
+                for st in range_constexpr(W2_STEPS):
+                    bw = fp8_operand(c["interq"], pick * IW, st, kb)
+                    scode = fx.ptr_load(c["intsc"] + (pick * UG_GROUPS + st * 4 + kb))
+                    bw = fx.Vector.from_elements(
+                        [picked.select(bw[d], fx.Int32(0)) for d in range(8)], fx.Int32
+                    )
+                    sb = picked.select(scode, fx.Int32(UNIT_SCALE))
+                    a, wd = held[st]
+                    sa = (wd >> (((st % 2) * 2 + rgd % 2) * 8)) & 0xFF
+                    acc = mfma_scaled(a, bw, acc, sa, sb, FP4, FP8, 0, 0)
+                if picked:
+                    wt = fx.ptr_load(rt["route"] + (t * 2 * TOPK + TOPK + k)).bitcast(
+                        fx.Float32
+                    )
+                    for q in range_constexpr(4):
+                        row = 4 * (lane // 16) + q
+                        fx.ptr_store(
+                            bf16_round(acc[q] * wt),
+                            c["contrib"] + ((t * TOPK + k) * ROWS + row),
+                        )
+        rocdl.sched_barrier(0)
+    gpu.barrier()
+    fold_latr(c, rgd, sent_latr)
+
+
 @flyc.jit
 def stage_down(c, rgd, nu, ops0):
     """Latent rows 16 rgd ..: every slot's w2 against its picks (wave w the slots
