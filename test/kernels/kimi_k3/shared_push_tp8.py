@@ -9,11 +9,14 @@ stage 1 with the shared down, stage 2) and then:
 * ``push``: the call with ``SharedPushAr.push_args(layer)`` (its shared tiles push), then ``SharedPushAr.reduce``
   (the latent half's all-reduce + norm + the pushed shared sum);
 * ``push_flat``: the pushing call, then C13's flat launch (push - push_flat is the split's cost against the flat
-  launch, push_flat - flat the push's inside the fused call).
+  launch, push_flat - flat the push's inside the fused call);
+* ``push_slice``: the pushing call, then ``SharedPushAr.reduce_slice`` (this rank's columns of the shared sum,
+  no gather).
 
-Times: µs a layer, median and slowest rank. Check (every rank, all-reduced counts), on each layer of a replayed
-``push`` graph: the three outputs against the rank-order f32 sum of the ranks' own partials, and against
-``MoeAr.reduce`` on the same partials, bit for bit.
+Times: µs a layer, median and slowest rank. Check (every rank, all-reduced counts), each layer run once more
+eagerly: the split's three outputs against the rank-order f32 sum of the ranks' own partials and against
+``MoeAr.reduce`` on the same partials, and ``reduce_slice``'s against the split's (its slice against this rank's
+columns of the full sum), bit for bit.
 
     torchrun --nproc-per-node 8 shared_push_tp8.py --rows 54,96,168
 """
@@ -110,56 +113,59 @@ def main():
     for m in rows:
         assert split.covers(m), m
         case = make_case(m, 1000 * m + rank, dev)  # each rank its own partials
-        keep = {}
 
         def arm(name):
             def body():
-                res = []
                 for i in range(nl):
-                    if name in ("push", "push_flat"):
+                    if name in ("push", "push_flat", "push_slice"):
                         latent, shared = run_case(case, push=(split.launches, *split.push_args(i)))
                         if name == "push":
-                            res.append((latent, shared, *split.reduce(i, latent, shared, w)))
+                            split.reduce(i, latent, shared, w)
+                        elif name == "push_slice":
+                            split.reduce_slice(i, latent, shared, w)
                         else:
                             flat.reduce(i, latent, shared, w)
                     else:
                         latent, shared = run_case(case)
                         flat.reduce(i, latent, shared, w)
-                if name != "push_flat":
-                    keep[name] = res
-
+    
             return body
 
         times = {}
         graphs = {}
-        for name in ("flat", "push", "push_flat"):
+        for name in ("flat", "push", "push_flat", "push_slice"):
             graphs[name] = capture(arm(name))
             times[name] = across(graph_us(graphs[name], args.reps, nl), dev)
-        # check: the last replay of the push graph, layer by layer
+        # check: each layer once more, eagerly; the split, its slice variant and the flat launch on one push
         torch.cuda.synchronize()
-        bads = torch.zeros(5, dtype=torch.int64, device=dev)
-        for i, (latent, shared, sl, ss, sn) in enumerate(keep["push"]):
-            fl, fs, fn = flat.reduce(i, latent.clone(), shared.clone(), w)
+        sl0 = slice(rank * (SHR // TP), (rank + 1) * (SHR // TP))
+        bads = torch.zeros(8, dtype=torch.int64, device=dev)
+        for i in range(nl):
+            latent, shared = run_case(case, push=(split.launches, *split.push_args(i)))
+            sl, ss, sn = split.reduce(i, latent, shared, w)
+            ql, qs, qn = split.reduce_slice(i, latent, shared, w)
+            fl, fs, fn = flat.reduce(i, latent, shared, w)
             al, as_ = rank_order(gathered(latent)), rank_order(gathered(shared))
             torch.cuda.synchronize()
-            bads += torch.tensor([bad(ss, as_), bad(sl, al), bad(ss, fs), bad(sl, fl), bad(sn, fn)],
+            bads += torch.tensor([bad(ss, as_), bad(sl, al), bad(ss, fs), bad(sl, fl), bad(sn, fn),
+                                  bad(qs, ss[:, sl0].contiguous()), bad(ql, sl), bad(qn, sn)],
                                  dtype=torch.int64, device=dev)  # fmt: skip
         dist.all_reduce(bads)
         b = dict(zip(("shared_vs_rankorder", "latent_vs_rankorder", "shared_vs_flat", "latent_vs_flat",
-                      "norm_vs_flat"), bads.tolist()))  # fmt: skip
+                      "norm_vs_flat", "slice_vs_full", "slice_latent", "slice_norm"), bads.tolist()))  # fmt: skip
         passed = all(v == 0 for v in b.values())
         ok &= passed
         out["check"].append({"m": m, **b, "pass": passed})
         t = {k: {"median": round(v[0], 2), "slowest": round(v[1], 2)} for k, v in times.items()}
         t["push_minus_flat"] = {k: round(times["push"][j] - times["flat"][j], 2)
                                 for j, k in ((0, "median"), (1, "slowest"))}  # fmt: skip
-        for a, b2 in (("push", "push_flat"), ("push_flat", "flat")):
+        for a, b2 in (("push", "push_flat"), ("push_flat", "flat"), ("push_slice", "push"), ("push_slice", "flat")):
             t[f"{a}_minus_{b2}"] = {k: round(times[a][j] - times[b2][j], 2) for j, k in ((0, "median"), (1, "slowest"))}
         out["time"].append({"m": m, **t})
         if rank == 0:
             print("TP8CHECK", json.dumps({"m": m, **b, "pass": passed}), flush=True)
             print("TP8TIME", json.dumps({"m": m, **t}), flush=True)
-        del graphs, keep, case
+        del graphs, case
         torch.cuda.empty_cache()
     if rank == 0 and args.json:
         with open(args.json, "w") as f:

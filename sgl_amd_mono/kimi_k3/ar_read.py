@@ -138,6 +138,7 @@ class SharedPushAr:
         self.peer = PeerBuffer(S.peer_bytes(), cpu_group, rank, K.TP, dev, init=S.arm)
         self.launches = max(layers) + 1
         self.split_launch = S.build_split(float(eps), self.launches)
+        self.slice_launch = S.build_split(float(eps), self.launches, gather=False)
 
     def covers(self, rows: int) -> bool:
         return rows in PUSH_ROWS
@@ -158,6 +159,20 @@ class SharedPushAr:
         assert latent.is_contiguous() and shared.is_contiguous() and shared.shape[0] == m
         out_l, out_n, out_s = torch.empty_like(latent), torch.empty_like(latent), torch.empty_like(shared)
         self.split_launch(
+            _p(latent), _p(shared), _p(w), _p(out_l), _p(out_s), _p(out_n), m, _p(self.peer.addresses),
+            self.rank, _p(self.epoch), layer, stream=torch.cuda.current_stream(),
+        )  # fmt: skip
+        return out_l, out_s, out_n
+
+    def reduce_slice(self, layer: int, latent, shared, w):
+        """``reduce`` for a consumer that reads only this rank's columns of the shared sum: (latent sum,
+        this rank's slice of the shared sum [m, 896] (columns [896 rank, 896 (rank + 1)), contiguous rows),
+        RMSNorm of the latent sum), with no gather of the shared sum."""
+        m = latent.shape[0]
+        assert latent.is_contiguous() and shared.is_contiguous() and shared.shape[0] == m
+        out_l, out_n = torch.empty_like(latent), torch.empty_like(latent)
+        out_s = shared.new_empty((m, shared.shape[1] // K.TP))
+        self.slice_launch(
             _p(latent), _p(shared), _p(w), _p(out_l), _p(out_s), _p(out_n), m, _p(self.peer.addresses),
             self.rank, _p(self.epoch), layer, stream=torch.cuda.current_stream(),
         )  # fmt: skip

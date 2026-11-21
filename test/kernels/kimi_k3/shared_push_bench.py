@@ -22,6 +22,7 @@ import torch
 
 TP = 8
 LAT, SHR = 3584, 7168
+SL = SHR // 8
 SETS = 3
 BF = torch.bfloat16
 GRAPH_ROWS = (54, 168, 96, 49, 192, 120)
@@ -63,6 +64,7 @@ class Emu:
         self.mr = S.MAX_ROWS
         self.push = S.build_push(launches, blocks=8, emulate=True)
         self.split = S.build_split(eps, launches, blocks=32, emulate=True)
+        self.split_slice = S.build_split(eps, launches, blocks=32, emulate=True, gather=False)
         self.flat = N.build_moe(eps, launches, blocks=32, emulate=True)
         self.bufs = [PeerBuffer(S.peer_bytes(), None, 0, 1, dev, init=S.arm) for _ in range(TP)]
         self.table = torch.tensor([b.local for b in self.bufs], dtype=torch.int64, device=dev)
@@ -72,12 +74,18 @@ class Emu:
         self.ep[guard.GUARD_DEADLINE] = guard.deadline_ticks(deadline) & 0x7FFFFFFF
         self.fep = self.ep.clone()
 
-    def layer(self, slot, m, io, w):
+    def layer(self, slot, m, io, w, which=("full", "slice")):
         s = torch.cuda.current_stream()
         self.push(io["ps"].data_ptr(), m, self.table.data_ptr(), 0, self.ep.data_ptr(), slot, stream=s)
-        self.split(io["pl"].data_ptr(), io["ps"].data_ptr(), w.data_ptr(), io["ol"].data_ptr(),
-                   io["os"].data_ptr(), io["on"].data_ptr(), m, self.table.data_ptr(), 0, self.ep.data_ptr(),
-                   slot, stream=s)  # fmt: skip
+        if "full" in which:
+            self.split(io["pl"].data_ptr(), io["ps"].data_ptr(), w.data_ptr(), io["ol"].data_ptr(),
+                       io["os"].data_ptr(), io["on"].data_ptr(), m, self.table.data_ptr(), 0, self.ep.data_ptr(),
+                       slot, stream=s)  # fmt: skip
+        # the slice variant on the same pushed slots: this rank's columns only, no gather
+        if "slice" in which:
+            self.split_slice(io["pl"].data_ptr(), io["ps"].data_ptr(), w.data_ptr(), io["ol2"].data_ptr(),
+                             io["oss"].data_ptr(), io["on2"].data_ptr(), m, self.table.data_ptr(), 0,
+                             self.ep.data_ptr(), slot, stream=s)  # fmt: skip
 
     def flat_layer(self, slot, m, io, w):
         self.flat(io["pl"].data_ptr(), io["ps"].data_ptr(), w.data_ptr(), io["fl"].data_ptr(),
@@ -88,7 +96,7 @@ class Emu:
 def buffers(mr, dev):
     z = lambda n: torch.zeros(TP, mr, n, dtype=BF, device=dev)  # noqa: E731
     return {"pl": z(LAT), "ps": z(SHR), "ol": z(LAT), "os": z(SHR), "on": z(LAT),
-            "fl": z(LAT), "fs": z(SHR), "fn": z(LAT)}  # fmt: skip
+            "fl": z(LAT), "fs": z(SHR), "fn": z(LAT), "ol2": z(LAT), "on2": z(LAT), "oss": z(SHR // TP)}  # fmt: skip
 
 
 def inputs(m, s, li, dev):
@@ -113,7 +121,7 @@ def check(args, emu, dev, w):
             xl, xs = inputs(m, s, slot, dev)
             io["pl"][:, :m].copy_(xl)
             io["ps"][:, :m].copy_(xs)
-            for k in ("ol", "os", "on"):
+            for k in ("ol", "os", "on", "ol2", "on2", "oss"):
                 io[k].zero_()
 
     fill(0)
@@ -147,11 +155,15 @@ def check(args, emu, dev, w):
                 "norm_vs_flat_bad": bad(io["on"][:, :m], io["fn"][:, :m]),
                 "shared_vs_flat_bad": bad(io["os"][:, :m], io["fs"][:, :m]),
                 "norm_vs_stock_bad": bad(io["on"][:, :m], n.expand(TP, -1, -1)),
+                "slice_vs_full_bad": sum(bad(io["oss"][r, :m], io["os"][r, :m, r * SL:(r + 1) * SL]) for r in range(TP)),
+                "slice_latent_bad": bad(io["ol2"][:, :m], io["ol"][:, :m]),
+                "slice_norm_bad": bad(io["on2"][:, :m], io["on"][:, :m]),
                 "rel_split": max(rel_l2(io["on"][r, :m], r64) for r in range(TP)),
                 "rel_stock": rel_l2(n, r64),
             }  # fmt: skip
             c["pass"] = (c["shared_bad"] == 0 and c["latent_bad"] == 0 and c["norm_vs_flat_bad"] == 0
-                         and c["shared_vs_flat_bad"] == 0)  # fmt: skip
+                         and c["shared_vs_flat_bad"] == 0 and c["slice_vs_full_bad"] == 0
+                         and c["slice_latent_bad"] == 0 and c["slice_norm_bad"] == 0)  # fmt: skip
             ok &= c["pass"]
             cases.append(c)
             print("EMU", json.dumps(c), flush=True)
@@ -196,15 +208,22 @@ def time_launches(args, emu, dev, w):
         def both():
             emu.ep[0:1].add_(1)
             for slot in range(nl):
-                emu.layer(slot, m, io, w)
+                emu.layer(slot, m, io, w, ("full",))
+
+        def sliced():
+            emu.ep[0:1].add_(1)
+            for slot in range(nl):
+                emu.layer(slot, m, io, w, ("slice",))
 
         def flat():
             emu.fep[0:1].add_(1)
             for slot in range(nl):
                 emu.flat_layer(slot, m, io, w)
 
-        r = {"m": m, "push": graph_us(push_only, nl), "push_split": graph_us(both, nl), "flat": graph_us(flat, nl)}
+        r = {"m": m, "push": graph_us(push_only, nl), "push_split": graph_us(both, nl), "flat": graph_us(flat, nl),
+             "push_slice": graph_us(sliced, nl)}
         r["split"] = r["push_split"] - r["push"]
+        r["slice"] = r["push_slice"] - r["push"]
         print("TIME", json.dumps({k: (round(v, 2) if isinstance(v, float) else v) for k, v in r.items()}), flush=True)
         out.append(r)
     return out

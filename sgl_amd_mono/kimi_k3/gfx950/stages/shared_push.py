@@ -182,9 +182,10 @@ def build_push(launches, max_rows=MAX_ROWS, blocks=PUSH_BLOCKS, emulate=False):
 
 
 @flyc.jit
-def slice_sum(c, t, q, xs, ag_s, max_rows):
+def slice_sum(c, t, q, xs, ag_s, out_slice, max_rows):
     """Unit q of this rank's slice of row t of the shared sum: the 8 ranks' partials in rank order (its own
-    from xs, the others' from rs_s), in f32, rounded once, then sent into every rank's gathered row."""
+    from xs, the others' from rs_s), in f32, rounded once, then sent into every rank's gathered row, or
+    (``out_slice``, an address) stored into row t of this rank's slice [m, SL]."""
     rank = c["rank"]
     own = _ld4(xs, t * (SHARED // 2) + rank * (SL // 2) + 4 * q)
     rs = c["rs_s_own"].value
@@ -198,14 +199,18 @@ def slice_sum(c, t, q, xs, ag_s, max_rows):
         nxt = f8(parts[src])
         acc = [acc[e] + nxt[e] for e in range(8)]
     summed = words8(acc)
-    for p in range_constexpr(TP):
-        st_sent(ag_s[p], t * (SHARED // 2) + rank * (SL // 2) + 4 * q, summed)
+    if const_expr(out_slice is not None):
+        _st4(summed, out_slice, t * (SL // 2) + 4 * q)
+    else:
+        for p in range_constexpr(TP):
+            st_sent(ag_s[p], t * (SHARED // 2) + rank * (SL // 2) + 4 * q, summed)
 
 
 @flyc.jit
-def split_row(c, t, a, red, max_rows, eps):
+def split_row(c, t, a, red, max_rows, eps, gather):
     """Row t: the latent two-shot with its RMSNorm (``ar_norm.moe_row``'s latent part) and the shared
-    sum: this rank's slice once the row's tiles are flagged, gathered in the latent's round."""
+    sum: this rank's slice once the row's tiles are flagged, gathered in the latent's round (``gather``)
+    or left as this rank's slice."""
     tid = c["tid"]
     lane = tid % 64
     wave = uniform(tid // 64)
@@ -226,9 +231,10 @@ def split_row(c, t, a, red, max_rows, eps):
     gpu.barrier()
     q = tid - SUM_T0
     if (q >= 0) & (q < SL // 8):
-        slice_sum(c, t, q, a["xs"], ag_s, max_rows)
-    srow = t * (SHARED // 2)
-    _st4(poll_sent4(c["ag_s_own"].value, [srow + 4 * tid])[0], a["out_s"] + fx.Int64(srow) * 4, 4 * tid)
+        slice_sum(c, t, q, a["xs"], ag_s, None if gather else a["out_s"], max_rows)
+    if const_expr(gather):
+        srow = t * (SHARED // 2)
+        _st4(poll_sent4(c["ag_s_own"].value, [srow + 4 * tid])[0], a["out_s"] + fx.Int64(srow) * 4, 4 * tid)
     wv = fx.Vector(bo.buffer_load(rsrc(a["wl"]), 4 * fx.min(tid, LATENT // 8 - 1), vec_width=4, dtype=T.i32))
     lrow = t * (LATENT // 2)
     zero = fx.Float32(0.0)
@@ -259,18 +265,20 @@ def split_row(c, t, a, red, max_rows, eps):
 _SPLIT_BUILDS: dict = {}
 
 
-def build_split(eps, launches, max_rows=MAX_ROWS, blocks=SPLIT_BLOCKS, emulate=False):
+def build_split(eps, launches, max_rows=MAX_ROWS, blocks=SPLIT_BLOCKS, emulate=False, gather=True):
     """The launch: ``launch(xl, xs, wl, out_l, out_s, out_n, m, peers, rank, epoch, slot, stream=)``:
     this rank's latent [m, LATENT] and shared [m, SHARED] partials (bf16, contiguous rows; the shared
     one pushed by ``push_tile`` / ``flag_tile`` with the same slot) -> the sums out_l / out_s and out_n = the
-    RMSNorm of out_l with the bf16 weight wl. ``emulate`` as ``build_push``'s."""
+    RMSNorm of out_l with the bf16 weight wl. ``gather`` False: out_s is this rank's slice of the shared sum,
+    [m, SL] (columns [SL rank, SL (rank + 1)), contiguous rows), with no gather. ``emulate`` as
+    ``build_push``'s (out_s then [TP, max_rows, SL] without ``gather``)."""
     keyed = key_tuple(locals(), SOURCES)
-    key = (eps, launches, max_rows, blocks, emulate)
+    key = (eps, launches, max_rows, blocks, emulate, gather)
     if key in _SPLIT_BUILDS:
         return _SPLIT_BUILDS[key]
     offs, half = layout(max_rows)
     fo = 2 * half
-    name = f"k3_moe_split_r{max_rows}_b{blocks}_l{launches}_e{int(emulate)}"
+    name = f"k3_moe_split_r{max_rows}_b{blocks}_l{launches}_e{int(emulate)}_g{int(gather)}"
     grid = blocks * TP if emulate else blocks
 
     @fx.struct
@@ -288,8 +296,9 @@ def build_split(eps, launches, max_rows=MAX_ROWS, blocks=SPLIT_BLOCKS, emulate=F
             bid = bid % blocks
             sh_l = fx.Int64(rank) * fx.Int64(max_rows * LATENT * 2)
             sh_s = fx.Int64(rank) * fx.Int64(max_rows * SHARED * 2)
+            sh_o = sh_s if gather else fx.Int64(rank) * fx.Int64(max_rows * SL * 2)
             xl, out_l, out_n = xl + sh_l, out_l + sh_l, out_n + sh_l
-            xs, out_s = xs + sh_s, out_s + sh_s
+            xs, out_s = xs + sh_s, out_s + sh_o
         else:
             rank = rank_arg
         own = load_ptr64(peers, rank)
@@ -300,7 +309,7 @@ def build_split(eps, launches, max_rows=MAX_ROWS, blocks=SPLIT_BLOCKS, emulate=F
             c = coll.region_context(peers, rank, epoch, slot, offs, half, tid, bid, launches)
             a = {"xl": xl, "xs": xs, "wl": wl, "out_l": out_l, "out_s": out_s, "out_n": out_n}
             for t in range(bid, m, blocks):
-                split_row(c, t, a, red, max_rows, eps)
+                split_row(c, t, a, red, max_rows, eps, gather)
 
     @flyc.jit
     def launch(
