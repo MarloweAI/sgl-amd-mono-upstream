@@ -446,8 +446,8 @@ def lds_types(key: K2Build) -> K2LdsTypes:
             scan: fx.Array[fx.Int32, WAVES, 16]
 
         @fx.struct
-        class UgLds:
-            latq: fx.Array[fx.Int32, gemv.ROWS * k2b.LQ_WORDS, 16]
+        class UgLds:  # a unit's rows, or every token's (``k2b.wave_ug``)
+            latq: fx.Array[fx.Int32, max(gemv.ROWS, s if k2b.wave_ug(s) else 0) * k2b.LQ_WORDS, 16]
             av: fx.Array[fx.Float32, THREADS, 16]
 
         @fx.struct
@@ -831,20 +831,10 @@ def k2_body(key: K2Build, k2_lds: K2Lds, scratch_base, args: dict) -> None:
             nu = k2b.load_route2(c)
             stamp(on, tls, tid, 11)
         total = nu * k2b.UG_GROUPS
-        last = total - 1
-        # reversed placement: the round's leftover tasks go to the high CTAs,
-        # whose early work ends first (the AttnRes / route CTAs start ug last)
         if const_expr(wide):
             k2b.run_ug_wide(c, total)
         else:
-            task = BLOCKS - 1 - bid
-            ops = k2b.ug_loads(c, fx.min(task, last))
-            while task < total:
-                nxt = task + BLOCKS
-                ops_n = k2b.ug_loads(c, fx.min(nxt, last))
-                k2b.stage_ug(c, task, ops)
-                task = nxt
-                ops = ops_n
+            k2b.run_ug_waves(c, total)
         if const_expr(wide):
             if (bid >= H0) & (bid < H0 + s):
                 # the shared h after ug: its SGU lands after the route table

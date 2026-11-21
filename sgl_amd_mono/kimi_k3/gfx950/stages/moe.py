@@ -1885,6 +1885,12 @@ def run_ug_wide(c, total):
     """This CTA's ug tasks (``ug_task``), a task's weights and latent rows a
     task ahead (the first task's weights in flight while the latent copy
     lands)."""
+    if const_expr(wave_ug(c["S"])):
+        wait_latq(c)
+        stamp(c["tl_on"], c["tls"], c["tid"], 12)
+        latq_all(c)
+        run_ug_waves(c, total)
+        return
     last = total - 1
     i = fx.Int32(0)
     task = ug_task(c, i)
@@ -1901,6 +1907,173 @@ def run_ug_wide(c, total):
         task = nxt
         ops = ops_n
         bq = bq_n
+
+
+# ---------------------------------------------------------------- ug a task a wave
+# Up to WAVE_UG_ROWS rows a ug task is one wave's: the 32-column group's four
+# 16-row blocks of w13 (both K halves of gate and up, contiguous under
+# ``guint``) streamed as one run, against the latent rows in LDS (a narrow
+# step's tokens; a wide step's unit picks, gathered from every token's row),
+# the epilogue in registers (no CTA barrier a task). The same MFMA
+# chains (a block's K halves), the same half sum, SiTUv2, bf16 rounding,
+# 32-column amax and MXFP8 words as ``stage_ug``: the same bits.
+UGW_RING = 8  # weight loads in flight a wave
+
+
+WAVE_UG_ROWS = 24  # every token's latent row fits a CTA's LDS
+
+
+def wave_ug(s):
+    """Whether an s-row step runs ug a task a wave (``run_ug_waves``)."""
+    return s <= WAVE_UG_ROWS
+
+
+def ugw_block(c, g, jj, up):
+    """w13's 16-row block of group g's gate (up 0) or up (1) rows 16 jj .."""
+    j = 2 * g + jj
+    return 2 * j + up if c["guint"] else up * (RI // ROWS) + j
+
+
+def ugw_scale_byte(c, jj, up, st):
+    """The byte of ``w13_scale_word``'s dword for block (jj, up) at step st:
+    (st % 2) 2 + block % 2."""
+    return (st % 2) * 2 + (up if c["guint"] else jj)
+
+
+@flyc.jit
+def latq_all(c):
+    """A wide step: every token's LQC row -> LDS ``latq`` (row t at word
+    t LQ_WORDS, its codes past LAT / 4 words)."""
+    s, tid = c["S"], c["tid"]
+    n = s * LQ_WORDS // 4
+    r = rsrc(c["lqc"], s * LQ_WORDS * 4)
+    for i in range_constexpr((n + THREADS - 1) // THREADS):
+        q = tid + THREADS * i
+        if q < n:
+            v = fx.Vector(
+                bo.buffer_load(
+                    r, fx.min(q, n - 1) * 4, vec_width=4, dtype=T.i32, cache_modifier=CM_DEV
+                )
+            )
+            fx.ptr_store(v, c["latq"] + q * 4)
+    gpu.barrier()
+
+
+def ugw_column(c, slot):
+    """This lane's MFMA column (lane % 16) of slot (unit) ``slot``: its latent
+    row's LDS word, its codes' LDS pointer, its pick t TOPK + k, and whether it
+    is one. Narrow: column t is token t (``kof``); wide: the unit's t-th pick
+    (a column past the unit reads the last one's row, as ``stage_ug_w``)."""
+    s, rt, lane = c["S"], c["rt"], c["lane"]
+    t = lane % 16
+    if const_expr(not wide(s)):
+        tr = fx.min(t, s - 1)
+        k = fx.ptr_load(rt["kof"] + (slot * s + tr))
+        live = (t < s) & (k >= 0)
+        return tr * (LAT // 4), c["latsc"] + tr * (LAT // 32), t * TOPK + k, live
+    st0, n = unit_of(c, slot)
+    p = fx.ptr_load(rt["toks"] + (st0 + fx.min(t, n - 1)))
+    tok = p // TOPK
+    return tok * LQ_WORDS, c["latq"] + (tok * LQ_WORDS + LAT // 4), p, t < n
+
+
+@flyc.jit
+def stage_ug_wv(c, task):
+    """This wave's ug task (slot / unit task / 12, group task % 12): the four
+    blocks' w13 streamed UGW_RING loads ahead, the eight K-half chains, then
+    in registers: the halves summed, SiTUv2, bf16, the group's amax over the
+    four lane rows (permlane swaps 16, 32), MXFP8 -> INTER / ISC of each
+    picking token."""
+    narrow = not wide(c["S"])
+    lane = c["lane"]
+    a, rt = c["args"], c["rt"]
+    slot = task // UG_GROUPS
+    g = task % UG_GROUPS
+    e = uniform(fx.ptr_load(rt["expert"] + slot))
+    r_w = rsrc(a["w13"])
+    r_s = rsrc(a["w13s"])
+    base = e * (2 * RI * W13_K // 8)
+    blocks = [(jj, up) for jj in range(2) for up in range(2)]
+    seq = [(b, st) for b in range(4) for st in range(W13_STEPS)]
+
+    def wload(i):
+        jj, up = blocks[seq[i][0]]
+        return fp4_tile_load(r_w, base, ugw_block(c, g, jj, up), W13_K, seq[i][1], lane * 4)
+
+    sw = {}
+    for jj, up in blocks:
+        for k1 in range(W13_STEPS // 2):
+            rg = ugw_block(c, g, jj, up)
+            key = (jj, up if not c["guint"] else 0, k1)
+            if key not in sw:
+                sw[key] = fx.Int32(
+                    bo.buffer_load(
+                        r_s, w13_scale_word(e, rg, 2 * k1, lane), vec_width=1, dtype=T.i32
+                    )
+                )
+    ring = [wload(i) for i in range(UGW_RING)]
+    kb = lane // 16
+    brow, srow, pick, live = ugw_column(c, slot)
+    accs = {}
+    for i in range_constexpr(len(seq)):
+        b, st = seq[i]
+        jj, up = blocks[b]
+        h = st // (W13_STEPS // 2)
+        if st % (W13_STEPS // 2) == 0:
+            accs[(b, h)] = fx.Vector.filled(4, 0.0, fx.Float32)
+        av = ring[i % UGW_RING]
+        if i + UGW_RING < len(seq):
+            ring[i % UGW_RING] = wload(i + UGW_RING)
+        bw = fp8_operand(c["latq"], brow, st, kb)
+        sb = fx.ptr_load(srow + (st * 4 + kb))
+        word = sw[(jj, up if not c["guint"] else 0, st // 2)]
+        accs[(b, h)] = mfma_scaled(
+            av, bw, accs[(b, h)], word, sb, FP4, FP8, ugw_scale_byte(c, jj, up, st), 0
+        )
+        # keep the stream's order: the scheduler would hoist the loads past the ring
+        rocdl.sched_barrier(0)
+    # (jj, up) -> block index b; lane: rows 4 (lane / 16) + i of token lane % 16
+    bi = {blocks[b]: b for b in range(4)}
+    vs = []
+    for jj in range_constexpr(2):
+        gb, ub = bi[(jj, 0)], bi[(jj, 1)]
+        for i in range_constexpr(4):
+            gv = fx.Float32(0.0) + accs[(gb, 0)][i] + accs[(gb, 1)][i]
+            uv = fx.Float32(0.0) + accs[(ub, 0)][i] + accs[(ub, 1)][i]
+            vs.append(bf16_round(situ_aiter(gv, uv)))
+    m = abs(vs[0])
+    for v in vs[1:]:
+        m = fx.max(m, abs(v))
+    amax = butterfly(m, (16, 32), fx.max)
+    code = e8m0_roundup(amax)
+    if live:
+        scale = (code << 23).bitcast(fx.Float32)
+        for jj in range_constexpr(2):
+            w = pk_fp8_f32(vs[4 * jj : 4 * jj + 4], scale)
+            at = pick * IW + g * 8 + 4 * jj + kb
+            if const_expr(narrow):
+                c["put_words"](c["inter"], at, [w])
+            else:
+                bo.buffer_store(w, rsrc(c["inter"].value), at, cache_modifier=CM_DEV)
+        if kb == 0:
+            if const_expr(narrow):
+                c["put"](c["isc"], pick * UG_GROUPS + g, code)
+            else:
+                bo.buffer_store(
+                    code, rsrc(c["isc"].value), pick * UG_GROUPS + g, cache_modifier=CM_DEV
+                )
+
+
+@flyc.jit
+def run_ug_waves(c, total):
+    """ug a task a wave: task t on CTA t % BLOCKS, wave t / BLOCKS % WAVES, so
+    every CU takes a task before any takes a second."""
+    task = c["bid"] + BLOCKS * c["wave"]
+    while task < total:
+        stage_ug_wv(c, task)
+        task = task + BLOCKS * WAVES
+    # the waves leave ug apart: the next stage's LDS (the same union) after all
+    gpu.barrier()
 
 
 @flyc.jit
