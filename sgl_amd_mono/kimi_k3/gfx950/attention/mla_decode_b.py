@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """``mla_decode_b``: one Kimi-K3 MLA layer's DCP8 verify decode at the tail's
 widths, e4m3 Q K and e4m3 P V, with the O accumulator split along the latent.
-Same inputs and outputs as ``mla_decode`` (the tail's split partials, LSEs, CSR
-maps and direct rows), so it drops in for aiter's ``mla_decode_fwd``.
+Same inputs as ``mla_decode``; its output is every row's merged o (bf16) and
+LSE (fp32), the split partials merged in the launch itself after a grid
+barrier, so the tail's reduce has nothing left to do.
 
 One launch, ``BLOCKS`` CTAs of 4 waves (one a SIMD, a CTA a CU), persistent.
 
@@ -45,12 +46,13 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from aiter.ops.flydsl.kernels import buffer_ops as bo
+from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import Int32, Int64, T, as_ir_value
 
-from sgl_amd_mono.common.ops import ballot, hw_exp2, popcount, rsrc, uniform, xred
+from sgl_amd_mono.common.ops import CM_DEV, ballot, hw_exp2, popcount, rsrc, uniform, xred
 from sgl_amd_mono.common.plan import BLOCKS, kernel_sources, key_tuple
 from sgl_amd_mono.kimi_k3.gfx950.attention import mla_decode as md
 
@@ -82,7 +84,18 @@ ITEM_OVH = 5  # an item's setup and partial stores, in blocks (measured ~12 us a
 MAX_PART = md.MAX_PART
 TBL, TBL_WORDS = md.TBL, md.TBL_WORDS
 T_R, T_KIND, T_N, T_NB, T_WR, T_IPRE, T_L, T_P, T_PB, T_KVP = range(10)
-DecodeBuffers = md.DecodeBuffers
+MERGE_K = 8  # a merge's split loads in flight
+T_NTILE = 2 * MAX_REQS * TBL + 1  # the plan table's word: the requests with more than one split
+
+
+class DecodeBuffers(md.DecodeBuffers):
+    """``mla_decode.DecodeBuffers`` (the split partials and the reduce's maps)
+    and the merge's arrival counter (never reset: a launch waits for the next
+    multiple of BLOCKS)."""
+
+    def __init__(self, device):
+        super().__init__(device)
+        self.sync = torch.zeros(4, dtype=torch.int32, device=device)
 
 
 @dataclass(frozen=True)
@@ -110,6 +123,86 @@ def _wave_sum(v):
 def _wave_max(v):
     for off in [32, 16, 8, 4, 2, 1]:
         v = xred(fx.Int32(v), off, fx.max)
+    return v
+
+
+def _atomic_add(addr, val):
+    """Device-scope atomic add of ``val`` on the int32 at global address ``addr``; its old value."""
+    ptr = llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<1>"), as_ir_value(addr)).result
+    op = llvm.AtomicRMWOp(
+        llvm.AtomicBinOp.add, ptr, as_ir_value(fx.Int32(val)), llvm.AtomicOrdering.monotonic, syncscope="agent"
+    )  # fmt: skip
+    return fx.Int32(op.result)
+
+
+@flyc.jit
+def _grid_barrier(sync, tid):
+    """Every CTA of the launch past this point (all BLOCKS resident, one a CU), its device-
+    coherent stores done: arrivals count up from the last launch's, never reset."""
+    rocdl.s_waitcnt(vmcnt=0)
+    _bar()
+    if tid == 0:
+        old = _atomic_add(fx.Int64(sync), 1)
+        target = (old & fx.Int32(-BLOCKS)) + BLOCKS
+        r = rsrc(sync)
+        v = fx.Int32(bo.buffer_load(r, 0, vec_width=1, dtype=T.i32, cache_modifier=CM_DEV))
+        while v - target < 0:
+            rocdl.s_sleep(1)
+            v = fx.Int32(bo.buffer_load(r, 0, vec_width=1, dtype=T.i32, cache_modifier=CM_DEV))
+    _bar()
+
+
+@flyc.jit
+def _merge(o, lse, logits, plse, indptr, fmap, pmap, ntile, bid, wave, lane):
+    """The split requests' (row, head) units, one a wave in turn over the launch's waves:
+    lane s takes split s's LSE (natural log, fp32); the max, the weights e^(lse - m) and
+    their sum; then the splits' fp32 partials (lane l: dims 8 l .. + 8) weighted in split
+    order; o in bf16 and lse = m + log(sum) to the request's rows."""
+    units = ntile * (G * NHA)
+    for u in range(bid * WAVES + wave, units, BLOCKS * WAVES):
+        t = u // (G * NHA)
+        j = (u % (G * NHA)) // NHA
+        h = u % NHA
+        p0 = uniform(_ld(indptr, t))
+        ns = uniform(_ld(indptr, t + 1)) - p0
+        row = uniform(_ld(fmap, 2 * t)) + j
+        prow = _ld(pmap, p0 + fx.min(lane, ns - 1)) + j
+        ls = (lane < ns).select(
+            fx.Float32(bo.buffer_load(rsrc(plse), prow * NHA + h, vec_width=1, dtype=T.f32, cache_modifier=CM_DEV)), fx.Float32(NEG)
+        )
+        m = _wave_fmax(ls)
+        w = (lane < ns).select(hw_exp2((ls - m) * LOG2E), fx.Float32(0.0))
+        ws = _wave_fsum(w)
+        acc = [fx.Float32(0.0)] * 8
+        # MERGE_K splits' loads in flight, then their weighted sums in split order
+        for c0 in range(0, ns, MERGE_K):
+            parts = []
+            for q in range_constexpr(MERGE_K):
+                sp = fx.min(c0 + q, ns - 1)
+                wsp = fx.Int32(rocdl.readlane(T.i32, w.bitcast(fx.Int32), sp)).bitcast(fx.Float32)
+                pr = fx.Int32(rocdl.readlane(T.i32, prow, sp))
+                base = (pr * NHA + h) * KV + 8 * lane
+                lo = fx.Vector(bo.buffer_load(rsrc(logits), base, vec_width=4, dtype=T.f32, cache_modifier=CM_DEV))
+                hi = fx.Vector(bo.buffer_load(rsrc(logits), base + 4, vec_width=4, dtype=T.f32, cache_modifier=CM_DEV))
+                parts.append(((c0 + q < ns).select(wsp, fx.Float32(0.0)), lo, hi))
+            for wsp, lo, hi in parts:
+                acc = [acc[e] + wsp * fx.Float32((lo if e < 4 else hi)[e % 4]) for e in range(8)]
+        inv = fx.Float32(1.0) / ws
+        ob = fx.Vector.from_elements([acc[e] * inv for e in range(8)], fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)
+        bo.buffer_store(ob, rsrc(o), ((row * NHA + h) * KV + 8 * lane) // 2)
+        if lane == 0:
+            bo.buffer_store(m + fx.Float32(rocdl.log(T.f32, ws.ir_value())) * LN2, rsrc(lse), row * NHA + h)
+
+
+def _wave_fmax(v):
+    for off in [32, 16, 8, 4, 2, 1]:
+        v = xred(fx.Float32(v), off, fx.max)
+    return v
+
+
+def _wave_fsum(v):
+    for off in [32, 16, 8, 4, 2, 1]:
+        v = xred(fx.Float32(v), off, lambda x, y: x + y)
     return v
 
 
@@ -327,8 +420,10 @@ def plan(c, tbl, scr, kv_ptr, g_ptr, nreq, indptr, fmap, pmap, bid, tid):
                 (T_L, L_c), (T_P, P_c), (T_PB, G * pb_c), (T_KVP, kvp_c),
             ):  # fmt: skip
                 fx.ptr_store(fx.Int32(v), row + f)
+        ntile_all = _wave_sum((live & (n > 1)).select(fx.Int32(1), fx.Int32(0)))
         if lane == 0:
             fx.ptr_store(total, tbl + 2 * MAX_REQS * TBL)
+            fx.ptr_store(ntile_all, tbl + T_NTILE)
     _bar()
     return fx.Int32(fx.ptr_load(tbl + 2 * MAX_REQS * TBL))
 
@@ -355,6 +450,7 @@ def build(key: MlaDecodeBuild):
     def mla_decode_b(
         q8: Int64, kv: Int64, kv_idx: Int64, kv_ptr: Int64, g_ptr: Int64, nreq: Int32, rank: Int32,
         o: Int64, lse: Int64, logits: Int64, plse: Int64, ptbl: Int64, tl: Int64,
+        indptr: Int64, fmap: Int64, pmap: Int64, sync: Int64,
     ):  # fmt: skip
         _ = keyed
         tlon = "tl" in probe
@@ -635,13 +731,24 @@ def build(key: MlaDecodeBuild):
                             for qd in range_constexpr(4):
                                 dim = 128 * wave + 32 * d + 8 * qd + 4 * hb
                                 vals = [fx.Float32(acc[3 * d + ct][4 * qd + e]) * invs[ct] for e in range(4)]
-                                bo.buffer_store(fx.Vector.from_elements(vals, fx.Float32), rsrc(logits), (prows[ct] * NHA + heads[ct]) * KV + dim)
+                                bo.buffer_store(
+                                    fx.Vector.from_elements(vals, fx.Float32), rsrc(logits), (prows[ct] * NHA + heads[ct]) * KV + dim,
+                                    cache_modifier=CM_DEV,
+                                )  # fmt: skip
                         if (wave == 0) & (hb == 0):
-                            bo.buffer_store(lvals[ct], rsrc(plse), prows[ct] * NHA + heads[ct])
+                            bo.buffer_store(lvals[ct], rsrc(plse), prows[ct] * NHA + heads[ct], cache_modifier=CM_DEV)
             if const_expr(tlon):
                 td = _memtime()
                 t_loop = t_loop + (tc - tb)
                 t_epi = t_epi + (td - tc)
+        # every CTA's split partials written: then the requests' splits merged here
+        tm0 = _memtime() if const_expr(tlon) else z
+        if const_expr("nobar" not in probe):
+            _grid_barrier(sync, tid)
+        if const_expr("nomerge" not in probe):
+            _merge(o, lse, logits, plse, indptr, fmap, pmap, uniform(fx.ptr_load(tbl + T_NTILE)), bid, wave, lane)
+        if const_expr(tlon):
+            t_epi = t_epi + (_memtime() - tm0)
         if const_expr(tlon):
             if tid == 0:
                 vals = [t_plan, t_set, t_loop, t_epi, _memtime() - tk0, _realtime() - rk0, n_it, n_bl]
@@ -654,10 +761,11 @@ def build(key: MlaDecodeBuild):
     def launch(
         q8: Int64, kv: Int64, kv_idx: Int64, kv_ptr: Int64, g_ptr: Int64, nreq: Int32, rank: Int32,
         o: Int64, lse: Int64, logits: Int64, plse: Int64, ptbl: Int64, tl: Int64,
+        indptr: Int64, fmap: Int64, pmap: Int64, sync: Int64,
         stream: fx.Stream = _STREAM,
     ):  # fmt: skip
         _ = keyed
-        mla_decode_b(q8, kv, kv_idx, kv_ptr, g_ptr, nreq, rank, o, lse, logits, plse, ptbl, tl).launch(
+        mla_decode_b(q8, kv, kv_idx, kv_ptr, g_ptr, nreq, rank, o, lse, logits, plse, ptbl, tl, indptr, fmap, pmap, sync).launch(
             grid=(BLOCKS,), block=(THREADS,), stream=stream
         )
 
@@ -727,6 +835,7 @@ def mla_decode_launch(key: MlaDecodeBuild, *, q8, kv, kv_idx, kv_ptr, g_ptr, ran
     build(key)(
         q8.data_ptr(), kv.data_ptr(), kv_idx.data_ptr(), kv_ptr.data_ptr(), g_ptr.data_ptr(), nreq, rank,
         o.data_ptr(), lse.data_ptr(), bufs.logits.data_ptr(), bufs.plse.data_ptr(), bufs.tbl.data_ptr(),
-        0 if tl is None else tl.data_ptr(),
+        0 if tl is None else tl.data_ptr(), bufs.indptr.data_ptr(), bufs.fmap.data_ptr(), bufs.pmap.data_ptr(),
+        bufs.sync.data_ptr(),
         stream=torch.cuda.current_stream(),
     )  # fmt: skip

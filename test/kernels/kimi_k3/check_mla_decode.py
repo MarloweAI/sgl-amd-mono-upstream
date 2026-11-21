@@ -240,7 +240,8 @@ def case(ps, args, dev, bufs):
             torch.cuda.synchronize()
             return 0.0, out
         if args.check:
-            mo, ml = merged(o, lse, bufs, s)
+            # design b merges its splits itself: every row in o / lse
+            mo, ml = (o.double(), lse.double()) if DESIGN == "b" else merged(o, lse, bufs, s)
             o64, l64, ob3 = refs(q8, b)
             has = l64 > -1e29
             e_ours, e_b3 = rel(mo[has], o64[has]), rel(ob3[has], o64[has])
@@ -290,7 +291,7 @@ def main():
     if args.compile:
         md = decode_module()
 
-        md.build(md.MlaDecodeBuild(scale=SCALE))(*([0] * 13), stream=0)
+        md.build(md.MlaDecodeBuild(scale=SCALE))(*([0] * (17 if DESIGN == "b" else 13)), stream=0)
         md.build_plan()(*([0] * 7), stream=0)
         print("COMPILE_OK", flush=True)
         return
