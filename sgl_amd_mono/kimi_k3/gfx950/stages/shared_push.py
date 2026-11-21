@@ -5,10 +5,10 @@ SGLang reduces the MoE's flat [latent | shared] partials in one all-reduce after
 The shared half is final once the shared down projection has run, long before the routed experts end.
 Here it travels on its own:
 
-* ``push``: right after the shared down projection, every rank stores its bf16 shared partial
-  [m, 7168] into its own slot of every peer's slot region (one-shot), then raises a tagged flag a
-  (row, 896-column chunk) on each peer. The launch waits for nothing, so the routed experts can run
-  beside it.
+* ``push``: once a [64, 64] tile of the shared down projection's bf16 output [m, 7168] is stored,
+  every rank stores the tile into its own slot of every peer's slot region (one-shot), then raises one
+  tagged flag a tile on each peer. Nothing in it waits, so it can run inside a launch that keeps going
+  (the routed experts' stage 1, whose grid also computes the shared down tiles).
 * ``split``: after the routed experts, a CTA a row runs the latent half's two-shot all-reduce with
   ``routed_expert_norm``'s RMSNorm (``ar_norm.py``'s flat launch, latent part), and sums the row's 8
   shared partials (its own from where the shared down wrote it, the peers' from their slots) in f32 in
@@ -19,8 +19,8 @@ push a layer's partial into a half a peer still reads: between two MoE layers of
 takes part in the latent all-reduce, which no rank leaves before every peer's ``split`` has read its
 slots. Flags carry the launch tag (step epoch x 256 + layer), so no region is ever cleared.
 
-``push_chunk`` / ``flag_chunk`` are the push's device functions, for a GEMM epilogue that pushes its
-own output tile: a (row, chunk) is published once its 896 columns are stored on every peer and drained.
+``context`` / ``push_tile`` / ``flag_tile`` are the push's device functions, for a GEMM tile epilogue:
+a tile is published once its stores to that peer are drained. ``build_push`` runs them on their own.
 """
 
 import flydsl.compiler as flyc
@@ -47,26 +47,28 @@ from sgl_amd_mono.kimi_k31.gfx950.stages import coll
 
 SOURCES = kernel_sources(__name__)
 
-CHUNK = 896  # columns a flag publishes
-NCH = SHARED // CHUNK  # chunks a row
-CU = CHUNK // 8  # 16 B units a chunk
-PUSH_NT = 64 * TP  # the push: wave p stores to rank p
+TM, TN = 64, 64  # a pushed tile: rows x columns of the shared output, one flag
+TILES_M = (MAX_ROWS + TM - 1) // TM
+TILES_N = SHARED // TN
+TU = TN // 8  # 16 B units a tile row
+PUSH_NT = 64 * TP  # the standalone push: wave p stores to rank p
 PUSH_BLOCKS = 32
 SPLIT_NT = SHARED // 8  # split: a shared unit a thread, the first LATENT / 8 a latent unit too
 SPLIT_BLOCKS = 256
-FLAG_T0 = 64  # split: the threads that poll the shared flags (wave 1; wave 0 runs the latent reduce)
+FLAG_T0 = 64  # split: the threads that poll the 7 x TILES_N flags of a row (wave 0 runs the latent reduce)
+assert FLAG_T0 + (TP - 1) * TILES_N <= SPLIT_NT
 
 
 def layout(max_rows=MAX_ROWS):
     """Byte offsets of one parity half and its size.
     rs_l / ag_l: the latent two-shot's sentinel regions ([src][row][LATENT / TP], [row][LATENT]);
-    sh: the shared slots [src][row][SHARED] bf16; fl: their flags, tagged pairs [src][row][NCH]."""
+    sh: the shared slots [src][row][SHARED] bf16; fl: their flags, tagged pairs [src][tile row][tile col]."""
     offs, off = {}, 0
     for name, size in (
         ("rs_l", TP * max_rows * (LATENT // TP) * 2),
         ("ag_l", max_rows * LATENT * 2),
         ("sh", TP * max_rows * SHARED * 2),
-        ("fl", TP * max_rows * NCH * 8),
+        ("fl", TP * TILES_M * TILES_N * 8),
     ):
         offs[name] = off
         off += (size + 255) // 256 * 256
@@ -85,34 +87,45 @@ def arm(buf, max_rows=MAX_ROWS):
         buf[p * half + offs["rs_l"] : p * half + offs["sh"]].fill_(0xFF)
 
 
-def slot_word(rank, t, k, u, max_rows=MAX_ROWS):
-    """Word offset of unit u of chunk k of row t of ``rank``'s slot in a slot region."""
-    return (rank * max_rows + t) * (SHARED // 2) + k * (CHUNK // 2) + 4 * u
+def slot_word(rank, t, w, max_rows=MAX_ROWS):
+    """Word offset of word w of row t of ``rank``'s slot in a slot region."""
+    return (rank * max_rows + t) * (SHARED // 2) + w
 
 
-def flag_pair(rank, t, k, max_rows=MAX_ROWS):
-    """Pair index of the flag of (``rank``'s slot, row t, chunk k) in a flag region."""
-    return (rank * max_rows + t) * NCH + k
+def tile_flag(rank, tm, tn):
+    """Pair index of the flag of tile (tm, tn) of ``rank``'s slot in a flag region."""
+    return (rank * TILES_M + tm) * TILES_N + tn
 
 
-@flyc.jit
-def push_chunk(c, xs, ldx, t, k, wave, lane, max_rows):
-    """Stores chunk k of row t of the partial xs (row stride ldx bf16) into this rank's slot on rank
-    ``wave`` (wave-uniform, this rank's own wave stores nothing)."""
-    dst = c["sh_of"](wave).value
-    for i in range_constexpr((CU + 63) // 64):
-        u = lane + 64 * i
-        if (u < CU) & (wave != c["rank"]):
-            v = _ld4(xs, t * (ldx // 2) + k * (CHUNK // 2) + 4 * u)
-            _st4(v, dst, slot_word(c["rank"], t, k, u, max_rows), CM_SYS)
+def context(peers, rank, epoch, slot, tid, bid, launches, max_rows=MAX_ROWS):
+    """The push's region context in any launch: ``peers`` the peer buffer's address table, ``epoch`` the
+    step epoch buffer, ``slot`` the MoE layer's launch slot, ``launches`` the slots a step."""
+    offs, half = layout(max_rows)
+    return coll.region_context(peers, rank, epoch, slot, offs, half, tid, bid, launches)
 
 
 @flyc.jit
-def flag_chunk(c, t, k, wave, lane, max_rows):
-    """Publishes (row t, chunk k) of this rank's slot on rank ``wave``; after the chunk's stores drained
-    (``s_waitcnt vmcnt(0)`` on every wave that stored, then a CTA barrier)."""
-    if (lane == 0) & (wave != c["rank"]):
-        c["put"](c["fl_of"](wave), flag_pair(c["rank"], t, k, max_rows), fx.Int32(1))
+def push_tile(c, out, ld, tm, tn, m, peer, lane, max_rows):
+    """One wave stores tile (tm, tn) of out [m, ld] bf16 (rows < m) into this rank's slot on rank ``peer``
+    (wave-uniform; nothing when it is this rank). The tile must be in memory: after its stores, the
+    workgroup's ``s_waitcnt vmcnt(0)`` and a barrier."""
+    dst = c["sh_of"](peer).value
+    for i in range_constexpr(TM * TU // 64):
+        j = lane + 64 * i
+        t = tm * TM + j // TU
+        w = tn * (TN // 2) + 4 * (j % TU)
+        if (t < m) & (peer != c["rank"]):
+            v = _ld4(out, t * (ld // 2) + w)
+            _st4(v, dst, slot_word(c["rank"], t, w, max_rows), CM_SYS)
+
+
+@flyc.jit
+def flag_tile(c, tm, tn, peer, lane):
+    """Publishes tile (tm, tn) of this rank's slot on rank ``peer`` (wave-uniform), from lane 0. Only after
+    the tile's stores to ``peer`` drained: ``s_waitcnt vmcnt(0)`` on the waves that stored them, then a
+    barrier between them and this wave."""
+    if (lane == 0) & (peer != c["rank"]):
+        c["put"](c["fl_of"](peer), tile_flag(c["rank"], tm, tn), fx.Int32(1))
 
 
 _PUSH_BUILDS: dict = {}
@@ -120,13 +133,12 @@ _PUSH_BUILDS: dict = {}
 
 def build_push(launches, max_rows=MAX_ROWS, blocks=PUSH_BLOCKS, emulate=False):
     """The launch: ``launch(xs, m, peers, rank, epoch, slot, stream=)``: this rank's shared partial xs
-    [m, SHARED] (bf16, contiguous rows) into its slot on every peer. ``emulate``: all TP ranks in one
+    [m, SHARED] (bf16, contiguous rows) into its slot on every peer, a tile at a time. ``emulate``: all TP ranks in one
     launch on one GPU (a check): CTA b is rank b // blocks, xs is [TP, max_rows, SHARED]."""
     keyed = key_tuple(locals(), SOURCES)
     key = (launches, max_rows, blocks, emulate)
     if key in _PUSH_BUILDS:
         return _PUSH_BUILDS[key]
-    offs, half = layout(max_rows)
     name = f"k3_shared_push_r{max_rows}_b{blocks}_l{launches}_e{int(emulate)}"
     grid = blocks * TP if emulate else blocks
 
@@ -139,16 +151,16 @@ def build_push(launches, max_rows=MAX_ROWS, blocks=PUSH_BLOCKS, emulate=False):
             xs = xs + fx.Int64(rank) * fx.Int64(max_rows * SHARED * 2)
         else:
             rank = rank_arg
-        c = coll.region_context(peers, rank, epoch, slot, offs, half, tid, bid, launches)
+        c = context(peers, rank, epoch, slot, tid, bid, launches, max_rows)
         wave = uniform(tid // 64)
         lane = tid % 64
-        items = m * NCH
-        for it in range(bid, items, blocks):
-            push_chunk(c, xs, SHARED, it // NCH, it % NCH, wave, lane, max_rows)
+        tiles = (m + TM - 1) // TM * TILES_N
+        for it in range(bid, tiles, blocks):
+            push_tile(c, xs, SHARED, it // TILES_N, it % TILES_N, m, wave, lane, max_rows)
         rocdl.s_waitcnt(vmcnt=0)
         gpu.barrier()
-        for it in range(bid, items, blocks):
-            flag_chunk(c, it // NCH, it % NCH, wave, lane, max_rows)
+        for it in range(bid, tiles, blocks):
+            flag_tile(c, it // TILES_N, it % TILES_N, wave, lane)
 
     @flyc.jit
     def launch(
@@ -170,11 +182,9 @@ def shared_sum(c, t, xs, out_s, max_rows):
     srow = t * (SHARED // 2)
     own = _ld4(xs, srow + 4 * tid)
     sh = c["sh_own"].value
-    k = tid // CU
-    u = tid % CU
     parts = []
     for src in range_constexpr(TP):
-        v = _ld4(sh, slot_word(src, t, k, u, max_rows), CM_SYS)
+        v = _ld4(sh, slot_word(src, t, 4 * tid, max_rows), CM_SYS)
         mine = rank == src
         parts.append(fx.Vector.from_elements([mine.select(own[e], v[e]) for e in range(4)], fx.Int32))
     acc = f8(parts[0])
@@ -198,11 +208,12 @@ def split_row(c, t, a, red, max_rows, eps):
         _push(c, rs_l, a["xl"], t, LATENT, tid, max_rows)
     if tid < LATENT // TP // 8:
         _reduce(c, c["rs_l_own"].value, ag_l, t, LATENT, tid, max_rows)
+    # the row's tile flags from the 7 peers: peer index s7 skips this rank
     f = tid - FLAG_T0
-    src = f // NCH
-    if (f >= 0) & (f < TP * NCH):
-        if src != c["rank"]:
-            c["poll"]([(c["fl_own"], flag_pair(src, t, f % NCH, max_rows), 1)])
+    s7 = f // TILES_N
+    src = s7 + (s7 >= c["rank"]).select(fx.Int32(1), fx.Int32(0))
+    if (f >= 0) & (f < (TP - 1) * TILES_N):
+        c["poll"]([(c["fl_own"], tile_flag(src, t // TM, f % TILES_N), 1)])
     gpu.barrier()
     shared_sum(c, t, a["xs"], a["out_s"], max_rows)
     wv = fx.Vector(bo.buffer_load(rsrc(a["wl"]), 4 * fx.min(tid, LATENT // 8 - 1), vec_width=4, dtype=T.i32))
