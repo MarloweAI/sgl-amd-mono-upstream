@@ -23,6 +23,9 @@ from sgl_amd_mono.kimi_k3.gfx950.stages import ar_read as K
 ROWS = range(49, K.MAX_ROWS + 1)
 # SharedPushAr's: the rows the fused shared chain pushes the shared partial at (its one definition).
 PUSH_ROWS = SHARED_PUSH_ROWS
+# The flat MoE all-reduce + latent norm beats aiter's all-reduce + RMSNorm up to 96 rows at TP8
+# (MI355X; at 120 rows and above it is slower).
+MOE_ROWS = range(49, 97)
 
 
 def _p(t) -> int:
@@ -99,7 +102,7 @@ class MoeAr:
         self.launch = N.build_moe(float(eps), max(layers) + 1)
 
     def covers(self, rows: int) -> bool:
-        return rows in ROWS
+        return rows in MOE_ROWS
 
     def reduce(self, layer: int, latent, shared, w):
         """(latent sum, shared sum, RMSNorm of the latent sum with ``w``) from this rank's partials
