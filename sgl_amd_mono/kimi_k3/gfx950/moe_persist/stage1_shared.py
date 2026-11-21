@@ -170,8 +170,13 @@ def _shared_tile(out, a, b, m, n, k, a_ld, b_ld, tiled_mma, param, bid_m, bid_n,
 @functools.cache
 def compile_stage1_shared(*, s1_use_nt, s1_prefetch_hidden, s1_xcd_swizzle, situ_beta, situ_linear_beta,
                           sh_block_m, sh_block_n, sh_block_k, sh_stages, sh_m_waves, sh_n_waves, sh_last=0,
-                          hidden=3584, inter=384, experts=896):
-    """(launcher, shared tile param) of one static configuration (``SHARED_CONFIGS``)."""
+                          push=None, hidden=3584, inter=384, experts=896):
+    """(launcher, shared tile param) of one static configuration (``SHARED_CONFIGS``).
+
+    ``push``: None, or the number of MoE layers a step (``launches``) of the shared partial's C18 push: every
+    shared workgroup then pushes its 64 x 64 tile into its slot on the other ranks and flags it
+    (``stages.shared_push``) once the tile is in memory, while the stage-1 workgroups run. The launch's push
+    arguments are (shared_out address, peer table address, rank, epoch buffer address, layer slot)."""
     N_OUT = 2 * inter
     NUM_N1 = N_OUT // BN1
     KH_TILE = BK1
@@ -186,7 +191,12 @@ def compile_stage1_shared(*, s1_use_nt, s1_prefetch_hidden, s1_xcd_swizzle, situ
     assert hparam.block_threads == 256, hparam.block_threads
     st, bm, bn, bk = sh_stages, sh_block_m, sh_block_n, sh_block_k
     tag = (f"h{hidden}_i{inter}_g1{'nt' if s1_use_nt else 'c'}{'_hpf' if s1_prefetch_hidden else ''}"
-           f"_xcd{s1_xcd_swizzle}_sh{bm}x{bn}x{bk}x{st}w{sh_m_waves}x{sh_n_waves}{'_last' if sh_last else ''}")
+           f"_xcd{s1_xcd_swizzle}_sh{bm}x{bn}x{bk}x{st}w{sh_m_waves}x{sh_n_waves}{'_last' if sh_last else ''}"
+           f"{'' if push is None else f'_push{push}'}")
+    if push is not None:
+        from sgl_amd_mono.kimi_k3.gfx950.stages import shared_push as S
+
+        assert (bm, bn) == (S.TM, S.TN), "the push's tiles are the shared tiles"
 
     @fx.struct
     class SharedAB:
@@ -223,6 +233,11 @@ def compile_stage1_shared(*, s1_use_nt, s1_prefetch_hidden, s1_xcd_swizzle, situ
         arg_inter_s: fx.Int64,
         arg_hidden: fx.Int64,
         i32_ntok: fx.Int32,
+        push_xs: fx.Int64,
+        push_peers: fx.Int64,
+        push_rank: fx.Int32,
+        push_epoch: fx.Int64,
+        push_slot: fx.Int32,
     ):
         tid = fx.Int32(gpu.thread_id("x"))
         bx = fx.Int32(gpu.block_id("x"))
@@ -243,6 +258,20 @@ def compile_stage1_shared(*, s1_use_nt, s1_prefetch_hidden, s1_xcd_swizzle, situ
             bid_n = (r // sh_tiles_m) * fx.Int32(NXCD) + x
             _shared_tile(sh_out, sh_a, sh_b, sh_m, sh_n, sh_k, sh_a_ld, sh_b_ld, tiled_mma, param, bid_m, bid_n,
                          storage.ab.a.peek().ptr, storage.ab.b.peek().ptr, storage.c.peek().ptr, tid)
+            if const_expr(push is not None):
+                # the tile's stores in memory, then its data into each other rank's slot (a wave a peer, peers w
+                # and w + 4), drained, then the flags
+                c = S.context(push_peers, push_rank, push_epoch, push_slot, tid, bx, push)
+                wave = rocdl.readfirstlane(T.i32, tid // 64)
+                lane = tid % 64
+                rocdl.s_waitcnt(vmcnt=0)
+                gpu.barrier()
+                for j in range_constexpr(2):
+                    S.push_tile(c, push_xs, hidden * 2, bid_m, bid_n, sh_m, wave + fx.Int32(4 * j), lane, S.MAX_ROWS)
+                rocdl.s_waitcnt(vmcnt=0)
+                gpu.barrier()
+                for j in range_constexpr(2):
+                    S.flag_tile(c, bid_m, bid_n, wave + fx.Int32(4 * j), lane)
         else:
             lane = tid % 64
             wave = rocdl.readfirstlane(T.i32, tid // 64)
@@ -321,6 +350,11 @@ def compile_stage1_shared(*, s1_use_nt, s1_prefetch_hidden, s1_xcd_swizzle, situ
         arg_hidden: fx.Int64,
         i32_ntok: fx.Int32,
         i32_s1_grid: fx.Int32,
+        push_xs: fx.Int64,
+        push_peers: fx.Int64,
+        push_rank: fx.Int32,
+        push_epoch: fx.Int64,
+        push_slot: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         m = fx.Int32(fx.get_scalar(sh_a.shape[0]))
@@ -338,7 +372,8 @@ def compile_stage1_shared(*, s1_use_nt, s1_prefetch_hidden, s1_xcd_swizzle, situ
         tiles_m = (m + param.block_m - 1) // param.block_m
         sh_ctas = tiles_m * (n // param.block_n)
         kernel(sh_out, sh_a, sh_b, m, n, k, a_ld, b_ld, tiles_m, sh_ctas, i32_s1_grid, tiled_mma, param, arg_w1, arg_w1s,
-               arg_eids, arg_cumsum, arg_mind, arg_inter, arg_inter_s, arg_hidden, i32_ntok).launch(
+               arg_eids, arg_cumsum, arg_mind, arg_inter, arg_inter_s, arg_hidden, i32_ntok, push_xs, push_peers,
+               push_rank, push_epoch, push_slot).launch(
             grid=(sh_ctas + i32_s1_grid, 1, 1), block=(256, 1, 1), stream=stream)
 
     return launch, hparam
@@ -352,9 +387,11 @@ SHARED_CONFIGS = {
 }
 
 
-def stage1_shared(g1: dict, act, w_down, shared_out, overrides: tuple = ()) -> None:
+def stage1_shared(g1: dict, act, w_down, shared_out, overrides: tuple = (), push=None) -> None:
     """aiter's stage 1 of one MoE call (``g1``: the keyword arguments fused_moe passes to flydsl_mxfp4_gemm1) and
-    shared_out [M, 7168] bf16 = act [M, 768] bf16 @ w_down [7168, 768]^T in one launch."""
+    shared_out [M, 7168] bf16 = act [M, 768] bf16 @ w_down [7168, 768]^T in one launch. ``push``: None, or
+    (launches, peers, rank, epoch, slot) of the shared partial's C18 push (``SharedPushAr.slots`` and
+    ``SharedPushAr.push_args(layer)``): its tiles also go to the other ranks' slots."""
     import torch
     from aiter.ops.flydsl.kernels.mxfp4_gemm1 import gemm1_grid
 
@@ -366,7 +403,11 @@ def stage1_shared(g1: dict, act, w_down, shared_out, overrides: tuple = ()) -> N
     cf.update(dict(overrides))
     launch, hparam = compile_stage1_shared(
         s1_use_nt=st["use_nt"], s1_prefetch_hidden=st["prefetch_hidden"], s1_xcd_swizzle=st["xcd_swizzle"],
-        situ_beta=float(g1["situ_beta"]), situ_linear_beta=float(g1["situ_linear_beta"]), **cf)
+        situ_beta=float(g1["situ_beta"]), situ_linear_beta=float(g1["situ_linear_beta"]),
+        push=None if push is None else int(push[0]), **cf)
+    ptr = lambda v: v if isinstance(v, int) else v.data_ptr()
+    pa = (0, 0, 0, 0, 0) if push is None else (shared_out.data_ptr(), ptr(push[1]), int(push[2]), ptr(push[3]),
+                                               int(push[4]))
     m = g1["n_tokens"]
     assert act.shape == (m, 768) and act.is_contiguous() and act.dtype == torch.bfloat16
     assert w_down.shape == (7168, 768) and w_down.is_contiguous()
@@ -387,6 +428,7 @@ def stage1_shared(g1: dict, act, w_down, shared_out, overrides: tuple = ()) -> N
         g1["hidden_states"].data_ptr(),
         int(m),
         gemm1_grid(m, BM1, NE=896, TOPK=16, INTER=384, BN=BN1),
+        *pa,
         torch.cuda.current_stream(),
     )
     from aiter.ops.flydsl.kernels.kernels_common import run_cached
@@ -411,7 +453,7 @@ def _install_hook():
         if held is None:
             return orig(**kw)
         _PENDING.held = None
-        stage1_shared(kw, *held)
+        stage1_shared(kw, *held[:3], push=held[3])
         return None
 
     flydsl_mxfp4_gemm1._k3_stage1_shared = True
@@ -419,11 +461,12 @@ def _install_hook():
 
 
 @contextlib.contextmanager
-def shared_down_in_stage1(act, w_down, shared_out):
+def shared_down_in_stage1(act, w_down, shared_out, push=None):
     """The next aiter MoE call on this thread runs its stage 1 as ``stage1_shared`` with this shared down
-    (shared_out = act @ w_down^T). Raises if the call took no stage 1 (the shared output would be missing)."""
+    (shared_out = act @ w_down^T) and ``push``. Raises if the call took no stage 1 (the shared output would be
+    missing)."""
     _install_hook()
-    _PENDING.held = (act, w_down, shared_out)
+    _PENDING.held = (act, w_down, shared_out, push)
     try:
         yield
         if getattr(_PENDING, "held", None) is not None:
