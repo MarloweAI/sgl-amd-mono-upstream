@@ -371,6 +371,8 @@ def _build(model, hf_config, ctx):
     front_off = _dcp_front_disable_reason(p)
     if front_off is not None and p.attn_dcp_size > 1:
         logger.info("monokernel: no DCP front: %s", front_off)
+    if p.attn_dcp_size > 1:
+        _fuse_qkv_g(backbone)
     mla_off = _mla_front_disable_reason(p)
     if mla_off is not None:
         logger.info("monokernel: no MLA projection front: %s", mla_off)
@@ -409,6 +411,8 @@ def _build(model, hf_config, ctx):
     # SGLang's attention on the packed layers (inproj.py): its verify launches
     inproj.for_device(device).warmup(k1_mod._draft_tokens())
     sgl = _SglFronts.install(backbone, runner, vcs, layers, ctx.widths) if dcp else None
+    if dcp:
+        _SglTails.install(backbone, runner, vcs, ctx.widths)
     global _FRONT_ROWS
     _FRONT_ROWS = frozenset(
         rows for rows, packed in layers.items()
@@ -1102,6 +1106,310 @@ class _SglFronts:
         # the gate is in the core: o_proj's wrapper has no gate input to apply
         out, _ = e.attn.o_proj(core)
         return out
+
+
+# The widest steps' fused_qkv_a and g_proj run as one GEMM on their
+# concatenated weights: from 24 requests it is faster than the two (5.6 us at
+# 144 rows, 8 at 180); below, the two separate tuned GEMMs are.
+QKV_G_MIN_ROWS = 144
+
+
+def _fp8_dtype():
+    """SGLang's e4m3 for aiter's MLA decode (its q's dtype)."""
+    from sglang.srt.layers.attention import aiter_backend as ab
+
+    return ab.fp8_dtype
+
+
+def _fuse_qkv_g(backbone) -> None:
+    """Each MLA layer's fused_qkv_a and g_proj weights (both on the layer's
+    input x, bf16) as row blocks of one [2112 + 1536, 7168] tensor, the
+    modules' weights views of it (``self_attn._qkv_g_weight``): the wide path
+    runs them as one GEMM. Every other reader sees the same weights."""
+    for layer in backbone.layers:
+        attn = getattr(layer, "self_attn", None)
+        fused = getattr(attn, "fused_qkv_a_proj_with_mqa", None)
+        g = getattr(attn, "g_proj", None)
+        if fused is None or g is None or hasattr(attn, "qkv_conv1d"):
+            continue
+        wq, wg = fused.weight, g.weight
+        if wq.dtype != torch.bfloat16 or wg.dtype != torch.bfloat16 or wq.shape[1] != wg.shape[1]:
+            continue
+        cat = torch.cat([wq.data, wg.data]).contiguous()
+        wq.data, wg.data = cat[: wq.shape[0]], cat[wq.shape[0] :]
+        attn._qkv_g_weight = cat
+
+
+# The widths whose absorb runs in the prologue (SGLang's prepare stopped after
+# q_b): every wide width (tier 0: -6 to -11 us an MLA layer on the mixes,
+# -3 to -5 at 100K).
+ABSORB_MIN_ROWS = 36
+
+
+class _SglTails:
+    """The MLA prologue, the decode and the tail inside SGLang's own MLA
+    attention at the verify widths past the front's, ``mla_tail.MIN_ROWS`` ..
+    ``MAX_ROWS``. SGLang's ROCm MLA prepare runs (fused_qkv_a, the q / kv
+    norms, q_b over all 96 heads, the absorb); then, in place of its core:
+    ``mla_prologue`` (the decode's e4m3 q and this rank's KV records),
+    ``mla_decode_b`` (its split plan once a step, from SGLang's DCP KV
+    indices; its splits merged in the launch), ``mla_tail`` on its rows with
+    no reduce (W_UV, the DCP exchange, the LSE combine and the output gate),
+    and SGLang's o_proj on the gated core. Every other step of these layers is SGLang's own
+    forward. One static rule a width."""
+
+    def __init__(self, runner, entries: list, rows: frozenset) -> None:
+        from sgl_amd_mono.kimi_k3.gfx950.attention import mla_decode_b as mdb
+        from sgl_amd_mono.kimi_k3.gfx950.attention import mla_tail as mt
+
+        dev = runner.device
+        self.runner, self.entries, self.rows = runner, entries, rows
+        self.core = {r: _front_core_buffer(r, dev) for r in rows}
+        self.q8 = {r: torch.empty(r, mt.NHA, mt.mf.DQK, dtype=_fp8_dtype(), device=dev) for r in rows}
+        self.out = {r: torch.empty(r, mt.NHA, mt.KV, dtype=torch.bfloat16, device=dev) for r in rows}
+        self.lse = {r: torch.empty(r, mt.NHA, dtype=torch.float32, device=dev) for r in rows}
+        # the decode's split partials and maps, one set for every layer
+        self.bufs = mdb.DecodeBuffers(dev)
+        # the tail's reduce maps: none (the decode merges its own splits)
+        self.no_reduce = [torch.zeros(n, dtype=torch.int32, device=dev) for n in (2, 2, 1)]
+        # the softmax scale of every MLA layer's gathered-head attention
+        scales = {e.attn.attn_mqa_for_dcp_decode.scaling for e in entries}
+        assert len(scales) == 1, scales
+        self.dkey = mdb.MlaDecodeBuild(scale=scales.pop())
+
+    @classmethod
+    def install(cls, backbone, runner, vcs: dict, widths):
+        """Every MLA layer's wide path at the widths the spec and the front
+        leave to SGLang, its builds run once (every rank the same launches in
+        the same order), then each layer's ROCm MLA core routed through it.
+        None where no width or no layer qualifies."""
+        from sgl_amd_mono.kimi_k3.gfx950.attention import mla_tail as mt
+
+        rows = frozenset(
+            r for r in range(mt.MIN_ROWS, mt.MAX_ROWS + 1, mt.G_ROWS)
+            if r not in widths and r > FRONT_MAX_ROWS
+        )  # fmt: skip
+        mla = [
+            i for i, layer in enumerate(backbone.layers)
+            if hasattr(layer, "self_attn") and not hasattr(layer.self_attn, "qkv_conv1d")
+        ]  # fmt: skip
+        if not rows or not mla or any(vcs.get(i) is None for i in mla):
+            return None
+        entries = [
+            # consecutive layers take alternate A2A copies (mla_tail.peer_end)
+            SimpleNamespace(
+                i=i, attn=backbone.layers[i].self_attn, w_vc=vcs[i],
+                key=mt.MlaTailBuild(par=n % 2), first=n == 0,
+            )
+            for n, i in enumerate(mla)
+        ]  # fmt: skip
+        self = cls(runner, entries, rows)
+        self._warmup()
+        for e in entries:
+            e.attn.forward_absorb_rocm_core = functools.partial(self.core_forward, e)
+            e.attn.forward_absorb_rocm_prepare = functools.partial(self.prepare, e)
+            if getattr(e.attn, "_qkv_g_weight", None) is not None:
+                e.gate = None
+                e.qkvg = torch.nn.Module()
+                e.qkvg.weight = torch.nn.Parameter(e.attn._qkv_g_weight, requires_grad=False)
+                e.attn.prepare_qkv_latent = functools.partial(self.qkv_latent, e)
+                e.attn._compute_output_gate = functools.partial(self.output_gate, e)
+        logger.info(
+            "monokernel: MLA prologue and tail in SGLang's MLA attention at %d .. %d rows (%d layers)",
+            min(rows), max(rows), len(entries),
+        )  # fmt: skip
+        return self
+
+    def _warmup(self) -> None:
+        """Every build once: the prologue on no owned row, the decode's plan and
+        decode on requests with no key, both A2A copies' tails on no reduce
+        tile and every row empty, in an epoch of their own."""
+        from sgl_amd_mono.kimi_k3.gfx950.attention import mla_decode_b as mdb
+        from sgl_amd_mono.kimi_k3.gfx950.attention import mla_prologue as mp
+        from sgl_amd_mono.kimi_k3.gfx950.attention import mla_tail as mt
+        from sgl_amd_mono.kimi_k3.gfx950.layer import scratch_region
+
+        dev, s = self.runner.device, min(self.rows)
+        f32, i32, bf = torch.float32, torch.int32, torch.bfloat16
+        qb = torch.zeros(s, mt.NHA, mp.QHD, dtype=bf, device=dev)
+        lat = torch.zeros(s, mt.mf.LATW, dtype=bf, device=dev)
+        # a throwaway absorb weight: the build is all that is warmed. SGLang's
+        # gathered w_kc_qrep is made in init_attention_backends, after this
+        # install runs inside load_model, so it does not exist yet.
+        w_kc = torch.zeros(mt.NHA, mp.QN, mt.KV, dtype=bf, device=dev)
+        # the builds the widths take
+        for absorb in {r >= ABSORB_MIN_ROWS for r in self.rows}:
+            mp.mla_prologue_launch(
+                mp.MlaPrologueBuild(absorb=absorb), q_pe=qb[..., mp.QHD - mp.ROPE :],
+                k_nope=lat[:, : mt.KV], k_pe=lat[:, mt.KV : mp.DQK],
+                # a slot of another rank: no record written
+                loc=torch.full((s,), self.runner.dcp_rank + 1, dtype=torch.int64, device=dev) % mt.DCP,
+                q8=self.q8[s], kv=torch.zeros(8, mp.DQK, dtype=torch.uint8, device=dev),
+                rank=self.runner.dcp_rank,
+                **(
+                    dict(q_b=qb, w_kc=w_kc) if absorb
+                    else dict(q_nope_out=torch.zeros(s, mt.NHA, mt.KV, dtype=bf, device=dev))
+                ),
+            )  # fmt: skip
+        nreq = s // mt.G_ROWS
+        ptr = torch.zeros(nreq + 1, dtype=i32, device=dev)
+        mdb.mla_decode_plan_launch(kv_ptr=ptr, g_ptr=ptr, nreq=nreq, bufs=self.bufs)
+        mdb.mla_decode_launch(
+            self.dkey, q8=self.q8[s], kv=torch.zeros(8, mp.DQK, dtype=torch.uint8, device=dev),
+            kv_idx=torch.zeros(1, dtype=i32, device=dev), kv_ptr=ptr, g_ptr=ptr, rank=self.runner.dcp_rank,
+            o=self.out[s], lse=self.lse[s], bufs=self.bufs,
+        )  # fmt: skip
+        self.runner.step_begin()
+        for e in self.entries[:2]:
+            mt.mla_tail_launch(
+                e.key, s=s, logits=torch.zeros(1, mt.NHA, mt.KV, dtype=f32, device=dev),
+                plse=torch.zeros(1, mt.NHA, dtype=f32, device=dev),
+                indptr=torch.zeros(2, dtype=i32, device=dev),
+                fmap=torch.zeros(2, dtype=i32, device=dev),
+                pmap=torch.zeros(1, dtype=i32, device=dev),
+                o=torch.zeros(s, mt.NHA, mt.KV, dtype=bf, device=dev),
+                lse=torch.zeros(s, mt.NHA, dtype=f32, device=dev),
+                empty=torch.ones(s, dtype=torch.bool, device=dev), w_vc=e.w_vc,
+                gate=torch.zeros(s, mt.GATE, dtype=bf, device=dev),
+                core=self.core[s], scratch=scratch_region(self.runner.scratch, "mla_tail"),
+                peers=self.runner.peer.addresses, rank=self.runner.dcp_rank,
+                layer=e.i, epoch=self.runner.epoch,
+            )  # fmt: skip
+        torch.cuda.synchronize()
+
+    def prepare(self, e, positions, hidden_states, forward_batch, zero_allocator,
+                llama_4_scaling=None, prev_topk_indices=None):  # fmt: skip
+        """``forward_absorb_rocm_prepare`` of layer ``e``: at a wide width's
+        target verify from ABSORB_MIN_ROWS rows, SGLang's prepare up to q_b
+        (the latent, the fused q / kv norm, the replicated q_b), the absorb
+        left to the prologue (``q_nope_out`` None, q_b's output in its place);
+        else SGLang's."""
+        attn = e.attn
+        rows = hidden_states.shape[0]
+        if not (
+            forward_batch.forward_mode.is_target_verify() and rows in self.rows and rows >= ABSORB_MIN_ROWS
+        ):
+            return type(attn).forward_absorb_rocm_prepare(
+                attn, positions, hidden_states, forward_batch, zero_allocator,
+                llama_4_scaling, prev_topk_indices,
+            )  # fmt: skip
+        from sglang.srt.layers.layer_boundary import get_attn_tp_context
+        from sglang.srt.models.deepseek_common.attention_forward_methods import forward_mla_rocm as frm
+
+        assert attn.is_dcp_q_replicate_phase(forward_batch) and attn.q_b_proj_qrep_weight is not None
+        q, latent = get_attn_tp_context().fetch_qkv_latent().split(
+            [attn.q_lora_rank, attn.kv_lora_rank + attn.qk_rope_head_dim], dim=-1
+        )
+        k_nope = latent[..., : attn.kv_lora_rank]
+        q, k_nope = frm.fused_qk_rmsnorm_bf16(
+            q, attn.q_a_layernorm.weight, attn.q_a_layernorm.variance_epsilon,
+            k_nope, attn.kv_a_layernorm.weight, attn.kv_a_layernorm.variance_epsilon,
+        )  # fmt: skip
+        k_nope = k_nope.unsqueeze(1)
+        q = frm.a16w16_linear(q, attn.q_b_proj_qrep_weight).view(-1, attn.num_local_heads * attn.dcp_size, attn.qk_head_dim)
+        _, q_pe, k_pe = attn._split_q_nope_pe(q, latent)
+        return (
+            q_pe, k_pe, None, k_nope, forward_batch, zero_allocator, positions, None,
+            llama_4_scaling, q,
+        )  # fmt: skip
+
+    def qkv_latent(self, e, hidden_states, forward_batch):
+        """``prepare_qkv_latent`` of layer ``e``: at a wide width's target
+        verify from QKV_G_MIN_ROWS rows, fused_qkv_a and g_proj as one GEMM (the
+        latent returned, g kept for ``output_gate``), else SGLang's."""
+        rows = hidden_states.shape[0]
+        attn = e.attn
+        if not (
+            forward_batch.forward_mode.is_target_verify() and rows in self.rows and rows >= QKV_G_MIN_ROWS
+        ):
+            return type(attn).prepare_qkv_latent(attn, hidden_states, forward_batch)
+        fused = attn.fused_qkv_a_proj_with_mqa
+        n = fused.weight.shape[0]
+        # fused_qkv_a's own linear method on the concatenated weight
+        out = fused.quant_method.apply(e.qkvg, hidden_states)
+        e.gate = out[:, n:]
+        return out[:, :n]
+
+    def output_gate(self, e, hidden_states):
+        """``_compute_output_gate`` of layer ``e``: g from the fused GEMM when
+        this step's latent came from it (its gate branch, if forked, joined),
+        else SGLang's."""
+        attn = e.attn
+        g, e.gate = e.gate, None
+        if g is None:
+            return type(attn)._compute_output_gate(attn, hidden_states)
+        alt, attn._gate_pending_stream = attn._gate_pending_stream, None
+        if alt is not None:
+            torch.cuda.current_stream().wait_stream(alt)
+        return g
+
+    def core_forward(self, e, q_pe, k_pe, q_nope_out, k_nope, forward_batch, zero_allocator,
+                     positions, topk_indices, llama_4_scaling, q_nope_unabsorbed=None):  # fmt: skip
+        """``forward_absorb_rocm_core`` of layer ``e``: at a wide width's
+        target verify, the prologue, the decode (its plan before the first
+        layer's), the tail and SGLang's o_proj on the gated core."""
+        attn = e.attn
+        rows = q_pe.shape[0]
+        if not (forward_batch.forward_mode.is_target_verify() and rows in self.rows):
+            return type(attn).forward_absorb_rocm_core(
+                attn, q_pe, k_pe, q_nope_out, k_nope, forward_batch, zero_allocator,
+                positions, topk_indices, llama_4_scaling, q_nope_unabsorbed,
+            )  # fmt: skip
+        from sglang.srt.model_executor.forward_context import get_attn_backend
+
+        from sgl_amd_mono.kimi_k3.gfx950.attention import mla_decode_b as mdb
+        from sgl_amd_mono.kimi_k3.gfx950.attention import mla_prologue as mp
+        from sgl_amd_mono.kimi_k3.gfx950.attention import mla_tail as mt
+        from sgl_amd_mono.kimi_k3.gfx950.layer import scratch_region
+
+        absorb = rows >= ABSORB_MIN_ROWS
+        assert topk_indices is None and llama_4_scaling is None
+        assert (q_nope_out is None) == absorb and (q_nope_unabsorbed is not None) == absorb
+        if e.first:
+            # once a forward, before its first tail: the steps' mailbox tags
+            self.runner.step_begin()
+        backend = get_attn_backend()
+        backend = getattr(backend, "full_attn_backend", backend)
+        fm = backend.forward_metadata
+        # the gathered-head attention SGLang's DCP verify calls
+        layer = attn.attn_mqa_for_dcp_decode
+        assert fm.use_asm_cprr_verify and fm.cprr_kernel_heads == layer.tp_q_head_num == mt.NHA
+        assert backend._resolve_fp8_kv_scale_float(layer, None) == 1.0
+        kv = backend.kv_layers.read(layer.layer_id).key()
+        q8 = self.q8[rows]
+        mp.mla_prologue_launch(
+            mp.MlaPrologueBuild(absorb=absorb), q_nope_out=q_nope_out, q_pe=q_pe,
+            k_nope=k_nope, k_pe=k_pe, loc=forward_batch.out_cache_loc, q8=q8,
+            kv=kv.view(torch.uint8).view(-1, mp.DQK), rank=self.runner.dcp_rank,
+            **(dict(q_b=q_nope_unabsorbed, w_kc=attn.w_kc_qrep) if absorb else {}),
+        )  # fmt: skip
+        out, lse, bufs = self.out[rows], self.lse[rows], self.bufs
+        assert layer.scaling == self.dkey.scale
+        if e.first:
+            # once a step: the split plan and the reduce's maps, from this rank's key counts
+            mdb.mla_decode_plan_launch(
+                kv_ptr=fm.cprr_kv_indptr, g_ptr=fm.global_kv_indptr, nreq=rows // mt.G_ROWS, bufs=bufs
+            )  # fmt: skip
+        mdb.mla_decode_launch(
+            self.dkey, q8=q8, kv=kv.view(torch.uint8).view(-1, mp.DQK), kv_idx=fm.cprr_kv_indices,
+            kv_ptr=fm.cprr_kv_indptr, g_ptr=fm.global_kv_indptr, rank=self.runner.dcp_rank,
+            o=out, lse=lse, bufs=bufs,
+        )  # fmt: skip
+        gate = attn._compute_output_gate(attn._gate_hidden_states)
+        attn._gate_hidden_states = None
+        core = self.core[rows]
+        mt.mla_tail_launch(
+            e.key, s=rows, logits=bufs.logits, plse=bufs.plse, indptr=self.no_reduce[0], fmap=self.no_reduce[1],
+            pmap=self.no_reduce[2], o=out, lse=lse, empty=fm.cprr_empty_rows, w_vc=e.w_vc,
+            gate=gate, core=core, scratch=scratch_region(self.runner.scratch, "mla_tail"),
+            peers=self.runner.peer.addresses, rank=self.runner.dcp_rank, layer=e.i,
+            epoch=self.runner.epoch,
+        )  # fmt: skip
+        # the gate is in the core: o_proj's wrapper has no gate input to apply
+        output, _ = attn.o_proj(core)
+        if attn.next_skip_topk is None:
+            return output
+        return output, None
 
 
 def _gu_interleaved(moe) -> bool:

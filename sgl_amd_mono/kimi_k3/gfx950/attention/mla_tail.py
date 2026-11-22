@@ -412,7 +412,7 @@ def build(key: MlaTailBuild):
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def mla_tail(
         logits: Int64, plse: Int64, indptr: Int64, fmap: Int64, pmap: Int64, o: Int64,
-        lse: Int64, empty: Int64, w_vc: Int64, gate: Int64, core: Int64, send: Int64,
+        lse: Int64, empty: Int64, w_vc: Int64, gate: Int64, g_rs: Int32, core: Int64, send: Int64,
         s: Int32, nt: Int32, scratch: Int64, peers: Int64, rank: Int32, layer: Int32,
         epoch: Int64,
     ):  # fmt: skip
@@ -433,7 +433,7 @@ def build(key: MlaTailBuild):
                 "put": mb.put, "poll": mb.poll, "records": key.records,
                 "red": lds.red.ptr, "xl": lds.xl.ptr, "wl": lds.wl.ptr,
                 "trdy": sreg(scratch, lay["trdy"][0], "trdy"),
-                "gbuf": gate, "on": False, "tls": None,
+                "gbuf": gate, "g_rs": g_rs, "on": False, "tls": None,
                 "a2a_peer": mc.PeerRegions(peers, key.par, peer_offset(), a2a_copy_bytes()),
                 "args": {
                     "logits": logits, "plse": plse, "indptr": indptr, "fmap": fmap,
@@ -458,13 +458,13 @@ def build(key: MlaTailBuild):
     @flyc.jit
     def launch(
         logits: Int64, plse: Int64, indptr: Int64, fmap: Int64, pmap: Int64, o: Int64,
-        lse: Int64, empty: Int64, w_vc: Int64, gate: Int64, core: Int64, send: Int64,
+        lse: Int64, empty: Int64, w_vc: Int64, gate: Int64, g_rs: Int32, core: Int64, send: Int64,
         s: Int32, nt: Int32, scratch: Int64, peers: Int64, rank: Int32, layer: Int32,
         epoch: Int64, stream: fx.Stream = _STREAM,
     ):  # fmt: skip
         _ = keyed
         mla_tail(
-            logits, plse, indptr, fmap, pmap, o, lse, empty, w_vc, gate, core, send,
+            logits, plse, indptr, fmap, pmap, o, lse, empty, w_vc, gate, g_rs, core, send,
             s, nt, scratch, peers, rank, layer, epoch,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)  # fmt: skip
 
@@ -486,7 +486,7 @@ def mla_tail_launch(
     ``o`` / ``lse``: the decode's output and LSE ([S, 96, 512] bf16 / [S, 96]
     fp32), the reduced rows written into them; ``empty``: SGLang's
     cprr_empty_rows (bool [S]); ``w_vc``: W_UV of all 96 heads (bf16 [96, 512,
-    128]); ``gate``: g_proj's rows (bf16 [S, 1536]); ``core`` [S, 1536] bf16
+    128]); ``gate``: g_proj's rows (bf16 [S, 1536], any row stride); ``core`` [S, 1536] bf16
     out; ``peers``: the DCP ranks' peer buffers (``peer_end`` bytes each);
     ``send`` [8, S, 12, 130] bf16 out, a ``records`` build only. ``s``: the
     step's verify rows."""
@@ -500,7 +500,7 @@ def mla_tail_launch(
     assert lse.dtype == f32 and lse.is_contiguous() and lse.numel() == s * NHA
     assert empty.dtype == torch.bool and empty.is_contiguous() and empty.numel() >= s
     assert tuple(w_vc.shape) == (NHA, KV, VD) and w_vc.dtype == bf and w_vc.is_contiguous()
-    assert tuple(gate.shape) == (s, GATE) and gate.dtype == bf and gate.is_contiguous()
+    assert tuple(gate.shape) == (s, GATE) and gate.dtype == bf and gate.stride(1) == 1 and gate.stride(0) % 8 == 0
     assert tuple(core.shape) == (s, GATE) and core.dtype == bf and core.is_contiguous()
     assert peers.dtype == torch.int64 and peers.numel() == DCP and key.par in (0, 1)
     assert (send is not None) == key.records
@@ -510,6 +510,6 @@ def mla_tail_launch(
     build(key)(
         logits.data_ptr(), plse.data_ptr(), indptr.data_ptr(), fmap.data_ptr(),
         pmap.data_ptr(), o.data_ptr(), lse.data_ptr(), empty.data_ptr(), w_vc.data_ptr(),
-        gate.data_ptr(), core.data_ptr(), mf.ptr(send), s, nt, scratch.data_ptr(),
+        gate.data_ptr(), gate.stride(0), core.data_ptr(), mf.ptr(send), s, nt, scratch.data_ptr(),
         peers.data_ptr(), rank, layer, epoch.data_ptr(), stream=torch.cuda.current_stream(),
     )  # fmt: skip

@@ -102,9 +102,11 @@ class PeerRegions:
     loaded (a scalar load of the ``peers`` table) where it is used, so no rank's
     base stays in SGPRs across the launch."""
 
-    def __init__(self, peers, par):
+    def __init__(self, peers, par, offset=None, copy_bytes=None):
         self.peers = peers
-        self.off = fx.Int64(peer_offset()) + fx.Int64(par) * fx.Int64(a2a_copy_bytes())
+        offset = peer_offset() if offset is None else offset
+        copy_bytes = a2a_copy_bytes() if copy_bytes is None else copy_bytes
+        self.off = fx.Int64(offset) + fx.Int64(par) * fx.Int64(copy_bytes)
 
     def __getitem__(self, rank):
         return sload64(sfresh64(self.peers) + fx.Int64(rank) * fx.Int64(8)) + self.off
@@ -244,16 +246,18 @@ def stage_combine(c, task):
     red = c["red"]
     # read before the traced branches (a dict lookup inside one is carried state)
     box = c.get("core_box")
+    g_rs = c.get("g_rs", GATE)  # g's row stride (bf16)
     pre_wait = c.get("pre_wait")
     # the launch's stamp points (g seen, records seen, core stored), if any
     tlp = c.get("comb_tl")
     b = task // NHL
     hl = task % NHL
     gpr = VD // 16  # g_proj groups a local head
-    # the head's g rows, from this rank's stage 1
-    if tid < gpr:
-        c["poll"]([(c["grdy"], hl * gpr + tid, 1)])
-    gpu.barrier()
+    # the head's g rows, from this rank's stage 1 (none: g given at launch)
+    if const_expr(c.get("grdy") is not None):
+        if tid < gpr:
+            c["poll"]([(c["grdy"], hl * gpr + tid, 1)])
+        gpu.barrier()
     if const_expr(tlp is not None):
         stamp(c["on"], c["tls"], tid, tlp[0])
     # the launch's own work for the CTA's idle waves (3 ..) during the wait
@@ -273,7 +277,7 @@ def stage_combine(c, task):
     u = tid % VAL_CELLS
     col = hl * VD + CELL_VALUES * u
     gw = fx.Vector(
-        bo.buffer_load(rsrc(c["gbuf"]), (t * GATE + col) // 2, vec_width=2, dtype=T.i32, cache_modifier=CM_DEV)
+        bo.buffer_load(rsrc(c["gbuf"]), (t * g_rs + col) // 2, vec_width=2, dtype=T.i32, cache_modifier=CM_DEV)
     )
     vcells = [a2a_cell(src, t, hl, u, s) for src in range(DCP)]
     if live:
