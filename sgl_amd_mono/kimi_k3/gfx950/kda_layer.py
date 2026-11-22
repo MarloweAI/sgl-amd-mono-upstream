@@ -105,6 +105,8 @@ def build(key: KdaLayerBuild):
     akey, kkey = key.attn, key.k2
     s = akey.tokens
     assert not kw.is_gemm(akey) and kkey.core_box and kkey.tokens == s
+    # a block-write front stores its bank row plain; K2 reads the bank before any poll
+    assert akey.write_idx < 0
     # a core box is a request's verify rows of a local head
     assert akey.qlen == oproj.CORE_REQ_ROWS and s // akey.qlen <= kw.WIDE_REQS
     cbox_off, cbox_n = k2.scratch_layout(kkey)["cbox"]
