@@ -86,10 +86,12 @@ TP_SIZE = 8
 # The decode context parallel sizes the launches run at. Under DCP the attention
 # hands o_proj the same TP-local 12-head core as without it.
 DCP_SIZES = (1, 8)
-# the DCP fronts 18 .. 30 rows wide run the decode core (mla_decode_c64) through
-# W_UV; narrower and wider steps their own attention (tier 0, 8K, a layer: the
-# core +4.1 us at 6 rows, +0.8 at 12, -14.9 at 18, -20.8 at 24)
-C64_ROWS = (18, 30)
+# the DCP fronts 12 .. 30 rows wide run the decode core (mla_decode_c64) through
+# W_UV; one request and wider steps their own attention. Tier 0, a layer: the
+# core -14.9 / -20.8 us at 18 / 24 rows (8K); at 12 rows -0.5 / -3.6 / -9.8 /
+# -20.8 at 8K / 28K / 56K / 100K (its attention grows half as fast with
+# context), at 6 rows +2.0 at 8K and even at the replay's mean context
+C64_ROWS = (12, 30)
 # K2's OPT_* bits (gfx950/layer.py: sentinel all-reduces, preloads, tagged x rows,
 # router partials, batched polls), each bit for bit the launch without it; unset
 # is layer.K2_OPT, all of them.
