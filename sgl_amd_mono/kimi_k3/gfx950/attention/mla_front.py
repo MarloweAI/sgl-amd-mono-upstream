@@ -742,12 +742,9 @@ def stage_kv(c):
                     ws += [(w << 16).bitcast(fx.Float32), (w & fx.Int32(-65536)).bitcast(fx.Float32)]
                 vals = [bf16_round((vals[j] * rs) * ws[j]) for j in range(4)]
             word = e4m3x4(vals)
-            row = fx.Int64(_ld(a["loc"], t * c["loc_words"])) >> 3
-            p = fx.inttoptr(
-                fx.PointerType.get(fx.Int32.ir_type, fx.AddressSpace.Global, 4),
-                a["kv"] + row * fx.Int64(DQK) + fx.Int64(k),
-            )
-            fx.generic_store(p, word)
+            row = fx.Int32(fx.Int64(_ld(a["loc"], t * c["loc_words"])) >> 3)
+            # device scope (as NEWKV): the decode core reads this row in this launch, on any XCD, once KVRDY is up
+            bo.buffer_store(word, rsrc(a["kv"]), row * (DQK // 4) + tid, cache_modifier=CM_DEV)
             bo.buffer_store(word, rsrc(c["newkv"]), r * words + tid, cache_modifier=CM_DEV)
     rocdl.s_waitcnt(vmcnt=0)
     gpu.barrier()
