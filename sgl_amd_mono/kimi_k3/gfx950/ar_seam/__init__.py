@@ -16,9 +16,9 @@ _HERE = Path(__file__).resolve().parent
 HIDDEN = 7168
 MAX_ROWS = 192
 HANDOFF_BYTES = MAX_ROWS * HIDDEN * 2
-# The widths SGLang's K3 layers take it at: past the KDA / MLA launches' row caps, and while aiter's
+# The widths SGLang's K3 layers take it at: past the KDA / MLA launches' row caps (24), and while aiter's
 # all-reduce blocks and one reader a row fit on the 256 CUs together (80 + 176).
-ROWS = range(49, 177)
+ROWS = range(25, 177)
 # lamportPollSlot's empty word: every byte 0xff
 SENTINEL = 0xFF
 
