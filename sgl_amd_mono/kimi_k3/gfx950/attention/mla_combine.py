@@ -37,7 +37,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl.expr import const_expr, gpu, range_constexpr
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
@@ -291,6 +291,9 @@ def stage_combine(c, task):
             ow, rsrc(a["core"]), (t * GATE + col) // 2,
             cache_modifier=0 if box is None else CM_DEV,
         )  # fmt: skip
+    if const_expr(box is not None):
+        # every wave drains its core stores before the box (gpu.barrier waits only lgkmcnt)
+        rocdl.s_waitcnt(vmcnt=0)
     gpu.barrier()
     if const_expr(tlp is not None):
         stamp(c["on"], c["tls"], tid, tlp[2])
