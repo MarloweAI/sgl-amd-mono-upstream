@@ -89,6 +89,7 @@ CNT_U = CNT_G + 4 * MAX_LAYERS  # then a layer's W_UV unit queue
 CNT_F = CNT_U + MAX_LAYERS  # then a layer's group-done flags: 3 groups x 16 copies (a few units poll a copy)
 CNT_WORDS = CNT_F + 48 * MAX_LAYERS
 NU = 2 * NHA  # W_UV units: (head, latent half)
+SM0 = 7  # the S interval's MFMA at which block t's softmax starts (after the column maxes' LDS read)
 OBW, RDW = 132, 36  # LDS words a row: a unit's bf16 o (128 + a pad), its k-half products (32 + a pad)
 WVW = 80  # LDS words a latent row of a unit's W_UV half (64 + a pad: a transposed read of 16 lanes is conflict free)
 HO = 12  # heads a DCP owner (the emit hooks' owner, head = HO owner + hl)
@@ -317,6 +318,7 @@ def decode_stage(key, lds, bid, tid, a, q_load, ready, kv_ready, emit_values, em
     pe_x, pe_w, pe_m, n_last = z, z, z, z  # the piece end: to its first barrier, the wait / write, the rest
     e_pre, e_post = z, z  # a piece's loop end to its piece end; its piece end to the next piece
     phs = [z] * 4  # phase sums inside the loop's intervals
+    t_rdy, r_rdy = z, z  # S: the ready hook's waits; the realtime the first one returned
 
     def stamp():
         return _memtime() if const_expr(phon) else z
@@ -518,25 +520,46 @@ def decode_stage(key, lds, bid, tid, a, q_load, ready, kv_ready, emit_values, em
     def xlen(x):
         return TILES * fx.max(fx.Int32(0), (ngr - x + 7) // 8)
 
+    def kfirst(x):
+        """List x's entries taken first, without a take: entry j by CTA 8 j + x."""
+        return fx.min(fx.Int32(BLOCKS // 8), xlen(x))
+
+    kall = kfirst(0)
+    for x_ in range_constexpr(1, 8):
+        kall = kall + kfirst(x_)
+
     def take():
         """The next entry: this XCD's list first, then the other XCDs' in turn (only which CTA runs an
         entry depends on the take order; npc when every list is done). The layer's queue counter, taken
         beside the XCD's, counts takes: past npc every entry has a taker, so an empty list ends the
-        search without walking the others (a take below npc walks them all, so none is left)."""
+        search without walking the others (a take below npc walks them all, so none is left). A list's
+        counter and the queue's count from past the entries taken first."""
         x = xcc
-        gv = _atomic_add(qa, 1)
-        v = _atomic_add(cx + fx.Int64(4) * fx.Int64(x), 1)
+        gv = _atomic_add(qa, 1) + kall
+        v = _atomic_add(cx + fx.Int64(4) * fx.Int64(x), 1) + kfirst(x)
         d = fx.Int32(0)
         while (v >= xlen(x)) & (gv < npc) & (d < 7):
             d = d + 1
             x = (xcc + d) % 8
-            v = _atomic_add(cx + fx.Int64(4) * fx.Int64(x), 1)
+            v = _atomic_add(cx + fx.Int64(4) * fx.Int64(x), 1) + kfirst(x)
         return (v < xlen(x)).select(_ld(wq, WQ_X + x * XLEN + fx.min(v, fx.Int32(XLEN - 1))), npc)
 
+    if const_expr(uton):
+        if tid == 0:
+            bo.buffer_store(fx.Int32(_realtime()), rsrc(tl), TL_UB + bid * 16 + 4)
     if tid == 0:
-        fx.ptr_store(take(), nxt)
+        # the first entry: list bid % 8's entry bid / 8 if there is one (the CTAs of an XCD, when CTAs go to
+        # XCDs in turn), else a take
+        x0, j0 = bid % 8, bid // 8
+        if j0 < xlen(x0):
+            fx.ptr_store(_ld(wq, WQ_X + x0 * XLEN + j0), nxt)
+        else:
+            fx.ptr_store(take(), nxt)
     _bar()
     idx = uniform(fx.Int32(fx.ptr_load(nxt)))
+    if const_expr(uton):
+        if tid == 0:
+            bo.buffer_store(fx.Int32(_realtime()), rsrc(tl), TL_UB + bid * 16 + 5)
     npk = fx.Int32(1)  # entries taken so far (the parity of nxt)
     # each role its own piece loop, so a role's per-lane constants live only in its loop
     if role == 0:
@@ -552,7 +575,11 @@ def decode_stage(key, lds, bid, tid, a, q_load, ready, kv_ready, emit_values, em
                 # S: q of column tiles ct (column n16: row 2 rp + ct / 2, head 32 ht + 16 (ct % 2) + n16):
                 # 4 steps of dims 128 st + 32 g .., and the rope's dims 512 + 16 g ..
                 qops = []
+                tr0 = _memtime() if const_expr(tlon) else z
                 ready(rq, HT * ht, HT)
+                if const_expr(tlon):
+                    t_rdy = t_rdy + (_memtime() - tr0)
+                    r_rdy = (r_rdy == z).select(_realtime(), r_rdy)
                 for ct in range_constexpr(4):
                     qt, qh = RT * rp + ct // 2, HT * ht + 16 * (ct % 2) + n16
                     qops.append([_cat8(q_load(rq, qh, qt, 128 * st + 32 * g), q_load(rq, qh, qt, 128 * st + 32 * g + 16))
@@ -560,8 +587,8 @@ def decode_stage(key, lds, bid, tid, a, q_load, ready, kv_ready, emit_values, em
                     if const_expr(ct == 0):
                         # column tile w's rope into LDS (column 16 w + n16, its chunk g)
                         _st16(qrl + (16 * w + n16) * 16 + 4 * g, q_load(rq, HT * ht + 16 * (w % 2) + n16, RT * rp + w // 2, 512 + 16 * g))
-                if tid == 0:
-                    fx.ptr_store(fx.Int32(0), lds.rcnt.ptr)
+                # block -1's column maxes (none: the first interval's softmax is of no keys)
+                fx.ptr_store(fx.Float32(NINF), red + TC * 4 + (16 * tcol + n16) * 4 + w)
                 _bar()
                 if const_expr(tlon):
                     tn = _memtime()
@@ -571,16 +598,18 @@ def decode_stage(key, lds, bid, tid, a, q_load, ready, kv_ready, emit_values, em
                 mg = [fx.Float32(NEG)] * 4  # the running max (column tile ct's column n16)
                 lw = [fx.Float32(0.0)] * 4  # the lane's row sums at mg
 
-                def s_iv(t, xc, mg, lw, phs, tq0, masked=True):
-                    """S's interval t: block t's masked scores (``xc``: its raw scores from interval t - 1)
-                    and column maxes over the wave's 16 keys to LDS, counted on ``rcnt``; the QK of block
-                    t + 1 (step by step over the four column tiles' independent accumulators: dims 0-511 in
-                    4 steps, then the rope's two halves) with, among its MFMAs, the masking, the wait for
-                    the four S waves' maxes and block t's softmax."""
+                def s_iv(t, xc, mg, lw, phs, tq0, nxt_max=1):
+                    """S's interval t: the QK of block t + 1 (step by step over the four column tiles'
+                    independent accumulators: dims 0-511 in 4 steps, then the rope's two halves) with, among
+                    its MFMAs, block t's softmax (``xc``: its masked scores, from interval t - 1; the four S
+                    waves' column maxes of block t, stored before the interval's barrier, then the running
+                    max). After the MFMAs, block t + 1's column maxes over the wave's 16 keys to LDS
+                    (``nxt_max`` 1; 2: masked to the piece and the rows' bounds; 0: none, the piece's last
+                    block)."""
                     kb = ring + ((t + 1) % NSLOT) * SLOT_W
                     rb = red + ((t + 2) % 2) * (TC * 4)
+                    rbn = red + ((t + 3) % 2) * (TC * 4)
                     pb = pall + ((t + 2) % 2) * (TC * PROW) + n16 * PROW + 4 * w + g
-                    rc = lds.rcnt.ptr
                     # the first two steps' A operands up front; the later steps' two steps ahead among the
                     # MFMAs (the interval's LDS reads spread over its MFMAs)
                     kops = [kop(kb, st) for st in range(2)] + [None, None]
@@ -592,9 +621,6 @@ def decode_stage(key, lds, bid, tid, a, q_load, ready, kv_ready, emit_values, em
                     mn, off = [], []
                     qrs = None
                     kbase = (b0 + t) * BK + 16 * w + 4 * g
-                    rooms = [kend0 - kbase, kend1 - kbase]
-                    xm = []
-                    cm = []  # column tile i's max over the lane's 4 keys
                     # MFMA i: step i / 4 of column tile i % 4 (steps 4, 5: the rope's halves). A tile's
                     # MFMAs are 4 apart: back to back on one accumulator they read it too early
                     for i in range_constexpr(24):
@@ -608,36 +634,8 @@ def decode_stage(key, lds, bid, tid, a, q_load, ready, kv_ready, emit_values, em
                                 sacc[ct] = _mfma16(kops[st], qops[ct][st], sacc[ct])
                         elif const_expr("noqk" not in probe):
                             sacc[ct] = _mfma16r(kr[st - 4], qrs[ct][st - 4], sacc[ct])
-                        if const_expr(i < 4):
-                            # block t's column tile i: masked scores (keys past the piece or the row's
-                            # bound: -inf) and their column max over the wave's 16 keys
-                            if const_expr(masked):
-                                room = rooms[i // 2]
-                                xs = [(fx.Int32(v) < room).select(xc[4 * i + v], fx.Float32(NINF)) for v in range(4)]
-                            else:
-                                xs = xc[4 * i : 4 * i + 4]
-                            xm += xs
-                            cm.append(fx.max(fx.max(fx.max(xs[0], xs[1]), xs[2]), xs[3]))
-                            if const_expr(i == 3):
-                                # the four tiles' maxes over the wave's 16 keys (lane bits 4, 5) as one transpose:
-                                # 32-swap tiles (0, 1) and (2, 3), then 16-swap the two results; lane l ends with
-                                # tile (0, 2, 1, 3)[l / 16], column l % 16
-                                a0, a1 = permlane_swap(32, cm[0].bitcast(fx.Int32), cm[1].bitcast(fx.Int32))
-                                a2, a3 = permlane_swap(32, cm[2].bitcast(fx.Int32), cm[3].bitcast(fx.Int32))
-                                r01 = fx.max(a0.bitcast(fx.Float32), a1.bitcast(fx.Float32))
-                                r23 = fx.max(a2.bitcast(fx.Float32), a3.bitcast(fx.Float32))
-                                b0_, b1_ = permlane_swap(16, r01.bitcast(fx.Int32), r23.bitcast(fx.Int32))
-                                m_ = fx.max(b0_.bitcast(fx.Float32), b1_.bitcast(fx.Float32))
-                                # -inf for a fully masked column: the running max (from NEG) absorbs it below
-                                fx.ptr_store(fx.Float32(m_) * qk_c, rb + (16 * tcol + n16) * 4 + w)
-                                if lane == 0:
-                                    _lds_add(rc, 1)
-                        if const_expr(i == 6):
+                        if const_expr(i == 0):
                             # the four S waves' block maxes of block t, then the running max after it
-                            tgt = 4 * (t + 2)
-                            cv = uniform(_lds_acquire(rc))
-                            while cv < tgt:
-                                cv = uniform(_lds_acquire(rc))
                             for c4 in range_constexpr(4):
                                 r4 = _ldsf4(rb + (16 * c4 + n16) * 4)
                                 # two 3-input maxes: (r0, r1, r2), then (that, r3, the running max)
@@ -650,14 +648,14 @@ def decode_stage(key, lds, bid, tid, a, q_load, ready, kv_ready, emit_values, em
                         if const_expr(i == 11):
                             # the rope's q of the four column tiles
                             qrs = [_lds16(qrl + (16 * c4 + n16) * 16 + 4 * g).bitcast(fx.Int64) for c4 in range(4)]
-                        if const_expr(7 <= i < 23):
+                        if const_expr(SM0 <= i < SM0 + 16):
                             # softmax element e of block t: column tile e / 4, key 16 w + 4 g + e % 4
-                            e = i - 7
+                            e = i - SM0
                             c4 = e // 4
                             if const_expr("nosm" in probe):
-                                ps.append(xm[e] + off[c4])
+                                ps.append(xc[e] + off[c4])
                             else:
-                                ps.append(hw_exp2(fmath.fma(xm[e], fx.Float32(qk_c), off[c4])))
+                                ps.append(hw_exp2(fmath.fma(xc[e], fx.Float32(qk_c), off[c4])))
                             if const_expr(e % 4 == 3):
                                 q4 = ps[e - 3 : e + 1]
                                 fx.ptr_store(_e4m3x4(q4), pb + 16 * c4 * PROW)
@@ -665,6 +663,28 @@ def decode_stage(key, lds, bid, tid, a, q_load, ready, kv_ready, emit_values, em
                         rocdl.sched_barrier(0)
                     tq2 = stamp()
                     xn = [fx.Float32(sacc[c][v]) for c in range(4) for v in range(4)]
+                    if const_expr(nxt_max > 0):
+                        # block t + 1's column tiles: masked scores (keys past the piece or the row's bound:
+                        # -inf) and their column maxes over the wave's 16 keys
+                        cm = []
+                        for ct in range_constexpr(4):
+                            if const_expr(nxt_max == 2):
+                                room = kend0 - kbase - BK if ct < 2 else kend1 - kbase - BK
+                                for v in range_constexpr(4):
+                                    xn[4 * ct + v] = (fx.Int32(v) < room).select(xn[4 * ct + v], fx.Float32(NINF))
+                            xs = xn[4 * ct : 4 * ct + 4]
+                            cm.append(fx.max(fx.max(fx.max(xs[0], xs[1]), xs[2]), xs[3]))
+                        # the four tiles' maxes over the wave's 16 keys (lane bits 4, 5) as one transpose:
+                        # 32-swap tiles (0, 1) and (2, 3), then 16-swap the two results; lane l ends with
+                        # tile (0, 2, 1, 3)[l / 16], column l % 16
+                        a0, a1 = permlane_swap(32, cm[0].bitcast(fx.Int32), cm[1].bitcast(fx.Int32))
+                        a2, a3 = permlane_swap(32, cm[2].bitcast(fx.Int32), cm[3].bitcast(fx.Int32))
+                        r01 = fx.max(a0.bitcast(fx.Float32), a1.bitcast(fx.Float32))
+                        r23 = fx.max(a2.bitcast(fx.Float32), a3.bitcast(fx.Float32))
+                        b0_, b1_ = permlane_swap(16, r01.bitcast(fx.Int32), r23.bitcast(fx.Int32))
+                        m_ = fx.max(b0_.bitcast(fx.Float32), b1_.bitcast(fx.Float32))
+                        # -inf for a fully masked column: the running max (from NEG) absorbs it
+                        fx.ptr_store(fx.Float32(m_) * qk_c, rbn + (16 * tcol + n16) * 4 + w)
                     if const_expr(phon):
                         tq3 = stamp()
                         phs = [phs[0] + (tq1 - tq0), phs[1] + (tq2 - tq1), phs[2] + (tq3 - tq2), phs[3]]
@@ -672,13 +692,16 @@ def decode_stage(key, lds, bid, tid, a, q_load, ready, kv_ready, emit_values, em
 
                 # block t's softmax needs the mask only in the piece's last block: pieces are whole blocks and
                 # the two rows of a tile's row pair see keys up to one apart, so every earlier block is whole
-                for tp in range(ni - 2):
+                for tp in range(ni - 3):
                     t = tp - 1
                     tq0 = stamp()
-                    xc, mg, lw, phs = s_iv(t, xc, mg, lw, phs, tq0, masked=False)
+                    xc, mg, lw, phs = s_iv(t, xc, mg, lw, phs, tq0)
                     ta, tw, tb = end_iv(ta, tw, tb)
                 tq0 = stamp()
-                xc, mg, lw, phs = s_iv(nb - 1, xc, mg, lw, phs, tq0)
+                xc, mg, lw, phs = s_iv(nb - 2, xc, mg, lw, phs, tq0, nxt_max=2)
+                ta, tw, tb = end_iv(ta, tw, tb)
+                tq0 = stamp()
+                xc, mg, lw, phs = s_iv(nb - 1, xc, mg, lw, phs, tq0, nxt_max=0)
                 ta, tw, tb = end_iv(ta, tw, tb)
                 # the last interval (O's P V of the last block) has no S work: block nb's softmax and
                 # block nb + 1's QK would be past the piece. An unsplit piece takes the next entry here
@@ -886,7 +909,7 @@ def decode_stage(key, lds, bid, tid, a, q_load, ready, kv_ready, emit_values, em
     _bar()
     ui = uniform(fx.Int32(fx.ptr_load(nxt + 2)))
     nuk = fx.Int32(1)
-    r_o, r_half = rsrc(o), rsrc(half)
+    r_o, r_half = rsrc(o, srows * fx.Int32(NHA * KV * 2)), rsrc(half)  # o: a split row's load fetches nothing
     pc = cnt + fx.Int64(4 * (CNT_H + layer * MAX_TILES))  # the head's W_UV pair: its units done
     # the unit's bf16 o, [32 rows][256 dims] (OBW words a row), and the second k half's products,
     # [n tile][32 rows][RDW]: rows padded so a b128 read of 16 lanes (16 rows) is bank-conflict free
@@ -941,7 +964,8 @@ def decode_stage(key, lds, bid, tid, a, q_load, ready, kv_ready, emit_values, em
             # merge: wave w merges rows 32 rb + w + 8 i (i < 4), a lane 4 dims, so a (row, piece) is one 1 KB line
             # a load. An unsplit tile's bf16 o as it is; a split tile's pieces in piece order: piece p's LSE in
             # lane p, the max and the weights' sum over the wave, the weighted partials. Every row's o, LSEs and
-            # first 8 pieces in one batch of loads, then a row's pieces 8 .. in one more
+            # first 8 pieces in one batch of loads, then a row's pieces 8 .. in one more. Rows past the step's issue
+            # no loads and no merge (an out-of-range load fetches nothing but costs its issue)
             rows = []
             for i in range_constexpr(4):
                 rl = wave + 8 * i
@@ -962,49 +986,54 @@ def decode_stage(key, lds, bid, tid, a, q_load, ready, kv_ready, emit_values, em
             lds_ = []
             for i in range_constexpr(4):
                 rl, rr, live, tv, kq, s0, col = rows[i]
-                ub = fx.Vector(bo.buffer_load(r_o, ((rr * NHA + h) * KV + d4) // 2, vec_width=2, dtype=T.i32, cache_modifier=CM_DEV))
-                okl = lu < kq
-                lp = fx.Float32(bo.buffer_load(r_plse, okl.select((s0 + lu) * TC + col, fx.Int32(MAX_SLOTS * TC)),
-                                               vec_width=1, dtype=T.f32, cache_modifier=CM_DEV))  # fmt: skip
-                lds_.append((ub, lp, [part_ld(kq, s0, col, fx.Int32(p8)) for p8 in range(8)]))
+                ub, lp = fx.Vector.filled(2, 0, fx.Int32), fx.Float32(0.0)
+                vv = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(8)]
+                if live:
+                    ub = fx.Vector(bo.buffer_load(r_o, (tv < 0).select(((rr * NHA + h) * KV + d4) // 2, srows * fx.Int32(NHA * KV // 2)),
+                                                  vec_width=2, dtype=T.i32, cache_modifier=CM_DEV))  # fmt: skip
+                    lp = fx.Float32(bo.buffer_load(r_plse, (lu < kq).select((s0 + lu) * TC + col, fx.Int32(MAX_SLOTS * TC)),
+                                                   vec_width=1, dtype=T.f32, cache_modifier=CM_DEV))  # fmt: skip
+                    vv = [part_ld(kq, s0, col, fx.Int32(p8)) for p8 in range(8)]
+                lds_.append((ub, lp, vv))
             for i in range_constexpr(4):
                 rl, rr, live, tv, kq, s0, col = rows[i]
                 ub, lp, vv = lds_[i]
-                if const_expr(uton):
-                    rocdl.sched_barrier(0)
-                    tA = _memtime()
-                    rocdl.sched_barrier(0)
-                okl = lu < kq
-                lp = okl.select(lp, fx.Float32(NEG))
-                mx = fx.Float32(butterfly(lp, (32, 16, 8, 4, 2, 1), fx.max))
-                wl = okl.select(hw_exp2((lp - mx) * fx.Float32(LOG2E)), fx.Float32(0.0))
-                wsum = fx.Float32(butterfly(wl, (32, 16, 8, 4, 2, 1)))
-                if const_expr(uton):
-                    rocdl.sched_barrier(0)
-                    tB = _memtime()
-                    ph_a = ph_a + (tB - tA)
-                    rocdl.sched_barrier(0)
-                acc = [fx.Float32(0.0)] * 4
-                for p8 in range_constexpr(8):
-                    wg = read_lane_i32(wl.bitcast(fx.Int32), fx.Int32(p8)).bitcast(fx.Float32)
-                    acc = [fmath.fma(wg, fx.Float32(vv[p8][e]), acc[e]) for e in range(4)]
-                for pb in range(8, kq, MAX_KP - 8):  # at most once
-                    v2 = [part_ld(kq, s0, col, pb + p) for p in range(MAX_KP - 8)]
-                    for p in range_constexpr(MAX_KP - 8):
-                        wg = read_lane_i32(wl.bitcast(fx.Int32), pb + p).bitcast(fx.Float32)
-                        acc = [fmath.fma(wg, fx.Float32(v2[p][e]), acc[e]) for e in range(4)]
-                inv = (wsum > fx.Float32(0.0)).select(fx.Float32(1.0) / wsum, fx.Float32(0.0))
-                mb = fx.Vector.from_elements([acc[e] * inv for e in range(4)], fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)
-                o2 = [live.select((tv < 0).select(fx.Int32(ub[e]), fx.Int32(mb[e])), fx.Int32(0)) for e in range(2)]
-                if live & (tv >= 0) & (c == 0) & (lu == 0):
-                    bo.buffer_store(mx + fx.Float32(rocdl.log(T.f32, fx.Float32(wsum).ir_value())) * LN2, rsrc(lse), rr * NHA + h,
-                                    cache_modifier=CM_DEV)  # fmt: skip
-                fx.ptr_store(o2[0], obl + rl * OBW + 2 * lu)
-                fx.ptr_store(o2[1], obl + rl * OBW + 2 * lu + 1)
-                if const_expr(uton):
-                    rocdl.sched_barrier(0)
-                    ph_b = ph_b + (_memtime() - tB)
-                    rocdl.sched_barrier(0)
+                if live:
+                    if const_expr(uton):
+                        rocdl.sched_barrier(0)
+                        tA = _memtime()
+                        rocdl.sched_barrier(0)
+                    okl = lu < kq
+                    lp = okl.select(lp, fx.Float32(NEG))
+                    mx = fx.Float32(butterfly(lp, (32, 16, 8, 4, 2, 1), fx.max))
+                    wl = okl.select(hw_exp2((lp - mx) * fx.Float32(LOG2E)), fx.Float32(0.0))
+                    wsum = fx.Float32(butterfly(wl, (32, 16, 8, 4, 2, 1)))
+                    if const_expr(uton):
+                        rocdl.sched_barrier(0)
+                        tB = _memtime()
+                        ph_a = ph_a + (tB - tA)
+                        rocdl.sched_barrier(0)
+                    acc = [fx.Float32(0.0)] * 4
+                    for p8 in range_constexpr(8):
+                        wg = read_lane_i32(wl.bitcast(fx.Int32), fx.Int32(p8)).bitcast(fx.Float32)
+                        acc = [fmath.fma(wg, fx.Float32(vv[p8][e]), acc[e]) for e in range(4)]
+                    for pb in range(8, kq, MAX_KP - 8):  # at most once
+                        v2 = [part_ld(kq, s0, col, pb + p) for p in range(MAX_KP - 8)]
+                        for p in range_constexpr(MAX_KP - 8):
+                            wg = read_lane_i32(wl.bitcast(fx.Int32), pb + p).bitcast(fx.Float32)
+                            acc = [fmath.fma(wg, fx.Float32(v2[p][e]), acc[e]) for e in range(4)]
+                    inv = (wsum > fx.Float32(0.0)).select(fx.Float32(1.0) / wsum, fx.Float32(0.0))
+                    mb = fx.Vector.from_elements([acc[e] * inv for e in range(4)], fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)
+                    o2 = [live.select((tv < 0).select(fx.Int32(ub[e]), fx.Int32(mb[e])), fx.Int32(0)) for e in range(2)]
+                    if live & (tv >= 0) & (c == 0) & (lu == 0):
+                        bo.buffer_store(mx + fx.Float32(rocdl.log(T.f32, fx.Float32(wsum).ir_value())) * LN2, rsrc(lse), rr * NHA + h,
+                                        cache_modifier=CM_DEV)  # fmt: skip
+                    fx.ptr_store(o2[0], obl + rl * OBW + 2 * lu)
+                    fx.ptr_store(o2[1], obl + rl * OBW + 2 * lu + 1)
+                    if const_expr(uton):
+                        rocdl.sched_barrier(0)
+                        ph_b = ph_b + (_memtime() - tB)
+                        rocdl.sched_barrier(0)
             if const_expr(uton):
                 rocdl.sched_barrier(0)
                 m2 = _memtime()
@@ -1098,6 +1127,7 @@ def decode_stage(key, lds, bid, tid, a, q_load, ready, kv_ready, emit_values, em
         if lane == 0:
             tm1 = _memtime()
             vals = [t_set, tw, tb, t_epi, tm1 - tk0, _realtime() - rk0, n_bl, n_un] + phs + [t_pe, pe_x, rk0, pe_w, pe_m, n_last, e_pre, e_post]
+            vals = vals + [t_rdy, r_rdy]
             if w < 2:
                 for f in range_constexpr(len(vals)):
                     bo.buffer_store(fx.Int32(vals[f]), rsrc(tl), bid * TL_W + 32 * (2 * role + w) + f)
