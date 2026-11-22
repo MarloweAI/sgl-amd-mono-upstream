@@ -295,7 +295,7 @@ def scratch_layout(key: MlaFrontBuild) -> dict:
         "wgt": s * (ns + 1),
         "msq": NA * s,
         "xrdy": NA,
-        "ss": (G_Q + G_KV) * s,
+        "ss": G_LAT * s,
         "qrdy": QBG,
         "absrdy": ABS,
         "kvrdy": nreq,
@@ -547,8 +547,8 @@ def stage1_wide(c, g, ops):
 @flyc.jit
 def s1_out(c, g, acc, t0, sj):
     """Stage-1 group g's rows for tokens t0 .. t0 + sj: a latent group to LAT
-    (and its rows' squares to SS for the q / kv norms), a g_proj group to
-    ``gate``."""
+    (and its rows' squares to SS: the q / kv norms read them, and the rope
+    groups' flag the KV record's wait), a g_proj group to ``gate``."""
     s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
     a = c["args"]
     fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
@@ -567,7 +567,7 @@ def s1_out(c, g, acc, t0, sj):
         fx.ptr_store(v * v, red + tid)
     rocdl.s_waitcnt(vmcnt=0)
     gpu.barrier()
-    if (tid < sj) & (g < G_Q + G_KV):
+    if (tid < sj) & (g < G_LAT):
         tot = fx.ptr_load(red + tid * ROWS)
         for rr in range_constexpr(1, ROWS):
             tot = tot + fx.ptr_load(red + (tid * ROWS + rr))
@@ -703,11 +703,12 @@ def stage_kv(c):
     request's NEWKV."""
     s, tid, red = c["S"], c["tid"], c["red"]
     a = c["args"]
-    n = G_KV * s
+    # the kv groups' squares, and the rope groups' flags (the record carries their rows)
+    n = (G_LAT - G_Q) * s
     per = -(-n // THREADS)
     got = c["poll"]([(c["ss"], G_Q * s + fx.min(tid + THREADS * i, n - 1), 1) for i in range(per)])
     for i in range_constexpr(per):
-        if tid + THREADS * i < n:
+        if tid + THREADS * i < G_KV * s:
             fx.ptr_store(f32_of(got[i][0]), red + (tid + THREADS * i))
     gpu.barrier()
     if tid < s:
