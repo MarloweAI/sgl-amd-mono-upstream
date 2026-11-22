@@ -392,8 +392,6 @@ markov_block_kernel(const Params p) {
                 }
             }
         }
-        // (the slab is uncached peer memory: its stores complete before the barrier, so before the records, which a
-        // peer's walk must see before its gather_step_logits reads the slab)
         __syncthreads();
         MARKOV_STAMP(3 + 5 * step);
         // this block's record of each sequence into every rank's slot
@@ -406,9 +404,16 @@ markov_block_kernel(const Params p) {
                 keep_best(best, bi, wave_bestv[seq][w], wave_bi[seq][w]);
             }
             const uint64_t key = bi == INT_MAX ? 0ull : candidate_key(best, bi + p.vocab_start);
-            __hip_atomic_store(static_cast<uint64_t *>(p.recv[d]) +
-                                   record_slot(parity, step, seq, record_src(p, d), blockIdx.x),
-                               (key << TAG_BITS) | tag, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+            uint64_t *const rec = static_cast<uint64_t *>(p.recv[d]) +
+                                  record_slot(parity, step, seq, record_src(p, d), blockIdx.x);
+            // a record carries its data; only the slab needs ordering: the peers' gather_step_logits read it once
+            // their walks saw the last records, so those release the block's slab stores (the barrier does not
+            // wait for them). A release every step would write back the L2 every step.
+            if (step + 1 == p.gamma && p.dst != p.whole) {
+                __hip_atomic_store(rec, (key << TAG_BITS) | tag, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+            } else {
+                __hip_atomic_store(rec, (key << TAG_BITS) | tag, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+            }
         }
         if (step + 1 < p.gamma) { // the next step's noise while the records cross (snoise's reads are behind a barrier)
             noise_of(step + 1, stemp);
