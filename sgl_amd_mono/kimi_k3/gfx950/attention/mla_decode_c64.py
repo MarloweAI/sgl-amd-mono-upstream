@@ -394,9 +394,14 @@ def decode_stage(key, lds, bid, tid, a, q_load, ready, kv_ready, emit_values, em
         out.append(_words(rows[8] + 512 + ((lane % 4) ^ ((lane // 16) % 4)) * 16))
         return out
 
-    def kv_ld(off):
+    def kv_ld(off, dev):
+        """A 16-byte record load; ``dev``: device scope (SC1), for the block ``kv_ready`` guards: its new
+        rows were written in this launch from another XCD, and the cache lines they share with rows read
+        earlier can sit stale in this XCD's L2 or this CU's L1."""
         if const_expr("noload" in probe):
             return fx.Vector.filled(4, 0, fx.Int32)
+        if const_expr(dev):
+            return fx.Vector(bo.buffer_load(r_kv, off, vec_width=4, dtype=T.i32, cache_modifier=CM_DEV))
         return fx.Vector(bo.buffer_load(r_kv, off, vec_width=4, dtype=T.i32))
 
     def kv_st(v, b, i):
@@ -408,8 +413,8 @@ def decode_stage(key, lds, bid, tid, a, q_load, ready, kv_ready, emit_values, em
             else:
                 _st16(sl + 4 * GRP_W + lane * 4 + w * 256, v)
 
-    def kv_load(rall):
-        return [kv_ld(off) for off in kv_offs(rall)]
+    def kv_load(rall, dev=False):
+        return [kv_ld(off, dev) for off in kv_offs(rall)]
 
     def kv_store(stg, b):
         for i in range_constexpr(NLD):
@@ -418,10 +423,15 @@ def decode_stage(key, lds, bid, tid, a, q_load, ready, kv_ready, emit_values, em
     def feed_prologue(b0, kvp, L, rq):
         """Block 0 into the ring; block 1 into registers; block 2's rows."""
         rs = [kv_rows(b0 + j, kvp, L) for j in range(3)]
+        s0 = [fx.Vector.filled(4, 0, fx.Int32)] * NLD
+        st = s0
         if (L - 1) // BK - b0 <= 1:
             kv_ready(rq)  # (loads past the request's last key read that key)
-        s0 = kv_load(rs[0])
-        st = kv_load(rs[1])
+            s0 = kv_load(rs[0], dev=True)
+            st = kv_load(rs[1], dev=True)
+        else:
+            s0 = kv_load(rs[0])
+            st = kv_load(rs[1])
         kv_store(s0, fx.Int32(0))
         return st, rs[2]
 
@@ -433,7 +443,9 @@ def decode_stage(key, lds, bid, tid, a, q_load, ready, kv_ready, emit_values, em
         kv_store(st, t + 2)
         if b0 + t + 3 == (L - 1) // BK:
             kv_ready(rq)
-        st = kv_load(rw)
+            st = kv_load(rw, dev=True)
+        else:
+            st = kv_load(rw)
         return st, rn
 
     def end_iv(ta, tw, tb):
@@ -784,13 +796,14 @@ def decode_stage(key, lds, bid, tid, a, q_load, ready, kv_ready, emit_values, em
                 mp = [fx.Float32(NEG)] * 2  # the running max after block b - 1 (column 32 ct + n32)
                 one = fx.Float32(1.0)
 
-                def o_iv(t, st, rw, acc, mp, phs):
+                def o_iv(t, st, rw, acc, mp, phs, dev=False):
                     """O's interval t: P V of block t - 1 after the rescale to its running max, among
-                    the interval's feed."""
+                    the interval's feed (``dev``: block t + 3 is the request's last, read after
+                    ``kv_ready`` at device scope)."""
                     tq0 = stamp()
                     rn = kv_rows(b0 + t + 4, kvp, L)
                     offs = kv_offs(rw)
-                    if b0 + t + 3 == (L - 1) // BK:
+                    if const_expr(dev):
                         kv_ready(rq)  # before block t + 3's loads
                     bp = t - 1
                     kb = ring + (bp % NSLOT) * SLOT_W
@@ -823,7 +836,7 @@ def decode_stage(key, lds, bid, tid, a, q_load, ready, kv_ready, emit_values, em
                             acc[d][ct] = _mfma32(vt[d], pops[ct], acc[d][ct])
                         for j in stores.get(i, ()):
                             kv_st(st[j], t + 2, j)
-                            nst[j] = kv_ld(offs[j])
+                            nst[j] = kv_ld(offs[j], dev)
                         rocdl.sched_barrier(0)
                     tq2 = stamp()
                     rw = rn
@@ -837,7 +850,18 @@ def decode_stage(key, lds, bid, tid, a, q_load, ready, kv_ready, emit_values, em
                 ta, tw, tb = end_iv(ta, tw, tb)
                 st, rw = feed(fx.Int32(0), st, rw, b0, kvp, L, rq)
                 ta, tw, tb = end_iv(ta, tw, tb)
-                for tp in range(nb):
+                # interval td feeds the request's last block (td <= 0: the prologue's or interval -1's or 0's
+                # feed did): intervals 1 .. td - 1, then td alone at device scope, then the rest
+                td = (L - 1) // BK - b0 - 3
+                tda = fx.max(fx.Int32(0), fx.min(td - 1, nb))
+                tdb = fx.max(fx.Int32(0), fx.min(td, nb))
+                for tp in range(tda):
+                    st, rw, acc, mp, phs = o_iv(tp + 1, st, rw, acc, mp, phs)
+                    ta, tw, tb = end_iv(ta, tw, tb)
+                for tp in range(tda, tdb):
+                    st, rw, acc, mp, phs = o_iv(tp + 1, st, rw, acc, mp, phs, dev=True)
+                    ta, tw, tb = end_iv(ta, tw, tb)
+                for tp in range(tdb, nb):
                     st, rw, acc, mp, phs = o_iv(tp + 1, st, rw, acc, mp, phs)
                     ta, tw, tb = end_iv(ta, tw, tb)
                 _bar()
