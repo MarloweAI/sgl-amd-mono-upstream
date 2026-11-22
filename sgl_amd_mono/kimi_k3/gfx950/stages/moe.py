@@ -171,6 +171,11 @@ UP_N = HIDDEN // TP  # 896 columns a rank up-projects
 UP_TASKS = UP_N // ROWS  # 56
 LN_TASKS = LAT // 128  # 28
 LN0 = 56  # lnorm's CTAs
+# a wide step's latent all-reduce, through sentinel words: a reduce-scatter of
+# 16-column groups (rank r owns groups LR_GROUPS r ..; lnorm CTA j reduces
+# group LR_GROUPS r + j), then every owner's sums to every rank
+LR_GROUPS = LAT // ROWS // TP  # 28
+assert LR_GROUPS == LN_TASKS
 RED_TASKS = HIDDEN // 128  # 56
 RED0 = 200
 UG_GROUPS = RI // 32  # 12
@@ -2279,11 +2284,47 @@ def run_down_waves(c, nu):
     publish(c["put"], c["dnd"], c["bid"], fx.Int32(1), c["tid"] == 0)
 
 
+def latr_rs_ix(src, g, v, s):
+    """The reduce-scatter word of (source rank, 16-column group g, item v = 8
+    token + pair) in the sentinel region of g's owner (rank g / LR_GROUPS):
+    [source][the owner's groups][token][8 pairs]."""
+    return (src * LR_GROUPS + g % LR_GROUPS) * (8 * s) + v
+
+
+def latr_ag_ix(g, v, s):
+    """Group g's summed word of item v in every rank's sentinel region:
+    [group][token][8 pairs], past the reduce-scatter's words."""
+    return (TP * LR_GROUPS + g) * (8 * s) + v
+
+
+@flyc.jit
+def latr_reduce(c, j):
+    """lnorm CTA j of a wide step: group LR_GROUPS rank + j of the latent
+    all-reduce, its sources' words summed in fp32 in rank order (as
+    ``sent_sum``) -> bf16 -> every rank (``latr_ag_ix``); re-armed after."""
+    s, tid = c["S"], c["tid"]
+    live = tid < 8 * s
+    v = fx.min(tid, 8 * s - 1)
+    for o in [c["rank"]]:
+        g = o * LR_GROUPS + j
+        idxs = [latr_rs_ix(src, g, v, s) for src in range(TP)]
+        ws = poll_sent(c["latrs_own"], idxs, [live] * TP, rearm=False)
+        lo, hi = bf2_f32(ws[0])
+        for src in range_constexpr(1, TP):
+            l2, h2 = bf2_f32(ws[src])
+            lo, hi = lo + l2, hi + h2
+        word = sent_word(bf16_pair(bf16_round(lo), bf16_round(hi)))
+        if live:
+            for p in range_constexpr(TP):
+                put_sent(c["latrs_peer"][p], latr_ag_ix(g, v, s), word)
+        rearm_sent(c["latrs_own"], idxs, [live] * TP)
+
+
 @flyc.jit
 def fold_wide(c, rgd):
     """Latent rows 16 rgd ..: every CTA's DND, then each token's 16 CONTRIB
     words folded in top-k order with a bf16 rounding an add (the narrow fold)
-    -> every rank's LATR."""
+    -> the rows' owner rank (``latr_reduce``)."""
     sent_latr = c.get("sent_latr", False)
     s, tid = c["S"], c["tid"]
     if tid < BLOCKS:
@@ -2310,10 +2351,9 @@ def fold_wide(c, rgd):
                 y0 = bf16_round(y0 + bf_lo(ws[k]))
                 y1 = bf16_round(y1 + bf_hi(ws[k]))
             if const_expr(sent_latr):
-                si = sent_ix(c["rank"], rgd * ROWS + 2 * rp, tt, s, LAT)
+                # the reduce-scatter: these rows to their owner only (``latrs_to``)
                 word = sent_word(bf16_pair(y0, y1))
-                for p in range_constexpr(TP):
-                    put_sent(c["latrs_peer"][p], si, word)
+                put_sent(c["latrs_to"], latr_rs_ix(c["rank"], rgd, v, s), word)
             else:
                 for p in range_constexpr(TP):
                     c["put_bf"](
@@ -2504,19 +2544,30 @@ def stage_lnorm(c, j):
     cp = tid % 64
     col = j * 128 + 2 * cp
     rounds = (s + 7) // 8
+    # the words a (token, column pair) sums: every rank's partial, or a wide
+    # step's one owner's sum (``latr_reduce``)
+    nsrc = 1 if wide(s) else TP
     if const_expr(sent_latr):
+        if const_expr(wide(s)):
+            latr_reduce(c, j)
         # every round's words in one poll; a dead thread holds a clamped copy
         # of a live one's words: it must not take them; re-armed once the LN
         # rows are out
         tts = [g * 8 + tid // 64 for g in range(rounds)]
-        sidxs = [
-            [sent_ix(src, col, fx.min(tt, s - 1), s, LAT) for src in range(TP)]
-            for tt in tts
-        ]
+        if const_expr(wide(s)):
+            sidxs = [
+                [latr_ag_ix(col // 16, fx.min(tt, s - 1) * 8 + (col % 16) // 2, s)]
+                for tt in tts
+            ]
+        else:
+            sidxs = [
+                [sent_ix(src, col, fx.min(tt, s - 1), s, LAT) for src in range(TP)]
+                for tt in tts
+            ]
         wall = poll_sent(
             c["latrs_own"],
             [i for sx in sidxs for i in sx],
-            [tt < s for tt in tts for _ in range(TP)],
+            [tt < s for tt in tts for _ in range(nsrc)],
             rearm=False,
         )
     items = []
@@ -2527,9 +2578,9 @@ def stage_lnorm(c, j):
         sidx = None
         if const_expr(sent_latr):
             sidx = sidxs[g]
-            ws = [wall[g * TP + src] for src in range(TP)]
+            ws = [wall[g * nsrc + src] for src in range(nsrc)]
             lo, hi = bf2_f32(ws[0])
-            for src in range_constexpr(1, TP):
+            for src in range_constexpr(1, nsrc):
                 l2, h2 = bf2_f32(ws[src])
                 lo, hi = lo + l2, hi + h2
         else:
@@ -2577,7 +2628,7 @@ def stage_lnorm(c, j):
     publish(c["put"], c["lnrdy"], j, fx.Int32(1), tid == 0)
     if const_expr(sent_latr):
         for g in range_constexpr(len(items)):
-            rearm_sent(c["latrs_own"], items[g][4], [items[g][0]] * TP)
+            rearm_sent(c["latrs_own"], items[g][4], [items[g][0]] * nsrc)
     gpu.barrier()
 
 
