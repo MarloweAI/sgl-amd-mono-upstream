@@ -1226,7 +1226,10 @@ class _SglTails:
         f32, i32, bf = torch.float32, torch.int32, torch.bfloat16
         qb = torch.zeros(s, mt.NHA, mp.QHD, dtype=bf, device=dev)
         lat = torch.zeros(s, mt.mf.LATW, dtype=bf, device=dev)
-        w_kc = self.entries[0].attn.w_kc_qrep
+        # a throwaway absorb weight: the build is all that is warmed. SGLang's
+        # gathered w_kc_qrep is made in init_attention_backends, after this
+        # install runs inside load_model, so it does not exist yet.
+        w_kc = torch.zeros(mt.NHA, mp.QN, mt.KV, dtype=bf, device=dev)
         # the builds the widths take
         for absorb in {r >= ABSORB_MIN_ROWS for r in self.rows}:
             mp.mla_prologue_launch(
