@@ -67,7 +67,6 @@ class Chain:
         self.S, self.nb, self.env, self.device = S, nb, env, device
         self.prev, self.nxt = prev, nxt
         self.k2w, self.w, self.sw, self.k2w_next = k2w, kw_, sw, k2w_next
-        assert S > kc.L, "the tail feeds the wide form"
         self.base_key = k2.K2Build(
             tokens=S, nblocks=nb, eps=k2w["eps"], out_eps=k2w["out_eps"], guint=True, opt=k2.K2_OPT
         )
@@ -301,10 +300,11 @@ def main():
             res["cases"].append(r)
             bad += not r["ok"]
             print("KDA_SEAM_CHECK", json.dumps(r), flush=True)
-            r = run_invariance(ch, torch.Generator(device=device).manual_seed(77 + nb))
-            res["invariance"].append(r)
-            bad += not r["equal"]
-            print("KDA_SEAM_INVARIANCE", json.dumps(r), flush=True)
+            if S > kc.L:  # a request alone against first / last of two
+                r = run_invariance(ch, torch.Generator(device=device).manual_seed(77 + nb))
+                res["invariance"].append(r)
+                bad += not r["equal"]
+                print("KDA_SEAM_INVARIANCE", json.dumps(r), flush=True)
     if args.out:
         with open(args.out, "w") as f:
             json.dump(res, f, indent=1)
