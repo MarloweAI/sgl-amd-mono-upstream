@@ -727,6 +727,11 @@ def k2_body(key: K2Build, k2_lds: K2Lds, scratch_base, args: dict) -> None:
                 off = sent_offset() + roff
                 c[region + "_peer"] = [shift(preg(b, off, region), lpar) for b in bases]
                 c[region + "_own"] = shift(preg(own, off, region), lpar)
+            if const_expr(wide and key.opt & OPT_SENT_LATR):
+                # the rank that owns this CTA's latent rows (``k2b.latr_reduce``)
+                owner = fx.min(bid, k2b.DOWN_TASKS - 1) // k2b.LR_GROUPS
+                off = sent_offset() + sent_layout()["latrs"][0]
+                c["latrs_to"] = shift(preg(load_ptr64(peers, owner), off, "latrs"), lpar)
         for region in (
             "part",
             "wgt",
