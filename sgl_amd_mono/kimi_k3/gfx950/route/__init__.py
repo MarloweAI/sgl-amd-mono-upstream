@@ -23,7 +23,7 @@ MIN_ROWS, MAX_ROWS = 25, 180
 # the chain above the KDA and MLA layer launches' row caps, the push at the split all-reduce's rows (below them
 # the flat all-reduce reads the shared output where the chain wrote it). The one definition both sides read.
 FUSED_SHARED_ROWS = range(MIN_ROWS, MAX_ROWS + 1)
-SHARED_PUSH_ROWS = range(49, MAX_ROWS + 1)
+SHARED_PUSH_ROWS = range(30, MAX_ROWS + 1)
 # aiter's _aux_uses_opus at block_m 16: Opus once 3 x rows x 16 >= 4 x 896
 OPUS_FROM_ROWS = 75
 
