@@ -579,14 +579,29 @@ def x_seen(c):
 def load_qlora_wide(c):
     """``load_qlora`` past 8 rows: a row's 96 group squares summed in group
     order (as ``load_qlora``) 16 rows at a time through LDS, then every row's
-    normed q latent into LDS (``xl``, rows padded)."""
+    normed q latent into LDS (``xl``, rows padded). The norm weights are read
+    before the squares are polled, and the latent rows right after (every group
+    landed), so their loads overlap the squares' sums."""
     s, tid, red = c["S"], c["tid"], c["red"]
     a = c["args"]
+    tiles = gemv.tiles(s)
+
+    def quads_of(ti):
+        t0, sj = tiles[ti]
+        quads = sj * QL // 8  # 4 words (8 bf16) a lane
+        out = []
+        for i in range_constexpr(-(-quads // THREADS)):
+            e = fx.min(tid + THREADS * i, quads - 1)
+            out.append((t0 + e // (QL // 8), e % (QL // 8) * 8, tid + THREADS * i < quads))
+        return out
+
+    qs = [quads_of(ti) for ti in range(len(tiles))]
+    nws = [[_ld4(a["q_nw"], k // 2) for _, k, _ in q] for q in qs]
     n = G_Q * s  # (row, group) items, row-major: 16 rows a 3 rounds
     per = -(-n // THREADS)
     es = [fx.min(tid + THREADS * i, n - 1) for i in range(per)]
     got = [w[0] for w in c["poll"]([(c["ss"], (e % G_Q) * s + e // G_Q, 1) for e in es])]
-    tiles = gemv.tiles(s)
+    lws = [[_ld4(c["lat"], (t * LATW + k) // 2, CM_DEV) for t, k, _ in q] for q in qs]
     rpad = G_Q + 1
     for ti in range_constexpr(len(tiles)):
         t0, sj = tiles[ti]
@@ -603,28 +618,16 @@ def load_qlora_wide(c):
         gpu.barrier()
     xrow = QL + LDS_PAD
     for ti in range_constexpr(len(tiles)):
-        t0, sj = tiles[ti]
-        quads = sj * QL // 8  # 4 words (8 bf16) a lane
-        nq = -(-quads // THREADS)
-        lw, nws = [], []
-        for i in range_constexpr(nq):
-            e = fx.min(tid + THREADS * i, quads - 1)
-            t = t0 + e // (QL // 8)
-            k = e % (QL // 8) * 8
-            lw.append(_ld4(c["lat"], (t * LATW + k) // 2, CM_DEV))
-            nws.append(_ld4(a["q_nw"], k // 2))
-        for i in range_constexpr(nq):
-            e = fx.min(tid + THREADS * i, quads - 1)
-            t = t0 + e // (QL // 8)
-            k = e % (QL // 8) * 8
+        for i in range_constexpr(len(qs[ti])):
+            t, k, live = qs[ti][i]
             rs = fx.ptr_load(red + (RSTD_W + t))
             out = []
             for d in range_constexpr(4):
-                w, nw = fx.Int32(lw[i][d]), fx.Int32(nws[i][d])
+                w, nw = fx.Int32(lws[ti][i][d]), fx.Int32(nws[ti][i][d])
                 y0 = bf16_round((bf_lo(w) * rs) * bf_lo(nw))
                 y1 = bf16_round((bf_hi(w) * rs) * bf_hi(nw))
                 out.append(fx.Vector.from_elements([y0, y1], fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)[0])
-            if tid + THREADS * i < quads:
+            if live:
                 fx.ptr_store(fx.Vector.from_elements(out, fx.Int32), c["xl"] + (t * xrow + k) // 2)
     gpu.barrier()
 
