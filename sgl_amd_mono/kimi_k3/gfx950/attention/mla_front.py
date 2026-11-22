@@ -1332,6 +1332,8 @@ def attention(c, rq, hg, sa, sb):
     acc = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(NCT * 4)]
     # q and the first block landed: the loop's waits count only its DMAs
     rocdl.s_waitcnt(vmcnt=0)
+    # every wave's DMAs in LDS before the patch overwrites the new token's slot
+    _bar()
     _kv_patch(c, rq, lr, own, b0, kvl0)
     _bar()
     pl0, al0, mll0, vt = c["pl"], c["al"], c["mll"], c["vt"]
