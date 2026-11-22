@@ -91,6 +91,22 @@ def partial_rows() -> int:
     return MAX_PART * G
 
 
+# the split partials' region: logits, then plse (fp32 words)
+PARTIAL_WORDS = MAX_PART * G * NHA * (KV + 1)
+_PARTIALS: dict = {}
+
+
+def partials(device):
+    """The split partials' fp32 region [PARTIAL_WORDS], one a device: the wide
+    path's decode partials (``DecodeBuffers``) and the C64 core's scratch at
+    the front's widths (``mla_decode_c64.StageBuffers``). A forward runs one
+    width, so one of the two; launches are stream-ordered, and each core reads
+    only what its own launch wrote first, so they share it."""
+    if device not in _PARTIALS:
+        _PARTIALS[device] = torch.empty(PARTIAL_WORDS, dtype=torch.float32, device=device)
+    return _PARTIALS[device]
+
+
 @dataclass(frozen=True)
 class MlaDecodeBuild:
     scale: float  # the softmax scale
@@ -603,13 +619,15 @@ def build_plan():
 
 
 class DecodeBuffers:
-    """The decode's outputs past ``o`` / ``lse``: the split partials and the
-    CSR maps (one set, reused by every layer)."""
+    """The decode's outputs past ``o`` / ``lse``: the split partials (views
+    into ``partials``) and the CSR maps (one set, reused by every layer)."""
 
     def __init__(self, device):
-        f32, i32 = torch.float32, torch.int32
-        self.logits = torch.empty(partial_rows(), NHA, KV, dtype=f32, device=device)
-        self.plse = torch.empty(partial_rows(), NHA, dtype=f32, device=device)
+        i32 = torch.int32
+        n = partial_rows() * NHA
+        region = partials(device)
+        self.logits = region[: n * KV].view(partial_rows(), NHA, KV)
+        self.plse = region[n * KV :].view(partial_rows(), NHA)
         self.indptr = torch.zeros(MAX_REQS + 1, dtype=i32, device=device)
         self.fmap = torch.zeros(2 * MAX_REQS, dtype=i32, device=device)
         self.pmap = torch.zeros(MAX_PART, dtype=i32, device=device)

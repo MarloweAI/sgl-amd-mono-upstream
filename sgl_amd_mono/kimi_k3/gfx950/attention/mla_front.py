@@ -2656,11 +2656,7 @@ def dec_buffers(device):
     from sgl_amd_mono.kimi_k3.gfx950.attention import mla_decode_c64 as mdc
 
     if device not in _DEC:
-        b = mdc.DecodeBuffers(device)
-        # the merged o and LSE between the core's pieces and its W_UV units
-        b.o = torch.zeros(MAX_REQS * G_ROWS * NHA * KV, dtype=torch.bfloat16, device=device)
-        b.lse = torch.zeros(MAX_REQS * G_ROWS * NHA, dtype=torch.float32, device=device)
-        _DEC[device] = b
+        _DEC[device] = mdc.StageBuffers(device, MAX_REQS * G_ROWS)
     return _DEC[device]
 
 

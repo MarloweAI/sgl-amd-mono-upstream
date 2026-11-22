@@ -1392,6 +1392,35 @@ class DecodeBuffers:
         self.wout = torch.zeros(MAX_REQS * G * NHA * 2 * WO, dtype=torch.float32, device=device)
 
 
+def _region_words(n: int) -> int:
+    """``n`` 4-byte words rounded up to a 256-byte multiple."""
+    return -(-n // 64) * 64
+
+
+class StageBuffers:
+    """``decode_stage``'s buffers in a caller's launch of up to ``rows`` rows:
+    the work list and counters its own (zeroed once), and the pieces' partials
+    and LSEs, the two latent halves and the unsplit tiles' bf16 o and LSE as
+    views into ``mla_decode.partials``, every one written in a launch before
+    that launch reads it."""
+
+    def __init__(self, device, rows: int):
+        import torch
+
+        self.wq = torch.zeros(WQ_WORDS, dtype=torch.int32, device=device)
+        self.cnt = torch.zeros(CNT_WORDS, dtype=torch.int32, device=device)
+        sizes = {
+            "part": PART_E, "plse": MAX_SLOTS * TC, "half": MAX_REQS * G * NHA * 2 * WO,
+            "o": rows * NHA * KV // 2, "lse": rows * NHA,
+        }  # fmt: skip
+        region, off = md.partials(device), 0
+        assert off + sum(_region_words(n) for n in sizes.values()) <= region.numel()
+        for name, n in sizes.items():
+            setattr(self, name, region[off : off + n])
+            off += _region_words(n)
+        self.o = self.o.view(torch.bfloat16)
+
+
 def mla_decode_plan_launch(*, kv_ptr, g_ptr, nreq, bufs):
     """The step's work list (``build_plan``): once a step, before its layers' decodes."""
     import torch
