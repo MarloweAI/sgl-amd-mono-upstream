@@ -1171,10 +1171,16 @@ class _SglTails:
 
         dev = runner.device
         self.runner, self.entries, self.rows = runner, entries, rows
-        self.core = {r: _front_core_buffer(r, dev) for r in rows}
-        self.q8 = {r: torch.empty(r, mt.NHA, mt.mf.DQK, dtype=_fp8_dtype(), device=dev) for r in rows}
-        self.out = {r: torch.empty(r, mt.NHA, mt.KV, dtype=torch.bfloat16, device=dev) for r in rows}
-        self.lse = {r: torch.empty(r, mt.NHA, dtype=torch.float32, device=dev) for r in rows}
+        # one set at the widest width, a width its leading rows (a row prefix
+        # of a contiguous [S, ...] tensor stays contiguous). The widths' graphs
+        # replay one at a time on the forward stream, and a layer reads only
+        # what its own launches wrote (an empty row's o / lse: the tail's
+        # fills), so the widths share the set.
+        r = max(rows)
+        self.core = _front_core_buffer(r, dev)
+        self.q8 = torch.empty(r, mt.NHA, mt.mf.DQK, dtype=_fp8_dtype(), device=dev)
+        self.out = torch.empty(r, mt.NHA, mt.KV, dtype=torch.bfloat16, device=dev)
+        self.lse = torch.empty(r, mt.NHA, dtype=torch.float32, device=dev)
         # the decode's split partials and maps, one set for every layer
         self.bufs = mdb.DecodeBuffers(dev)
         # the tail's reduce maps: none (the decode merges its own splits)
@@ -1251,7 +1257,7 @@ class _SglTails:
                 k_nope=lat[:, : mt.KV], k_pe=lat[:, mt.KV : mp.DQK],
                 # a slot of another rank: no record written
                 loc=torch.full((s,), self.runner.dcp_rank + 1, dtype=torch.int64, device=dev) % mt.DCP,
-                q8=self.q8[s], kv=torch.zeros(8, mp.DQK, dtype=torch.uint8, device=dev),
+                q8=self.q8[:s], kv=torch.zeros(8, mp.DQK, dtype=torch.uint8, device=dev),
                 rank=self.runner.dcp_rank,
                 **(
                     dict(q_b=qb, w_kc=w_kc) if absorb
@@ -1262,9 +1268,9 @@ class _SglTails:
         ptr = torch.zeros(nreq + 1, dtype=i32, device=dev)
         mdb.mla_decode_plan_launch(kv_ptr=ptr, g_ptr=ptr, nreq=nreq, bufs=self.bufs)
         mdb.mla_decode_launch(
-            self.dkey, q8=self.q8[s], kv=torch.zeros(8, mp.DQK, dtype=torch.uint8, device=dev),
+            self.dkey, q8=self.q8[:s], kv=torch.zeros(8, mp.DQK, dtype=torch.uint8, device=dev),
             kv_idx=torch.zeros(1, dtype=i32, device=dev), kv_ptr=ptr, g_ptr=ptr, rank=self.runner.dcp_rank,
-            o=self.out[s], lse=self.lse[s], bufs=self.bufs,
+            o=self.out[:s], lse=self.lse[:s], bufs=self.bufs,
         )  # fmt: skip
         self.runner.step_begin()
         for e in self.entries[:2]:
@@ -1278,7 +1284,7 @@ class _SglTails:
                 lse=torch.zeros(s, mt.NHA, dtype=f32, device=dev),
                 empty=torch.ones(s, dtype=torch.bool, device=dev), w_vc=e.w_vc,
                 gate=torch.zeros(s, mt.GATE, dtype=bf, device=dev),
-                core=self.core[s], scratch=scratch_region(self.runner.scratch, "mla_tail"),
+                core=self.core[:s], scratch=scratch_region(self.runner.scratch, "mla_tail"),
                 peers=self.runner.peer.addresses, rank=self.runner.dcp_rank,
                 layer=e.i, epoch=self.runner.epoch,
             )  # fmt: skip
@@ -1386,14 +1392,14 @@ class _SglTails:
         assert fm.use_asm_cprr_verify and fm.cprr_kernel_heads == layer.tp_q_head_num == mt.NHA
         assert backend._resolve_fp8_kv_scale_float(layer, None) == 1.0
         kv = backend.kv_layers.read(layer.layer_id).key()
-        q8 = self.q8[rows]
+        q8 = self.q8[:rows]
         mp.mla_prologue_launch(
             mp.MlaPrologueBuild(absorb=absorb), q_nope_out=q_nope_out, q_pe=q_pe,
             k_nope=k_nope, k_pe=k_pe, loc=forward_batch.out_cache_loc, q8=q8,
             kv=kv.view(torch.uint8).view(-1, mp.DQK), rank=self.runner.dcp_rank,
             **(dict(q_b=q_nope_unabsorbed, w_kc=attn.w_kc_qrep) if absorb else {}),
         )  # fmt: skip
-        out, lse, bufs = self.out[rows], self.lse[rows], self.bufs
+        out, lse, bufs = self.out[:rows], self.lse[:rows], self.bufs
         assert layer.scaling == self.dkey.scale
         if e.first:
             # once a step: the split plan and the reduce's maps, from this rank's key counts
@@ -1407,7 +1413,7 @@ class _SglTails:
         )  # fmt: skip
         gate = attn._compute_output_gate(attn._gate_hidden_states)
         attn._gate_hidden_states = None
-        core = self.core[rows]
+        core = self.core[:rows]
         mt.mla_tail_launch(
             e.key, s=rows, logits=bufs.logits, plse=bufs.plse, indptr=self.no_reduce[0], fmap=self.no_reduce[1],
             pmap=self.no_reduce[2], o=out, lse=lse, empty=fm.cprr_empty_rows, w_vc=e.w_vc,
