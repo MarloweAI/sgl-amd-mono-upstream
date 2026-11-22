@@ -1025,7 +1025,8 @@ class _SglFronts:
                 key, w = built
                 # consecutive fronts take alternate QG copies (mla_front.peer_end)
                 keys[r] = dataclasses.replace(
-                    key, nblocks=0, write_idx=-1, x_in=True, qg_par=n % 2
+                    key, nblocks=0, write_idx=-1, x_in=True, qg_par=n % 2,
+                    core="c64" if C64_ROWS[0] <= r <= C64_ROWS[1] else "f", mla_ord=n,
                 )
             entries.append(SimpleNamespace(i=i, attn=layer.self_attn, keys=keys, w=w))
         self = cls(runner, entries, rows)
