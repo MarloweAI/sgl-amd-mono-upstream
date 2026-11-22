@@ -928,14 +928,15 @@ def qg_wait(c, rq, h0, nh):
 
 @flyc.jit
 def qg_wait_wave(c, rq, h0, nh):
-    """``qg_wait`` for the calling wave alone: its lanes 0 and 1 poll the
-    sources' flags, so the wave's later loads follow them and no barrier is
-    needed (the decode core's hooks run on some of a CTA's waves)."""
+    """``qg_wait`` for the calling wave alone: heads h0 .. h0 + nh - 1 span
+    sources s0 .. s1 (up to 4 at nh = 32), lane i polling source s0 + i, so
+    the wave's later loads follow every one of them and no barrier is needed
+    (the decode core's hooks run on some of a CTA's waves)."""
     lane = c["tid"] % 64
     s0 = h0 // NHL
     s1 = (h0 + nh - 1) // NHL
-    if lane < 2:
-        src = (lane == 0).select(s0, s1)
+    if lane <= s1 - s0:
+        src = s0 + lane
         c["poll"]([(Addr("qgf", Space.PEER, qg_base(c, c["rank"]) + fx.Int64(QG_DATA)), src * MAX_REQS + rq, 1)])
 
 
