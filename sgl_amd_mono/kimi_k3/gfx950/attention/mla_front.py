@@ -384,10 +384,22 @@ def _st_bf(ptr, i, v, cm=0):
     bo.buffer_store(fx.Float32(v).to(fx.BFloat16), rsrc(ptr), i, cache_modifier=cm)
 
 
+E4M3_MAX = 448.0
+
+
+def _sat(x):
+    """x within +-448, e4m3's largest finite (+-inf to it too); NaN stays NaN."""
+    x = fx.Float32(x)
+    return (x > fx.Float32(E4M3_MAX)).select(
+        fx.Float32(E4M3_MAX), (x < fx.Float32(-E4M3_MAX)).select(fx.Float32(-E4M3_MAX), x)
+    )
+
+
 def e4m3x2(a, b, old, hi):
-    """Two f32 -> e4m3 bytes into half ``hi`` of ``old`` (v_cvt_pk_fp8_f32:
-    round to nearest even, no saturation), as torch casts bf16 to float8_e4m3fn."""
-    return fx.Int32(rocdl.cvt_pk_fp8_f32(T.i32, a, b, old, hi))
+    """Two f32 -> e4m3 bytes into half ``hi`` of ``old``: saturating, round to nearest
+    even (v_cvt_pk_fp8_f32 on the value within +-448), as B300's cvt.rn.satfinite;
+    torch's float8_e4m3fn cast of the bf16 value wherever |x| <= 448."""
+    return fx.Int32(rocdl.cvt_pk_fp8_f32(T.i32, _sat(a), _sat(b), old, hi))
 
 
 def e4m3x4(v):

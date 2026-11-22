@@ -12,9 +12,17 @@ casts, the KV record write and the window concatenation:
          slot ``loc`` = local row x 8 + rank, but the reserved padding slot 0): the normed latent k_nope [t,
          0 .. 511], then the rope part k_pe [t, 0 .. 63], at local row loc / 8
 
-Every cast is torch's bf16 -> float8_e4m3fn (round to nearest even, no
-saturation: v_cvt_pk_fp8_f32 on the exact fp32 value), so both outputs are
+Every cast is bf16 -> float8_e4m3fn, saturating (``mla_front.e4m3x2``: round to
+nearest even within +-448, as B300's cvt.rn.satfinite), so both outputs are
 SGLang's bytes. A thread takes 16 output bytes at a time, grid-strided.
+
+An ``absorb`` build takes q_b's output itself and runs the absorb q_nope @
+W_UK too, in place of SGLang's batched GEMM and its bf16 round trip: a (head,
+64 latent columns) task a CTA, three each (768 tasks), the head's rows and the
+W_UK tile (its 128 rows of 64 columns) in LDS (two buffers: the next task's
+loads in flight under each task's MFMAs), MFMAs over all of K a wave (wave 2 b + w: columns 32 w ..,
+16-row tiles b, b + 4, ..), each output rounded to bf16 then cast to e4m3, as
+SGLang's absorb then cast do.
 """
 
 from dataclasses import dataclass
@@ -25,9 +33,12 @@ import torch
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr.typing import Int32, Int64, T
 
-from sgl_amd_mono.common.ops import rsrc
+from flydsl.expr import const_expr, gpu, range_constexpr
+
+from sgl_amd_mono.common.ops import bf16_round, rsrc
 from sgl_amd_mono.common.plan import BLOCKS, THREADS, kernel_sources, key_tuple
 from sgl_amd_mono.kimi_k3.gfx950.attention import mla_front as mf
+from sgl_amd_mono.kimi_k3.gfx950.stages import gemv
 
 SOURCES = kernel_sources(__name__)
 
@@ -40,6 +51,12 @@ DCP = mf.DCP
 PIECE = 16  # output bytes a thread a step: 16 values
 Q_PIECES = DQK // PIECE  # 36 a (row, head)
 K_PIECES = DQK // PIECE  # 36 a record
+QN = QHD - ROPE  # 128: q_nope's columns a head (the absorb's K)
+ABS_COLS = 64  # latent columns an absorb task
+ABS_TASKS = NHA * (KV // ABS_COLS)  # 768: three a CTA
+ABS_ROW = QN + 8  # bf16 a token's q_nope row in LDS
+W_ROW = ABS_COLS + 8  # bf16 a W_UK tile row (an n) in LDS
+MAX_ROWS = 180
 
 _BUILDS: dict = {}
 _STREAM = fx.Stream(None)
@@ -48,6 +65,77 @@ _STREAM = fx.Stream(None)
 @dataclass(frozen=True)
 class MlaPrologueBuild:
     """One build serves every width (S a launch argument)."""
+
+    absorb: bool = False  # q_b's output and W_UK in (else the absorb's output)
+
+
+def _abs_loads(qb, wkc, s, tid, task):
+    """Absorb task ``task``'s W_UK tile (its 128 rows of 64 columns) and its
+    head's q_nope rows, a thread's pieces, all in flight."""
+    h = task // (KV // ABS_COLS)
+    cb = task % (KV // ABS_COLS)
+    w = []
+    for i in range_constexpr(QN * (ABS_COLS // 8) // THREADS):
+        p = tid + THREADS * i
+        n, seg = p // (ABS_COLS // 8), p % (ABS_COLS // 8)
+        w.append(mf._ld4(wkc, (h * (QN * KV) + n * KV + cb * ABS_COLS + seg * 8) // 2))
+    q = []
+    for i in range_constexpr(-(-MAX_ROWS * (QN // 8) // THREADS)):
+        e = fx.min(tid + THREADS * i, s * (QN // 8) - 1)
+        t, seg = e // (QN // 8), e % (QN // 8)
+        q.append(mf._ld4(qb, ((t * NHA + h) * QHD + seg * 8) // 2))
+    return w, q
+
+
+@flyc.jit
+def _absorb(qb, wkc, q8, s, bid, tid, lds):
+    """This CTA's absorb tasks (head task // 8, latent columns 64 (task % 8) ..)
+    into q8's nope columns, the next task's loads in flight under each task's
+    MFMAs (two LDS buffers)."""
+    lane, wave = tid % 64, tid // 64
+    vq, tg = wave % 2, wave // 2
+    g, r16 = lane // 16, lane % 16
+    ntask = ABS_TASKS // BLOCKS
+    nxt = _abs_loads(qb, wkc, s, tid, bid)
+    for k in range_constexpr(ntask):
+        task = bid + BLOCKS * k
+        h = task // (KV // ABS_COLS)
+        cb = task % (KV // ABS_COLS)
+        xl, wl = (lds.xl0.ptr, lds.wl0.ptr) if k % 2 == 0 else (lds.xl1.ptr, lds.wl1.ptr)
+        w, q = nxt
+        for i in range_constexpr(len(w)):
+            p = tid + THREADS * i
+            n, seg = p // (ABS_COLS // 8), p % (ABS_COLS // 8)
+            fx.ptr_store(w[i], wl + (n * W_ROW + seg * 8) // 2)
+        for i in range_constexpr(len(q)):
+            e = tid + THREADS * i
+            if e < s * (QN // 8):
+                t, seg = e // (QN // 8), e % (QN // 8)
+                fx.ptr_store(q[i], xl + (t * ABS_ROW + seg * 8) // 2)
+        if const_expr(k + 1 < ntask):
+            nxt = _abs_loads(qb, wkc, s, tid, task + BLOCKS)
+        mf._bar()
+        for ti in range_constexpr(-(-MAX_ROWS // gemv.ROWS) // 4):
+            t0 = (tg + 4 * ti) * gemv.ROWS
+            if t0 < s:
+                sj = fx.min(fx.Int32(gemv.ROWS), s - t0)
+                acc = mf._tgemv(lane, wl, W_ROW, 32 * vq, 0, QN // 32, xl + t0 * (ABS_ROW // 2), ABS_ROW, sj)
+                if r16 < sj:
+                    vals = [None] * 8
+                    for dt in range_constexpr(2):
+                        for i in range_constexpr(4):
+                            vals[2 * i + dt] = bf16_round(fx.Float32(acc[dt][i]))
+                    words = fx.Vector.from_elements([mf.e4m3x4(vals[0:4]), mf.e4m3x4(vals[4:8])], fx.Int32)
+                    col = cb * ABS_COLS + 32 * vq + 8 * g
+                    bo.buffer_store(words, rsrc(q8), (((t0 + r16) * NHA + h) * DQK + col) // 4)
+
+
+@fx.struct
+class _AbsLds:  # two buffers: a task's rows and tile while the next one's land
+    xl0: fx.Array[fx.Int32, MAX_ROWS * ABS_ROW // 2, 16]
+    wl0: fx.Array[fx.Int32, QN * W_ROW // 2, 16]
+    xl1: fx.Array[fx.Int32, MAX_ROWS * ABS_ROW // 2, 16]
+    wl1: fx.Array[fx.Int32, QN * W_ROW // 2, 16]
 
 
 def _bf16x8(base, i):
@@ -70,31 +158,47 @@ def build(key: MlaPrologueBuild):
     keyed = key_tuple(key, SOURCES)
     nthreads = BLOCKS * THREADS
 
-    @flyc.kernel(name="k3_mono_mla_prologue", known_block_size=[THREADS, 1, 1])
+    @flyc.kernel(name=f"k3_mono_mla_prologue_a{int(key.absorb)}", known_block_size=[THREADS, 1, 1])
     def mla_prologue(
         qn: Int64, qp: Int64, kn: Int64, kn_rs: Int32, kp: Int64, kp_rs: Int32, loc: Int64,
         q8: Int64, kv: Int64, s: Int32, rank: Int32,
     ):  # fmt: skip
         _ = keyed
-        gid = fx.block_idx.x * THREADS + fx.thread_idx.x
-        nq = s * NHA * Q_PIECES
-        # q: a (row, head, 16 columns) piece a thread a step
-        for k in range((nq + nthreads - 1) // nthreads):
-            p = gid + fx.Int32(k) * nthreads
-            live = p < nq
-            pc = fx.min(p, nq - 1)
-            th = pc // Q_PIECES
-            j = pc % Q_PIECES
-            nope = j < KV // PIECE
-            # both sources' pieces loaded (clamped), the right one kept
-            a = _bf16x8(qn, th * KV + fx.min(j, KV // PIECE - 1) * PIECE)
-            b = _bf16x8(qn, th * KV + fx.min(j, KV // PIECE - 1) * PIECE + 8)
-            jr = fx.max(j - KV // PIECE, 0)
-            ra = _bf16x8(qp, th * QHD + jr * PIECE)
-            rb = _bf16x8(qp, th * QHD + jr * PIECE + 8)
-            vals = [nope.select(x, y) for x, y in zip(a + b, ra + rb)]
-            if live:
-                bo.buffer_store(_e4m3x16(vals), rsrc(q8), pc * (PIECE // 4))
+        bid, tid = fx.block_idx.x, fx.thread_idx.x
+        gid = bid * THREADS + tid
+        if const_expr(key.absorb):
+            # qn: q_b's output [S, 96, 192]; qp: W_UK [96, 128, 512] (n innermost)
+            lds = fx.SharedAllocator().allocate(_AbsLds).peek()
+            _absorb(qn, qp, q8, s, bid, tid, lds)
+            # the rope columns: a (row, head, 16 columns) piece a thread a step
+            nr = s * NHA * (ROPE // PIECE)
+            for k in range((nr + nthreads - 1) // nthreads):
+                p = gid + fx.Int32(k) * nthreads
+                pc = fx.min(p, nr - 1)
+                th = pc // (ROPE // PIECE)
+                j = pc % (ROPE // PIECE)
+                vals = _bf16x8(qn, th * QHD + QN + j * PIECE) + _bf16x8(qn, th * QHD + QN + j * PIECE + 8)
+                if p < nr:
+                    bo.buffer_store(_e4m3x16(vals), rsrc(q8), (th * DQK + KV + j * PIECE) // 4)
+        else:
+            nq = s * NHA * Q_PIECES
+            # q: a (row, head, 16 columns) piece a thread a step
+            for k in range((nq + nthreads - 1) // nthreads):
+                p = gid + fx.Int32(k) * nthreads
+                live = p < nq
+                pc = fx.min(p, nq - 1)
+                th = pc // Q_PIECES
+                j = pc % Q_PIECES
+                nope = j < KV // PIECE
+                # both sources' pieces loaded (clamped), the right one kept
+                a = _bf16x8(qn, th * KV + fx.min(j, KV // PIECE - 1) * PIECE)
+                b = _bf16x8(qn, th * KV + fx.min(j, KV // PIECE - 1) * PIECE + 8)
+                jr = fx.max(j - KV // PIECE, 0)
+                ra = _bf16x8(qp, th * QHD + jr * PIECE)
+                rb = _bf16x8(qp, th * QHD + jr * PIECE + 8)
+                vals = [nope.select(x, y) for x, y in zip(a + b, ra + rb)]
+                if live:
+                    bo.buffer_store(_e4m3x16(vals), rsrc(q8), pc * (PIECE // 4))
         # the records of the rows this rank owns: a (row, 16 bytes) piece a thread
         nk = s * K_PIECES
         for k in range((nk + nthreads - 1) // nthreads):
@@ -135,17 +239,27 @@ def build(key: MlaPrologueBuild):
     return launch
 
 
-def mla_prologue_launch(key: MlaPrologueBuild, *, q_nope_out, q_pe, k_nope, k_pe, loc, q8, kv, rank):
+def mla_prologue_launch(key: MlaPrologueBuild, *, q_pe, k_nope, k_pe, loc, q8, kv, rank, q_nope_out=None, q_b=None, w_kc=None):
     """Host launcher. ``q_nope_out`` bf16 [S, 96, 512] (contiguous: SGLang's
     absorb output) and ``q_pe`` [S, 96, 64] (the rope columns of q_b's
-    contiguous [S, 96, 192] output, a view); ``k_nope`` / ``k_pe``:
-    the rows' normed latent [S, 512] and rope part [S, 64] (bf16, unit column
-    stride, any row stride); ``loc``: the rows' KV slots (int64); ``q8`` [S, 96,
-    576] out (e4m3 or uint8); ``kv``: this rank's KV pool rows [., 576]."""
-    s = q_nope_out.shape[0]
+    contiguous [S, 96, 192] output, a view); an ``absorb`` build: ``q_b`` (that
+    output) and ``w_kc`` (W_UK [96, 128, 512], contiguous: SGLang's replicated w_kc_qrep) instead of
+    ``q_nope_out``; ``k_nope`` / ``k_pe``: the rows' normed latent [S, 512]
+    and rope part [S, 64] (bf16, unit column stride, any row stride); ``loc``:
+    the rows' KV slots (int64); ``q8`` [S, 96, 576] out (e4m3 or uint8);
+    ``kv``: this rank's KV pool rows [., 576]."""
+    s = q_pe.shape[0]
     bf = torch.bfloat16
-    assert q_nope_out.dtype == bf and q_nope_out.is_contiguous() and tuple(q_nope_out.shape) == (s, NHA, KV)
     assert q_pe.dtype == bf and tuple(q_pe.shape) == (s, NHA, ROPE) and q_pe.stride() == (NHA * QHD, QHD, 1)
+    if key.absorb:
+        assert q_nope_out is None and s <= MAX_ROWS
+        assert q_b.dtype == bf and q_b.is_contiguous() and q_b.numel() == s * NHA * QHD
+        assert q_pe.data_ptr() == q_b.data_ptr() + QN * 2
+        assert w_kc.dtype == bf and tuple(w_kc.shape) == (NHA, QN, KV) and w_kc.is_contiguous(), w_kc.stride()
+        a0, a1 = q_b.data_ptr(), w_kc.data_ptr()
+    else:
+        assert q_nope_out.dtype == bf and q_nope_out.is_contiguous() and tuple(q_nope_out.shape) == (s, NHA, KV)
+        a0, a1 = q_nope_out.data_ptr(), q_pe.data_ptr()
     k_nope, k_pe = k_nope.reshape(s, -1), k_pe.reshape(s, -1)
     assert k_nope.dtype == bf and k_nope.shape[1] == KV and k_nope.stride(1) == 1
     assert k_pe.dtype == bf and k_pe.shape[1] == ROPE and k_pe.stride(1) == 1
@@ -154,7 +268,6 @@ def mla_prologue_launch(key: MlaPrologueBuild, *, q_nope_out, q_pe, k_nope, k_pe
     assert q8.numel() == s * NHA * DQK and q8.element_size() == 1 and q8.is_contiguous()
     assert kv.element_size() == 1 and kv.stride(-2) == DQK
     build(key)(
-        q_nope_out.data_ptr(), q_pe.data_ptr(), k_nope.data_ptr(), k_nope.stride(0),
-        k_pe.data_ptr(), k_pe.stride(0), loc.data_ptr(), q8.data_ptr(), kv.data_ptr(), s, rank,
-        stream=torch.cuda.current_stream(),
+        a0, a1, k_nope.data_ptr(), k_nope.stride(0), k_pe.data_ptr(), k_pe.stride(0),
+        loc.data_ptr(), q8.data_ptr(), kv.data_ptr(), s, rank, stream=torch.cuda.current_stream(),
     )  # fmt: skip

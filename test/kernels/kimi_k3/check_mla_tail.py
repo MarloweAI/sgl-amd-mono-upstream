@@ -483,7 +483,7 @@ def time_case(caps, w_vc, gates, s, peers, epoch, par):
 
 def check_prologue(device, seed):
     """``mla_prologue`` against SGLang's bytes at every tail width: the
-    decode's q (torch's e4m3 cast of cat(q_nope_out, q_pe)) and the KV records
+    decode's q (torch's e4m3 cast of cat(q_nope_out, q_pe), within +-448) and the KV records
     of the rows this rank owns (cast of cat(k_nope, k_pe) at local row loc / 8),
     every other pool row untouched."""
     from sgl_amd_mono.kimi_k3.gfx950.attention import mla_prologue as mp
@@ -496,6 +496,13 @@ def check_prologue(device, seed):
             qn = (torch.randn(s, NHA, KV, generator=g, device=device) * 3).to(BF)
             qb = (torch.randn(s, NHA, mp.QHD, generator=g, device=device) * 3).to(BF)
             lat = (torch.randn(s, 2112, generator=g, device=device) * 3).to(BF)
+            # past e4m3's range (saturated), at the edges of it, and inf
+            for x in (qn, qb, lat):
+                v = x.view(-1)
+                v[::997] = 1000.0
+                v[1::997] = -470.0
+                v[2::997] = 452.0
+                v[3::1999] = float("inf")
             kn, kp = lat[:, 1536 : 1536 + KV], lat[:, 1536 + KV :]
             nloc = 4 * s
             slots = torch.randperm(nloc * DCP, generator=torch.Generator().manual_seed(s + rank))[:s]
@@ -505,7 +512,7 @@ def check_prologue(device, seed):
             pool = torch.randint(0, 255, (nloc, DQK), generator=g, device=device, dtype=torch.int32).to(torch.uint8)
             want = pool.clone()
             own = ((loc % DCP) == rank) & (loc != 0)
-            rec = torch.cat([kn, kp], -1).to(F8).view(torch.uint8)
+            rec = torch.cat([kn, kp], -1).float().clamp(-448, 448).to(F8).view(torch.uint8)
             want[loc[own] // DCP] = rec[own]
             q8 = torch.empty(s, NHA, DQK, dtype=F8, device=device)
             mp.mla_prologue_launch(
@@ -513,13 +520,80 @@ def check_prologue(device, seed):
                 k_nope=kn, k_pe=kp, loc=loc, q8=q8, kv=pool, rank=rank,
             )  # fmt: skip
             torch.cuda.synchronize()
-            wq = torch.cat([qn, qb[..., mp.QHD - mp.ROPE :]], -1).to(F8)
+            wq = torch.cat([qn, qb[..., mp.QHD - mp.ROPE :]], -1).float().clamp(-448, 448).to(F8)
             ok = torch.equal(q8.view(torch.uint8), wq.view(torch.uint8)) and torch.equal(pool, want)
             if not ok:
                 fails.append((s, rank))
     print(f"prologue: q and KV records bit for bit at {len(range(mt.MIN_ROWS, mt.MAX_ROWS + 1, G)) * 2} (width, rank) cases"
           + ("" if not fails else f" FAIL {fails[:4]}"))  # fmt: skip
     return ["prologue"] if fails else []
+
+
+def check_prologue_absorb(device, seed):
+    """The absorb prologue against SGLang's batched absorb (torch.bmm on the
+    replicated W_UK, contiguous) then the plain prologue: the q's e4m3 bytes
+    (the rope columns bit for bit), the nope columns' rel-L2 to an fp32
+    reference against stock's, and both graph-timed."""
+    from sgl_amd_mono.kimi_k3.gfx950.attention import mla_prologue as mp
+
+    g = torch.Generator(device=device).manual_seed(seed + 51)
+    w_kc = (torch.randn(NHA, 128, KV, generator=g, device=device) * 0.09).to(BF)
+    fails = []
+    for s in (36, 54, 96, 144, 180):
+        qb = (torch.randn(s, NHA, mp.QHD, generator=g, device=device) * 2).to(BF)
+        lat = (torch.randn(s, 2112, generator=g, device=device)).to(BF)
+        loc = torch.full((s,), 1, dtype=torch.int64, device=device)
+        kv = torch.zeros(8, DQK, dtype=torch.uint8, device=device)
+        q8 = torch.empty(s, NHA, DQK, dtype=F8, device=device)
+        qno = torch.empty(s, NHA, KV, dtype=BF, device=device)
+        q8s = torch.empty(s, NHA, DQK, dtype=F8, device=device)
+        kw = dict(k_nope=lat[:, 1536:2048], k_pe=lat[:, 2048:], loc=loc, kv=kv, rank=0)
+
+        def ours():
+            mp.mla_prologue_launch(mp.MlaPrologueBuild(absorb=True), q_pe=qb[..., 128:], q8=q8, q_b=qb, w_kc=w_kc, **kw)
+
+        def stock():
+            torch.bmm(qb[..., :128].transpose(0, 1), w_kc, out=qno.transpose(0, 1))
+            mp.mla_prologue_launch(mp.MlaPrologueBuild(), q_nope_out=qno, q_pe=qb[..., 128:], q8=q8s, **kw)
+
+        ours()
+        stock()
+        torch.cuda.synchronize()
+        rope_eq = torch.equal(q8.view(torch.uint8)[..., KV:], q8s.view(torch.uint8)[..., KV:])
+        ref = torch.einsum("shn,hnk->shk", qb[..., :128].float(), w_kc.float())
+        e_o, e_s = cf.rel(q8[..., :KV].float(), ref), cf.rel(q8s[..., :KV].float(), ref)
+        same = (q8.view(torch.uint8)[..., :KV] == q8s.view(torch.uint8)[..., :KV]).float().mean().item()
+        t_o, t_s = graph_us(ours), graph_us(stock)
+        ok = rope_eq and e_o <= 1.25 * e_s
+        print(f"absorb prologue {s} rows: rope bit for bit {rope_eq}, nope bytes equal {same:.4f}, rel to fp32 {e_o:.3e} "
+              f"(stock {e_s:.3e}); us ours {t_o:.1f} stock bmm + prologue {t_s:.1f} {'ok' if ok else 'FAIL'}")  # fmt: skip
+        if not ok:
+            fails.append(s)
+    return ["prologue-absorb"] if fails else []
+
+
+def check_qkv_g(device, seed):
+    """fused_qkv_a and g_proj as one GEMM on their concatenated weights
+    against SGLang's two GEMMs (bit for bit, or rel-L2 to fp32 against the
+    two's), graph-timed, at the wide widths."""
+    g = torch.Generator(device=device).manual_seed(seed + 41)
+    wq = (torch.randn(2112, 7168, generator=g, device=device) * 0.02).to(BF)
+    wg = (torch.randn(GATE, 7168, generator=g, device=device) * 0.02).to(BF)
+    cat = torch.cat([wq, wg]).contiguous()
+    for s in (36, 54, 72, 96, 120, 144, 180):
+        x = (torch.randn(s, 7168, generator=g, device=device) * 0.5).to(BF)
+        q2, g2 = cf._linear(x, wq), cf._linear(x, wg)
+        out = cf._linear(x, cat)
+        same = torch.equal(out[:, :2112], q2) and torch.equal(out[:, 2112:], g2)
+        ref = x.float() @ cat.float().t()
+        e1 = cf.rel(out, ref)
+        e2 = cf.rel(torch.cat([q2, g2], -1), ref)
+        t1 = graph_us(lambda: cf._linear(x, cat))
+        t2 = graph_us(lambda: (cf._linear(x, wq), cf._linear(x, wg)))
+        t3 = graph_us(lambda: torch.nn.functional.linear(x, cat))
+        e3 = cf.rel(torch.nn.functional.linear(x, cat), ref)
+        print(f"qkv+g {s} rows: bit for bit {same}, rel to fp32 one {e1:.2e} two {e2:.2e} torch {e3:.2e}; "
+              f"us one {t1:.1f} two {t2:.1f} torch {t3:.1f}")  # fmt: skip
 
 
 def main():
@@ -530,6 +604,7 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--par", type=int, default=0, choices=(0, 1))
     ap.add_argument("--diag", action="store_true")
+    ap.add_argument("--qkv-g", action="store_true", help="the fused qkv_a + g_proj GEMM only")
     ap.add_argument("--time", action="store_true", help="time rank 0's tail against SGLang's chain")
     args = ap.parse_args()
     device = torch.device("cuda", 0)
@@ -538,7 +613,11 @@ def main():
     w_vc = (torch.randn(NHA, KV, VD, generator=g, device=device) * 0.045).to(BF)
     peers = TailPeers(device)
     epoch = cf.new_epoch(device)
+    if args.qkv_g:
+        check_qkv_g(device, args.seed)
+        return
     fails = check_prologue(device, args.seed)
+    fails += check_prologue_absorb(device, args.seed)
     for n in args.reqs:
         ps = contexts(n, args.mode, args.ctx, args.seed)
         print(f"== {n} requests ({args.mode}): P = {ps[:8]}{' ...' if n > 8 else ''}")
