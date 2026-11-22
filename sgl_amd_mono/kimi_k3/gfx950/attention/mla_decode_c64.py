@@ -90,6 +90,7 @@ CNT_F = CNT_U + MAX_LAYERS  # then a layer's group-done flags: 3 groups x 16 cop
 CNT_WORDS = CNT_F + 48 * MAX_LAYERS
 NU = 2 * NHA  # W_UV units: (head, latent half)
 SM0 = 7  # the S interval's MFMA at which block t's softmax starts (after the column maxes' LDS read)
+QSW = KV // 4 + 4  # words a column of a piece's q (dims 0-511, e4m3) staged in ring slot 2: a pad, so b128 reads are conflict free
 OBW, RDW = 132, 36  # LDS words a row: a unit's bf16 o (128 + a pad), its k-half products (32 + a pad)
 WVW = 80  # LDS words a latent row of a unit's W_UV half (64 + a pad: a transposed read of 16 lanes is conflict free)
 HO = 12  # heads a DCP owner (the emit hooks' owner, head = HO owner + hl)
@@ -305,6 +306,14 @@ def decode_stage(key, lds, bid, tid, a, q_load, ready, kv_ready, emit_values, em
     qk_c = key.scale * LOG2E
     probe = key.probe
     tlon = "tl" in probe
+    # timing-only idealisations (wrong numerics): "nordy" no readiness waits, "capN" every piece at most N blocks, "zq" no
+    # q loads, "zw" no W_UV loads
+    if const_expr("nordy" in probe):
+        ready = lambda rq, h0, nh: None  # noqa: E731
+        kv_ready = lambda rq: None  # noqa: E731
+    cap = int(probe.split("cap")[1].split(",")[0]) if "cap" in probe else 0
+    if const_expr("zq" in probe):
+        q_load = lambda rq, head, t, byte: fx.Vector.filled(4, 0, fx.Int32)  # noqa: E731
     phon = "ph" in probe  # phase stamps inside an interval (with "tl")
     uton = tlon and "ut" in probe  # the W_UV stage's stamps
     kv, kv_idx, kv_ptr, g_ptr, rank = a["kv"], a["kv_idx"], a["kv_ptr"], a["g_ptr"], a["rank"]
@@ -457,6 +466,8 @@ def decode_stage(key, lds, bid, tid, a, q_load, ready, kv_ready, emit_values, em
         L = uniform(L)
         kvp = uniform(kvp)
         b1 = fx.min(b1, (uniform(lim1) + BK - 1) // BK)
+        if const_expr(cap > 0):
+            b1 = fx.min(b1, b0 + cap)
         nb = b1 - b0
         # intervals -1 .. nb (ni = nb + 2): interval t the softmax of block t and the QK of block t
         # + 1 (S), P V of block t - 1 (O), block t + 2 into its slot
@@ -574,19 +585,33 @@ def decode_stage(key, lds, bid, tid, a, q_load, ready, kv_ready, emit_values, em
             if nb > 0:
                 # S: q of column tiles ct (column n16: row 2 rp + ct / 2, head 32 ht + 16 (ct % 2) + n16):
                 # 4 steps of dims 128 st + 32 g .., and the rope's dims 512 + 16 g ..
-                qops = []
                 tr0 = _memtime() if const_expr(tlon) else z
                 ready(rq, HT * ht, HT)
                 if const_expr(tlon):
                     t_rdy = t_rdy + (_memtime() - tr0)
                     r_rdy = (r_rdy == z).select(_realtime(), r_rdy)
+                # the tile's q (dims 0-511 of its 64 columns, 32 KB) read once by the four S waves into ring slot 2
+                # (free until interval 0's feed), each thread 8 chunks of 16 bytes (chunk k: column k / 32, bytes
+                # 16 (k % 32) ..); column tile w's rope into LDS (column 16 w + n16, its chunk g)
+                qsl = ring + 2 * SLOT_W
+                qv = []
+                for i in range_constexpr(8):
+                    k = 256 * i + tid
+                    col, ch = k // 32, k % 32
+                    qv.append(q_load(rq, HT * ht + 16 * ((col // 16) % 2) + col % 16, RT * rp + col // 32, 16 * ch))
+                qrv = q_load(rq, HT * ht + 16 * (w % 2) + n16, RT * rp + w // 2, 512 + 16 * g)
+                rocdl.sched_barrier(0)
+                for i in range_constexpr(8):
+                    k = 256 * i + tid
+                    _st16(qsl + (k // 32) * QSW + 4 * (k % 32), qv[i])
+                _st16(qrl + (16 * w + n16) * 16 + 4 * g, qrv)
+                _bar()
+                # q of column tiles ct (column n16: row 2 rp + ct / 2, head 32 ht + 16 (ct % 2) + n16): 4 steps of
+                # dims 128 st + 32 g ..
+                qops = []
                 for ct in range_constexpr(4):
-                    qt, qh = RT * rp + ct // 2, HT * ht + 16 * (ct % 2) + n16
-                    qops.append([_cat8(q_load(rq, qh, qt, 128 * st + 32 * g), q_load(rq, qh, qt, 128 * st + 32 * g + 16))
-                                 for st in range(4)])  # fmt: skip
-                    if const_expr(ct == 0):
-                        # column tile w's rope into LDS (column 16 w + n16, its chunk g)
-                        _st16(qrl + (16 * w + n16) * 16 + 4 * g, q_load(rq, HT * ht + 16 * (w % 2) + n16, RT * rp + w // 2, 512 + 16 * g))
+                    qb = qsl + (16 * ct + n16) * QSW + 8 * g
+                    qops.append([_cat8(_lds16(qb + 32 * st), _lds16(qb + 32 * st + 4)) for st in range(4)])
                 # block -1's column maxes (none: the first interval's softmax is of no keys)
                 fx.ptr_store(fx.Float32(NINF), red + TC * 4 + (16 * tcol + n16) * 4 + w)
                 _bar()
@@ -749,6 +774,7 @@ def decode_stage(key, lds, bid, tid, a, q_load, ready, kv_ready, emit_values, em
                 n_un = n_un + 1
             if nb > 0:
                 st, rw = feed_prologue(b0, kvp, L, rq)
+                _bar()  # (the S waves' q into ring slot 2)
                 _bar()
                 if const_expr(tlon):
                     tn = _memtime()
@@ -943,7 +969,7 @@ def decode_stage(key, lds, bid, tid, a, q_load, ready, kv_ready, emit_values, em
         c = ui % 2
         gh = h // HT
         # W_UV[h]'s latent half c (bf16 [512 latent][128 out]: one contiguous 64 KB) into LDS before the wait
-        for st in range_constexpr(8):
+        for st in range_constexpr(8 if "zw" not in probe else 0):
             k = st * THREADS + tid  # 16-byte chunk k: latent row k / 16, out dims 8 (k % 16) ..
             _st16(wvl + (k // 16) * WVW + 4 * (k % 16), _ld4(wuv, ((h * KV + 256 * c) * WO + 8 * k) // 2))
         if const_expr("nowait" not in probe):
