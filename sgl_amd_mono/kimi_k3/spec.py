@@ -421,9 +421,8 @@ def _tails(packed_layers: dict, batch, device) -> None:
     rows), and it is not a block-write layer (whose front writes a bank row
     its own K2 then reads).
     Every other layer keeps the seam in its own front: layer 1 (the dense
-    layer's stream), the block-write layers, the one-request form (6 rows: its
-    front overlaps its in_proj stream, so the move costs more in the tail than
-    it saves, tier 0 2026-11-20), every width K1 declines at, where SGLang's
+    layer's stream), the block-write layers, the one-request form (the steps
+    the wide form does not take), every width K1 declines at, where SGLang's
     layer runs its own seam, and (``_Built.set_aux``) a layer whose front forms
     a DSpark capture. On Kimi-K3 that is 60 of the 69 KDA layers, 57 with
     DSpark's captures (layers 8, 52, 68 keep their fronts).

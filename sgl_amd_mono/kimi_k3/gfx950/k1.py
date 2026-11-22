@@ -263,9 +263,10 @@ def _unsupported_reasons(layer) -> list[str]:
 
 
 # The width rule: the wide form takes a step of R requests x L rows for
-# WIDE_FROM_REQS <= R <= WIDE_MAX_REQS; the one-request form keeps R = 1. At 6
-# rows the one-request form is the faster on tier 0 (35.2 against 38.3 us).
-WIDE_FROM_REQS = 2
+# WIDE_FROM_REQS <= R <= WIDE_MAX_REQS, one request included, so 6 rows runs as
+# one launch with its seam in the previous K2's tail, as 12-24 rows do; the
+# one-request form keeps the steps the wide form does not take.
+WIDE_FROM_REQS = 1
 WIDE_MAX_REQS = 8
 
 
