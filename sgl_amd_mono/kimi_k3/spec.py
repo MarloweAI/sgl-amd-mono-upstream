@@ -154,6 +154,13 @@ SGLANG_READS = {
         "AiterAttnBackend.make_mla_meta_data(is_cp_round_robin)",
         "AiterAttnBackend.make_mla_meta_data(nhead_override)",
         "cprr_kernel_heads",
+        # the e4m3 dtype aiter's MLA decode takes its q in (the wide path's prologue)
+        "fp8_dtype",
+    ),
+    # the wide path's q prepare: SGLang's own fused q/kv norm and q_b GEMM
+    "srt/models/deepseek_common/attention_forward_methods/forward_mla_rocm.py": (
+        "a16w16_linear",
+        "fused_qk_rmsnorm_bf16",
     ),
     # the attention stops here and the launch runs o_proj; both attention
     # classes expose it. The rest are what the forward and the checks read.
@@ -1116,9 +1123,9 @@ QKV_G_MIN_ROWS = 144
 
 def _fp8_dtype():
     """SGLang's e4m3 for aiter's MLA decode (its q's dtype)."""
-    from sglang.srt.layers.attention import aiter_backend as ab
+    from sglang.srt.layers.attention.aiter_backend import fp8_dtype
 
-    return ab.fp8_dtype
+    return fp8_dtype
 
 
 def _fuse_qkv_g(backbone) -> None:
@@ -1294,19 +1301,22 @@ class _SglTails:
                 llama_4_scaling, prev_topk_indices,
             )  # fmt: skip
         from sglang.srt.layers.layer_boundary import get_attn_tp_context
-        from sglang.srt.models.deepseek_common.attention_forward_methods import forward_mla_rocm as frm
+        from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla_rocm import (
+            a16w16_linear,
+            fused_qk_rmsnorm_bf16,
+        )
 
         assert attn.is_dcp_q_replicate_phase(forward_batch) and attn.q_b_proj_qrep_weight is not None
         q, latent = get_attn_tp_context().fetch_qkv_latent().split(
             [attn.q_lora_rank, attn.kv_lora_rank + attn.qk_rope_head_dim], dim=-1
         )
         k_nope = latent[..., : attn.kv_lora_rank]
-        q, k_nope = frm.fused_qk_rmsnorm_bf16(
+        q, k_nope = fused_qk_rmsnorm_bf16(
             q, attn.q_a_layernorm.weight, attn.q_a_layernorm.variance_epsilon,
             k_nope, attn.kv_a_layernorm.weight, attn.kv_a_layernorm.variance_epsilon,
         )  # fmt: skip
         k_nope = k_nope.unsqueeze(1)
-        q = frm.a16w16_linear(q, attn.q_b_proj_qrep_weight).view(-1, attn.num_local_heads * attn.dcp_size, attn.qk_head_dim)
+        q = a16w16_linear(q, attn.q_b_proj_qrep_weight).view(-1, attn.num_local_heads * attn.dcp_size, attn.qk_head_dim)
         _, q_pe, k_pe = attn._split_q_nope_pe(q, latent)
         return (
             q_pe, k_pe, None, k_nope, forward_batch, zero_allocator, positions, None,
