@@ -274,8 +274,9 @@ def scratch_bytes(key: KdaWideBuild) -> int:
 
 def lds_barrier():
     """``s_barrier`` for an LDS hand-off between waves: fenced, so no LDS access
-    moves across it, and the waves' global loads and stores stay in flight (a
-    plain barrier waits for every store's acknowledgement)."""
+    moves across it, and the waves' global loads and stores stay in flight.
+    Neither this nor ``gpu.barrier`` waits for global stores (gfx950 waits only
+    lgkmcnt there): a hand-off of global data waits vmcnt first."""
     fx.memory_fence(ordering=fx.AtomicOrdering.Release, syncscope="workgroup")
     rocdl.s_barrier()
     fx.memory_fence(ordering=fx.AtomicOrdering.Acquire, syncscope="workgroup")
@@ -1126,7 +1127,8 @@ def kda_task(c, task, req, h, hf, k):
             )
     lds_barrier()
     if const_expr(box is not None):
-        # every wave's core stores acknowledged, then the task's box
+        # every wave drains its core stores, then the task's box
+        rocdl.s_waitcnt(vmcnt=0)
         gpu.barrier()
         if (tid == 0) & (hf == 0):
             Mailbox(box[1]).put(box[0], task, fx.Int32(1))
