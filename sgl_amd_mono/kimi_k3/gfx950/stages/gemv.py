@@ -33,7 +33,7 @@ def chunks(k):
     return (n + WAVES - 1) // WAVES, n
 
 
-def loads(lane, wave, w, row0, k, nt=True, ldk=None, k0=0, nbytes=None):
+def loads(lane, wave, w, row0, k, nt=True, ldk=None, k0=0, nbytes=None, cm=CM_NT):
     """This wave's operands of weight rows ``row0`` .. + 16 (row-major, ``ldk``
     bf16 a row at ``w``, K columns ``k0`` .. ``k0 + k``): a list a chunk
     (clamped into K: ``mfmas`` zeroes the extra). ``nbytes`` bounds the buffer:
@@ -55,7 +55,7 @@ def loads(lane, wave, w, row0, k, nt=True, ldk=None, k0=0, nbytes=None):
                         base + 16 * q,
                         vec_width=4,
                         dtype=T.i32,
-                        cache_modifier=CM_NT if nt else 0,
+                        cache_modifier=cm if nt else 0,
                     )
                 )
                 for q in range(4)

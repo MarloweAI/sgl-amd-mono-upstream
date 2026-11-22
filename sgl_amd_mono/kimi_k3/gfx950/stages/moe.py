@@ -54,6 +54,7 @@ from sgl_amd_mono.common.mx import (
 )
 from sgl_amd_mono.common.ops import (
     CM_DEV,
+    CM_NT,
     _xpartner,
     ballot,
     bf2_f32,
@@ -629,6 +630,9 @@ def early_shape(kind):
     }[kind]
 
 
+EARLY_CM = CM_NT  # the early weights' cache policy
+
+
 def early_loads(c, kind, i, q):
     """Early task (i, q) of ``kind``'s weights for this wave: issued as early as
     the CTA can, then ``early_compute`` takes them."""
@@ -639,7 +643,7 @@ def early_loads(c, kind, i, q):
         row0 = c["rank"] * (LAT // TP) + i * 2 * ROWS
         return [
             gemv.loads(c["lane"], c["wave"], a["w_ld"], row0 + h * ROWS, klen,
-                       ldk=HIDDEN, k0=q * klen)
+                       ldk=HIDDEN, k0=q * klen, cm=EARLY_CM)
             for h in range(2)
         ]  # fmt: skip
     if kind == 0:
@@ -648,7 +652,7 @@ def early_loads(c, kind, i, q):
         w, row0 = a["w_ld"], c["rank"] * (LAT // TP) + i * ROWS
     else:
         w, row0 = a["w_sgu"], i * ROWS
-    return gemv.loads(c["lane"], c["wave"], w, row0, klen, ldk=HIDDEN, k0=q * klen)
+    return gemv.loads(c["lane"], c["wave"], w, row0, klen, ldk=HIDDEN, k0=q * klen, cm=EARLY_CM)
 
 
 def early_compute(c, kind, i, q, ops):
@@ -1999,7 +2003,10 @@ def run_ug_wide(c, total):
 # the epilogue in registers (no CTA barrier a task). The same MFMA
 # chains (a block's K halves), the same half sum, SiTUv2, bf16 rounding,
 # 32-column amax and MXFP8 words as ``stage_ug``: the same bits.
-UGW_RING = 8  # weight loads in flight a wave
+UGW_RING = 8  # weight loads in flight a wave while every wave streams
+# a wave's later tasks run with few waves left streaming: deeper
+UGW_RING_LATE = 24
+UGW_CM = CM_NT  # w13 tiles' cache policy
 
 
 WAVE_UG_ROWS = 24  # every token's latent row fits a CTA's LDS
@@ -2060,9 +2067,9 @@ def ugw_column(c, slot):
 
 
 @flyc.jit
-def stage_ug_wv(c, task):
+def stage_ug_wv(c, task, depth=UGW_RING):
     """This wave's ug task (slot / unit task / 12, group task % 12): the four
-    blocks' w13 streamed UGW_RING loads ahead, the eight K-half chains, then
+    blocks' w13 streamed ``depth`` loads ahead, the eight K-half chains, then
     in registers: the halves summed, SiTUv2, bf16, the group's amax over the
     four lane rows (permlane swaps 16, 32), MXFP8 -> INTER / ISC of each
     picking token."""
@@ -2080,7 +2087,9 @@ def stage_ug_wv(c, task):
 
     def wload(i):
         jj, up = blocks[seq[i][0]]
-        return fp4_tile_load(r_w, base, ugw_block(c, g, jj, up), W13_K, seq[i][1], lane * 4)
+        return fp4_tile_load(
+            r_w, base, ugw_block(c, g, jj, up), W13_K, seq[i][1], lane * 4, UGW_CM
+        )
 
     sw = {}
     for jj, up in blocks:
@@ -2093,7 +2102,7 @@ def stage_ug_wv(c, task):
                         r_s, w13_scale_word(e, rg, 2 * k1, lane), vec_width=1, dtype=T.i32
                     )
                 )
-    ring = [wload(i) for i in range(UGW_RING)]
+    ring = [wload(i) for i in range(depth)]
     kb = lane // 16
     brow, srow, pick, live = ugw_column(c, slot)
     accs = {}
@@ -2103,9 +2112,9 @@ def stage_ug_wv(c, task):
         h = st // (W13_STEPS // 2)
         if st % (W13_STEPS // 2) == 0:
             accs[(b, h)] = fx.Vector.filled(4, 0.0, fx.Float32)
-        av = ring[i % UGW_RING]
-        if i + UGW_RING < len(seq):
-            ring[i % UGW_RING] = wload(i + UGW_RING)
+        av = ring[i % depth]
+        if i + depth < len(seq):
+            ring[i % depth] = wload(i + depth)
         bw = fp8_operand(c["latq"], brow, st, kb)
         sb = fx.ptr_load(srow + (st * 4 + kb))
         word = sw[(jj, up if not c["guint"] else 0, st // 2)]
@@ -2149,11 +2158,18 @@ def stage_ug_wv(c, task):
 @flyc.jit
 def run_ug_waves(c, total):
     """ug a task a wave: task t on CTA t % BLOCKS, wave t / BLOCKS % WAVES, so
-    every CU takes a task before any takes a second."""
+    every CU takes a task before any takes a second. A wave's second task on
+    runs where most waves are done: UGW_RING_LATE loads ahead."""
     task = c["bid"] + BLOCKS * c["wave"]
-    while task < total:
+    # the first round (at most one task a wave)
+    while task < fx.min(total, BLOCKS * WAVES):
         stage_ug_wv(c, task)
         task = task + BLOCKS * WAVES
+    s = c["S"]
+    if const_expr((max_units(s) if wide(s) else max_u(s)) * UG_GROUPS > BLOCKS * WAVES):
+        while task < total:
+            stage_ug_wv(c, task, UGW_RING_LATE)
+            task = task + BLOCKS * WAVES
     # the waves leave ug apart: the next stage's LDS (the same union) after all
     gpu.barrier()
 
@@ -2178,6 +2194,7 @@ def wait_ug(c):
 # bf16(w acc) products, into CONTRIB for ``fold_wide``.
 DOWNW_NB = 8  # a wave task's 16-row blocks
 DOWNW_CHUNKS = LAT // (DOWNW_NB * ROWS)  # 28 tasks a unit
+DOWNW_CM = CM_NT  # w2 tiles' cache policy
 
 
 def w2_word(c, e, rgd, st, lane):
@@ -2191,37 +2208,50 @@ def w2_word(c, e, rgd, st, lane):
     )
 
 
+# a block pair's (rows 32 m ..) code dword at a K step pair (4 n ..): blocks
+# 2m, 2m + 1 and steps 2n, 2n + 1 share it (``scale_index``; rg0 is even)
+DOWNW_WORDS = (DOWNW_NB // 2) * ((W2_STEPS + 1) // 2)  # 8
+
+
+def downw_word_at(i, st):
+    """``downw_loads``' code word index of block i at K step st."""
+    return (i // 2) * ((W2_STEPS + 1) // 2) + st // 2
+
+
+def downw_task(c, d):
+    """Wave task d's (expert, 8-block chunk)."""
+    return uniform(fx.ptr_load(c["rt"]["expert"] + d // DOWNW_CHUNKS)), d % DOWNW_CHUNKS
+
+
+def downw_tile(c, e, ch, k):
+    """w2 tile k (block k / 3 at K step k % 3) of expert e's chunk ch."""
+    return fp4_tile_load(
+        rsrc(c["args"]["w2"]), e * (LAT * RI // 8), ch * DOWNW_NB + k // W2_STEPS, RI,
+        k % W2_STEPS, c["lane"] * 4, DOWNW_CM,
+    )  # fmt: skip
+
+
+def downw_code(c, e, ch, w):
+    """Code word w (block pair w / 2, K step pair w % 2) of expert e's chunk ch."""
+    m, n = w // ((W2_STEPS + 1) // 2), w % ((W2_STEPS + 1) // 2)
+    return w2_word(c, e, ch * DOWNW_NB + 2 * m, 2 * n, c["lane"])
+
+
 def downw_loads(c, d):
     """Wave task d's w2 tiles and code words (blocks 8 (d % 28) .., unit d /
     28): flat, ``stage_down_wv`` unpacks."""
-    lane = c["lane"]
-    u, ch = d // DOWNW_CHUNKS, d % DOWNW_CHUNKS
-    e = uniform(fx.ptr_load(c["rt"]["expert"] + u))
-    r_w = rsrc(c["args"]["w2"])
-    rg0 = ch * DOWNW_NB
-    av = [
-        fp4_tile_load(r_w, e * (LAT * RI // 8), rg0 + i, RI, st, lane * 4)
-        for i in range(DOWNW_NB)
-        for st in range(W2_STEPS)
-    ]
-    sa = [w2_word(c, e, rg0 + i, st, lane) for i in range(DOWNW_NB) for st in range(W2_STEPS)]
-    return av + sa
+    e, ch = downw_task(c, d)
+    av = [downw_tile(c, e, ch, k) for k in range(DOWNW_NB * W2_STEPS)]
+    return av + [downw_code(c, e, ch, w) for w in range(DOWNW_WORDS)]
 
 
-@flyc.jit
-def stage_down_wv(c, d, ops):
-    """Wave task d (``ops``: ``downw_loads``): this lane's column, the unit's
-    t-th pick (a column past the unit reads the last one's), its INTER words
-    and ISC codes from scratch; the eight blocks' chains; bf16(w acc) a pick
-    and row -> CONTRIB."""
+def downw_inter(c, d):
+    """Wave task d's INTER words and ISC codes of this lane's column (the
+    unit's t-th pick; a column past the unit reads the last one's)."""
     s, lane = c["S"], c["lane"]
-    rt = c["rt"]
-    u, ch = d // DOWNW_CHUNKS, d % DOWNW_CHUNKS
-    rg0 = ch * DOWNW_NB
-    st0, n = unit_of(c, u)
-    t = lane % 16
+    st0, n = unit_of(c, d // DOWNW_CHUNKS)
     kb = lane // 16
-    p = fx.ptr_load(rt["toks"] + (st0 + fx.min(t, n - 1)))
+    p = fx.ptr_load(c["rt"]["toks"] + (st0 + fx.min(lane % 16, n - 1)))
     ri = rsrc(c["inter"].value, s * TOPK * IW * 4)
     rc = rsrc(c["isc"].value, s * TOPK * UG_GROUPS * 4)
     bws, sbs = [], []
@@ -2244,15 +2274,40 @@ def stage_down_wv(c, d, ops):
                 )
             )
         )  # fmt: skip
+    return bws + sbs
+
+
+@flyc.jit
+def stage_down_wv(c, d, ops, iv, dn):
+    """Wave task d (``ops``: ``downw_loads``, ``iv``: ``downw_inter``): the
+    eight blocks' chains, each tile's slot refilled with task dn's as its MFMA
+    takes it; bf16(w acc) a pick and row -> CONTRIB. Returns task dn's ops."""
+    s, lane = c["S"], c["lane"]
+    rt = c["rt"]
+    u, ch = d // DOWNW_CHUNKS, d % DOWNW_CHUNKS
+    rg0 = ch * DOWNW_NB
+    st0, n = unit_of(c, u)
+    t = lane % 16
+    kb = lane // 16
+    p = fx.ptr_load(rt["toks"] + (st0 + fx.min(t, n - 1)))
+    bws, sbs = iv[:W2_STEPS], iv[W2_STEPS:]
     nab = DOWNW_NB * W2_STEPS
+    nxt = [None] * (nab + DOWNW_WORDS)
+    e_n, ch_n = downw_task(c, dn)
     accs = []
     for i in range_constexpr(DOWNW_NB):
         acc = fx.Vector.filled(4, 0.0, fx.Float32)
         for st in range_constexpr(W2_STEPS):
+            k = i * W2_STEPS + st
+            w = downw_word_at(i, st)
             acc = mfma_scaled(
-                ops[i * W2_STEPS + st], bws[st], acc, ops[nab + i * W2_STEPS + st], sbs[st],
-                FP4, FP8, (st % 2) * 2 + i % 2, 0,
+                ops[k], bws[st], acc, ops[nab + w], sbs[st], FP4, FP8, (st % 2) * 2 + i % 2, 0,
             )  # fmt: skip
+            nxt[k] = downw_tile(c, e_n, ch_n, k)
+            if const_expr(i % 2 == 1 and (st % 2 == 1 or st == W2_STEPS - 1)):
+                nxt[nab + w] = downw_code(c, e_n, ch_n, w)
+            # keep the stream's order: the scheduler would hoist the loads past the ring
+            rocdl.sched_barrier(0)
         accs.append(acc)
     if t < n:
         wt = fx.ptr_load(
@@ -2265,22 +2320,28 @@ def stage_down_wv(c, d, ops):
             for h in range_constexpr(2):
                 w = bf16_pair(a[2 * h] * wt, a[2 * h + 1] * wt)
                 bo.buffer_store(w, r, at + h, cache_modifier=CM_DEV)
+    return nxt
 
 
 @flyc.jit
 def run_down_waves(c, nu):
     """Down a task a wave (task d on CTA d % BLOCKS, wave d / BLOCKS % WAVES):
-    the first task's weights in flight before INTER is waited for; then DND."""
+    the first task's weights in flight before INTER is waited for; a task's
+    INTER read a task ahead and its weights streamed in under the previous
+    task's MFMAs; then DND."""
     total = nu * DOWNW_CHUNKS
     last = total - 1
     d = c["bid"] + BLOCKS * c["wave"]
     ops = downw_loads(c, fx.min(d, last))
     wait_ug(c)
     stamp(c["tl_on"], c["tls"], c["tid"], 15)
+    iv = downw_inter(c, fx.min(d, last))
     while d < total:
-        stage_down_wv(c, d, ops)
-        d = d + BLOCKS * WAVES
-        ops = downw_loads(c, fx.min(d, last))
+        nd = d + BLOCKS * WAVES
+        iv_n = downw_inter(c, fx.min(nd, last))
+        ops = stage_down_wv(c, d, ops, iv, fx.min(nd, last))
+        iv = iv_n
+        d = nd
     publish(c["put"], c["dnd"], c["bid"], fx.Int32(1), c["tid"] == 0)
 
 
