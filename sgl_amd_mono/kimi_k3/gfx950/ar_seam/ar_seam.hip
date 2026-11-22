@@ -198,6 +198,8 @@ DINLINE void two_stage(const Exchange& ex, __amdgpu_buffer_rsrc_t result) {
   constexpr int ngpus = kWorld;
   constexpr int pack_size = 8;
   constexpr int tnum_gpu = THREAD_NUM / ngpus;
+  // warp 0 alone stores the reduced part, and end_sync's release is issued from its first ngpus lanes: one wave
+  static_assert(tnum_gpu == 64, "the 2-stage's reducing warp must be one wave");
   const int rank = ex.rank;
   const int size = ex.count;
   const RankSignals& sg = ex.sg;
@@ -248,7 +250,7 @@ DINLINE void two_stage(const Exchange& ex, __amdgpu_buffer_rsrc_t result) {
   if constexpr (has_tail) {
     if (warp_id == 0 && idx < end) tmp_out[idx - start] = aiter::packed_reduce<P, ngpus, A>(ptrs, idx);
   }
-  aiter::end_sync<ngpus>(sg, self_sg, rank);
+  aiter::end_sync<ngpus, false>(sg, self_sg, rank);  // final_sync false: a release, which publishes tmp_out
 
   for (int idx = tid; idx < largest_part; idx += stride) {
     int dst_idx = (warp_id + rank) % ngpus * part + idx;
