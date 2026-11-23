@@ -33,8 +33,11 @@ from aiter.ops.flydsl.kernels.mxfp4_gemm1 import (
 )
 from aiter.ops.flydsl.kernels.mxfp4_gemm_common import _udiv, _umod, global_typed_ptr
 
+from sgl_amd_mono.common.plan import kernel_sources, key_tuple
+
 BM1, BN1, BK1 = 16, 128, 256
 NXCD = 8
+SOURCES = kernel_sources(__name__)
 
 
 @flyc.jit
@@ -177,6 +180,7 @@ def compile_stage1_shared(*, s1_use_nt, s1_prefetch_hidden, s1_xcd_swizzle, situ
     shared workgroup then pushes its 64 x 64 tile to the tile's column owner and flags it
     (``stages.shared_push``) once the tile is in memory, while the stage-1 workgroups run. The launch's push
     arguments are (shared_out address, peer table address, rank, epoch buffer address, layer slot)."""
+    keyed = key_tuple(locals(), SOURCES)
     if push is not None:
         from sgl_amd_mono.kimi_k3.gfx950.stages import shared_push as S
 
@@ -352,6 +356,7 @@ def compile_stage1_shared(*, s1_use_nt, s1_prefetch_hidden, s1_xcd_swizzle, situ
         push_slot: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
+        _ = keyed
         m = fx.Int32(fx.get_scalar(sh_a.shape[0]))
         n = fx.Int32(fx.get_scalar(sh_b.shape[1]))
         k = fx.Int32(fx.get_scalar(sh_a.shape[1]))
