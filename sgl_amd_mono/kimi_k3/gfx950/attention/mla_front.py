@@ -337,19 +337,20 @@ _STREAM = fx.Stream(None)
 
 def _bar():
     """``s_barrier`` for an LDS hand-off: this wave's LDS accesses retired, its
-    global loads still in flight (``gpu.barrier`` drains them)."""
+    global loads and stores still in flight (``gpu.barrier`` leaves them too:
+    its workgroup-scope fences wait for LDS only)."""
     llvm.inline_asm(
         res=None, operands_=[], asm_string="s_waitcnt lgkmcnt(0)\n\ts_barrier",
         constraints="~{memory}", has_side_effects=True,
     )  # fmt: skip
 
 
-def _published(nwait):
-    """Every wave's stores landed (its newest ``nwait`` loads may still be in
-    flight), then ``s_barrier``: a hand-off flag may follow."""
+def _published():
+    """Every wave's loads and stores landed (``vmcnt`` counts both), then
+    ``s_barrier``: a hand-off flag may follow."""
     llvm.inline_asm(
         res=None, operands_=[],
-        asm_string=f"s_waitcnt vmcnt({nwait}) lgkmcnt(0)\n\ts_barrier",
+        asm_string="s_waitcnt vmcnt(0) lgkmcnt(0)\n\ts_barrier",
         constraints="~{memory}", has_side_effects=True,
     )  # fmt: skip
 
@@ -814,9 +815,9 @@ def s2_out(c, h, acc, t0, sj):
 
 
 @flyc.jit
-def stage2_flag(c, h, nwait):
-    """Group h's rows landed (the newest ``nwait`` loads aside), then its QRDY."""
-    _published(nwait)
+def stage2_flag(c, h):
+    """Group h's rows landed, then its QRDY."""
+    _published()
     if c["tid"] == 0:
         c["put"](c["qrdy"], h, fx.Int32(1))
 
@@ -2461,7 +2462,7 @@ def build(key: MlaFrontBuild):
             stamp(on, tls, tid, 3)
             if live_qb:
                 stage2(c, qbg, ops)
-                stage2_flag(c, qbg, 0)
+                stage2_flag(c, qbg)
             _bar()
             stamp(on, tls, tid, 4)
             # stage 3: this rank's 48 absorb tasks, one a CTA; then the q flags
