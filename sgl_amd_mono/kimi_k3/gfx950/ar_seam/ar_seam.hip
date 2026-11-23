@@ -3,8 +3,8 @@
 //
 // Blocks [0, n_ar) run aiter's own all-reduce for the message (custom_all_reduce.cuh in the image:
 // lamportAllReduceTwoShotWaveSplit up to 1 MiB, cross_device_reduce_2stage above), the same exchange
-// and the same sums, except that the result goes to a rank-local uncached hand-off buffer in the
-// lamport sentinel format instead of the output tensor. Block n_ar + t then reads row t: it loads and
+// and the same sums, except that the result goes to a rank-local hand-off buffer, at device scope, in
+// the lamport sentinel format instead of the output tensor. Block n_ar + t then reads row t: it loads and
 // scores its bank rows while the all-reduce runs, polls its row of the hand-off and re-arms it, and
 // runs SGLang's attn_res_hip._agg_kernel (HAS_ADD, APPLY_OUT_NORM, optional bank snapshot) with
 // Triton's operation order, reduction trees, DPP reductions and FMA contractions, so prefix_out,
@@ -66,7 +66,7 @@ struct Read {
   const uint16_t* ow;   // [H] bf16 output RMSNorm weight
   uint16_t* prefix_out;
   uint16_t* out;
-  ui32x4_t* handoff;  // [kMaxRows, H] bf16, uncached, rank-local
+  ui32x4_t* handoff;  // [kMaxRows, H] bf16, rank-local
   int64_t bank_stride_t;
   int64_t bank_stride_b;
   float score_eps;
@@ -85,6 +85,28 @@ struct Read {
 #define K3_STAMP(rd, i)
 #endif
 
+// ---- the hand-off's 16 B accesses, at device scope ----
+//
+// Its writers (the all-reduce blocks) and its readers run on different XCDs, whose L2s are not coherent with each
+// other. sc1 is the cache policy gfx950 gives an agent-scope relaxed atomic, here on one 16 B access (a 4 B atomic
+// would split each in four); nt is aiter's streaming hint. So the hand-off is coherent on any device memory.
+
+using v4u = uint32_t __attribute__((ext_vector_type(4)));
+constexpr int kDeviceScope = 16 | 2;  // the buffer intrinsics' cache policy on gfx950: sc1 | nt
+
+DINLINE __amdgpu_buffer_rsrc_t handoff_rsrc(ui32x4_t* handoff) {
+  return __builtin_amdgcn_make_buffer_rsrc(handoff, 0, static_cast<int>(kHandoffBytes), 0x00020000);
+}
+
+DINLINE void handoff_store(__amdgpu_buffer_rsrc_t h, int64_t pack, ui32x4_t v) {
+  __builtin_amdgcn_raw_buffer_store_b128(__builtin_bit_cast(v4u, v), h, static_cast<int>(pack * 16), 0, kDeviceScope);
+}
+
+DINLINE ui32x4_t handoff_load(__amdgpu_buffer_rsrc_t h, int64_t pack) {
+  return __builtin_bit_cast(ui32x4_t,
+                            __builtin_amdgcn_raw_buffer_load_b128(h, static_cast<int>(pack * 16), 0, kDeviceScope));
+}
+
 // ---- aiter's all-reduce blocks (custom_all_reduce.cuh, the image's aiter), result -> hand-off ----
 
 DINLINE ui32x4_t canonical(ui32x4_t v) {
@@ -94,7 +116,7 @@ DINLINE ui32x4_t canonical(ui32x4_t v) {
 }
 
 // lamportAllReduceTwoShotWaveSplit<bf16, 8>, part = ex.count
-DINLINE void two_shot(const Exchange& ex, ui32x4_t* __restrict__ result) {
+DINLINE void two_shot(const Exchange& ex, __amdgpu_buffer_rsrc_t result) {
   constexpr int ngpus = kWorld;
   constexpr int64_t max_part = aiter::lamportTwoShotMaxPart(ngpus);
   constexpr int64_t buffer_packs = ngpus * max_part;
@@ -152,11 +174,11 @@ DINLINE void two_shot(const Exchange& ex, ui32x4_t* __restrict__ result) {
 #pragma unroll
     for (int j = 0; j < 4; ++j) sum_val.i[j] = aiter::lamportCanonicalize(sum_val.i[j]);
     if (wave_id == 0) {
-      __builtin_nontemporal_store(sum_val.i, result + (int64_t)rank * part + pos);
+      handoff_store(result, (int64_t)rank * part + pos, sum_val.i);
     } else {
       __builtin_nontemporal_store(sum_val.i, peer_inbox + inbox_packs + send_off);
       sum_val.i = aiter::lamportPollSlot(self_inbox + inbox_packs + recv_off);
-      __builtin_nontemporal_store(sum_val.i, result + (int64_t)peer * part + pos);
+      handoff_store(result, (int64_t)peer * part + pos, sum_val.i);
     }
   }
 
@@ -172,10 +194,12 @@ DINLINE void two_shot(const Exchange& ex, ui32x4_t* __restrict__ result) {
 
 // cross_device_reduce_2stage<bf16, 8, *, has_tail, false>, size = ex.count, gridDim.x -> ex.n_ar
 template <bool has_tail>
-DINLINE void two_stage(const Exchange& ex, ui32x4_t* __restrict__ result) {
+DINLINE void two_stage(const Exchange& ex, __amdgpu_buffer_rsrc_t result) {
   constexpr int ngpus = kWorld;
   constexpr int pack_size = 8;
   constexpr int tnum_gpu = THREAD_NUM / ngpus;
+  // warp 0 alone stores the reduced part, and end_sync's release is issued from its first ngpus lanes: one wave
+  static_assert(tnum_gpu == 64, "the 2-stage's reducing warp must be one wave");
   const int rank = ex.rank;
   const int size = ex.count;
   const RankSignals& sg = ex.sg;
@@ -226,7 +250,7 @@ DINLINE void two_stage(const Exchange& ex, ui32x4_t* __restrict__ result) {
   if constexpr (has_tail) {
     if (warp_id == 0 && idx < end) tmp_out[idx - start] = aiter::packed_reduce<P, ngpus, A>(ptrs, idx);
   }
-  aiter::end_sync<ngpus>(sg, self_sg, rank);
+  aiter::end_sync<ngpus, false>(sg, self_sg, rank);  // final_sync false: a release, which publishes tmp_out
 
   for (int idx = tid; idx < largest_part; idx += stride) {
     int dst_idx = (warp_id + rank) % ngpus * part + idx;
@@ -235,7 +259,7 @@ DINLINE void two_stage(const Exchange& ex, ui32x4_t* __restrict__ result) {
       ui32x4_t i;
     } reduced;
     reduced.data = tmps[warp_id][idx];
-    __builtin_nontemporal_store(canonical(reduced.i), result + dst_idx);
+    handoff_store(result, dst_idx, canonical(reduced.i));
   }
 }
 
@@ -363,7 +387,7 @@ struct Reader {
     float pv[kE] = {};
     if (math) {
       ui32x4_t got[kReps];
-      poll_row(rd.handoff + int64_t{t} * kRowPacks, tid, got);
+      poll_row(handoff_rsrc(rd.handoff), int64_t{t} * kRowPacks, tid, got);
 #pragma unroll
       for (int k = 0; k < kReps; ++k) {
         const int c = col(tid, k);
@@ -473,7 +497,7 @@ struct Reader {
 
   // this thread's packs of a hand-off row until none holds a sentinel half (lamportPollSlot on all of
   // them at once), then re-armed
-  DINLINE static void poll_row(ui32x4_t* row, int tid, ui32x4_t (&got)[kReps]) {
+  DINLINE static void poll_row(__amdgpu_buffer_rsrc_t h, int64_t row, int tid, ui32x4_t (&got)[kReps]) {
     uint32_t wait = 0;
 #pragma unroll
     for (int k = 0; k < kReps; ++k) wait |= col(tid, k) < kHidden ? 1u << k : 0u;
@@ -481,7 +505,7 @@ struct Reader {
       asm volatile("" ::: "memory");
 #pragma unroll
       for (int k = 0; k < kReps; ++k)
-        if (wait & (1u << k)) got[k] = __builtin_nontemporal_load(row + col(tid, k) / 8);
+        if (wait & (1u << k)) got[k] = handoff_load(h, row + col(tid, k) / 8);
 #pragma unroll
       for (int k = 0; k < kReps; ++k) {
         if (!(wait & (1u << k))) continue;
@@ -494,7 +518,7 @@ struct Reader {
     const ui32x4_t sentinel{0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu};
 #pragma unroll
     for (int k = 0; k < kReps; ++k)
-      if (col(tid, k) < kHidden) __builtin_nontemporal_store(sentinel, row + col(tid, k) / 8);
+      if (col(tid, k) < kHidden) handoff_store(h, row + col(tid, k) / 8, sentinel);
   }
 
   DINLINE static void unpack(uint4 v, float* f) {
@@ -516,9 +540,9 @@ template <int kAlgo, int kNvb>
 __global__ __launch_bounds__(kThreads, 1) void seam_kernel(const Exchange ex, const Read rd) {
   if (static_cast<int>(blockIdx.x) < ex.n_ar) {
     if constexpr (kAlgo == kTwoShot) {
-      two_shot(ex, rd.handoff);
+      two_shot(ex, handoff_rsrc(rd.handoff));
     } else {
-      two_stage<kAlgo == kTwoStageTail>(ex, rd.handoff);
+      two_stage<kAlgo == kTwoStageTail>(ex, handoff_rsrc(rd.handoff));
     }
     K3_STAMP(rd, 4 * kMaxRows + blockIdx.x);
     return;
