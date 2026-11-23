@@ -371,6 +371,11 @@ def compile_stage1_shared(*, s1_use_nt, s1_prefetch_hidden, s1_xcd_swizzle, situ
     return launch, hparam
 
 
+def bucket(rows: int) -> int:
+    """aiter's tuned-table bucket of a stage-1 call (get_padded_M): 64, 128 or 256 rows."""
+    return 64 if rows <= 64 else 128 if rows <= 128 else 256
+
+
 # the shared tile a stock bucket (get_padded_M 64 / 128 / 256): LDS <= 40 KB keeps stage 1's 4 workgroups a CU;
 # 64 x 64 is the C18 push's tile (shared_push.TM / TN), 4 waves the launch's 256 threads.
 # block_k 64 keeps the K order of SGLang's own hgemm (bit for bit); block_k 32 does not.
@@ -388,8 +393,6 @@ def stage1_shared(g1: dict, act, w_down, shared_out, overrides: tuple = (), push
     the other ranks' slots."""
     import torch
     from aiter.ops.flydsl.kernels.mxfp4_gemm1 import gemm1_grid
-
-    from . import bucket
 
     m = g1["n_tokens"]
     cf = dict(SHARED_CONFIGS[bucket(m)])
