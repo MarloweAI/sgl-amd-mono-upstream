@@ -61,6 +61,7 @@ from sgl_amd_mono.common.ops import (
     popcount,
     read_lane_i32,
 )
+from sgl_amd_mono.common.ops import clock as _clock
 from sgl_amd_mono.common.ops import rsrc as _rsrc
 from sgl_amd_mono.common.ops import uniform as _uniform
 from sgl_amd_mono.common.ops import uniform_f32 as _uniform_f32
@@ -292,6 +293,9 @@ class FlashBuild(msgspec.Struct, frozen=True):
     # past ISEL_ONE_POOLS pools, else on one CTA; both select the same pools in the
     # same order
     select_ctas: bool = True
+    # profiling builds only: each CTA stamps the 100 MHz clock as it leaves each stage
+    # (scratch ``prof``: [BLOCKS, PROF_MARKS] int64; names in ``SC["_prof_marks"]``)
+    prof: bool = False
     # with dsa: the MLA latent cache holds E4M3 bytes (SGLang's raw FP8 layout, no
     # scale): a row is written as its bf16 normed values cast to E4M3, and read
     # back exactly into the bf16 key tile
@@ -388,6 +392,14 @@ def build_flash_kernel(key: FlashBuild):
     SC, SY = layout(
         S, W, expert_inter, kda, dsa, max_pools, dense, head, tokens, GROUPED
     )
+    PROF = key.prof
+    PROF_MARKS = 48
+    prof_names = []
+    if PROF:
+        SC = dict(SC)
+        SC["prof"] = SC["_bytes"]
+        SC["_bytes"] += BLOCKS * PROF_MARKS * 8
+        SC["_prof_marks"] = prof_names
     # producers of each box: the gates' rows and the kda heads
     BOXES = {"box_a_in": S, "box_a": S, "box_o_in": S * H}
     assert not kda or S * H % BOX_WORDS == 0
@@ -1254,6 +1266,22 @@ def build_flash_kernel(key: FlashBuild):
 
         def start(name):
             return (bid + (G - base[name])) & (G - 1)
+
+        def mark(name):
+            """Profiling builds: thread 0 stamps the clock as its CTA leaves ``name``."""
+            if const_expr(PROF):
+                i = len(prof_names)
+                assert i < PROF_MARKS
+                prof_names.append(name)
+                if tid == 0:
+                    c = _clock()
+                    bo.buffer_store(
+                        fx.Vector.from_elements(
+                            [fx.Int32(c), fx.Int32(c >> 32)], fx.Int32
+                        ),
+                        _rsrc(scratch + fx.Int64(SC["prof"])),
+                        (bid * PROF_MARKS + i) * 2,
+                    )
 
         def n_sel(count=S):
             """This lane's local MFMA B column; inactive columns duplicate the last one."""
@@ -4540,28 +4568,43 @@ def build_flash_kernel(key: FlashBuild):
                 | fx.Int64(fx.Uint32(t32[n]))
                 for i, n in enumerate(DSA_TAB)
             }
+            mark("start")
             run_seam("aseam", "attn", early_seam)
+            mark("aseam")
             run_gate("agate", "attn", early_gate)
+            mark("agate")
             # the step's row table -> LDS, read from the cache stage on (which
             # begins with a barrier)
             if tid < S * ROW_WORDS:
                 lds_st(rows_lds, tid, row_words)
             dsa_qkv_fp8(tv, t32)
             dsa_qkv_bf16(tv, t32)
+            mark("qkv_a")
             dsa_qnorm(tv, t32)
+            mark("qnorm")
             dsa_cache(tv, t32)
+            mark("cache")
             dsa_q_b(tv, t32)
+            mark("q_b")
             dsa_index_q(tv, t32)
+            mark("index_q")
             dsa_iq_quant(tv, t32)
+            mark("iq_quant")
             dsa_uk(tv, t32)
+            mark("uk")
             dsa_iscore(tv, t32)
+            mark("iscore")
             if const_expr(key.select_ctas):
                 dsa_iselect_slices(tv, t32)
             else:
                 dsa_iselect_one(tv, t32)
+            mark("iselect")
             dsa_split(tv, t32)
+            mark("split")
             dsa_uv(tv, t32)
+            mark("uv")
             dsa_oproj(tv, t32)
+            mark("oproj")
 
         # ===================== the model's tail: mHC post, stream mean, final norm, LM head
         # hpost: one task a 32-column tile, every row: the four streams as the terminal
@@ -4734,12 +4777,17 @@ def build_flash_kernel(key: FlashBuild):
         if const_expr(kda):
             r_wo_kda = _rsrc(w_o)
             O_CPW = P // 64 // WAVES
+            mark("start")
             if const_expr(tokens):
                 write_step_tables()
             run_seam("aseam", "attn", early_seam)
+            mark("aseam")
             run_gate("agate", "attn", early_gate)
+            mark("agate")
             run_inproj()
+            mark("inproj")
             run_fgb()
+            mark("fgb")
 
             def kda_oproj(done=None):
                 run_oproj(
@@ -4758,14 +4806,18 @@ def build_flash_kernel(key: FlashBuild):
                 run_kda_verify()
             else:
                 run_kda(kda_oproj)
+            mark("kda")
             kda_oproj(start("kda") < S * H if OPROJ_IN_KDA else None)
+            mark("oproj")
             run_seam("seam", "ffn_own")
         elif const_expr(dsa):
             run_dsa()
             run_seam("seam", "ffn_own")
         else:
             run_seam("seam", "ffn")
+        mark("seam")
         run_gate("gate", "ffn")
+        mark("gate")
         # ======== dense MLP (layers 0-2): FP8 gate | up + clamped SiLU, FP8 down + TP reduce
         # bf16 activations; gate and up rounded to bf16 as SGLang's GEMM stores them, mid
         # rounded to bf16 as its activation stores it
@@ -5098,6 +5150,7 @@ def build_flash_kernel(key: FlashBuild):
             # ---- up/gate: a wave the gate and up row groups of 4 of the 32 K units
             N_UG_C = expert_inter // UG_BLK
             ug_red = xs + UNIT_ROWS * XW if UG_RED_IN_X else red
+            mark("router+table")
             lo, hi = cta_tasks("ug", n_units * N_UG_C)
             for ti in range(lo, hi, 1):
                 ti = fx.Int32(ti)
@@ -5217,6 +5270,7 @@ def build_flash_kernel(key: FlashBuild):
             GDN_S_BYTES = HIDDEN * MB
             NWQ = UNIT_ROWS * MW // 2 // THREADS
             assert NWQ * THREADS * 2 == UNIT_ROWS * MW and UNIT_ROWS * MB <= THREADS
+            mark("ug")
             lo, hi = cta_tasks("down", n_units * N_HC)
             for ti in range(lo, hi, 1):
                 ti = fx.Int32(ti)
@@ -5283,6 +5337,7 @@ def build_flash_kernel(key: FlashBuild):
                         put2(mb("dpart"), o, acc[0], acc[1])
                         put2(mb("dpart"), o + 2, acc[2], acc[3])
 
+            mark("down")
             # ---- sum: 16 hidden rows of every row, slots in order, route-weighted
             ST = GROUPED_SUM_TILE
 
@@ -5322,6 +5377,7 @@ def build_flash_kernel(key: FlashBuild):
 
         if const_expr(GROUPED):
             run_grouped()
+            mark("dsum")
             return
         # the shared expert needs only the activation blocks: it runs before the router
         # scores, its weights loading before the gate's flag on CTAs that run no router

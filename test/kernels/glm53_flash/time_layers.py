@@ -155,6 +155,7 @@ def _build(args, kinds: list, rows: int, rank: int, tp: int, group, device):
             and not (dense or head),
             verify=args.verify if kind in ("kda", "dsa") else 1,
             kv_fp8=args.kv_fp8 and dsa,
+            prof=args.prof,
         )
         runtimes[kind] = FlashRuntime(key, rank, group, device)
         runtimes[kind].set_deadline(60.0)
@@ -203,6 +204,35 @@ def _build(args, kinds: list, rows: int, rank: int, tp: int, group, device):
             extra.append(dict(caches=caches, rows=table, page_table=pt))
     cl._gen = _GEN
     return runtimes, ops, extra
+
+
+def _profile(graph, runtimes, rows: int, rank: int, samples: int = 9) -> None:
+    """Each kind's last launch of a replay: per stage, the time (µs from the first
+    CTA's start) by which every CTA has left it, median over ``samples`` replays."""
+    from sgl_amd_mono.glm53_flash.gfx950.layout import BLOCKS
+
+    got = {kind: [] for kind in runtimes}
+    for _ in range(samples):
+        graph.replay()
+        torch.cuda.synchronize()
+        for kind, rt in runtimes.items():
+            names = rt.sc.get("_prof_marks", [])
+            if not names:
+                continue
+            n = len(names)
+            st = rt.scratch[rt.sc["prof"] :].view(torch.int64)[: BLOCKS * 48]
+            st = st.view(BLOCKS, 48)[:, :n].double()
+            t0 = st[:, 0].min()
+            got[kind].append(((st.max(0).values - t0) / 100.0).tolist())
+    if rank != 0:
+        return
+    for kind, runs in got.items():
+        if not runs:
+            continue
+        names = runtimes[kind].sc["_prof_marks"]
+        med = [statistics.median(r[i] for r in runs) for i in range(len(names))]
+        parts = " ".join(f"{nm}={v:.1f}" for nm, v in zip(names, med))
+        print(f"PROF kind={kind} rows={rows} done_us {parts}", flush=True)
 
 
 def _time(args, rows: int, rank: int, tp: int, group, device) -> None:
@@ -269,6 +299,8 @@ def _time(args, rows: int, rank: int, tp: int, group, device) -> None:
             f"clean={all(c for _, c in medians)}",
             flush=True,
         )
+    if args.prof:
+        _profile(graph, runtimes, rows, rank)
     del graph
     dist.barrier(group=group)
     for rt in runtimes.values():
@@ -290,6 +322,9 @@ def main() -> int:
         default="model",
     )
     ap.add_argument("--rows", default="2,4,8", help="comma-separated widths")
+    ap.add_argument(
+        "--prof", action="store_true", help="stage stamps (a profiling build)"
+    )
     ap.add_argument("--layers", type=int, default=12, help="launches of one kind")
     ap.add_argument("--reps", type=int, default=200, help="graph replays a trial")
     ap.add_argument("--trials", type=int, default=7)
