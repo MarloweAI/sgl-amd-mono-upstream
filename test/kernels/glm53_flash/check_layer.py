@@ -16,7 +16,11 @@ gathered embedding rows, and writes the spec's step tables (``--step-rows``: the
 step's rows, fewer than the width); ``--check-head``: the tail's logits against a
 torch tail and an f32 tail; ``--replays N``: a graph of ``--layers`` launches
 replays the eager step bitwise; ``--verify L`` (``kda`` or ``dsa``): an MTP verify
-launch of L rows a request equals its tokens' L decode launches bitwise."""
+launch of L rows a request equals its tokens' L decode launches bitwise;
+``--kv-fp8`` (``dsa``): every sparse-attention launch on an E4M3 MLA cache;
+``--compare-kv-fp8``: a sparse-attention launch on an E4M3 MLA cache against the
+bf16 launch on the same keys in bf16: it writes its rows as the bf16 launch's cast
+to E4M3, and the index cache and kpool rings bitwise."""
 
 import argparse
 import os
@@ -237,10 +241,10 @@ MAX_LEN = 8192
 LENS = (4100, 1500, 2050, 7000, 2049, 64, 3333)
 
 
-def dsa_caches(rows: int, device, lens=None):
+def dsa_caches(rows: int, device, lens=None, kv_fp8: bool = False):
     """SGLang's DSA caches for ``rows`` requests of up to MAX_LEN tokens (256-token
     pages; page 0 is the padding page), its 64-token page table and the step's row
-    table."""
+    table; with ``kv_fp8`` the MLA cache in E4M3 (the same keys rounded)."""
     from sgl_amd_mono.glm53_flash.gfx950.config import (
         INDEX_DIM,
         KPOOL,
@@ -262,6 +266,8 @@ def dsa_caches(rows: int, device, lens=None):
     per = MAX_LEN // 256
     pages = 1 + rows * per
     kv = torch.randn(pages * 256, KV_LORA, generator=g, device=device).bfloat16()
+    if kv_fp8:
+        kv = kv.to(torch.float8_e4m3fn)
     idx = torch.zeros(pages, 64 * (INDEX_DIM + 4), dtype=torch.uint8, device=device)
     off = torch.arange(64, device=device)[:, None]
     d = torch.arange(INDEX_DIM, device=device)[None, :]
@@ -487,12 +493,13 @@ def compare_shuffled(args, rank, tp, group, device) -> bool:
         inter=GLOBAL_INTER // tp,
         dsa=True,
         max_pools=args.max_pools,
+        kv_fp8=args.kv_fp8,
         stop=False,
     )
     ffn, w = ffn_weights(rank, tp, device), dsa_weights(rank, tp, device)
     x, res, post, comb = layer_inputs(args.rows, device)
     lens = [int(v) for v in args.lens.split(",")] if args.lens else None
-    caches, table, pt = dsa_caches(args.rows, device, lens)
+    caches, table, pt = dsa_caches(args.rows, device, lens, args.kv_fp8)
     results = []
     for k, weights in (
         (key, w),
@@ -519,6 +526,68 @@ def compare_shuffled(args, rank, tp, group, device) -> bool:
         flush=True,
     )
     return same_out and same_cache and wrote
+
+
+def compare_kv_fp8(args, rank, tp, group, device) -> bool:
+    """One sparse-attention launch on an E4M3 MLA cache and one on the same keys in
+    bf16: the E4M3 launch writes each of its rows as the bf16 launch's row cast to
+    E4M3 (saturating, round to nearest even), the index cache and the kpool rings
+    bitwise as the bf16 launch; its outputs differ only by its own rows' rounding."""
+    from msgspec.structs import replace
+
+    from sgl_amd_mono.glm53_flash.gfx950.config import FP8_MAX
+    from sgl_amd_mono.glm53_flash.gfx950.kernel import FlashBuild
+    from sgl_amd_mono.glm53_flash.gfx950.runner import FlashLayerOp, FlashRuntime
+
+    key = FlashBuild(
+        rows=args.rows,
+        tp=tp,
+        launches_per_step=1,
+        inter=GLOBAL_INTER // tp,
+        dsa=True,
+        max_pools=args.max_pools,
+        stop=False,
+    )
+    ffn, w = ffn_weights(rank, tp, device), dsa_weights(rank, tp, device)
+    x, res, post, comb = layer_inputs(args.rows, device)
+    lens = [int(v) for v in args.lens.split(",")] if args.lens else None
+    c8, table, pt = dsa_caches(args.rows, device, lens, kv_fp8=True)
+    c16 = replace(c8, kv_cache=c8.kv_cache.bfloat16())
+    results = []
+    for k, c in ((key, c16), (replace(key, kv_fp8=True), c8)):
+        rt = FlashRuntime(k, rank, group, device)
+        rt.set_deadline(args.deadline)
+        op = FlashLayerOp(rt, ffn, 0, dsa=w)
+        c = replace(
+            c,
+            kv_cache=c.kv_cache.clone(),
+            idx_cache=c.idx_cache.clone(),
+            tail_k=c.tail_k.clone(),
+            tail_g=c.tail_g.clone(),
+        )
+        out = op.launch(x, res, post, comb, caches=c, rows=table, page_table=pt)
+        torch.cuda.synchronize()
+        results.append((tuple(t.clone() for t in out), c))
+        rt.close()
+    (out_a, c_a), (out_b, c_b) = results
+    want = c_a.kv_cache.float().clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
+    same_kv = torch.equal(_bits(want), _bits(c_b.kv_cache))
+    wrote = not torch.equal(_bits(c_b.kv_cache), _bits(c8.kv_cache))
+    same_rest = all(
+        torch.equal(getattr(c_a, n), getattr(c_b, n))
+        for n in ("idx_cache", "tail_k", "tail_g")
+    )
+    rel = max(
+        ((a.float() - b.float()).norm() / a.float().norm().clamp_min(1e-30)).item()
+        for a, b in zip(out_a, out_b)
+    )
+    finite = all(bool(torch.isfinite(t.float()).all()) for t in out_b)
+    print(
+        f"rank {rank}: fp8 KV vs bf16 KV: kv rows cast {same_kv} (written {wrote}), "
+        f"index and rings {same_rest}, outputs rel {rel:.3g}, finite {finite}",
+        flush=True,
+    )
+    return same_kv and wrote and same_rest and finite and rel < 5e-2
 
 
 # router weights and biases whose keys tie after bf16 rounding (see tie_router)
@@ -897,6 +966,7 @@ def build(args, kind, rank, tp, group, device, layers=1, shuffled=False):
         tokens=kind == "embed",
         head=kind == "head",
         grouped=args.rows >= GROUPED_FROM and not dense and kind != "head",
+        kv_fp8=args.kv_fp8 and dsa,
         stop=False,
     )
     rt = FlashRuntime(key, rank, group, device)
@@ -944,7 +1014,7 @@ def build(args, kind, rank, tp, group, device, layers=1, shuffled=False):
             lens = [int(v) for v in args.lens.split(",")] if args.lens else list(LENS)
             # the valid rows past the given lengths: SGLang's padding (slot 0)
             lens = lens[:valid] + [0] * (args.rows - min(valid, len(lens)))
-            caches, table, pt = dsa_caches(args.rows, device, lens)
+            caches, table, pt = dsa_caches(args.rows, device, lens, args.kv_fp8)
             # SGLang's page table has the step's rows; the width's pad rows read row 0
             pt = pt[:valid].clone()
             table[valid:, ROW_BT] = 0
@@ -1224,6 +1294,7 @@ def check_verify(args, rank, tp, group, device) -> bool:
             max_pools=0 if kda else args.max_pools,
             verify=verify,
             grouped=rows >= GROUPED_FROM,
+            kv_fp8=args.kv_fp8 and not kda,
             stop=False,
         )
         rt = FlashRuntime(key, rank, group, device)
@@ -1307,7 +1378,7 @@ def check_verify(args, rank, tp, group, device) -> bool:
 
     lens = [int(v) for v in args.lens.split(",")] if args.lens else list(LENS)
     lens = (lens * R)[:R]
-    caches, _, pt = dsa_caches(R, device, lens)
+    caches, _, pt = dsa_caches(R, device, lens, args.kv_fp8)
     ring = 4 + L
     g = _gen(11, device)
     tails = [
@@ -1368,15 +1439,20 @@ def check_verify(args, rank, tp, group, device) -> bool:
             if diff:
                 print(f"rank {rank}: token {j} output {n} differs by {diff}")
     for name in ("kv_cache", "idx_cache", "tail_k", "tail_g"):
-        same = torch.equal(getattr(vc, name), getattr(dc, name))
+        same = torch.equal(_bits(getattr(vc, name)), _bits(getattr(dc, name)))
         ok &= same
         print(f"rank {rank}: {name} equals the decode launches' {same}")
     print(f"rank {rank}: verify vs {L} decode launches ok {ok}", flush=True)
     return ok
 
 
+def _bits(t: torch.Tensor) -> torch.Tensor:
+    """An E4M3 tensor's bytes (compared as integers), else the tensor."""
+    return t.view(torch.uint8) if t.dtype == torch.float8_e4m3fn else t
+
+
 def _changed_rows(before: torch.Tensor, after: torch.Tensor) -> set:
-    d = (before != after).reshape(before.shape[0], -1).any(1)
+    d = (_bits(before) != _bits(after)).reshape(before.shape[0], -1).any(1)
     return set(d.nonzero().flatten().tolist())
 
 
@@ -1454,6 +1530,8 @@ def main() -> int:
     ap.add_argument(
         "--writes", action="store_true", help="check the rows a launch writes"
     )
+    ap.add_argument("--kv-fp8", action="store_true", help="dsa: an E4M3 MLA cache")
+    ap.add_argument("--compare-kv-fp8", action="store_true")
     args = ap.parse_args()
     MAX_LEN = args.max_len
     args.max_pools = args.max_pools or MAX_LEN // 4
@@ -1464,6 +1542,7 @@ def main() -> int:
     group = dist.new_group(backend="gloo")
     for flag, check in (
         (args.compare_shuffled, compare_shuffled),
+        (args.compare_kv_fp8, compare_kv_fp8),
         (args.check_routing, check_routing),
         (args.check_keys, check_keys),
         (args.check_dense, check_dense),
