@@ -81,6 +81,33 @@ def _kda_state(rows: int, tp: int, device, verify: int = 1):
     return state, idx
 
 
+def _fold(state, rows: int, tp: int, device, kept: int):
+    """``state`` on the fold-in-verify contract: a ring of its own a layer, every
+    request (ring row r for slot r + 1) with ``kept`` tokens to fold, the kept
+    window verified at the stock width of ``rows`` // 4 requests."""
+    from msgspec.structs import replace
+
+    from sgl_amd_mono.glm53_flash.gfx950.config import KDA_HEADS, KDA_PROJ
+    from sgl_amd_mono.glm53_flash.gfx950.runner import FlashKdaFold
+
+    P, H, R = KDA_PROJ // tp, KDA_HEADS // tp, rows // 4
+    g = cl._gen(13, device)
+    slots = state.rec_state.shape[0]
+    ring = [
+        (torch.randn(R, 4, n, generator=g, device=device) * s_).bfloat16()
+        for n, s_ in ((3 * P, 1.0), (P, 1.0), (H, 1.0))
+    ]
+    half = torch.full((R, H), int(R <= 2), dtype=torch.int32, device=device)
+    fold_len = torch.full((slots + 1,), kept, dtype=torch.int32, device=device)
+    rr = torch.arange(R, dtype=torch.int32, device=device)
+    return replace(
+        state,
+        inter_rec=None,
+        inter_conv=None,
+        fold=FlashKdaFold.make(*ring, half, fold_len, rr),
+    )
+
+
 def _verify_caches(rows: int, L: int, pos: int, device, kv_fp8: bool = False):
     """``check_layer``'s verify inputs: rows // L requests of pos + 1 tokens, request
     r's row j at pos + j, SGLang's verify page table (the request's row for each of
@@ -155,6 +182,7 @@ def _build(args, kinds: list, rows: int, rank: int, tp: int, group, device):
             and not (dense or head),
             verify=args.verify if kind in ("kda", "dsa") else 1,
             kv_fp8=args.kv_fp8 and dsa,
+            fold=args.fold >= 0 and kind == "kda" and args.verify > 1,
         )
         runtimes[kind] = FlashRuntime(key, rank, group, device)
         runtimes[kind].set_deadline(60.0)
@@ -185,6 +213,8 @@ def _build(args, kinds: list, rows: int, rank: int, tp: int, group, device):
         if kind == "kda":
             attn = cl.kda_weights(rank, tp, device)
             state, idx = _kda_state(rows, tp, device, args.verify)
+            if args.fold >= 0 and args.verify > 1:
+                state = _fold(state, rows, tp, device, args.fold)
             ops.append(FlashLayerOp(runtimes[kind], ffn, n, kda=attn))
             extra.append(dict(state=state, state_idx=idx))
         else:
@@ -262,7 +292,7 @@ def _time(args, rows: int, rank: int, tp: int, group, device) -> None:
             f"TIME kind={args.kind} rows={rows} verify={args.verify} tp={tp} "
             f"launches={len(kinds)} "
             f"pos={args.pos} fp8={'row-major' if args.row_major else 'in-place'} "
-            f"kv={'e4m3' if args.kv_fp8 else 'bf16'} "
+            f"kv={'e4m3' if args.kv_fp8 else 'bf16'} fold={args.fold} "
             f"us_per_launch median={median:.2f} min={min(per_launch):.2f} "
             f"max={max(per_launch):.2f} "
             f"slowest_rank_median={max(m for m, _ in medians):.2f} "
@@ -308,6 +338,12 @@ def main() -> int:
         help="kda, dsa or model: an MTP verify step's rows a request",
     )
     ap.add_argument("--kv-fp8", action="store_true", help="an E4M3 MLA cache")
+    ap.add_argument(
+        "--fold",
+        type=int,
+        default=-1,
+        help="kda with --verify: the fold-in-verify contract, this many kept tokens",
+    )
     args = ap.parse_args()
     assert args.verify == 1 or args.kind in ("kda", "dsa", "model"), (
         "--verify times kda, dsa or model launches"

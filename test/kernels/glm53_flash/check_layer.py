@@ -602,8 +602,13 @@ def check_fold(args, rank, tp, group, device) -> bool:
     verify output, every state, conv window and ring row bitwise equal. The
     monokernel's raw inputs (pre-conv q | k | v, a, b) are read from its
     mailboxes; SGLang's steps take random ones. Accept lengths 1-4 a request a
-    cycle; requests join fresh (nothing kept) and leave."""
+    cycle; requests join fresh (nothing kept) and leave. SGLang's readers of a
+    running state outside verify act on both arms alike: a retraction backup
+    (fold-first flush into the request's own slot, kept count 0, the state copied
+    out and back into another slot) and a no-buffer checkpoint (flush, then the
+    working slot copied to a checkpoint slot)."""
     from sglang.kernels.ops.attention.linear.kda_fold_verify_gfx950 import (
+        kda_fold_pending_gfx950,
         kda_fold_verify_gfx950,
     )
 
@@ -627,7 +632,8 @@ def check_fold(args, rank, tp, group, device) -> bool:
     T, D = 4, KDA_DIM
     P, H = KDA_PROJ // tp, KDA_HEADS // tp
     IN_ROWS = FlashShard(tp=tp).kda_in_rows
-    NR, SLOTS = 4, 6  # ring rows (requests 0..3), state slots 1..4 (+0 pad, spare)
+    NR, SLOTS = 4, 8  # ring rows (requests 0..3); slots 1..6 working, 7 checkpoint
+    CKPT = SLOTS - 1
     key = FlashBuild(
         rows=T,
         tp=tp,
@@ -705,14 +711,62 @@ def check_fold(args, rank, tp, group, device) -> bool:
         return sc[o : o + 2 * n_pairs : 2].clone().view(torch.float32)
 
     live = {}  # request (ring row) -> slot
+    free = list(range(1, CKPT))
     kinds = {}  # monokernel steps by (kept tokens, the kept tokens' width)
     o_abs = []
     ok, counts = True, {"mono": 0, "sglang": 0, "o": 0, "state": 0}
+    def flush(r):
+        """SGLang's KdaFoldState.flush: fold the kept tokens into the own slot."""
+        slot = live[r]
+        for a_ in (mix, ref):
+            kda_fold_pending_gfx950(
+                conv_weight=w.conv_w,
+                conv_state=a_["conv"].transpose(-1, -2),
+                src_indices=torch.tensor([slot], dtype=torch.int32, device=device),
+                dst_indices=torch.tensor([slot], dtype=torch.int32, device=device),
+                ring_rows=torch.tensor([r], dtype=torch.int32, device=device),
+                fold_len=a_["fl"][slot : slot + 1].clone(),
+                ring_x=a_["rx"],
+                ring_a=a_["ra"],
+                ring_b=a_["rb"],
+                ring_half=a_["rh"],
+                A_log=w.a_log,
+                dt_bias=w.dt_bias,
+                ssm_states=a_["rec"],
+                arrivals=a_["arr"],
+                num_heads=H,
+                lower_bound=KDA_LOWER_BOUND,
+            )
+            a_["fl"][slot] = 0
+
     for cyc in range(args.fold_cycles):
+        # readers of a running state outside verify
+        if live and torch.rand(1, generator=gc).item() < 0.2:
+            r = sorted(live)[int(torch.randint(len(live), (1,), generator=gc))]
+            kept = int(mix["fl"][live[r]])
+            flush(r)
+            old = live[r]
+            if torch.rand(1, generator=gc).item() < 0.5:
+                # retraction backup, then the state loaded back into another slot
+                new = free.pop(0)
+                for a_ in (mix, ref):
+                    for n_ in ("rec", "conv"):
+                        a_[n_][new] = a_[n_][old].clone()
+                    a_["fl"][new] = 0
+                live[r] = new
+                free.append(old)
+                counts["retract"] = counts.get("retract", 0) + 1
+            else:
+                # no-buffer checkpoint copy of the working slot
+                for a_ in (mix, ref):
+                    for n_ in ("rec", "conv"):
+                        a_[n_][CKPT] = a_[n_][old]
+                counts["ckpt"] = counts.get("ckpt", 0) + 1
+            counts["flushed_kept"] = counts.get("flushed_kept", 0) + int(kept > 0)
         # joins and leaves
         for r in range(NR):
             if r not in live and torch.rand(1, generator=gc).item() < 0.5:
-                slot = r + 1
+                slot = free.pop(0)
                 live[r] = slot
                 st = rnd(H, D, D, scale=0.05)
                 cv = rnd(3, 3 * P).bfloat16()
@@ -721,7 +775,7 @@ def check_fold(args, rank, tp, group, device) -> bool:
                     a_["conv"][slot] = cv
                     a_["fl"][slot] = 0
             elif r in live and torch.rand(1, generator=gc).item() < 0.15:
-                del live[r]
+                free.append(live.pop(r))
         if not live:
             continue
         reqs = sorted(live)
