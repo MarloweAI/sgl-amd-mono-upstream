@@ -2274,12 +2274,14 @@ def build_flash_kernel(key: FlashBuild):
             r_dtb = _rsrc(dt_bias)
             r_won = _rsrc(w_on)
             r_idx = _rsrc(state_idx)
-            for t in range(start("kda"), S * H, G):
+            # one task a (request, head), then a (pad row, head): indexed by request,
+            # so no two requests' heads share a CTA at any width
+            for t in range(start("kda"), NREQ * H + (S - NREQ * VL) * H, G):
                 t = fx.Int32(t)
-                s = t // H
+                req = t // H
                 h = t % H
-                if (s % VL == 0) & (s < NREQ * VL):
-                    req = s // VL
+                s = req * VL
+                if t < NREQ * H:
                     idx = kda_slot(r_idx, s)
                     valid = idx > 0
                     slot = fx.Int64(fx.max(idx, fx.Int32(0)))
@@ -2593,14 +2595,15 @@ def build_flash_kernel(key: FlashBuild):
                             signal("box_o_in", row * H + h)
                         gpu.barrier()
                 if const_expr(NREQ * VL < S):
-                    if s >= NREQ * VL:
+                    if t >= NREQ * H:
+                        pr = NREQ * VL + (t - NREQ * H) // H
                         if wave == 0:
                             put(
                                 mb("o_in"),
-                                (s * P + h * KD + 2 * lane) // 2,
+                                (pr * P + h * KD + 2 * lane) // 2,
                                 bf16_pair(fx.Float32(0.0), fx.Float32(0.0)),
                             )
-                            signal("box_o_in", t)
+                            signal("box_o_in", pr * H + h)
 
         def run_kda(then):
             """``then``: the CTA's o_proj task, run between the head's output and its
