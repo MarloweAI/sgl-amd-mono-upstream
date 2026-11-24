@@ -418,6 +418,9 @@ def build_flash_kernel(key: FlashBuild):
     # split tile, the pool select
     # (grouped: a unit's rows only, its MXFP8 input or mid)
     XQ_ROWS = UNIT_ROWS if GROUPED else S
+    # the sparse-attention o_proj stages its rows' o one head group at a time when
+    # all heads' rows would not fit beside the launch's other LDS (TP2 past 8 rows)
+    O_PASSES = HG if dsa and S * MH * V_DIM // 2 > 32768 else 1
     X_WORDS = max(
         HIDDEN // 2 + 64,
         XQ_ROWS * HIDDEN // 4,
@@ -427,7 +430,7 @@ def build_flash_kernel(key: FlashBuild):
         S * SH.dense_inter // 2 if dense else 0,
         S * P // 2 if kda else 0,
         S * KDA_DIM if kda else 0,
-        S * MH * V_DIM // 2 if dsa else 0,
+        S * MH * V_DIM // 2 // O_PASSES if dsa else 0,
         SPLIT_WORDS if dsa else 0,
         SEL_BINS + 2 * 2048 if dsa else 0,
     )
@@ -2307,8 +2310,32 @@ def build_flash_kernel(key: FlashBuild):
         # One task a 16-row tile of the row-major [HIDDEN, K] weight; the FFN seam
         # sums the TP partials as it does vLLM's. ``unit_of(row0, chunk)`` issues
         # one K chunk (``cpw`` a wave, prefetched ``ahead`` at a time) of the weight.
-        def run_oproj(unit_of, K, cpw, ahead, done=None):
-            """``done``: the CTA ran its task already (inside its kda task)."""
+        def stage_rows_part(box, K, KP, part):
+            """``stage_rows`` of K values ``part * KP ..`` of every row's bf16 [K]
+            vector into LDS words ``n * KP / 2 ..``."""
+            QR = KP // 4
+            n = S * QR // THREADS
+            assert n * THREADS == S * QR
+
+            def src(q):
+                return (q // QR) * (K // 2) + part * (KP // 2) + (q % QR) * 2
+
+            for g0 in range_constexpr(0, n, STAGE_GROUP):
+                group = range(g0, min(g0 + STAGE_GROUP, n))
+                got = poll([(box, src(tid + i * THREADS), 2) for i in group])
+                for k, i in enumerate(group):
+                    for j in range_constexpr(2):
+                        lds_st(
+                            xs,
+                            (tid + i * THREADS) * 2 + j,
+                            got[k][j].bitcast(fx.Float32),
+                        )
+
+        def run_oproj(unit_of, K, cpw, ahead, done=None, passes=1):
+            """``done``: the CTA ran its task already (inside its kda task). With
+            ``passes`` > 1 the rows' K values are staged a part at a time: in pass p
+            wave w runs chunks ``p * WAVES * cpw / passes + w * cpw / passes ..``
+            and ``unit_of(row0, chunk, p)`` reads part p's LDS rows."""
             attn_base = fx.Int64(SY["attn"]) + fx.Int64(peer_slot) * fx.Int64(
                 SY["_part_stride"]
             )
@@ -2319,10 +2346,14 @@ def build_flash_kernel(key: FlashBuild):
                 t = fx.Int32(t)
                 row0 = t * O_TILE
 
-                def u_o(c):
-                    return unit_of(row0, wave * cpw + c)
+                CPP = cpw // passes
 
-                pre = [u_o(c) for c in range(ahead)]
+                def u_o(c, p=0):
+                    if const_expr(passes == 1):
+                        return unit_of(row0, wave * cpw + c)
+                    return unit_of(row0, p * WAVES * CPP + wave * CPP + c, p)
+
+                pre = [u_o(c) for c in range(min(ahead, CPP))]
                 if const_expr(kda):
                     # wave w waits for lines w, w + WAVES, .. of the CTA's box (16
                     # kda heads' words a line), then every thread reads the payload
@@ -2334,9 +2365,22 @@ def build_flash_kernel(key: FlashBuild):
                                 [(_uniform(wave) + li * WAVES, 0, BOX_WORDS)],
                             )
                     gpu.barrier()
-                stage_rows(mb("o_in"), K)
-                gpu.barrier()
-                acc = run_units(u_o, cpw, ahead, pre)
+                if const_expr(passes == 1):
+                    stage_rows(mb("o_in"), K)
+                    gpu.barrier()
+                    acc = run_units(u_o, cpw, ahead, pre)
+                else:
+                    acc = [fx.Float32(0.0) for _ in range(4)]
+                    for p in range_constexpr(passes):
+                        stage_rows_part(mb("o_in"), K, K // passes, p)
+                        gpu.barrier()
+                        part = run_units(
+                            lambda c, p=p: u_o(c, p), CPP, min(ahead, CPP), pre
+                        )
+                        acc = [acc[e] + part[e] for e in range(4)]
+                        if const_expr(p + 1 < passes):
+                            pre = [u_o(c, p + 1) for c in range(min(ahead, CPP))]
+                            gpu.barrier()
                 reduce_rows(1, acc, emit_out(O_TILE))
                 gpu.barrier()
                 if wave < W:
@@ -4455,14 +4499,26 @@ def build_flash_kernel(key: FlashBuild):
             r_wo, r_so = _rsrc(tv["w_o"]), _rsrc(tv["s_o"])
             OK = MH * V_DIM
             O8_CPW = OK // (128 if O8 else 64) // WAVES
-            run_oproj(
-                lambda row0, kc: proj_unit(
-                    O8, r_wo, r_so, row0, kc, OK, HIDDEN, n_sel() * (OK // 2), O_SH
-                ),
-                OK,
-                O8_CPW,
-                min(4, O8_CPW),
-            )
+            if const_expr(O_PASSES == 1):
+                run_oproj(
+                    lambda row0, kc: proj_unit(
+                        O8, r_wo, r_so, row0, kc, OK, HIDDEN, n_sel() * (OK // 2), O_SH
+                    ),
+                    OK,
+                    O8_CPW,
+                    min(4, O8_CPW),
+                )
+            else:
+                # part p's rows hold K values p * OKP ..: chunk kc's B words start at
+                # the row's (kc - p * chunks a part) chunk
+                OKP = OK // O_PASSES
+                PCH = OKP // (128 if O8 else 64)
+
+                def o_unit(row0, kc, p):
+                    lw = n_sel() * (OKP // 2) - p * PCH * (64 if O8 else 32)
+                    return proj_unit(O8, r_wo, r_so, row0, kc, OK, HIDDEN, lw, O_SH)
+
+                run_oproj(o_unit, OK, O8_CPW, min(4, O8_CPW), passes=O_PASSES)
 
         def run_dsa():
             # the layer's argument table (entry i in lane i): pointers, then int32 geometry
@@ -4688,7 +4744,7 @@ def build_flash_kernel(key: FlashBuild):
                 )
 
             # a CTA with a kda task (at most one) runs its o_proj task inside it
-            assert S * H <= G
+            assert not OPROJ_IN_KDA or S * H <= G
             if const_expr(VERIFY):
                 run_kda_verify()
             else:

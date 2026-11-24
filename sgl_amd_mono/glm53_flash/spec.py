@@ -62,10 +62,9 @@ WIDTHS = (2, 4, 8, 12, 16)
 GROUPED_FROM = 9
 ROWS = tuple(range(1, max(WIDTHS) + 1))
 TP_SIZES = (2, 4, 8)
-# the rows a step runs on the kernels at most at this TP size: at TP2 a sparse-
-# attention launch of 8 rows does not fit the LDS, so wider steps run the model's
-# forward
-TP_MAX_ROWS = {2: 4}
+# the rows a step runs on the kernels at most at this TP size; wider steps run the
+# model's forward
+TP_MAX_ROWS = {2: 16}
 # SGLang's DSA cache: 256-token KV pages (an index page holds 64 kpool pools)
 PAGE_SIZE = 256
 
