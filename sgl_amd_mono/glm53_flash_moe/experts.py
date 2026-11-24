@@ -20,11 +20,20 @@ Workgroups (256 threads, 4 waves), in id order:
   block's 4th zeroes it.
 - Blocks from num_valid_ids[0] / 32 on exit at once and touch no counter.
 
-Weights are read nontemporal (streamed once). Output groups: after its atomics land, a G2 workgroup adds 2 on
+The shared expert (slot 288 of the sort) follows its own path in stock (SGLang's dense MLP): its weights are the
+dense layers' own (row-major fp4 [N, K/2], row-major e8m0 [N, K/32]); its G1 reads the activations quantized
+with even-rounded scales (``a1_even``), rounds gate and up to bf16, applies aiter's ``fused_clamp_act_mul`` (silu as
+x / (1 + exp2(-x log2 e)), correctly rounded division), rounds to bf16 and quantizes the intermediate with
+``dynamic_mxfp4_quant``'s even scales; its G2 rounds to bf16 and stores the shared rows (one route a token) to
+``shared_out``. The hook of a completed output group then writes bf16(f32(routed) + f32(shared)) for its rows.
+Tasks of the shared expert take their own code path (chosen by the block's expert id) and its blocks are dispatched
+first.
+
+Routed weights are read nontemporal (streamed once). Output groups: after its atomics land, a G2 workgroup adds 2 on
 ``count[i][s]`` for every 16-token tile i among its block's rows and every 256-column slab s it covers. The
 workgroup that brings it to ``tile_target[i]`` (2 x the sorted blocks holding a token of tile i: the front's sort
 gives it) zeroes it and runs ``hook(i, s)`` once rows 16 i .. 16 i + 15, columns 256 s .. + 255 have every route
-added (read them with sc1 loads). Every counter is 0 between launches."""
+added (read them with sc1 loads); it adds the shared rows. Every counter is 0 between launches."""
 
 import functools
 
@@ -46,7 +55,8 @@ SOURCES = kernel_sources(__name__)
 _STREAM = fx.Stream(None)
 
 THREADS = 256
-NE = 289  # 288 routed + the shared expert
+NE = 288  # routed experts
+SHARED = 288  # the shared expert's id in the sort
 I = 1024  # a rank's intermediate
 G1_N = 64  # intermediate columns of a G1 workgroup
 G1_WGS = I // G1_N  # G1 workgroups of a block
@@ -133,6 +143,21 @@ def _e8m0_ceil(amax):
     return e + ((e < 0xFF) & ((u & 0x7FFFFF) != 0)).select(fx.Int32(1), fx.Int32(0))
 
 
+def _e8m0_even(amax):
+    """``dynamic_mxfp4_quant``'s scale: the biased exponent of amax rounded to even, less 2, at least 0."""
+    raw = ((amax.bitcast(fx.Int32) + 0x200000) & -8388608) >> 23
+    raw = raw & 0xFF
+    return (raw >= 2).select(raw - 2, fx.Int32(0))
+
+
+def _silu_shared(gate, up, limit):
+    """aiter's ``fused_clamp_act_mul`` (silu) on bf16 gate / up: up in [-limit, limit], gate <= limit,
+    gate / (1 + exp2(-(gate log2 e))) * up."""
+    g = fx.min(bf16_round(gate), limit)
+    u = fx.max(fx.min(bf16_round(up), limit), -limit)
+    return g / (fx.Float32(1.0) + hw_exp2(-(g * fx.Float32(1.44269504089)))) * u
+
+
 def _fp4x4(v, scale):
     """Four f32 -> four E2M1 (two bytes) at the dequant ``scale``."""
     q = rocdl.cvt_scalef32_pk_fp4_f32(T.i32, fx.Int32(0), v[0], v[1], scale, 0)
@@ -141,10 +166,56 @@ def _fp4x4(v, scale):
 
 
 def hook(c, token_tile, slab):
-    """Runs on the workgroup that completed output rows 16 token_tile .., columns 256 slab ..: nothing yet."""
+    """Runs on the workgroup that completed output rows 16 token_tile .., columns 256 slab ..: every route of those
+    rows has landed (sc1 loads); adds the shared rows, f32 sum rounded once to bf16."""
+    a, tid = c["args"], c["tid"]
+    ro = rsrc(a["out"], fx.Int64(c["m"]) * (D * 2))
+    rsh = rsrc(a["shared"], fx.Int64(c["m"]) * (D * 2))
+    row = token_tile * 16 + tid // 16
+    for i in range_constexpr(2):
+        w = (row * (D * 2) + slab * 512 + (tid % 16) * 32 + i * 16) // 4
+        o = _load(ro, w, cm=CM_DEV)
+        sh = _load(rsh, w, cm=CM_DEV)
+        res = []
+        for d in range_constexpr(4):
+            lo = (o[d] << 16).bitcast(fx.Float32) + (sh[d] << 16).bitcast(fx.Float32)
+            hi = (o[d] & -65536).bitcast(fx.Float32) + (sh[d] & -65536).bitcast(fx.Float32)
+            res.append(fx.Vector.from_elements([lo, hi], fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)[0])
+        bo.buffer_store(fx.Vector.from_elements(res, fx.Int32), ro, w)
 
 
 # ---- G1 ----
+
+
+def _srcs(c, w, s, w_sh, s_sh, e, w_bytes, s_bytes):
+    """A task's weight and e8m0 sources: the routed expert's, or the shared expert's dense tensors."""
+    if const_expr(c["sh"]):
+        return {"rw": rsrc(w_sh), "rs": rsrc(s_sh)}
+    return {"rw": rsrc(w + e * w_bytes), "rs": rsrc(s + e * s_bytes)}
+
+
+def _w_load(c, rg, kc, k):
+    """This lane's 16 B of row group rg, K step kc (K = k): aiter's shuffle (streamed nontemporal), or the shared
+    expert's row-major rows (a row's 128 B line serves two K steps: cached)."""
+    lane = c["lane"]
+    if const_expr(c["sh"]):
+        return _load(c["rw"], (rg * 16 + lane % 16) * (k // 8) + kc * 16 + (lane // 16) * 4)
+    return _load(c["rw"], rg * (2 * k) + kc * 256 + lane * 4, cm=CM_NT)
+
+
+def _s_word(c, rg, kc, k):
+    """The e8m0 dword of row groups rg, rg + 1 and K steps kc, kc + 1 (kc, rg even; byte (kc % 2) * 2 + j): one
+    e8m0_shuffle dword, or (the shared expert) four bytes of its row-major scales."""
+    lane = c["lane"]
+    if const_expr(not c["sh"]):
+        return _load_word(c["rs"], ((rg // 2) * (k // 256) + kc // 2) * 64 + lane)
+    shift = (lane // 16) * 8
+    word = fx.Int32(0)
+    for j in range_constexpr(2):
+        v = fx.Vector(bo.buffer_load(c["rs"], ((rg + j) * 16 + lane % 16) * (k // 128) + kc // 2 * 2, 2, T.i32))
+        for h in range_constexpr(2):
+            word = word | (((v[h] >> shift) & 0xFF) << (8 * (h * 2 + j)))
+    return word
 
 
 def _g1_loads(c, step):
@@ -152,7 +223,7 @@ def _g1_loads(c, step):
     their scales, and (even steps) the gate / up scale dwords of the step pair."""
     lane, kc = c["lane"], c["k0"] + step
     w = [
-        _load(c["rw"], (c["rg"] + u * (I // 16) + j) * (2 * D) + kc * 256 + lane * 4, cm=CM_NT)
+        _w_load(c, c["rg"] + u * (I // 16) + j, kc, D)
         for u in range(2)
         for j in range(2)
     ]
@@ -160,7 +231,7 @@ def _g1_loads(c, step):
     xs = [_load_byte(c["ras"], t * (D // 32) + kc * 4 + lane // 16) for t in c["toks"]]
     s = None
     if const_expr(step % 2 == 0):
-        s = [_load_word(c["rs"], ((c["rp"] + u * (I // 32)) * (D // 256) + kc // 2) * 64 + lane) for u in range(2)]
+        s = [_s_word(c, c["rg"] + u * (I // 16), kc, D) for u in range(2)]
     return w, x, xs, s
 
 
@@ -169,15 +240,17 @@ def _g1_epilogue(c, blk, nt, acc):
     lane, g = c["lane"], c["wave"] // 2
     neg = -c["limit"]
     rm = rsrc(c["args"]["mid"], MID_BYTES)
+    sh = c["sh"]
+    act = (lambda g_, u_: _silu_shared(g_, u_, c["limit"])) if sh else (lambda g_, u_: _silu(g_, u_, neg))
     for rt in range_constexpr(2):
         row = blk * BM + rt * 16 + lane % 16
-        vals = [[bf16_round(_silu(acc[0][j][rt][i], acc[1][j][rt][i], neg)) for i in range(4)] for j in range(2)]
-        amax = fx.Float32(1e-10)
+        vals = [[bf16_round(act(acc[0][j][rt][i], acc[1][j][rt][i])) for i in range(4)] for j in range(2)]
+        amax = fx.Float32(0.0 if sh else 1e-10)
         for j in range_constexpr(2):
             for i in range_constexpr(4):
                 amax = fx.max(amax, fx.max(vals[j][i], -vals[j][i]))
         amax = xred(xred(amax, 16, fx.max), 32, fx.max)
-        e = _e8m0_ceil(amax)
+        e = _e8m0_even(amax) if const_expr(sh) else _e8m0_ceil(amax)
         scale = (e << 23).bitcast(fx.Float32)
         for j in range_constexpr(2):
             off = row * MID_ROW + nt * (G1_N // 2) + g * 16 + j * 8 + (lane // 16) * 2
@@ -223,20 +296,20 @@ def _count_block(c, cnt):
         _add_agent(cnt)
 
 
-def _g1_tile(c, blk, nt):
-    """G1 tile (block ``blk``, intermediate columns 64 ``nt`` ..), then its count on the block's counter."""
+def _g1_tile(c, blk, nt, e, sh):
+    """G1 tile (block ``blk``, intermediate columns 64 ``nt`` .., expert ``e``; ``sh``: the shared expert's path),
+    then its count on the block's counter."""
     a, lane, wave = c["args"], c["lane"], c["wave"]
-    e = fx.Int64(uniform(ld_i32(a["seids"], blk)))
     g, h = wave // 2, wave % 2
+    k = {**c, "sh": sh}
     k = {
-        **c,
-        "rw": rsrc(a["w13"] + e * W13_BYTES),
-        "rs": rsrc(a["s13"] + e * S13_BYTES),
-        "ra": rsrc(a["a1"], fx.Int64(c["m"]) * (D // 2)),
-        "ras": rsrc(a["a1s"], fx.Int64(c["m"]) * (D // 32)),
+        **k,
+        **_srcs(k, a["w13"], a["s13"], a["w13sh"], a["s13sh"], e, W13_BYTES, S13_BYTES),
+        # the shared expert's activations: x quantized with even scales
+        "ra": rsrc(a["a1e"] if sh else a["a1"], fx.Int64(c["m"]) * (D // 2)),
+        "ras": rsrc(a["a1es"] if sh else a["a1s"], fx.Int64(c["m"]) * (D // 32)),
         "toks": [ld_i32(a["sids"], blk * BM + rt * 16 + lane % 16) & 0xFFFFFF for rt in range(2)],
         "rg": nt * (G1_N // 16) + 2 * g,  # the gate row group of j = 0 (16 weight rows)
-        "rp": nt * (G1_N // 32) + g,  # its e8m0 row-group pair
         "k0": h * G1_STEPS,
     }
     zero = fx.Vector.filled(4, 0.0, fx.Float32)
@@ -264,7 +337,11 @@ def _g1_tile(c, blk, nt):
 @flyc.jit
 def gemm1(c, blk, nt):
     if blk * BM < c["nv"]:
-        _g1_tile(c, blk, nt)
+        ei = uniform(ld_i32(c["args"]["seids"], blk))
+        if ei == SHARED:
+            _g1_tile(c, blk, nt, fx.Int64(ei), True)
+        else:
+            _g1_tile(c, blk, nt, fx.Int64(ei), False)
 
 
 # ---- G2 ----
@@ -326,10 +403,10 @@ def _g2_loads(c, step):
     (even K steps) the scale dword of the K step pair."""
     lane, n, kc = c["lane"], step // G2_STEPS, step % G2_STEPS
     rg = c["rg"] + n * (G2_N // 16)
-    w = [_load(c["rw"], (rg + j) * (2 * I) + kc * 256 + lane * 4, cm=CM_NT) for j in range(2)]
+    w = [_w_load(c, rg + j, kc, I) for j in range(2)]
     s = None
     if const_expr(kc % 2 == 0):
-        s = _load_word(c["rs"], ((rg // 2) * (I // 256) + kc // 2) * 64 + lane)
+        s = _s_word(c, rg, kc, I)
     return w, s
 
 
@@ -356,25 +433,35 @@ def _g2_x(c, rt, kc):
 
 
 def _g2_combine(c, acc, toks, tws, ro, n):
-    """weight x sum of tile ``n`` as bf16 pairs added into the output."""
+    """weight x sum of tile ``n`` as bf16 pairs: added into the output, or (the shared expert, weight 1) stored to
+    its rows of ``shared_out`` (written through); the other access falls outside its buffer."""
+    rsh = rsrc(c["args"]["shared"], fx.Int64(c["m"]) * (D * 2))
     for rt in range_constexpr(2):
         for j in range_constexpr(2):
             col = (c["rg"] + n * (G2_N // 16) + j) * 16 + (c["lane"] // 16) * 4
-            for p in range_constexpr(2):
-                pair = fx.Vector.from_elements(
+            off = toks[rt] * (D * 2) + col * 2
+            pairs = [
+                fx.Vector.from_elements(
                     [acc[j][rt][2 * p] * tws[rt], acc[j][rt][2 * p + 1] * tws[rt]], fx.Float32
                 ).to(fx.BFloat16)
-                rocdl.raw_ptr_buffer_atomic_fadd(pair, ro, toks[rt] * (D * 2) + (col + 2 * p) * 2, 0)
+                for p in range(2)
+            ]
+            if const_expr(c["sh"]):
+                both = fx.Vector.from_elements([pairs[p].bitcast(fx.Int32)[0] for p in range(2)], fx.Int32)
+                bo.buffer_store(both, rsh, off, cache_modifier=CM_SYS, offset_is_bytes=True)
+            else:
+                for p in range_constexpr(2):
+                    rocdl.raw_ptr_buffer_atomic_fadd(pairs[p], ro, off + 4 * p, 0)
 
 
-def _g2_tile(c, blk, q):
-    """G2 workgroup (block ``blk``, output columns 512 ``q`` ..) once the block's G1 tiles are in."""
+def _g2_tile(c, blk, q, e, sh):
+    """G2 workgroup (block ``blk``, output columns 512 ``q`` .., expert ``e``; ``sh``: the shared expert's path) once
+    the block's G1 tiles are in."""
     a, lane, wave = c["args"], c["lane"], c["wave"]
-    e = fx.Int64(uniform(ld_i32(a["seids"], blk)))
+    k = {**c, "sh": sh}
     k = {
-        **c,
-        "rw": rsrc(a["w2"] + e * W2_BYTES),
-        "rs": rsrc(a["s2"] + e * S2_BYTES),
+        **k,
+        **_srcs(k, a["w2"], a["s2"], a["w2sh"], a["s2sh"], e, W2_BYTES, S2_BYTES),
         "rg": q * (G2_SPAN * G2_N // 16) + 2 * wave,  # the wave's first w2 row group (16 output columns)
     }
     steps = G2_SPAN * G2_STEPS
@@ -411,16 +498,28 @@ def _g2_tile(c, blk, q):
 @flyc.jit
 def gemm2(c, blk, q):
     if blk * BM < c["nv"]:
-        _g2_tile(c, blk, q)
+        ei = uniform(ld_i32(c["args"]["seids"], blk))
+        if ei == SHARED:
+            _g2_tile(c, blk, q, fx.Int64(ei), True)
+        else:
+            _g2_tile(c, blk, q, fx.Int64(ei), False)
+
+
+def _block_order(c, b):
+    """Workgroup block slot b -> sorted block: the shared expert's blocks (the sort's last, one per 32 rows) first,
+    so its tiles, on the dense layout's slower stream, start earliest."""
+    nb = c["nv"] // BM
+    ns = fx.min((c["m"] + BM - 1) // BM, nb)
+    return (b < nb).select((b + nb - ns) % fx.max(nb, 1), b)
 
 
 @flyc.jit
 def _run(c, bid):
     g1 = c["blocks"] * G1_WGS
     if bid < g1:
-        gemm1(c, bid // G1_WGS, bid % G1_WGS)
+        gemm1(c, _block_order(c, bid // G1_WGS), bid % G1_WGS)
     else:
-        gemm2(c, (bid - g1) // G2_WGS, (bid - g1) % G2_WGS)
+        gemm2(c, _block_order(c, (bid - g1) // G2_WGS), (bid - g1) % G2_WGS)
 
 
 @functools.cache
@@ -433,16 +532,18 @@ def build():
 
     @flyc.kernel(name="glm53f_moe_experts", known_block_size=[THREADS, 1, 1])
     def kexperts(
-        a1: Int64, a1s: Int64, sids: Int64, sw: Int64, seids: Int64, nvalid: Int64, w13: Int64, w2: Int64,
-        s13: Int64, s2: Int64, out: Int64, mid: Int64, ws: Int64, target: Int64, m: Int32, blocks: Int32,
+        a1: Int64, a1s: Int64, a1e: Int64, a1es: Int64, sids: Int64, sw: Int64, seids: Int64, nvalid: Int64,
+        w13: Int64, w2: Int64, s13: Int64, s2: Int64, w13sh: Int64, s13sh: Int64, w2sh: Int64, s2sh: Int64,
+        out: Int64, shared: Int64, mid: Int64, ws: Int64, target: Int64, m: Int32, blocks: Int32,
         limit: Float32,
     ):  # fmt: skip
         _ = keyed
         tid = fx.Int32(fx.thread_idx.x)
         lds = fx.SharedAllocator().allocate(Lds).peek()
         args = {
-            "a1": a1, "a1s": a1s, "sids": sids, "sw": sw, "seids": seids, "w13": w13, "w2": w2, "s13": s13,
-            "s2": s2, "out": out, "mid": mid, "ws": ws, "target": target,
+            "a1": a1, "a1s": a1s, "a1e": a1e, "a1es": a1es, "sids": sids, "sw": sw, "seids": seids, "w13": w13,
+            "w2": w2, "s13": s13, "s2": s2, "w13sh": w13sh, "s13sh": s13sh, "w2sh": w2sh, "s2sh": s2sh, "out": out,
+            "shared": shared, "mid": mid, "ws": ws, "target": target,
         }  # fmt: skip
         c = {
             "args": args, "tid": tid, "lane": tid % 64, "wave": uniform(tid // 64), "m": m, "blocks": blocks,
@@ -452,13 +553,15 @@ def build():
 
     @flyc.jit
     def launch(
-        a1: Int64, a1s: Int64, sids: Int64, sw: Int64, seids: Int64, nvalid: Int64, w13: Int64, w2: Int64,
-        s13: Int64, s2: Int64, out: Int64, mid: Int64, ws: Int64, target: Int64, m: Int32, blocks: Int32,
+        a1: Int64, a1s: Int64, a1e: Int64, a1es: Int64, sids: Int64, sw: Int64, seids: Int64, nvalid: Int64,
+        w13: Int64, w2: Int64, s13: Int64, s2: Int64, w13sh: Int64, s13sh: Int64, w2sh: Int64, s2sh: Int64,
+        out: Int64, shared: Int64, mid: Int64, ws: Int64, target: Int64, m: Int32, blocks: Int32,
         limit: Float32, stream: fx.Stream = _STREAM,
     ):  # fmt: skip
         _ = keyed
         kexperts(
-            a1, a1s, sids, sw, seids, nvalid, w13, w2, s13, s2, out, mid, ws, target, m, blocks, limit
+            a1, a1s, a1e, a1es, sids, sw, seids, nvalid, w13, w2, s13, s2, w13sh, s13sh, w2sh, s2sh, out, shared, mid,
+            ws, target, m, blocks, limit,
         ).launch(grid=(blocks * WGS,), block=(THREADS,), stream=stream)
 
     return launch
@@ -466,11 +569,12 @@ def build():
 
 @functools.cache
 def workspace(device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
-    """(counters, zeroed and left zeroed by every launch; the intermediate). Made once a device, outside graph
-    capture (SGLang warms up eagerly first)."""
+    """(counters, zeroed and left zeroed by every launch; the intermediate; the shared expert's rows). Made once a
+    device, outside graph capture (SGLang warms up eagerly first)."""
     return (
         torch.zeros(COUNTER_WORDS, dtype=torch.int32, device=device),
         torch.empty(MID_BYTES, dtype=torch.uint8, device=device),
+        torch.empty(MAX_ROWS, D, dtype=torch.bfloat16, device=device),
     )
 
 
@@ -489,6 +593,8 @@ def tile_targets(sorted_ids: torch.Tensor, num_valid_ids: torch.Tensor, m: int) 
 def experts(
     a1: torch.Tensor,
     a1_scale: torch.Tensor,
+    a1_even: torch.Tensor,
+    a1_even_scale: torch.Tensor,
     sorted_ids: torch.Tensor,
     sorted_weights: torch.Tensor,
     sorted_expert_ids: torch.Tensor,
@@ -497,23 +603,34 @@ def experts(
     w2: torch.Tensor,
     w13_scale: torch.Tensor,
     w2_scale: torch.Tensor,
+    w13_shared: torch.Tensor,
+    w13_shared_scale: torch.Tensor,
+    w2_shared: torch.Tensor,
+    w2_shared_scale: torch.Tensor,
     moe_buf: torch.Tensor,
     swiglu_limit: float | None,
     tile_target: torch.Tensor,
 ) -> torch.Tensor:
     """The experts on the front's outputs (``front``'s names): a1 [M, 2048] fp4x2 and its per-token e8m0 [M, 128],
-    the sort, Quark's w4a4 weights [289, ...] as aiter shuffles them, ``moe_buf`` [M, 4096] bf16 zeroed (added
+    the same with even-rounded scales for the shared expert (``a1_even``, ``a1_even_scale``),
+    the sort, Quark's w4a4 routed weights [288, ...] as aiter shuffles them, the shared expert's dense weights as
+    SGLang's linear layers hold them (gate_up [2048, 2048] fp4x2 / [2048, 128] e8m0, down [4096, 512] / [4096, 32],
+    row-major), ``moe_buf`` [M, 4096] bf16 zeroed (added
     into), ``tile_target`` int32 [16] (the front's, or ``tile_targets``). Returns ``moe_buf``."""
     m = a1.shape[0]
     blocks = sorted_expert_ids.shape[0]
     assert 1 <= m <= MAX_ROWS and blocks <= MAX_BLOCKS and sorted_ids.shape[0] == blocks * BM
     assert w13.shape[0] == NE and w13.numel() * w13.element_size() == NE * W13_BYTES
     assert w2.numel() * w2.element_size() == NE * W2_BYTES and moe_buf.shape == (m, D)
-    counters, mid = workspace(a1.device)
+    assert w13_shared.numel() * w13_shared.element_size() == W13_BYTES and w13_shared_scale.numel() == S13_BYTES
+    assert w2_shared.numel() * w2_shared.element_size() == W2_BYTES and w2_shared_scale.numel() == S2_BYTES
+    counters, mid, shared_rows = workspace(a1.device)
     build()(
-        a1.data_ptr(), a1_scale.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(),
-        sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w13.data_ptr(), w2.data_ptr(),
-        w13_scale.data_ptr(), w2_scale.data_ptr(), moe_buf.data_ptr(), mid.data_ptr(), counters.data_ptr(),
+        a1.data_ptr(), a1_scale.data_ptr(), a1_even.data_ptr(), a1_even_scale.data_ptr(), sorted_ids.data_ptr(),
+        sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w13.data_ptr(),
+        w2.data_ptr(), w13_scale.data_ptr(), w2_scale.data_ptr(), w13_shared.data_ptr(), w13_shared_scale.data_ptr(),
+        w2_shared.data_ptr(), w2_shared_scale.data_ptr(), moe_buf.data_ptr(), shared_rows.data_ptr(),
+        mid.data_ptr(), counters.data_ptr(),
         tile_target.data_ptr(), m, blocks, float(swiglu_limit) if swiglu_limit else float("inf"),
         torch.cuda.current_stream(),
     )  # fmt: skip
