@@ -36,6 +36,8 @@ SGLANG_READS = {
     "srt/mem_cache/memory_pool.py": (
         "conv",
         "temporal",
+        "intermediate_ssm",
+        "intermediate_conv_window",
         "get_key_buffer",
         "get_index_k_with_scale_buffer",
         "get_compress_tail_buffers",
@@ -88,8 +90,10 @@ def _outputs(name: str, a: torch.Tensor, b: torch.Tensor) -> dict[str, dict]:
     return {"index": _metrics(_index_keys(a), _index_keys(b))}
 
 
-def _regions(L, forward_batch, S: int, state_idx) -> dict:
-    """The cache entries the layer writes this step: name -> (tensor, index)."""
+def _regions(L, forward_batch, S: int, state_idx, verify: int = 1) -> dict:
+    """The cache entries the layer writes this step: name -> (tensor, index). A KDA
+    verify step writes its requests' per-draft-row states (SGLang's intermediate
+    caches, request r at row r), not the states."""
     from sglang.srt.model_executor.forward_context import (
         get_attn_backend,
         get_token_to_kv_pool,
@@ -97,6 +101,12 @@ def _regions(L, forward_batch, S: int, state_idx) -> dict:
 
     if L.kda:
         cache = get_attn_backend().linear_attn_backend.state_layer_cache(L.i)
+        if verify > 1:
+            req = torch.arange(S // verify, device=state_idx.device)
+            return {
+                "conv": (cache.intermediate_conv_window[0], req),
+                "state": (cache.intermediate_ssm, req),
+            }
         sel = state_idx[state_idx > 0].long()
         return {"conv": (cache.conv[0], sel), "state": (cache.temporal, sel)}
     pool = get_token_to_kv_pool()
@@ -105,7 +115,9 @@ def _regions(L, forward_batch, S: int, state_idx) -> dict:
     slots = loc[valid].long()
     kv = pool.get_key_buffer(L.i)
     tail_k, tail_g = pool.get_compress_tail_buffers(L.i)
-    req = forward_batch.req_pool_indices[:S][valid].long()
+    # a verify step's request rows are its requests' (one a request), the rows' each
+    req = forward_batch.req_pool_indices[: S // verify].repeat_interleave(verify)
+    req = req[valid].long()
     return {
         "kv": (kv.view(kv.shape[0], -1), slots),
         "index": (
@@ -117,7 +129,9 @@ def _regions(L, forward_batch, S: int, state_idx) -> dict:
     }
 
 
-def reference(L, positions, hidden_in, forward_batch, S: int, state_idx) -> dict:
+def reference(
+    L, positions, hidden_in, forward_batch, S: int, state_idx, verify: int = 1
+) -> dict:
     """The normal layer's outputs on ``hidden_in`` (the written streams, or layer 0's
     embedded tokens); the caches are restored after."""
     from sglang.srt.layers.layer_boundary.residual.batch import (
@@ -127,7 +141,7 @@ def reference(L, positions, hidden_in, forward_batch, S: int, state_idx) -> dict
     )
     from sglang.srt.utils.common import BumpAllocator
 
-    regions = _regions(L, forward_batch, S, state_idx)
+    regions = _regions(L, forward_batch, S, state_idx, verify)
     saved = {name: t[idx].clone() for name, (t, idx) in regions.items()}
     if L.i == 0:
         start(forward_batch)
@@ -259,6 +273,7 @@ def compare(
     forward_batch,
     S: int,
     state_idx,
+    verify: int = 1,
 ) -> None:
     from sglang.srt.runtime_context import get_parallel
 
@@ -266,7 +281,7 @@ def compare(
     if get_parallel().tp_rank != 0:
         return
     outputs = _outputs("streams", streams, ref["streams"])
-    for name, (t, idx) in _regions(L, forward_batch, S, state_idx).items():
+    for name, (t, idx) in _regions(L, forward_batch, S, state_idx, verify).items():
         outputs.update(_outputs(name, t[idx], ref[name]))
     if x32 is not None:
         outputs["x_vs_fp32"] = _metrics(out[0][:S], x32)
