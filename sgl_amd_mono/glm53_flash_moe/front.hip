@@ -4,8 +4,9 @@
 // as slot 288 when SHARED), the rows' MXFP4 activation quant and the zeroed MoE output.
 //
 // CTA roles, in id order (a CTA waits only on CTAs with lower ids):
-// - router (g, n, s): row tiles g RB .. (RB = ceil(R / 4)), experts 16 n.., K slice s of 4: its 8 waves' MFMA sums
-//   added in wave order -> f32 partial logits; counts itself on each of its row tiles. Never waits.
+// - router (g, n, s): row tiles g RB .. (RB = ceil(R / 3) up to 12 row tiles, else 4), experts 16 n.., K slice s
+//   of 4: its 8 waves' MFMA sums added in wave order -> f32 partial logits; counts itself on each of its row
+//   tiles. Never waits.
 // - top-k (8 rows each): quantizes its rows (x bf16 -> MXFP4 a1 [M, 2048 B] and per-token e8m0 scales [M, 128]) and
 //   zeroes their MoE output while the router runs; then, once its row tile's 72 router tiles are counted, sums the
 //   K slices in order and picks each row's top 8, a wave a row. The last top-k CTA to finish sorts every route.
@@ -738,8 +739,9 @@ void check(const at::Tensor &t, at::ScalarType dt, int64_t numel, const char *na
                 ": a contiguous tensor of >= ", numel, " elements of the right dtype on the GPU");
 }
 
-// Row tiles a router CTA takes: at most 4 row groups, so 72-288 router CTAs.
-int row_tiles_per_cta(int R) { return (R + 3) / 4; }
+// Row tiles a router CTA takes: at most 3 row groups up to 192 rows (at most 216 router CTAs, so they and the top-k
+// CTAs each have a CU), 4 above.
+int row_tiles_per_cta(int R) { return R <= 12 ? (R + 2) / 3 : RB_MAX; }
 
 void front(const at::Tensor &x, const at::Tensor &w, const at::Tensor &bias, double scale,
            const c10::optional<at::Tensor> &valid, at::Tensor &partial, at::Tensor &logits, at::Tensor &topk_ids,

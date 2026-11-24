@@ -69,13 +69,6 @@ def capacity(m: int, k: int = TOPK) -> int:
     return (p + min(ne, p) * (BM - 1) + BM - 1) // BM * BM
 
 
-def partial_floats(m: int) -> int:
-    """The router's f32 partials: row groups of ceil(R / 4) row tiles x 18 expert tiles x 4 K slices."""
-    r = (m + 15) // 16
-    rb = (r + 3) // 4
-    return (r + rb - 1) // rb * (E // 16) * 4 * rb * 256
-
-
 @functools.cache
 def _counters(device: torch.device) -> torch.Tensor:
     # every counter is 0 between launches. Made outside graph capture (SGLang warms up eagerly first).
