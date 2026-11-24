@@ -421,13 +421,15 @@ def build_flash_kernel(key: FlashBuild):
     # the sparse-attention o_proj stages its rows' o one head group at a time when
     # all heads' rows would not fit beside the launch's other LDS (TP2 past 8 rows)
     O_PASSES = HG if dsa and S * MH * V_DIM // 2 > 32768 else 1
+    # and the dense MLP's down its rows' mid one half of K at a time
+    DN_PASSES = 2 if dense and S * SH.dense_inter // 2 > 32768 else 1
     X_WORDS = max(
         HIDDEN // 2 + 64,
         XQ_ROWS * HIDDEN // 4,
         S * ROW_TILE * (1 + 2 * HC_MULT) + HC_MULT * N_MIX * (ROW_TILE + 4),
         (UNIT_ROWS * expert_inter // 4 if GROUPED else down_x_words(S, expert_inter)),
         S * HIDDEN // 2 if whole or head else 0,
-        S * SH.dense_inter // 2 if dense else 0,
+        S * SH.dense_inter // 2 // DN_PASSES if dense else 0,
         S * P // 2 if kda else 0,
         S * KDA_DIM if kda else 0,
         S * MH * V_DIM // 2 // O_PASSES if dsa else 0,
@@ -4855,10 +4857,42 @@ def build_flash_kernel(key: FlashBuild):
                         unit = (fmt, wv, live.select(sc, fx.Float32(0.0)), bw)
                     return unit
 
-                pre = [u_dn(c) for c in range(DDN_CPW)]
-                stage_rows(mb("dmid"), DI)
-                gpu.barrier()
-                acc = run_units(u_dn, DDN_CPW, DDN_CPW, pre)
+                if const_expr(DN_PASSES == 1):
+                    pre = [u_dn(c) for c in range(DDN_CPW)]
+                    stage_rows(mb("dmid"), DI)
+                    gpu.barrier()
+                    acc = run_units(u_dn, DDN_CPW, DDN_CPW, pre)
+                else:
+                    # pass p: K blocks p * DKP .., wave w its CPP blocks of them; the
+                    # LDS rows hold the pass's DKP blocks
+                    DKP = DDN_KB // DN_PASSES
+                    CPP = DKP // WAVES
+                    assert CPP * WAVES == DKP
+
+                    def u_dnp(c, p):
+                        kb = p * DKP + wave * CPP + c
+                        return unit_fp8_rm(
+                            r_dn,
+                            r_dns,
+                            row0,
+                            kb,
+                            DI,
+                            HIDDEN,
+                            n_sel() * (DKP * 64) + (wave * CPP + c) * 64,
+                            DDN_KB,
+                            DENSE_SH,
+                        )
+
+                    pre = [u_dnp(c, 0) for c in range(CPP)]
+                    acc = [fx.Float32(0.0) for _ in range(4)]
+                    for p in range_constexpr(DN_PASSES):
+                        stage_rows_part(mb("dmid"), DI, DI // DN_PASSES, p)
+                        gpu.barrier()
+                        part = run_units(lambda c, p=p: u_dnp(c, p), CPP, CPP, pre)
+                        acc = [acc[e] + part[e] for e in range(4)]
+                        if const_expr(p + 1 < DN_PASSES):
+                            pre = [u_dnp(c, p + 1) for c in range(CPP)]
+                            gpu.barrier()
                 reduce_rows(1, acc, emit_out(DN_TILE))
                 gpu.barrier()
                 peer_reduce("ffn", t, store_x, DN_TILE)
