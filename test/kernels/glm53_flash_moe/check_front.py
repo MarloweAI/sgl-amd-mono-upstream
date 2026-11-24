@@ -150,6 +150,10 @@ def check_front(rows, shared=False):
         idx = torch.tensor(idx, dtype=torch.long)
         if not torch.equal(sr_b[idx], mine[idx]):
             msgs.append(f"sorted scales differ: {(sr_b[idx] != mine[idx]).sum().item()} of {len(idx)}")
+        from sgl_amd_mono.glm53_flash_moe.experts import tile_targets
+
+        if not torch.equal(f["tile_target"], tile_targets(f["sorted_ids"], f["num_valid_ids"], m)):
+            msgs.append(f"tile_target {f['tile_target'].tolist()}")
         if f["moe_buf"].abs().sum().item() != 0:
             msgs.append("moe_buf not zeroed")
         print(f"front m={m} shared={shared}: {'OK' if not msgs else '; '.join(sorted(set(msgs)))}", flush=True)

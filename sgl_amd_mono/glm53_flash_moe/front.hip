@@ -392,7 +392,7 @@ struct SortLds {
     int     base[E + 1];
     int16_t block_e[MAX_BLOCKS];
     int     wsum[WAVES];
-    int     tiles[MAX_ROWS / 16];
+    uint32_t tile_blocks[MAX_ROWS / 16][(MAX_BLOCKS + 31) / 32]; // the sorted blocks holding a token of each tile
 };
 
 // Inclusive scan across a wave (row shifts, then row broadcasts).
@@ -436,6 +436,7 @@ __device__ void sort_routes(const Params &p, SortLds &s) {
     const int P   = p.M * K;
     const int mw  = (p.M + 31) / 32;
     for (int i = tid; i < NE * MW; i += THREADS) s.mask[i] = 0;
+    for (int i = tid; i < (MAX_ROWS / 16) * ((MAX_BLOCKS + 31) / 32); i += THREADS) (&s.tile_blocks[0][0])[i] = 0;
     __syncthreads();
     // every route's expert and weight, all loads in flight at once
     int   es[PR];
@@ -482,6 +483,8 @@ __device__ void sort_routes(const Params &p, SortLds &s) {
             for (int i = 0; i < t / 32; ++i) rank += __popc(s.mask[ex * MW + i]);
             rank += __popc(s.mask[ex * MW + t / 32] & ((1u << (t % 32)) - 1u));
             dest[k] = s.base[ex] * BM + rank;
+            const int b = dest[k] / BM;
+            atomicOr(&s.tile_blocks[t / 16][b / 32], 1u << (b % 32));
         }
     }
     __syncthreads(); // the masks are read; their space takes the row -> route map
@@ -516,20 +519,11 @@ __device__ void sort_routes(const Params &p, SortLds &s) {
         st_dev(p.num_valid, nv);
         st_dev(p.num_valid + 1, p.M);
     }
-    // each block's 16-token tiles, counted once a block (the row -> route map is final above)
-    if (tid < MAX_ROWS / 16) s.tiles[tid] = 0;
-    __syncthreads();
-    for (int b = tid; b < run; b += THREADS) {
-        const int ex = s.block_e[b], first = b * BM - s.base[ex] * BM, live = min(BM, s.cnt[ex] - first);
-        uint32_t seen = 0;
-        for (int j = 0; j < live; ++j) seen |= 1u << ((s.row_route[b * BM + j] / K) / 16);
-        while (seen) {
-            atomicAdd(&s.tiles[__builtin_ctz(seen)], 1);
-            seen &= seen - 1;
-        }
+    if (tid < MAX_ROWS / 16) {
+        int n = 0;
+        for (int w = 0; w < (run + 31) / 32; ++w) n += __popc(s.tile_blocks[tid][w]);
+        p.tile_target[tid] = 2 * n;
     }
-    __syncthreads();
-    if (tid < MAX_ROWS / 16) p.tile_target[tid] = 2 * s.tiles[tid];
 }
 
 // ---- the router tiles, their top-k and the sort ----
