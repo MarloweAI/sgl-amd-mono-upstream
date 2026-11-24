@@ -529,11 +529,21 @@ def _g2_loads(c, step):
     return w, s
 
 
-def _g2_stage(c, blk):
-    """The block's 32 intermediate rows and their e8m0, read once (sc1) into LDS."""
+def _live_rows(c, blk):
+    """Whether each of this thread's 4 intermediate rows (tid // 32 + 8 i) holds a route (pad rows: token M)."""
+    a = c["args"]
+    return [(ld_i32(a["sids"], blk * BM + c["tid"] // 32 + 8 * i) & 0xFFFFFF) < c["m"] for i in range(4)]
+
+
+def _g2_stage(c, blk, live):
+    """The block's 32 intermediate rows and their e8m0, read once (sc1) into LDS; pad rows (``live``: this thread's
+    rows) are not read (their bytes stay whatever LDS held: their outputs fall outside every buffer)."""
     tid, lds = c["tid"], c["lds"]
     rm = rsrc(c["args"]["mid"], MID_BYTES)
-    got = [_load(rm, blk * (BM * MID_ROW // 4) + (tid + THREADS * i) * 4, cm=CM_DEV) for i in range(4)]
+    got = [
+        _load(rm, live[i].select(blk * (BM * MID_ROW // 4) + (tid + THREADS * i) * 4, fx.Int32(MID_BYTES)), cm=CM_DEV)
+        for i in range(4)
+    ]
     sw = _load(rm, MID_SCALE_AT // 4 + blk * (BM * MID_SCALES // 4) + fx.min(tid, 63) * 4, cm=CM_DEV)
     for i in range_constexpr(4):
         u = tid + THREADS * i
@@ -628,8 +638,9 @@ def _g2_tile(c, blk, q, e, sh):
     k["wrows"] = [(v & 0xFFFFFF, fx.min((v >> 24) & 0xFF, SLOTS - 1)) for v in wid]
     tws = [fx.Float32(bo.buffer_load(rsrc(a["sw"]), r, 1, T.f32)) for r in rows]
     groups = _group_rows(c, blk)
+    live = _live_rows(c, blk)
     _await_block(c, a["ws"] + fx.Int64(blk * LINE), SH_WGS if sh else G2_WGS)
-    _g2_stage(c, blk)
+    _g2_stage(c, blk, live)
     ro = rsrc(a["out"], fx.Int64(c["m"]) * (D * 2))
     zero = fx.Vector.filled(4, 0.0, fx.Float32)
     acc = [[zero, zero] for _ in range(2)]  # [j][row tile]
