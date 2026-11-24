@@ -163,6 +163,62 @@ def ours_intermediate(f):
     return out
 
 
+def one_route(x, f, ws, raw, g):
+    """Each token routed to one random expert (no shared slot): stock's stage 1 / quant / stage 2 and ``experts``
+    each add one weighted down-projection onto a zeroed row, so the outputs are the per-route bf16 values entering
+    the atomics. Returns the fraction of bf16 values that differ."""
+    from aiter import ActivationType, QuantType, dtypes
+    from aiter.fused_moe import fused_moe_2stages
+    from aiter.ops.quant import fused_dynamic_mxfp4_quant_moe_sort
+
+    m = x.shape[0]
+    eid = torch.randint(0, fm.E, (m,), device=dev, generator=g).sort().values.cpu().tolist()
+    w = (torch.rand(m, generator=g, device=dev) + 0.5).cpu().tolist()
+    rows, wts, blocks = [], [], []
+    t = 0
+    while t < m:
+        e, n = eid[t], 0
+        while t < m and eid[t] == e:
+            rows.append(t)
+            wts.append(w[t])
+            t, n = t + 1, n + 1
+        pad = -n % fm.BM
+        rows += [(1 << 24) | m] * pad
+        wts += [0.0] * pad
+        blocks += [e] * ((n + pad) // fm.BM)
+    cap = len(rows)
+    sid = torch.tensor(rows, dtype=torch.int32, device=dev)
+    sw = torch.tensor(wts, dtype=torch.float32, device=dev)
+    seid = torch.tensor(blocks, dtype=torch.int32, device=dev)
+    nv = torch.tensor([cap, m], dtype=torch.int32, device=dev)
+    a1, a1s = fused_dynamic_mxfp4_quant_moe_sort(
+        x, sorted_ids=sid, num_valid_ids=nv, token_num=m, topk=1, block_size=fm.BM, sorted_weights=sw,
+        num_experts_upper_bound=fm.E,
+    )  # fmt: skip
+    w13, w2, s13, s2 = ws
+    ids = torch.tensor(eid, dtype=torch.int32, device=dev).view(m, 1)
+    ref = fused_moe_2stages(
+        x, w13, w2, 1, sid, sw, seid, nv, torch.zeros(m, fm.D, dtype=torch.bfloat16, device=dev), True, fm.BM,
+        activation=ActivationType.Silu, quant_type=QuantType.per_1x32, q_dtype_a=dtypes.fp4x2, q_dtype_w=w13.dtype,
+        w1_scale=s13, w2_scale=s2, topk_ids=ids, topk_weights=torch.tensor(w, device=dev).view(m, 1),
+        swiglu_limit=LIMIT, gate_mode=GateMode_SEPARATED(), routing_num_experts=fm.E,
+        prequantized_a1=a1.view(dtypes.fp4x2), prequantized_a1_scale=a1s.view(dtypes.fp8_e8m0),
+    )  # fmt: skip
+    one = dict(f)
+    one.update(sorted_ids=sid, sorted_weights=sw, sorted_expert_ids=seid, num_valid_ids=nv,
+               tile_target=ex.tile_targets(sid, nv, m))  # fmt: skip
+    ex.workspace(dev)[2].zero_()  # no shared route: the hook adds zeros
+    out = ours(one, ws, raw, torch.zeros(m, fm.D, dtype=torch.bfloat16, device=dev))
+    torch.cuda.synchronize()
+    return (out.view(torch.int16) != ref.view(torch.int16)).float().mean().item()
+
+
+def GateMode_SEPARATED():
+    from aiter.ops.flydsl.moe_common import GateMode
+
+    return GateMode.SEPARATED.value
+
+
 def rel(a, b):
     return ((a.float() - b.float()).norm() / b.float().norm()).item()
 
@@ -192,6 +248,9 @@ def check(rows, ws, raw):
         sbad = sum(int((mine[k][1] != theirs[k][1]).sum()) for k in theirs)
         if qbad or sbad:
             msgs.append(f"intermediate differs from stock's: {qbad} fp4 bytes, {sbad} scales of {len(theirs)} routes")
+        one = one_route(x, f, ws, raw, g)
+        if one:
+            msgs.append(f"one route a token: {one:.2%} of bf16 values differ from stock's")
         sh_ref = stock_shared(x, raw)
         g1 = shared_only(f, m)
         buf = torch.zeros(m, fm.D, dtype=torch.bfloat16, device=dev)
@@ -207,7 +266,8 @@ def check(rows, ws, raw):
         if err_sh > 5e-3:
             msgs.append("shared rows")
         ok &= not msgs
-        print(f"experts m={m}: intermediate {'bitwise = stock' if not (qbad or sbad) else 'DIFFERS'}; "
+        print(f"experts m={m}: intermediate {'bitwise = stock' if not (qbad or sbad) else 'DIFFERS'}, "
+              f"one-route outputs {'bitwise = stock' if not one else f'{one:.2%} differ'}; "
               f"rel-L2 vs stock {err:.2e} / {err2:.2e} (stock run-to-run {floor:.2e}, ours run-to-run "
               f"{rel(outs[1], outs[0]):.2e}); shared rows alone vs stock's shared path {err_sh:.2e} "
               f"({bits:.1%} of bf16 values differ) {'OK' if not msgs else '; '.join(msgs)}", flush=True)

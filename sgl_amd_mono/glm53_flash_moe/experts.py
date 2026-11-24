@@ -14,12 +14,12 @@ Workgroups (256 threads, 4 waves), in id order:
   gate <= limit, |up| <= limit, gate * sigmoid(gate) * up, rounded to bf16, then a scale per 32 columns
   (RCEIL e8m0 of amax / 6, amax from 1e-10) and v_cvt_scalef32_pk_fp4_f32. It stores the fp4 row-major [cap, 512 B]
   and its e8m0 [cap, 32] written through (sc0 sc1), waits for the stores, and adds 1 to block b's counter.
-- G2 (block b, quarter q) for q < 4: output columns 512 q .. 512 q + 511 (four 128-column tiles, one after another)
+- G2 (block b, slab q) for q < 16: output columns 256 q .. 256 q + 255 (two 128-column tiles, one after another)
   over K = 1024; each wave takes 32 columns of a tile. Its first w2 loads go out, then thread 0 polls until block
-  b's counter reaches 16 (every G1 workgroup has a lower id and never waits); the workgroup reads the block's
+  b's counter counts its G1 workgroups (each has a lower id and never waits); the workgroup reads the block's
   intermediate once into LDS (sc1 loads) and adds weight x sum as bf16 pairs into the output (buffer atomics; rows
   whose token is past M fall outside the output's buffer range). Its departure counts on the same counter; the
-  block's 4th zeroes it.
+  block's last zeroes it.
 - Blocks from num_valid_ids[0] / 32 on exit at once and touch no counter.
 
 The shared expert (slot 288 of the sort) follows its own path in stock (SGLang's dense MLP): its weights are the
@@ -29,10 +29,11 @@ x / (1 + exp2(-x log2 e)), correctly rounded division), rounds to bf16 and quant
 ``dynamic_mxfp4_quant``'s even scales; its G2 rounds to bf16 and stores the shared rows (one route a token) to
 ``shared_out``. The hook of a completed output group then writes bf16(f32(routed) + f32(shared)) for its rows.
 Tasks of the shared expert take their own code path (chosen by the block's expert id) and its blocks are dispatched
-first.
+first; its dense rows stream slower, so its G1 issues both K steps of a row's 128 B line together and its G2 runs
+as 16 workgroups of 128 columns (slots right after the G1 workgroups, for the sort's last blocks).
 
-Routed weights are read nontemporal (streamed once). Output groups: after its atomics land, a G2 workgroup adds 2 on
-``count[i][s]`` for every 16-token tile i among its block's rows and every 256-column slab s it covers. The
+Routed weights are read nontemporal (streamed once). Output groups: after its atomics land, a G2 workgroup adds 1 on
+``count[i][s]`` for every 16-token tile i among its block's rows and every 128-column tile of slab s it covers. The
 workgroup that brings it to ``tile_target[i]`` (2 x the sorted blocks holding a token of tile i: the front's sort
 gives it) zeroes it and runs ``hook(i, s)`` once rows 16 i .. 16 i + 15, columns 256 s .. + 255 have every route
 added (read them with sc1 loads); it adds the shared rows. Every counter is 0 between launches."""
@@ -64,9 +65,11 @@ WIDE_ROWS = 32  # from this many rows on, G1 workgroups take 128 columns (32 a w
 G1_STEPS = D // 128  # 128-deep MFMA steps of G1
 G1_PREFETCH = 4  # G1 steps of loads a wave has in flight
 G2_N = 128  # output columns of a G2 tile
-G2_SPAN = 4  # G2 tiles of a G2 workgroup
+G2_SPAN = 2  # G2 tiles of a G2 workgroup
 G2_WGS = D // (G2_N * G2_SPAN)  # G2 workgroups of a block
-G2_SLABS = G2_SPAN * G2_N // 256  # 256-column output slabs of a G2 workgroup
+SH_SPAN = 1  # G2 tiles of a shared-expert G2 workgroup (its dense layout streams slower: more workgroups)
+SH_WGS = D // (G2_N * SH_SPAN)  # G2 workgroups of a shared-expert block
+SH_SLOTS = MAX_ROWS // BM * SH_WGS  # their slots, after the G1 workgroups (the shared blocks are the sort's last)
 G2_STEPS = I // 128  # 128-deep MFMA steps of a G2 tile
 G2_PREFETCH = 8  # G2 steps of w2 loads a wave has in flight
 LOG2E = 1.4426950408889634
@@ -319,10 +322,14 @@ def _g1_tile(c, blk, nt, e, sh):
     acc = [[[zero, zero] for _ in range(nj)] for _ in range(2)]  # [gate / up][j][row tile]
     pend = [_g1_loads(k, s) for s in range(G1_PREFETCH)]
     sc = None
+    # the shared expert's dense rows: both K steps of a row's 128 B line go out together
+    burst = 2 if sh else 1
     for step in range_constexpr(G1_STEPS):
         wv, x, xs, s = pend.pop(0)
-        if const_expr(step + G1_PREFETCH < G1_STEPS):
-            pend.append(_g1_loads(k, step + G1_PREFETCH))
+        if const_expr(step % burst == 0):
+            for b in range_constexpr(burst):
+                if const_expr(step + G1_PREFETCH + b < G1_STEPS):
+                    pend.append(_g1_loads(k, step + G1_PREFETCH + b))
         if const_expr(s is not None):
             sc = s
         for u in range_constexpr(2):
@@ -351,15 +358,15 @@ def gemm1(c, blk, nt):
 
 
 @flyc.jit
-def _await_block(c, cnt):
+def _await_block(c, cnt, g2_wgs):
     """Thread 0 polls the block's counter until its G1 tiles are in, then counts this workgroup's departure (the
-    block's last G2 workgroup zeroes it); the workgroup then meets."""
+    block's last of ``g2_wgs`` G2 workgroups zeroes it); the workgroup then meets."""
     if c["tid"] == 0:
         v = _ld_agent(cnt)
         while v < _g1_wgs(c):
             rocdl.s_sleep(1)
             v = _ld_agent(cnt)
-        if _add_agent(cnt) == _g1_wgs(c) + G2_WGS - 1:
+        if _add_agent(cnt) == _g1_wgs(c) + g2_wgs - 1:
             _st_agent(cnt, 0)
     gpu.barrier()
 
@@ -378,31 +385,33 @@ def _group_rows(c, blk):
 
 
 @flyc.jit
-def _arrive_groups(c, q, rows):
-    """Counts this G2 workgroup on the output group of every token tile among the block's rows, for each slab it
-    covers (2 a slab: two 128-column tiles); the group's last arrival zeroes the count and the workgroup runs
-    ``hook`` for it."""
+def _arrive_groups(c, q, span, rows):
+    """Counts this G2 workgroup (columns 128 ``span`` ``q`` ..) on the output group of every token tile among the
+    block's rows, for each slab it covers (1 a 128-column tile); the group's last arrival zeroes the count and the
+    workgroup runs ``hook`` for it."""
     tid, flags = c["tid"], c["lds"]
     tile, first, target = rows
-    for h in range_constexpr(G2_SLABS):
+    nsl, add = max(span // 2, 1), min(span, 2)
+    s0 = q * span // 2
+    for h in range_constexpr(nsl):
         done = fx.Int32(-1)
         if first:
-            cnt = c["args"]["ws"] + fx.Int64(GROUP_AT + (tile * SLABS + q * G2_SLABS + h) * LINE)
-            if _add_agent(cnt, 2) == target - 2:
+            cnt = c["args"]["ws"] + fx.Int64(GROUP_AT + (tile * SLABS + s0 + h) * LINE)
+            if _add_agent(cnt, add) == target - add:
                 _st_agent(cnt, 0)
                 done = tile
         if tid < BM:
             fx.ptr_store(done, flags + (h * BM + tid))
     gpu.barrier()
-    for h in range_constexpr(G2_SLABS):
+    for h in range_constexpr(nsl):
         for t in range_constexpr(BM):
             i = fx.ptr_load(flags + (h * BM + t))
             if i >= 0:
-                hook(c, i, q * G2_SLABS + h)
+                hook(c, i, s0 + h)
 
 
 def _g2_loads(c, step):
-    """One wave's w2 operands of G2 step ``step`` (tile step // 8 of the quarter, K step step % 8): rows j = 0, 1, and
+    """One wave's w2 operands of G2 step ``step`` (tile step // 8 of the workgroup's, K step step % 8): rows j = 0, 1, and
     (even K steps) the scale dword of the K step pair."""
     lane, n, kc = c["lane"], step // G2_STEPS, step % G2_STEPS
     rg = c["rg"] + n * (G2_N // 16)
@@ -458,22 +467,23 @@ def _g2_combine(c, acc, toks, tws, ro, n):
 
 
 def _g2_tile(c, blk, q, e, sh):
-    """G2 workgroup (block ``blk``, output columns 512 ``q`` .., expert ``e``; ``sh``: the shared expert's path) once
-    the block's G1 tiles are in."""
+    """G2 workgroup (block ``blk``, output columns 128 span ``q`` .. (span: 4 routed, 1 the shared expert), expert
+    ``e``; ``sh``: the shared expert's path) once the block's G1 tiles are in."""
+    span = SH_SPAN if sh else G2_SPAN
     a, lane, wave = c["args"], c["lane"], c["wave"]
     k = {**c, "sh": sh}
     k = {
         **k,
         **_srcs(k, a["w2"], a["s2"], a["w2sh"], a["s2sh"], e, W2_BYTES, S2_BYTES),
-        "rg": q * (G2_SPAN * G2_N // 16) + 2 * wave,  # the wave's first w2 row group (16 output columns)
+        "rg": q * (span * G2_N // 16) + 2 * wave,  # the wave's first w2 row group (16 output columns)
     }
-    steps = G2_SPAN * G2_STEPS
+    steps = span * G2_STEPS
     pend = [_g2_loads(k, s) for s in range(G2_PREFETCH)]
     rows = [blk * BM + rt * 16 + lane % 16 for rt in range(2)]
     toks = [ld_i32(a["sids"], r) & 0xFFFFFF for r in rows]
     tws = [fx.Float32(bo.buffer_load(rsrc(a["sw"]), r, 1, T.f32)) for r in rows]
     groups = _group_rows(c, blk)
-    _await_block(c, a["ws"] + fx.Int64(blk * LINE))
+    _await_block(c, a["ws"] + fx.Int64(blk * LINE), SH_WGS if sh else G2_WGS)
     _g2_stage(c, blk)
     ro = rsrc(a["out"], fx.Int64(c["m"]) * (D * 2))
     zero = fx.Vector.filled(4, 0.0, fx.Float32)
@@ -495,24 +505,39 @@ def _g2_tile(c, blk, q, e, sh):
             acc = [[zero, zero] for _ in range(2)]
         rocdl.sched_barrier(0)
     _store_done()
-    _arrive_groups(c, q, groups)
+    _arrive_groups(c, q, span, groups)
 
 
 @flyc.jit
 def gemm2(c, blk, q):
+    """A routed block's G2 workgroup q (a shared-expert block's are ``gemm2_shared``'s)."""
     if blk * BM < c["nv"]:
         ei = uniform(ld_i32(c["args"]["seids"], blk))
-        if ei == SHARED:
-            _g2_tile(c, blk, q, fx.Int64(ei), True)
-        else:
+        if ei != SHARED:
             _g2_tile(c, blk, q, fx.Int64(ei), False)
+
+
+def _shared_blocks(c):
+    """(the sort's block count, its last ns blocks: the shared expert's at most)."""
+    nb = c["nv"] // BM
+    return nb, fx.min((c["m"] + BM - 1) // BM, nb)
+
+
+@flyc.jit
+def gemm2_shared(c, p):
+    """Shared-expert G2 slot p: block (p // SH_WGS) of the sort's last ns, workgroup p % SH_WGS."""
+    nb, ns = _shared_blocks(c)
+    if p // SH_WGS < ns:
+        blk = nb - ns + p // SH_WGS
+        ei = uniform(ld_i32(c["args"]["seids"], blk))
+        if ei == SHARED:
+            _g2_tile(c, blk, p % SH_WGS, fx.Int64(ei), True)
 
 
 def _block_order(c, b):
     """Workgroup block slot b -> sorted block: the shared expert's blocks (the sort's last, one per 32 rows) first,
     so its tiles, on the dense layout's slower stream, start earliest."""
-    nb = c["nv"] // BM
-    ns = fx.min((c["m"] + BM - 1) // BM, nb)
+    nb, ns = _shared_blocks(c)
     return (b < nb).select((b + nb - ns) % fx.max(nb, 1), b)
 
 
@@ -521,8 +546,11 @@ def _run(c, bid):
     g1 = c["blocks"] * _g1_wgs(c)
     if bid < g1:
         gemm1(c, _block_order(c, bid // _g1_wgs(c)), bid % _g1_wgs(c))
+    elif bid < g1 + SH_SLOTS:
+        gemm2_shared(c, bid - g1)
     else:
-        gemm2(c, _block_order(c, (bid - g1) // G2_WGS), (bid - g1) % G2_WGS)
+        b2 = bid - g1 - SH_SLOTS
+        gemm2(c, _block_order(c, b2 // G2_WGS), b2 % G2_WGS)
 
 
 @functools.cache
@@ -566,7 +594,7 @@ def build(wide: bool):
         kexperts(
             a1, a1s, a1e, a1es, sids, sw, seids, nvalid, w13, w2, s13, s2, w13sh, s13sh, w2sh, s2sh, out, shared, mid,
             ws, target, m, blocks, limit,
-        ).launch(grid=(blocks * (I // (128 if wide else 64) + G2_WGS),), block=(THREADS,), stream=stream)
+        ).launch(grid=(blocks * (I // (128 if wide else 64) + G2_WGS) + SH_SLOTS,), block=(THREADS,), stream=stream)
 
     return launch
 
