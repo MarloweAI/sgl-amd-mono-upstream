@@ -292,6 +292,8 @@ def dsa_caches(rows: int, device, lens=None, kv_fp8: bool = False):
     # 64-token page table: page p of a request is 64-token pages 4p .. 4p + 3
     pt = (req_pages[:, :, None] * 4 + torch.arange(4, device=device)).view(rows, -1)
     table = torch.full((rows, ROW_WORDS), -1, dtype=torch.int32, device=device)
+    # a pad row's block-table row is 0, as the spec's step tables write it
+    table[:, ROW_BT] = 0
     lens = lens or list(LENS[: rows - 1]) + [0]
     for r, n in enumerate(lens):
         table[r, ROW_BT] = r
@@ -551,6 +553,7 @@ def compare_kv_fp8(args, rank, tp, group, device) -> bool:
         inter=GLOBAL_INTER // tp,
         dsa=True,
         max_pools=args.max_pools,
+        grouped=args.rows >= GROUPED_FROM,
         stop=False,
     )
     ffn, w = ffn_weights(rank, tp, device), dsa_weights(rank, tp, device)
