@@ -157,6 +157,7 @@ from .layout import (
     sample_wave_batches,
     stage_tasks,
     ug_tasks,
+    uv_rows,
     uv_tiles,
 )
 from .tiles import (
@@ -529,7 +530,12 @@ def build_flash_kernel(key: FlashBuild):
     DNW_OFF = KEYS_OFF + LDS_KEYS
     RED_OFF = DNW_OFF + S * MOE_SLOTS
     OUT_OFF = RED_OFF + RED_WORDS
-    OUT_WORDS = max(S * ROW_TILE, S * 2 * UG_TILE, S * DN_TILE)
+    OUT_WORDS = max(
+        S * ROW_TILE,
+        S * 2 * UG_TILE,
+        S * DN_TILE,
+        min(S, 16) * UV_TILE if dsa and uv_rows(S) else 0,
+    )
     # the grouped MoE's route table: each expert's row mask (2 words), pick count and
     # first pick, the units (expert | rows - 1 << 9 | first pick << 13) in expert
     # order, the picks (row * MOE_SLOTS + slot) by expert then row, scan sums, units
@@ -4711,6 +4717,156 @@ def build_flash_kernel(key: FlashBuild):
                             put(mb("sp_l"), ml, m_l[j][1])
                     gpu.barrier()
 
+        def merge_split(s, head, n_used, SPH):
+            """The (row, head)'s split partials merged: bf16 pairs in LDS words
+            0 .. KV_LORA / 2."""
+            if wave == 0:  # split weights exp(m - M) / L -> misc[split]
+                spi = fx.min(lane, n_used - 1)
+                sp_ml = (s * N_SPLIT + spi) * MH + head
+                mlv = poll([(mb("sp_m"), sp_ml, 1), (mb("sp_l"), sp_ml, 1)])
+                ok_sp = lane < n_used
+                m_sp = ok_sp.select(mlv[0][0].bitcast(fx.Float32), fx.Float32(NEG))
+                l_sp = ok_sp.select(mlv[1][0].bitcast(fx.Float32), fx.Float32(0.0))
+                m_all = wave_max(m_sp)
+                w_sp = _exp(m_sp - m_all)
+                den = wave_sum(l_sp * w_sp)
+                if lane < N_SPLIT:
+                    lds_st(
+                        misc,
+                        lane,
+                        ok_sp.select(
+                            w_sp * (den > 0.0).select(_rcp(den), fx.Float32(0.0)),
+                            fx.Float32(0.0),
+                        ),
+                    )
+            gpu.barrier()
+            dp = tid % (KV_LORA // 2)
+            hf = tid // (KV_LORA // 2)
+            got = poll(
+                [
+                    (
+                        mb("sp_acc"),
+                        (
+                            (s * N_SPLIT + fx.min(hf * SPH + q, n_used - 1)) * MH
+                            + head
+                        )
+                        * (KV_LORA // 2)
+                        + dp,
+                        1,
+                    )
+                    for q in range(SPH)
+                ]
+            )
+            o0 = fx.Float32(0.0)
+            o1 = fx.Float32(0.0)
+            for q in range_constexpr(SPH):
+                wj = lds_ld(misc, hf * SPH + q)
+                a0, a1 = bf2_f32(got[q][0])
+                o0 = o0 + a0 * wj
+                o1 = o1 + a1 * wj
+            # the split past the first BASE_SPLITS (the tail's keys) joins the
+            # second half
+            if (n_used > BASE_SPLITS) & (hf == 1):
+                last = poll(
+                    [
+                        (
+                            mb("sp_acc"),
+                            ((s * N_SPLIT + BASE_SPLITS) * MH + head)
+                            * (KV_LORA // 2)
+                            + dp,
+                            1,
+                        )
+                    ]
+                )[0][0]
+                wj = lds_ld(misc, BASE_SPLITS)
+                a0, a1 = bf2_f32(last)
+                o0 = o0 + a0 * wj
+                o1 = o1 + a1 * wj
+            lds_st(red, (hf * (KV_LORA // 2) + dp) * 2, o0)
+            lds_st(red, (hf * (KV_LORA // 2) + dp) * 2 + 1, o1)
+            gpu.barrier()
+            if tid < KV_LORA // 2:
+                o0 = lds_ld(red, tid * 2) + lds_ld(red, (KV_LORA // 2 + tid) * 2)
+                o1 = lds_ld(red, tid * 2 + 1) + lds_ld(
+                    red, (KV_LORA // 2 + tid) * 2 + 1
+                )
+                lds_st(xs, tid, bf16_pair(o0, o1))
+            gpu.barrier()
+
+        # ===== split merge, one (row, head) a task -> mailbox ``o_lat``; then W_UV,
+        # 64 v rows of one head a task, every row (each row's values as dsa_uv's)
+        def dsa_uv_rows(tv, t32):
+            r_wkvb = _rsrc(tv["w_kvb"])
+            UV_R = UV_TILE // 16
+            UV_WPR = WAVES // UV_R
+            UV_CPW = KV_LORA // 64 // UV_WPR
+            SPH = BASE_SPLITS // 2
+            LW = KV_LORA // 2
+            for tt in range(start("uvm"), S * MH, G):
+                tt = fx.Int32(tt)
+                s = tt // MH
+                head = tt % MH
+                pos = row_word(s, ROW_POS)
+                _, _, nk = row_keys(pos)
+                n_used = fx.max((nk + SPLIT_KEYS - 1) // SPLIT_KEYS, fx.Int32(1))
+                merge_split(s, head, n_used, SPH)
+                if tid < LW:
+                    put(mb("o_lat"), (s * MH + head) * LW + tid, lds_ld(xs, tid))
+                gpu.barrier()
+            NVT = V_DIM // UV_TILE
+            for t in range(start("uvg"), MH * NVT, G):
+                t = fx.Int32(t)
+                head = t // NVT
+                tile = t % NVT
+
+                def u_uv(c):
+                    row0 = head * (NOPE_DIM + V_DIM) + NOPE_DIM + tile * UV_TILE
+                    row0 = row0 + (wave // UV_WPR) * 16
+                    kc = (wave % UV_WPR) * UV_CPW + c
+                    return unit_rm(
+                        r_wkvb,
+                        row0,
+                        kc,
+                        KV_LORA,
+                        MH * (NOPE_DIM + V_DIM),
+                        n_sel(min(S, 16)) * LW + kc * 32,
+                    )
+
+                pre = [u_uv(c) for c in range(UV_CPW)]
+                # every row's merged latent of the head -> LDS rows (LW words)
+                NQ = S * LW // 2
+                got = poll(
+                    [
+                        (
+                            mb("o_lat"),
+                            ((q // (LW // 2)) * MH + head) * LW + (q % (LW // 2)) * 2,
+                            2,
+                        )
+                        for q in [tid + i * THREADS for i in range(NQ // THREADS)]
+                    ]
+                )
+                for i in range_constexpr(NQ // THREADS):
+                    for j in range_constexpr(2):
+                        lds_st(
+                            xs, (tid + i * THREADS) * 2 + j, got[i][j].bitcast(fx.Float32)
+                        )
+                gpu.barrier()
+                accs = run_units_rg(None, UV_CPW, UV_CPW, LW, pre=pre)
+                # a row group at a time through ``outs``
+                for g in range_constexpr(NG):
+                    GN = min(16, S - 16 * g)
+                    reduce_rows(UV_R, accs[g], emit_out(UV_TILE), GN)
+                    gpu.barrier()
+                    if tid < GN * UV_TILE // 4:
+                        n = tid // (UV_TILE // 4)
+                        r = (tid % (UV_TILE // 4)) * 4
+                        put_bf(
+                            mb("o_in"),
+                            ((n + 16 * g) * MH + head) * V_DIM + tile * UV_TILE + r,
+                            [lds_ld(outs, n * UV_TILE + r + i) for i in range(4)],
+                        )
+                    gpu.barrier()
+
         # ===== split merge + W_UV: 64 v rows of one (row, head) a task
         def dsa_uv(tv, t32):
             r_wkvb = _rsrc(tv["w_kvb"])
@@ -4740,78 +4896,7 @@ def build_flash_kernel(key: FlashBuild):
                 pre = [
                     [u_uv(tile0 + j, c) for c in range(UV_CPW)] for j in range(UV_TPT)
                 ]
-                if wave == 0:  # split weights exp(m - M) / L -> misc[split]
-                    spi = fx.min(lane, n_used - 1)
-                    sp_ml = (s * N_SPLIT + spi) * MH + head
-                    mlv = poll([(mb("sp_m"), sp_ml, 1), (mb("sp_l"), sp_ml, 1)])
-                    ok_sp = lane < n_used
-                    m_sp = ok_sp.select(mlv[0][0].bitcast(fx.Float32), fx.Float32(NEG))
-                    l_sp = ok_sp.select(mlv[1][0].bitcast(fx.Float32), fx.Float32(0.0))
-                    m_all = wave_max(m_sp)
-                    w_sp = _exp(m_sp - m_all)
-                    den = wave_sum(l_sp * w_sp)
-                    if lane < N_SPLIT:
-                        lds_st(
-                            misc,
-                            lane,
-                            ok_sp.select(
-                                w_sp * (den > 0.0).select(_rcp(den), fx.Float32(0.0)),
-                                fx.Float32(0.0),
-                            ),
-                        )
-                gpu.barrier()
-                dp = tid % (KV_LORA // 2)
-                hf = tid // (KV_LORA // 2)
-                got = poll(
-                    [
-                        (
-                            mb("sp_acc"),
-                            (
-                                (s * N_SPLIT + fx.min(hf * SPH + q, n_used - 1)) * MH
-                                + head
-                            )
-                            * (KV_LORA // 2)
-                            + dp,
-                            1,
-                        )
-                        for q in range(SPH)
-                    ]
-                )
-                o0 = fx.Float32(0.0)
-                o1 = fx.Float32(0.0)
-                for q in range_constexpr(SPH):
-                    wj = lds_ld(misc, hf * SPH + q)
-                    a0, a1 = bf2_f32(got[q][0])
-                    o0 = o0 + a0 * wj
-                    o1 = o1 + a1 * wj
-                # the split past the first BASE_SPLITS (the tail's keys) joins the
-                # second half
-                if (n_used > BASE_SPLITS) & (hf == 1):
-                    last = poll(
-                        [
-                            (
-                                mb("sp_acc"),
-                                ((s * N_SPLIT + BASE_SPLITS) * MH + head)
-                                * (KV_LORA // 2)
-                                + dp,
-                                1,
-                            )
-                        ]
-                    )[0][0]
-                    wj = lds_ld(misc, BASE_SPLITS)
-                    a0, a1 = bf2_f32(last)
-                    o0 = o0 + a0 * wj
-                    o1 = o1 + a1 * wj
-                lds_st(red, (hf * (KV_LORA // 2) + dp) * 2, o0)
-                lds_st(red, (hf * (KV_LORA // 2) + dp) * 2 + 1, o1)
-                gpu.barrier()
-                if tid < KV_LORA // 2:
-                    o0 = lds_ld(red, tid * 2) + lds_ld(red, (KV_LORA // 2 + tid) * 2)
-                    o1 = lds_ld(red, tid * 2 + 1) + lds_ld(
-                        red, (KV_LORA // 2 + tid) * 2 + 1
-                    )
-                    lds_st(xs, tid, bf16_pair(o0, o1))
-                gpu.barrier()
+                merge_split(s, head, n_used, SPH)
                 for j in range_constexpr(UV_TPT):
                     acc = run_units(None, UV_CPW, UV_CPW, pre[j])
                     reduce_rows(UV_R, acc, emit_out(UV_TILE), 1)
@@ -4895,7 +4980,10 @@ def build_flash_kernel(key: FlashBuild):
             mark("iselect")
             dsa_split(tv, t32)
             mark("split")
-            dsa_uv(tv, t32)
+            if const_expr(uv_rows(S)):
+                dsa_uv_rows(tv, t32)
+            else:
+                dsa_uv(tv, t32)
             mark("uv")
             dsa_oproj(tv, t32)
             mark("oproj")
