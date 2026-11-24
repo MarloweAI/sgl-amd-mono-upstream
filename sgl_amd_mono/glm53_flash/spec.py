@@ -56,15 +56,15 @@ from sgl_amd_mono.glm53_flash import (
 )
 
 # kernel widths; a step of fewer rows runs at the next width, the rest pad rows
-# (12: two MTP5 or three MTP3 requests)
-WIDTHS = (2, 4, 8, 12, 16)
+# (12: two MTP5 or three MTP3 requests; 24 and 32 rows at TP2 only)
+WIDTHS = (2, 4, 8, 12, 16, 24, 32)
 # above this width the MoE runs expert-major (``FlashBuild.grouped``)
 GROUPED_FROM = 9
 ROWS = tuple(range(1, max(WIDTHS) + 1))
 TP_SIZES = (2, 4, 8)
 # the rows a step runs on the kernels at most at this TP size; wider steps run the
 # model's forward
-TP_MAX_ROWS = {2: 16}
+TP_MAX_ROWS = {2: 32, 4: 16, 8: 16}
 # SGLang's DSA cache: 256-token KV pages (an index page holds 64 kpool pools)
 PAGE_SIZE = 256
 
