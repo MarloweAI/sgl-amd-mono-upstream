@@ -634,21 +634,29 @@ def check_fold(args, rank, tp, group, device) -> bool:
     IN_ROWS = FlashShard(tp=tp).kda_in_rows
     NR, SLOTS = 4, 8  # ring rows (requests 0..3); slots 1..6 working, 7 checkpoint
     CKPT = SLOTS - 1
-    key = FlashBuild(
-        rows=T,
-        tp=tp,
-        launches_per_step=1,
-        inter=GLOBAL_INTER // tp,
-        kda=True,
-        verify=T,
-        fold=True,
-        kda_raw_o=True,
-        stop=False,
-    )
-    rt = FlashRuntime(key, rank, group, device)
-    rt.set_deadline(args.deadline)
+    # the monokernel's widths (--fold-widths): a step of k requests runs at 4 k rows
     ffn, w = ffn_weights(rank, tp, device), kda_weights(rank, tp, device)
-    op = FlashLayerOp(rt, ffn, 0, kda=w)
+    mono_rt = {}
+    for width in map(int, args.fold_widths.split(",")):
+        rt = FlashRuntime(
+            FlashBuild(
+                rows=width,
+                tp=tp,
+                launches_per_step=1,
+                inter=GLOBAL_INTER // tp,
+                kda=True,
+                verify=T,
+                fold=True,
+                kda_raw_o=True,
+                grouped=width >= GROUPED_FROM,
+                stop=False,
+            ),
+            rank,
+            group,
+            device,
+        )
+        rt.set_deadline(args.deadline)
+        mono_rt[width // T] = (rt, FlashLayerOp(rt, ffn, 0, kda=w))
     g = torch.Generator(device=device).manual_seed(1234 + args.seed)
     gc = torch.Generator().manual_seed(77 + args.seed)
 
@@ -703,11 +711,10 @@ def check_fold(args, rank, tp, group, device) -> bool:
             lower_bound=KDA_LOWER_BOUND,
         ).view(rows * T, H, D)
 
-    sc = rt.scratch.view(torch.int32)
-
-    def box(name, n_pairs):
+    def box(rt, name, n_pairs):
         """A mailbox's first n_pairs value words (f32 bits)."""
         o = rt.sc[name] // 4
+        sc = rt.scratch.view(torch.int32)
         return sc[o : o + 2 * n_pairs : 2].clone().view(torch.float32)
 
     live = {}  # request (ring row) -> slot
@@ -781,16 +788,24 @@ def check_fold(args, rank, tp, group, device) -> bool:
         reqs = sorted(live)
         mono = torch.rand(1, generator=gc).item() < 0.5
         if mono:
-            r = reqs[int(torch.randint(len(reqs), (1,), generator=gc))]
-            slot = live[r]
-            kept = int(mix["fl"][slot])
-            wide = kept > 0 and int(mix["rh"][r].min()) == 0
-            kinds[(kept, "w8" if wide else "w4")] = kinds.get((kept, "w8" if wide else "w4"), 0) + 1
+            ks = [k for k in mono_rt if k <= len(reqs)]
+            k = ks[int(torch.randint(len(ks), (1,), generator=gc))]
+            pick = torch.randperm(len(reqs), generator=gc)[:k].tolist()
+            chosen = [reqs[i] for i in pick]
+            rt, op = mono_rt[k]
+            for r in chosen:
+                kept = int(mix["fl"][live[r]])
+                wide = kept > 0 and int(mix["rh"][r].min()) == 0
+                kk = (k, kept, "w8" if wide else "w4")
+                kinds[kk] = kinds.get(kk, 0) + 1
             ring_rows.fill_(-1)
-            ring_rows[0] = r
-            x0, res, post, comb = layer_inputs(T, device)
-            x0 = rnd(T, HIDDEN).bfloat16()
-            idx = torch.full((T,), slot, dtype=torch.int32, device=device)
+            ring_rows[:k] = torch.tensor(chosen, dtype=torch.int32, device=device)
+            n = k * T
+            x0, res, post, comb = layer_inputs(n, device)
+            x0 = rnd(n, HIDDEN).bfloat16()
+            idx = torch.tensor(
+                [live[r] for r in chosen for _ in range(T)], dtype=torch.int32, device=device
+            )
             op.launch(x0, res, post, comb, state=state, state_idx=idx)
             rt.advance_step()
             torch.cuda.synchronize()
@@ -798,19 +813,19 @@ def check_fold(args, rank, tp, group, device) -> bool:
             if any(words):
                 print(f"rank {rank}: error words {words}", flush=True)
                 return False
-            proj = box("proj", T * IN_ROWS).view(T, IN_ROWS)
+            proj = box(rt, "proj", n * IN_ROWS).view(n, IN_ROWS)
             x = proj[:, : 3 * P].bfloat16().contiguous()
             b = proj[:, 3 * P : 3 * P + H].bfloat16().contiguous()
-            a = box("gates", T * 2 * P).view(T, 2 * P)[:, :P].bfloat16().contiguous()
+            a = box(rt, "gates", n * 2 * P).view(n, 2 * P)[:, :P].bfloat16().contiguous()
             o_mono = (
-                box("o_in", T * P // 2).view(torch.int32).view(torch.bfloat16)
-            ).view(T, H, D)
-            o_ref = k_step(ref, 1, [slot], [r], x, a, b)
+                box(rt, "o_in", n * P // 2).view(torch.int32).view(torch.bfloat16)
+            ).view(n, H, D)
+            o_ref = k_step(ref, k, [live[r] for r in chosen], chosen, x, a, b)
             torch.cuda.synchronize()
             same_o = torch.equal(o_mono.view(torch.int16), o_ref.view(torch.int16))
             o_abs.append(o_ref.float().abs().mean().item())
             counts["mono"] += 1
-            accepted = {r: int(torch.randint(1, 5, (1,), generator=gc))}
+            accepted = {r: int(torch.randint(1, 5, (1,), generator=gc)) for r in chosen}
         else:
             k = min(len(reqs), int(torch.randint(1, 4, (1,), generator=gc)))
             pick = torch.randperm(len(reqs), generator=gc)[:k].tolist()
@@ -855,11 +870,12 @@ def check_fold(args, rank, tp, group, device) -> bool:
             ok = False
     print(
         f"rank {rank}: fold hand-off over {args.fold_cycles} cycles {counts}; "
-        f"monokernel steps by (kept, kept width) {dict(sorted(kinds.items()))}; "
+        f"monokernel request-steps by (requests, kept, kept width) {dict(sorted(kinds.items()))}; "
         f"mean |o| {sum(o_abs) / max(len(o_abs), 1):.3g}; ok {ok}",
         flush=True,
     )
-    rt.close()
+    for rt, _ in mono_rt.values():
+        rt.close()
     return ok
 
 
@@ -1807,6 +1823,9 @@ def main() -> int:
     ap.add_argument("--compare-kv-fp8", action="store_true")
     ap.add_argument("--fold-cycles", type=int, default=0)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument(
+        "--fold-widths", default="4", help="with --fold-cycles: the monokernel's widths"
+    )
     args = ap.parse_args()
     MAX_LEN = args.max_len
     args.max_pools = args.max_pools or MAX_LEN // 4
