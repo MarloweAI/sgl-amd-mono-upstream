@@ -92,7 +92,9 @@ MID_BYTES = MAX_CAP * (MID_ROW + MID_SCALES)
 # banks) and its e8m0
 XL_ROW = MID_ROW // 4 + 4
 XL_SCALES = BM * XL_ROW
-LDS_WORDS = XL_SCALES + BM * MID_SCALES // 4
+PART_AT = XL_SCALES + BM * MID_SCALES // 4  # the parts variant's G2 staging: 32 rows x 128 columns of bf16
+PART_ROW = G2_N // 2 + 4  # its row in dwords, padded
+LDS_WORDS = PART_AT
 # counters, a 128 B line each: the blocks', then the output groups' (16-token tile x 256 columns)
 LINE = 128
 TOKEN_TILES = MAX_ROWS // 16
@@ -171,9 +173,86 @@ def _fp4x4(v, scale):
     return fx.Int32(q).to(fx.Int16)
 
 
+SLOTS = TOPK + 1  # a token's routes in the sort (slot field of its sorted ids): TOPK routed, then the shared expert
+# from PARTS_ROWS rows, the atomic-free combine: G2 stores each route's bf16 rows to parts [token][slot][D], and
+# reduce workgroups after the G2 slots sum each output group once it is complete (deterministic); below, bf16 atomics
+PARTS_ROWS = 32
+PART_ROWS = SLOTS + 1  # a token's rows of parts: its slots', then a 256-column slab's routes' expert ids + 1
+ID_SPAN = 16  # dwords of a slab's ids (slot s at dword s)
+
+
+def _bf16_add(a, b):
+    """bf16 pairs a + b (packed dwords), each sum rounded to bf16 (RNE)."""
+    lo = (a << 16).bitcast(fx.Float32) + (b << 16).bitcast(fx.Float32)
+    hi = (a & -65536).bitcast(fx.Float32) + (b & -65536).bitcast(fx.Float32)
+    return fx.Vector.from_elements([lo, hi], fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)[0]
+
+
+def _hook_parts(c, token_tile, slab):
+    """The parts variant's hook, for rows 16 token_tile .., columns 256 slab ..: the routes present (their expert
+    id + 1 in the slab's id row; 0: absent, read as 0) added as bf16 in ascending expert order (the order a sort's
+    atomics mostly land in, each add rounded), then the shared rows as bf16(f32(routed) + f32(shared)); the slab's
+    ids are put back to 0."""
+    a, tid = c["args"], c["tid"]
+    ro = rsrc(a["out"], fx.Int64(c["m"]) * (D * 2))
+    rp = rsrc(a["shared"], fx.Int64(c["m"]) * (PART_ROWS * D * 2))
+    row = token_tile * 16 + tid // 16
+    idw = ((row * PART_ROWS + SLOTS) * (D * 2)) // 4 + slab * ID_SPAN
+    ids = [_load(rp, idw + h * 4, cm=CM_DEV) for h in range(3)]
+    e = [ids[s // 4][s % 4] for s in range(SLOTS)]
+    one, nil = fx.Int32(1), fx.Int32(0)
+    key = [(v == 0).select(fx.Int32(1 << 30), v) for v in e[:TOPK]]
+    rank = []
+    for s in range(TOPK):
+        r = nil
+        for t in range(TOPK):
+            if t != s:  # ties (absent routes) broken by slot
+                before = (key[t] <= key[s]) if t < s else (key[t] < key[s])
+                r = r + before.select(one, nil)
+        rank.append(r)
+    # the slots in that order, then the shared expert's; an absent route's offset falls outside the buffer
+    order = []
+    for r in range(TOPK):
+        v = nil
+        for s in range(TOPK):
+            v = (rank[s] == r).select(fx.Int32(s), v)
+        order.append(v)
+    order.append(fx.Int32(TOPK))
+    present = []
+    for r in range(TOPK):
+        p = nil
+        for s in range(TOPK):
+            p = (order[r] == s).select(e[s], p)
+        present.append(p != 0)
+    present.append(e[TOPK] != 0)
+    for i in range_constexpr(2):
+        col = slab * 512 + (tid % 16) * 32 + i * 16
+        parts = [
+            _load(rp, present[r].select(((row * PART_ROWS + order[r]) * (D * 2) + col) // 4, fx.Int32(1 << 29)),
+                  cm=CM_DEV)
+            for r in range(SLOTS)
+        ]  # fmt: skip
+        res = []
+        for d in range_constexpr(4):
+            acc = parts[0][d]
+            for r in range_constexpr(1, TOPK):
+                acc = _bf16_add(acc, parts[r][d])
+            sh = parts[TOPK][d]
+            lo = (acc << 16).bitcast(fx.Float32) + (sh << 16).bitcast(fx.Float32)
+            hi = (acc & -65536).bitcast(fx.Float32) + (sh & -65536).bitcast(fx.Float32)
+            res.append(fx.Vector.from_elements([lo, hi], fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)[0])
+        bo.buffer_store(fx.Vector.from_elements(res, fx.Int32), ro, (row * (D * 2) + col) // 4)
+    zero = fx.Vector.filled(4, 0, fx.Int32)
+    for h in range_constexpr(3):
+        bo.buffer_store(zero, rp, idw + h * 4, mask=tid % 16 == 0, cache_modifier=CM_DEV)
+
+
 def hook(c, token_tile, slab):
     """Runs on the workgroup that completed output rows 16 token_tile .., columns 256 slab ..: every route of those
     rows has landed (sc1 loads); adds the shared rows, f32 sum rounded once to bf16."""
+    if const_expr(c["parts"]):
+        _hook_parts(c, token_tile, slab)
+        return
     a, tid = c["args"], c["tid"]
     ro = rsrc(a["out"], fx.Int64(c["m"]) * (D * 2))
     rsh = rsrc(a["shared"], fx.Int64(c["m"]) * (D * 2))
@@ -397,6 +476,12 @@ def _arrive_groups(c, q, span, rows):
     tile, first, target = rows
     nsl, add = max(span // 2, 1), min(span, 2)
     s0 = q * span // 2
+    if const_expr(c["parts"]):
+        # the parts variant: a reduce workgroup waits for the group instead
+        for h in range_constexpr(nsl):
+            if first:
+                _add_agent(c["args"]["ws"] + fx.Int64(GROUP_AT + (tile * SLABS + s0 + h) * LINE), add)
+        return
     for h in range_constexpr(nsl):
         done = fx.Int32(-1)
         if first:
@@ -448,9 +533,43 @@ def _g2_x(c, rt, kc):
     return x, fx.ptr_load(lds + (XL_SCALES + r * (MID_SCALES // 4) + kc)) >> ((lane // 16) * 8)
 
 
+def _g2_parts(c, acc, tws, n):
+    """The parts variant's combine of tile ``n``: the workgroup's 32 rows x 128 columns of weight x sum (bf16) go
+    through LDS so each row's 256 B is stored whole to its route's part (and, at tile 0, the route's expert id)."""
+    lane, wave, tid, st = c["lane"], c["wave"], c["tid"], c["lds"] + PART_AT
+    rp = rsrc(c["args"]["shared"], fx.Int64(c["m"]) * (PART_ROWS * D * 2))
+    gpu.barrier()
+    for rt in range_constexpr(2):
+        for j in range_constexpr(2):
+            pairs = [
+                fx.Vector.from_elements(
+                    [acc[j][rt][2 * p] * tws[rt], acc[j][rt][2 * p + 1] * tws[rt]], fx.Float32
+                ).to(fx.BFloat16).bitcast(fx.Int32)[0]
+                for p in range(2)
+            ]
+            at = (rt * 16 + lane % 16) * PART_ROW + (wave * 32 + j * 16 + (lane // 16) * 4) // 2
+            fx.ptr_store(fx.Vector.from_elements(pairs, fx.Int32), st + at)
+    gpu.barrier()
+    v4i = fx.Vector.make_type(4, fx.Int32)
+    col0 = (c["rg"] - 2 * wave) * 16 + n * G2_N
+    for h in range_constexpr(2):
+        tok, slot = c["wrows"][h]
+        r = tid // 16 + 16 * h
+        v = fx.Vector(fx.ptr_load(st + (r * PART_ROW + (tid % 16) * 4), result_type=v4i))
+        off = (tok * PART_ROWS + slot) * (D * 2) + col0 * 2 + (tid % 16) * 16
+        bo.buffer_store(v, rp, off, cache_modifier=CM_DEV, offset_is_bytes=True)
+        if const_expr(n == 0):
+            at = (tok * PART_ROWS + SLOTS) * (D * 2) + ((col0 // 256) * ID_SPAN + slot) * 4
+            bo.buffer_store(c["e32"] + 1, rp, at, mask=tid % 16 == 0, cache_modifier=CM_DEV, offset_is_bytes=True)
+
+
 def _g2_combine(c, acc, toks, tws, ro, n):
     """weight x sum of tile ``n`` as bf16 pairs: added into the output, or (the shared expert, weight 1) stored to
-    its rows of ``shared_out`` (written through); the other access falls outside its buffer."""
+    its rows of ``shared_out`` (written through); the other access falls outside its buffer. The parts variant
+    stores every route's pairs to its row of parts."""
+    if const_expr(c["parts"]):
+        _g2_parts(c, acc, tws, n)
+        return
     rsh = rsrc(c["args"]["shared"], fx.Int64(c["m"]) * (D * 2))
     for rt in range_constexpr(2):
         for j in range_constexpr(2):
@@ -486,6 +605,9 @@ def _g2_tile(c, blk, q, e, sh):
     pend = [_g2_loads(k, s) for s in range(pf)]
     rows = [blk * BM + rt * 16 + lane % 16 for rt in range(2)]
     toks = [ld_i32(a["sids"], r) & 0xFFFFFF for r in rows]
+    k["e32"] = uniform(ld_i32(a["seids"], blk))
+    wid = [ld_i32(a["sids"], blk * BM + c["tid"] // 16 + 16 * h) for h in range(2)]
+    k["wrows"] = [(v & 0xFFFFFF, fx.min((v >> 24) & 0xFF, SLOTS - 1)) for v in wid]
     tws = [fx.Float32(bo.buffer_load(rsrc(a["sw"]), r, 1, T.f32)) for r in rows]
     groups = _group_rows(c, blk)
     _await_block(c, a["ws"] + fx.Int64(blk * LINE), SH_WGS if sh else G2_WGS)
@@ -547,6 +669,24 @@ def _block_order(c, b):
 
 
 @flyc.jit
+def _reduce(c, r):
+    """The parts variant's reduce workgroup r (after every G2 slot): once output group (r // SLABS, r % SLABS) has
+    every route (its count at the tile's target), zeroes the count and writes the group's output rows."""
+    tile, slab = r // SLABS, r % SLABS
+    if tile * 16 < c["m"]:
+        if c["tid"] == 0:
+            cnt = c["args"]["ws"] + fx.Int64(GROUP_AT + r * LINE)
+            want = ld_i32(c["args"]["target"], tile)
+            v = _ld_agent(cnt)
+            while v < want:
+                rocdl.s_sleep(1)
+                v = _ld_agent(cnt)
+            _st_agent(cnt, 0)
+        gpu.barrier()
+        _hook_parts(c, tile, slab)
+
+
+@flyc.jit
 def _run(c, bid):
     g1 = c["blocks"] * _g1_wgs(c)
     if bid < g1:
@@ -555,20 +695,29 @@ def _run(c, bid):
         gemm2_shared(c, bid - g1)
     else:
         b2 = bid - g1 - SH_SLOTS
-        gemm2(c, _block_order(c, b2 // G2_WGS), b2 % G2_WGS)
+        if const_expr(c["parts"]):
+            if b2 < c["blocks"] * G2_WGS:
+                gemm2(c, _block_order(c, b2 // G2_WGS), b2 % G2_WGS)
+            else:
+                _reduce(c, b2 - c["blocks"] * G2_WGS)
+        else:
+            gemm2(c, _block_order(c, b2 // G2_WGS), b2 % G2_WGS)
 
 
 @functools.cache
-def build(kind: str):
-    """The launch of ``kind`` (``PREFETCH``'s keys): G1 workgroups of 128 columns ("wide") or 64."""
+def build(kind: str, parts: bool = False):
+    """The launch of ``kind`` (``PREFETCH``'s keys): G1 workgroups of 128 columns ("wide") or 64; ``parts``: the
+    atomic-free combine (``shared`` is then the parts buffer)."""
     wide = kind == "wide"
-    keyed = (("sources", SOURCES), ("kind", kind), ("prefetch", PREFETCH[kind]))
+    keyed = (("sources", SOURCES), ("kind", kind), ("prefetch", PREFETCH[kind]), ("parts", parts))
 
     @fx.struct
     class Lds:
-        words: fx.Array[fx.Int32, LDS_WORDS, 16]
+        words: fx.Array[fx.Int32, LDS_WORDS + (BM * PART_ROW if parts else 0), 16]
 
-    @flyc.kernel(name="glm53f_moe_experts_" + kind, known_block_size=[THREADS, 1, 1])
+    name = "glm53f_moe_experts_" + kind + ("_parts" if parts else "")
+
+    @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def kexperts(
         a1: Int64, a1s: Int64, a1e: Int64, a1es: Int64, sids: Int64, sw: Int64, seids: Int64, nvalid: Int64,
         w13: Int64, w2: Int64, s13: Int64, s2: Int64, w13sh: Int64, s13sh: Int64, w2sh: Int64, s2sh: Int64,
@@ -586,7 +735,7 @@ def build(kind: str):
         c = {
             "args": args, "tid": tid, "lane": tid % 64, "wave": uniform(tid // 64), "m": m, "blocks": blocks,
             "limit": limit, "nv": uniform(ld_i32(nvalid, 0)), "lds": lds.words.ptr, "wide": wide,
-            "pf": PREFETCH[kind],
+            "pf": PREFETCH[kind], "parts": parts,
         }  # fmt: skip
         _run(c, fx.Int32(fx.block_idx.x))
 
@@ -601,19 +750,24 @@ def build(kind: str):
         kexperts(
             a1, a1s, a1e, a1es, sids, sw, seids, nvalid, w13, w2, s13, s2, w13sh, s13sh, w2sh, s2sh, out, shared, mid,
             ws, target, m, blocks, limit,
-        ).launch(grid=(blocks * (I // (128 if wide else 64) + G2_WGS) + SH_SLOTS,), block=(THREADS,), stream=stream)
+        ).launch(
+            grid=(blocks * (I // (128 if wide else 64) + G2_WGS) + SH_SLOTS + (TOKEN_TILES * SLABS if parts else 0),),
+            block=(THREADS,), stream=stream,
+        )
 
     return launch
 
 
 @functools.cache
 def workspace(device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
-    """(counters, zeroed and left zeroed by every launch; the intermediate; the shared expert's rows). Made once a
-    device, outside graph capture (SGLang warms up eagerly first)."""
+    """(counters, zeroed and left zeroed by every launch; the intermediate; the shared expert's rows; the parts
+    variant's per-route rows, zeroed and left zeroed). Made once a device, outside graph capture (SGLang warms up
+    eagerly first)."""
     return (
         torch.zeros(COUNTER_WORDS, dtype=torch.int32, device=device),
         torch.empty(MID_BYTES, dtype=torch.uint8, device=device),
         torch.empty(MAX_ROWS, D, dtype=torch.bfloat16, device=device),
+        torch.zeros(MAX_ROWS, PART_ROWS, D, dtype=torch.bfloat16, device=device),
     )
 
 
@@ -663,12 +817,14 @@ def experts(
     assert w2.numel() * w2.element_size() == NE * W2_BYTES and moe_buf.shape == (m, D)
     assert w13_shared.numel() * w13_shared.element_size() == W13_BYTES and w13_shared_scale.numel() == S13_BYTES
     assert w2_shared.numel() * w2_shared.element_size() == W2_BYTES and w2_shared_scale.numel() == S2_BYTES
-    counters, mid, shared_rows = workspace(a1.device)
-    build("wide" if m >= WIDE_ROWS else "narrow" if m >= DEEP_ROWS else "deep")(
+    counters, mid, shared_rows, parts = workspace(a1.device)
+    use_parts = m >= PARTS_ROWS
+    rows_out = parts if use_parts else shared_rows
+    build("wide" if m >= WIDE_ROWS else "narrow" if m >= DEEP_ROWS else "deep", use_parts)(
         a1.data_ptr(), a1_scale.data_ptr(), a1_even.data_ptr(), a1_even_scale.data_ptr(), sorted_ids.data_ptr(),
         sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w13.data_ptr(),
         w2.data_ptr(), w13_scale.data_ptr(), w2_scale.data_ptr(), w13_shared.data_ptr(), w13_shared_scale.data_ptr(),
-        w2_shared.data_ptr(), w2_shared_scale.data_ptr(), moe_buf.data_ptr(), shared_rows.data_ptr(),
+        w2_shared.data_ptr(), w2_shared_scale.data_ptr(), moe_buf.data_ptr(), rows_out.data_ptr(),
         mid.data_ptr(), counters.data_ptr(),
         tile_target.data_ptr(), m, blocks, float(swiglu_limit) if swiglu_limit else float("inf"),
         torch.cuda.current_stream(),
