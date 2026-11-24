@@ -394,12 +394,29 @@ def build_flash_kernel(key: FlashBuild):
     )
     PROF = key.prof
     PROF_MARKS = 48
+    # the stamps' stages in the order the launch leaves them (a cached build traces
+    # nothing, so the names are not taken from the trace)
     prof_names = []
+    PROF_NAMES = None
     if PROF:
+        assert kda or dsa
+        att = (
+            ["start", "aseam", "agate", "inproj", "fgb", "kda", "oproj"]
+            if kda
+            else ["start", "aseam", "agate", "qkv_a", "qnorm", "cache", "q_b"]
+            + ["index_q", "iq_quant", "uk", "iscore", "iselect", "split", "uv", "oproj"]
+        )
+        ffn = ["seam", "gate"] + (
+            []
+            if dense
+            else ["router"]
+            + (["table", "ug", "down", "dsum"] if GROUPED else ["ug", "down"])
+        )
+        PROF_NAMES = att + ffn
         SC = dict(SC)
         SC["prof"] = SC["_bytes"]
         SC["_bytes"] += BLOCKS * PROF_MARKS * 8
-        SC["_prof_marks"] = prof_names
+        SC["_prof_marks"] = PROF_NAMES
     # producers of each box: the gates' rows and the kda heads
     BOXES = {"box_a_in": S, "box_a": S, "box_o_in": S * H}
     assert not kda or S * H % BOX_WORDS == 0
@@ -1271,7 +1288,7 @@ def build_flash_kernel(key: FlashBuild):
             """Profiling builds: thread 0 stamps the clock as its CTA leaves ``name``."""
             if const_expr(PROF):
                 i = len(prof_names)
-                assert i < PROF_MARKS
+                assert i < PROF_MARKS and PROF_NAMES[i] == name, (i, name)
                 prof_names.append(name)
                 if tid == 0:
                     c = _clock()
@@ -5150,7 +5167,7 @@ def build_flash_kernel(key: FlashBuild):
             # ---- up/gate: a wave the gate and up row groups of 4 of the 32 K units
             N_UG_C = expert_inter // UG_BLK
             ug_red = xs + UNIT_ROWS * XW if UG_RED_IN_X else red
-            mark("router+table")
+            mark("table")
             lo, hi = cta_tasks("ug", n_units * N_UG_C)
             for ti in range(lo, hi, 1):
                 ti = fx.Int32(ti)
@@ -5375,6 +5392,7 @@ def build_flash_kernel(key: FlashBuild):
                 peer_reduce("ffn", t, store_x, ST)
                 gpu.barrier()
 
+        mark("router")
         if const_expr(GROUPED):
             run_grouped()
             mark("dsum")
@@ -5588,6 +5606,7 @@ def build_flash_kernel(key: FlashBuild):
                             lds_ld(dnw, s * MOE_SLOTS + slot),
                         )
 
+        mark("ug")
         # ======== 4. mid MXFP8 quant + expert down + route weighting + MoE TP reduce
         DN_R = (DN_TILE + 15) // 16
         DN_WPR = WAVES // DN_R
@@ -5739,6 +5758,7 @@ def build_flash_kernel(key: FlashBuild):
 
             peer_reduce("ffn", t, store_x, DN_TILE)
             gpu.barrier()
+        mark("down")
 
     @flyc.jit
     def launch(
