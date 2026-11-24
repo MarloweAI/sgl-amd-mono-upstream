@@ -190,6 +190,12 @@ def down_prefetch_batch(samples: int) -> int:
     return 9 if samples <= 8 else 3
 
 
+def uv_rows(samples: int) -> bool:
+    """W_UV runs once a head over every row's merged latent (a merge task a (row,
+    head), then a GEMV task a (head, 64 v rows)), not once a row."""
+    return samples >= 8
+
+
 def uv_tiles(samples: int) -> int:
     """V tiles of one (row, head) a uv task covers: two at 8 rows, so a CTA merges
     the head's split partials once."""
@@ -297,6 +303,15 @@ def layout(
             ("sp_l", samples * N_SPLIT * H * pair_bytes),
             ("o_in", samples * H * V_DIM // 2 * pair_bytes),
         ]
+        if uv_rows(samples):
+            # each (row, head)'s merged latent (bf16 pairs)
+            items += [("o_lat", samples * H * KV_LORA // 2 * pair_bytes)]
+        if samples > 16:
+            # o as plain bf16 pairs, released by the W_UV tasks' box
+            items += [
+                ("o_plain", samples * H * V_DIM // 2 * 4),
+                ("box_o_dsa", BLOCKS * box_lines(H * (V_DIM // UV_TILE)) * BOX_LINE),
+            ]
     items += [
         ("rnew", samples * HC_MULT * HIDDEN // 2 * pair_bytes),
         ("pmix", samples * N_ROW_TILES * PMIX * pair_bytes),
@@ -384,7 +399,11 @@ def stage_tasks(
             ("iscore", samples * 8),
             ("iselect", samples),
             ("split", samples * (H // WAVES) * BASE_SPLITS),
-            ("uv", samples * H * (V_DIM // UV_TILE) // uv_tiles(samples)),
+            *(
+                [("uvm", samples * H), ("uvg", H * (V_DIM // UV_TILE))]
+                if uv_rows(samples)
+                else [("uv", samples * H * (V_DIM // UV_TILE) // uv_tiles(samples))]
+            ),
             ("oproj", HIDDEN // O_TILE),
         ]
     if kda:
