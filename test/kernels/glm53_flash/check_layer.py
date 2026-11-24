@@ -546,6 +546,7 @@ def compare_kv_fp8(args, rank, tp, group, device) -> bool:
         inter=GLOBAL_INTER // tp,
         dsa=True,
         max_pools=args.max_pools,
+        grouped=args.rows >= GROUPED_FROM,
         stop=False,
     )
     ffn, w = ffn_weights(rank, tp, device), dsa_weights(rank, tp, device)
