@@ -233,10 +233,12 @@ def moe_fused(
     shared_w2_scale: torch.Tensor,
     valid: torch.Tensor | None = None,
     given: tuple[torch.Tensor, torch.Tensor] | None = None,
+    push: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """The routed experts (weights [288, ...], aiter-shuffled) and the shared expert (its dense layers' own row-major
     weights, uint8 as SGLang holds them: ``shared_*``, as slot 288 of the sort) in two launches:
-    ``front`` with the shared slot, then ``experts.experts`` (G1 + G2 in one launch). Returns [m, 4096] bf16."""
+    ``front`` with the shared slot, then ``experts.experts`` (G1 + G2 in one launch; ``push``: its peer output,
+    flags and epoch). Returns [m, 4096] bf16."""
     from .experts import experts
 
     f = front(x, gate_w, bias, scale, valid=valid, shared=True, sorted_scale=False, given=given)
@@ -260,4 +262,5 @@ def moe_fused(
         f["moe_buf"],
         swiglu_limit,
         f["tile_target"],
+        push=push,
     )

@@ -243,9 +243,26 @@ def _hook_parts(c, token_tile, slab):
             hi = (acc & -65536).bitcast(fx.Float32) + (sh & -65536).bitcast(fx.Float32)
             res.append(fx.Vector.from_elements([lo, hi], fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)[0])
         bo.buffer_store(fx.Vector.from_elements(res, fx.Int32), ro, (row * (D * 2) + col) // 4)
+        if const_expr(c["push"]):
+            # the same 16 B to the peer's output, written through (sc0 sc1)
+            rpeer = rsrc(a["peer_out"], fx.Int64(c["m"]) * (D * 2))
+            bo.buffer_store(fx.Vector.from_elements(res, fx.Int32), rpeer, (row * (D * 2) + col) // 4,
+                            cache_modifier=CM_SYS)  # fmt: skip
     zero = fx.Vector.filled(4, 0, fx.Int32)
     for h in range_constexpr(3):
         bo.buffer_store(zero, rp, idw + h * 4, mask=tid % 16 == 0, cache_modifier=CM_DEV)
+    if const_expr(c["push"]):
+        # every thread's stores have landed, then the group's flag (the launch's epoch) goes to the peer
+        rocdl.s_waitcnt(vmcnt=0)
+        gpu.barrier()
+        _flag(c, token_tile * SLABS + slab)
+
+
+@flyc.jit
+def _flag(c, i):
+    """Thread 0 stores the epoch to the peer's flag ``i`` (sc0 sc1)."""
+    if c["tid"] == 0:
+        bo.buffer_store(c["epoch"], rsrc(c["args"]["peer_flags"]), i, cache_modifier=CM_SYS)
 
 
 def hook(c, token_tile, slab):
@@ -714,24 +731,28 @@ def _run(c, bid):
 
 
 @functools.cache
-def build(kind: str, parts: bool = False):
+def build(kind: str, parts: bool = False, push: bool = False):
     """The launch of ``kind`` (``PREFETCH``'s keys): G1 workgroups of 128 columns ("wide") or 64; ``parts``: the
-    atomic-free combine (``shared`` is then the parts buffer)."""
+    atomic-free combine (``shared`` is then the parts buffer); ``push`` (with ``parts``): each reduce workgroup
+    also writes its output group to ``peer_out`` and then the epoch (read once from ``epoch_ptr``) to
+    ``peer_flags[16 t + s]`` (the other builds ignore those three arguments)."""
+    assert parts or not push
     wide = kind == "wide"
-    keyed = (("sources", SOURCES), ("kind", kind), ("prefetch", PREFETCH[kind]), ("parts", parts, SLAB_MAJOR))
+    keyed = (("sources", SOURCES), ("kind", kind), ("prefetch", PREFETCH[kind]), ("parts", parts, SLAB_MAJOR),
+             ("push", push))  # fmt: skip
 
     @fx.struct
     class Lds:
         words: fx.Array[fx.Int32, LDS_WORDS + (BM * PART_ROW if parts else 0), 16]
 
-    name = "glm53f_moe_experts_" + kind + ("_parts" if parts else "")
+    name = "glm53f_moe_experts_" + kind + ("_parts" if parts else "") + ("_push" if push else "")
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def kexperts(
         a1: Int64, a1s: Int64, a1e: Int64, a1es: Int64, sids: Int64, sw: Int64, seids: Int64, nvalid: Int64,
         w13: Int64, w2: Int64, s13: Int64, s2: Int64, w13sh: Int64, s13sh: Int64, w2sh: Int64, s2sh: Int64,
         out: Int64, shared: Int64, mid: Int64, ws: Int64, target: Int64, m: Int32, blocks: Int32,
-        limit: Float32,
+        limit: Float32, epoch_ptr: Int64, peer_out: Int64, peer_flags: Int64,
     ):  # fmt: skip
         _ = keyed
         tid = fx.Int32(fx.thread_idx.x)
@@ -739,13 +760,15 @@ def build(kind: str, parts: bool = False):
         args = {
             "a1": a1, "a1s": a1s, "a1e": a1e, "a1es": a1es, "sids": sids, "sw": sw, "seids": seids, "w13": w13,
             "w2": w2, "s13": s13, "s2": s2, "w13sh": w13sh, "s13sh": s13sh, "w2sh": w2sh, "s2sh": s2sh, "out": out,
-            "shared": shared, "mid": mid, "ws": ws, "target": target,
+            "shared": shared, "mid": mid, "ws": ws, "target": target, "peer_out": peer_out, "peer_flags": peer_flags,
         }  # fmt: skip
         c = {
             "args": args, "tid": tid, "lane": tid % 64, "wave": uniform(tid // 64), "m": m, "blocks": blocks,
             "limit": limit, "nv": uniform(ld_i32(nvalid, 0)), "lds": lds.words.ptr, "wide": wide,
-            "pf": PREFETCH[kind], "parts": parts,
+            "pf": PREFETCH[kind], "parts": parts, "push": push,
         }  # fmt: skip
+        if const_expr(push):
+            c["epoch"] = uniform(ld_i32(epoch_ptr, 0))
         _run(c, fx.Int32(fx.block_idx.x))
 
     @flyc.jit
@@ -753,12 +776,12 @@ def build(kind: str, parts: bool = False):
         a1: Int64, a1s: Int64, a1e: Int64, a1es: Int64, sids: Int64, sw: Int64, seids: Int64, nvalid: Int64,
         w13: Int64, w2: Int64, s13: Int64, s2: Int64, w13sh: Int64, s13sh: Int64, w2sh: Int64, s2sh: Int64,
         out: Int64, shared: Int64, mid: Int64, ws: Int64, target: Int64, m: Int32, blocks: Int32,
-        limit: Float32, stream: fx.Stream = _STREAM,
+        limit: Float32, epoch_ptr: Int64, peer_out: Int64, peer_flags: Int64, stream: fx.Stream = _STREAM,
     ):  # fmt: skip
         _ = keyed
         kexperts(
             a1, a1s, a1e, a1es, sids, sw, seids, nvalid, w13, w2, s13, s2, w13sh, s13sh, w2sh, s2sh, out, shared, mid,
-            ws, target, m, blocks, limit,
+            ws, target, m, blocks, limit, epoch_ptr, peer_out, peer_flags,
         ).launch(
             grid=(blocks * (I // (128 if wide else 64) + G2_WGS) + SH_SLOTS + (TOKEN_TILES * SLABS if parts else 0),),
             block=(THREADS,), stream=stream,
@@ -812,13 +835,16 @@ def experts(
     moe_buf: torch.Tensor,
     swiglu_limit: float | None,
     tile_target: torch.Tensor,
+    push: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """The experts on the front's outputs (``front``'s names): a1 [M, 2048] fp4x2 and its per-token e8m0 [M, 128],
     the same with even-rounded scales for the shared expert (``a1_even``, ``a1_even_scale``),
     the sort, Quark's w4a4 routed weights [288, ...] as aiter shuffles them, the shared expert's dense weights as
     SGLang's linear layers hold them (gate_up [2048, 2048] fp4x2 / [2048, 128] e8m0, down [4096, 512] / [4096, 32],
     row-major), ``moe_buf`` [M, 4096] bf16 zeroed (added
-    into), ``tile_target`` int32 [16] (the front's, or ``tile_targets``). Returns ``moe_buf``."""
+    into), ``tile_target`` int32 [16] (the front's, or ``tile_targets``). ``push`` = (peer_out [M, 4096] bf16,
+    peer_flags uint32 [256], epoch_ptr uint32 [1]), from PARTS_ROWS rows only: the push build also writes each
+    finished 16-token x 256-column output group to peer_out and then the epoch to its flag. Returns ``moe_buf``."""
     m = a1.shape[0]
     blocks = sorted_expert_ids.shape[0]
     assert 1 <= m <= MAX_ROWS and blocks <= MAX_BLOCKS and sorted_ids.shape[0] == blocks * BM
@@ -829,13 +855,15 @@ def experts(
     counters, mid, shared_rows, parts = workspace(a1.device)
     use_parts = m >= PARTS_ROWS
     rows_out = parts if use_parts else shared_rows
-    build("wide" if m >= WIDE_ROWS else "narrow" if m >= DEEP_ROWS else "deep", use_parts)(
+    assert push is None or use_parts, "the push build covers the atomic-free combine only"
+    peer_out, peer_flags, epoch = push if push is not None else (moe_buf, counters, counters)
+    build("wide" if m >= WIDE_ROWS else "narrow" if m >= DEEP_ROWS else "deep", use_parts, push is not None)(
         a1.data_ptr(), a1_scale.data_ptr(), a1_even.data_ptr(), a1_even_scale.data_ptr(), sorted_ids.data_ptr(),
         sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w13.data_ptr(),
         w2.data_ptr(), w13_scale.data_ptr(), w2_scale.data_ptr(), w13_shared.data_ptr(), w13_shared_scale.data_ptr(),
         w2_shared.data_ptr(), w2_shared_scale.data_ptr(), moe_buf.data_ptr(), rows_out.data_ptr(),
         mid.data_ptr(), counters.data_ptr(),
-        tile_target.data_ptr(), m, blocks, float(swiglu_limit) if swiglu_limit else float("inf"),
-        torch.cuda.current_stream(),
+        tile_target.data_ptr(), m, blocks, float(swiglu_limit) if swiglu_limit else float("inf"), epoch.data_ptr(),
+        peer_out.data_ptr(), peer_flags.data_ptr(), torch.cuda.current_stream(),
     )  # fmt: skip
     return moe_buf
