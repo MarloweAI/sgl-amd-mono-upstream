@@ -177,6 +177,7 @@ SLOTS = TOPK + 1  # a token's routes in the sort (slot field of its sorted ids):
 # from PARTS_ROWS rows, the atomic-free combine: G2 stores each route's bf16 rows to parts [token][slot][D], and
 # reduce workgroups after the G2 slots sum each output group once it is complete (deterministic); below, bf16 atomics
 PARTS_ROWS = 32
+SLAB_MAJOR = True  # with the atomic-free combine, G2 slots slab by slab (each slab's output groups complete in turn)
 PART_ROWS = SLOTS + 1  # a token's rows of parts: its slots', then a 256-column slab's routes' expert ids + 1
 ID_SPAN = 16  # dwords of a slab's ids (slot s at dword s)
 
@@ -695,7 +696,15 @@ def _run(c, bid):
         gemm2_shared(c, bid - g1)
     else:
         b2 = bid - g1 - SH_SLOTS
-        if const_expr(c["parts"]):
+        if const_expr(c["parts"] and SLAB_MAJOR):
+            # slab by slab: every block's G2 workgroup of slab q, then slab q's reduce workgroups
+            per = c["blocks"] + TOKEN_TILES
+            q, w = b2 // per, b2 % per
+            if w < c["blocks"]:
+                gemm2(c, _block_order(c, w), q)
+            else:
+                _reduce(c, (w - c["blocks"]) * SLABS + q)
+        elif const_expr(c["parts"]):
             if b2 < c["blocks"] * G2_WGS:
                 gemm2(c, _block_order(c, b2 // G2_WGS), b2 % G2_WGS)
             else:
@@ -709,7 +718,7 @@ def build(kind: str, parts: bool = False):
     """The launch of ``kind`` (``PREFETCH``'s keys): G1 workgroups of 128 columns ("wide") or 64; ``parts``: the
     atomic-free combine (``shared`` is then the parts buffer)."""
     wide = kind == "wide"
-    keyed = (("sources", SOURCES), ("kind", kind), ("prefetch", PREFETCH[kind]), ("parts", parts))
+    keyed = (("sources", SOURCES), ("kind", kind), ("prefetch", PREFETCH[kind]), ("parts", parts, SLAB_MAJOR))
 
     @fx.struct
     class Lds:
