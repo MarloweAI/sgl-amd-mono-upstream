@@ -169,6 +169,8 @@ class FlashKdaFold(msgspec.Struct, frozen=True):
     address-stable buffer) and the three rings' row strides in elements."""
 
     table: torch.Tensor
+    # the tensors the table names, held while it is
+    buffers: tuple = ()
 
     @staticmethod
     def make(ring_x, ring_a, ring_b, ring_half, fold_len, ring_rows) -> "FlashKdaFold":
@@ -196,7 +198,8 @@ class FlashKdaFold(msgspec.Struct, frozen=True):
             ring_b.stride(0),
         ]
         return FlashKdaFold(
-            table=torch.tensor(host, dtype=torch.int64, device=ring_x.device)
+            table=torch.tensor(host, dtype=torch.int64, device=ring_x.device),
+            buffers=(ring_x, ring_a, ring_b, ring_half, fold_len, ring_rows),
         )
 
 
