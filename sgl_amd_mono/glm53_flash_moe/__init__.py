@@ -43,6 +43,33 @@ def capacity(m: int, k: int = TOPK) -> int:
 
 
 def partial_floats(m: int) -> int:
+    """The router's f32 partials: 4 K slices x the rows rounded to 16 x 288."""
+    return 4 * ((m + 15) // 16) * 16 * E
+
+
+@functools.cache
+def ops():
+    """``torch.ops`` of ``front.hip``, built at first use."""
+    from sgl_amd_mono.common.hip_ext import load
+
+    sources = {p.name: p.read_text() for p in sorted(_HERE.glob("*.hip"))}
+    # aiter's JIT flushes f32 denormals; the sigmoid matches its top-k only with the same flag
+    return load(
+        "sgl_amd_mono_g53f_moe_front",
+        sources,
+        "gfx950",
+        ("-fgpu-flush-denormals-to-zero",),
+    )
+
+
+def capacity(m: int, k: int = TOPK) -> int:
+    """Sorted rows for m rows of k routes: every used expert pads its last block by fewer than BM rows."""
+    p = m * k
+    ne = E + (k - TOPK)
+    return (p + min(ne, p) * (BM - 1) + BM - 1) // BM * BM
+
+
+def partial_floats(m: int) -> int:
     """The router's f32 partials: row groups of ceil(R / 4) row tiles x 18 expert tiles x 4 K slices."""
     r = (m + 15) // 16
     rb = (r + 3) // 4
@@ -111,6 +138,7 @@ def front(
         _counters(dev),
         k,
     )
+    out["partial"] = partial
     return out
 
 

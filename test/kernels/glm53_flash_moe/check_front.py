@@ -81,8 +81,8 @@ def check_front(rows, shared=False):
             f = fm.front(x, gw, bias, SCALE, valid=valid, shared=shared, sorted_scale=True)
         torch.cuda.synchronize()
         msgs = []
-        ref = x.float() @ gw.float().t()
-        lg = f["logits"][:m]
+        ref = (x.float() @ gw.float().t())[:nvalid]
+        lg = f["logits"][:nvalid]
         err = ((lg - ref).norm() / ref.norm()).item()
         if err > 1e-5:
             msgs.append(f"logits rel-L2 {err:.2e}")

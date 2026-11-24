@@ -75,7 +75,7 @@ struct Params {
     const uint16_t *bias;   // [E] bf16
     float           scale;  // routed_scaling_factor, folded into the routed weights
     const int      *valid;  // or null: rows from *valid on are padding, routed nowhere
-    float          *partial; // [G * NT * KSPLIT, RB * 256] f32 router partials, G = ceil(R / RB)
+    float          *partial; // [KSPLIT, R * 16, E] f32 router partials
     float          *logits;  // [R * 16, E] f32
     int            *topk_ids; // [M, K]
     float          *topk_w;
@@ -161,28 +161,51 @@ __device__ __forceinline__ void warp_reduce_max(float &val_o, int &idx) {
     idx   = __builtin_amdgcn_readlane(k, WAVE - 1);
 }
 
-// One row's top 8 by one wave, in registers: lane l holds expert vectors l and l + 64 (4 experts each), the
-// vectors aiter's 64-thread block scans in the same order; ``logit(v, i)`` gives the logit of expert 4 v + i as
-// aiter reads it (bf16 widened to f32). Lanes 0..7 return their rank's expert and weight.
+// A row's scores in registers: lane l holds expert vectors l and l + 64 (4 experts each), the vectors aiter's
+// 64-thread block scans in the same order.
+struct RowScores {
+    float sc[2][4]; // sigmoid + bias; -inf past expert 287
+    float sg[2][4]; // pre-bias sigmoid = routing weight
+};
+
+// ``logit(v, i)`` gives the logit of expert 4 (lane + 64 v) + i as aiter reads it (bf16 widened to f32)
 template <typename Logit>
-__device__ void topk_row(Logit logit, const uint16_t *bias, float scale, int &out_id, float &out_w) {
+__device__ __forceinline__ RowScores row_scores(Logit logit, const float (&bias)[2][4]) {
     const int lane = threadIdx.x & (WAVE - 1);
-    float sc[2][4], sg[2][4];
+    RowScores r;
 #pragma unroll
     for (int v = 0; v < 2; ++v) {
         const int  e    = lane + WAVE * v;
         const bool live = e < E / 4;
 #pragma unroll
         for (int i = 0; i < 4; i++) {
-            float g  = live ? logit(v, i) : 0.0f;
-            g        = __builtin_amdgcn_rcpf(1.0f + exp2f(-C_LOG2E * g));
-            sg[v][i] = g; // pre-bias sigmoid = routing weight
-            sc[v][i] = live ? g + bf16_f32(bias[e * 4 + i]) : -INFINITY;
+            float g     = live ? logit(v, i) : 0.0f;
+            g           = __builtin_amdgcn_rcpf(1.0f + exp2f(-C_LOG2E * g));
+            r.sg[v][i]  = g;
+            r.sc[v][i]  = live ? g + bias[v][i] : -INFINITY;
         }
     }
-    float sum = 0.0f;
-    int   topk_indice = 0;
-    float topk_value  = 0.0f;
+    return r;
+}
+
+// The bias of this lane's experts (vectors lane and lane + 64), widened to f32
+__device__ __forceinline__ void lane_bias(const uint16_t *bias, float (&b)[2][4]) {
+    const int lane = threadIdx.x & (WAVE - 1);
+#pragma unroll
+    for (int v = 0; v < 2; ++v) {
+        const uint2 w = *reinterpret_cast<const uint2 *>(bias + min(lane + WAVE * v, E / 4 - 1) * 4);
+        b[v][0]       = __builtin_bit_cast(float, w.x << 16);
+        b[v][1]       = __builtin_bit_cast(float, w.x & 0xFFFF0000u);
+        b[v][2]       = __builtin_bit_cast(float, w.y << 16);
+        b[v][3]       = __builtin_bit_cast(float, w.y & 0xFFFF0000u);
+    }
+}
+
+// aiter's eight rounds: the wave's arg-max (each lane's first best in scan order, then warp_reduce_max), its
+// pre-bias sigmoid, the expert out of the race. Lane k returns rank k's expert and sigmoid.
+__device__ void topk_rounds(RowScores r, int &rid, float &rsig) {
+    const int lane = threadIdx.x & (WAVE - 1);
+#pragma unroll 1
     for (int k = 0; k < TOPK; ++k) {
         float max_val = -INFINITY;
         int   max_idx = k;
@@ -190,13 +213,12 @@ __device__ void topk_row(Logit logit, const uint16_t *bias, float scale, int &ou
         for (int v = 0; v < 2; ++v)
 #pragma unroll
             for (int i = 0; i < 4; i++) {
-                if (sc[v][i] > max_val) {
-                    max_val = sc[v][i];
+                if (r.sc[v][i] > max_val) {
+                    max_val = r.sc[v][i];
                     max_idx = (lane + WAVE * v) * 4 + i;
                 }
             }
         warp_reduce_max(max_val, max_idx);
-        // the chosen expert's lane, register; its pre-bias sigmoid, and its score out of the race
         const int owner = (max_idx >> 2) & (WAVE - 1), vv = max_idx >> 8, ii = max_idx & 3;
         float mine = 0.0f;
 #pragma unroll
@@ -204,17 +226,141 @@ __device__ void topk_row(Logit logit, const uint16_t *bias, float scale, int &ou
 #pragma unroll
             for (int i = 0; i < 4; i++) {
                 const bool hit = v == vv && i == ii;
-                mine           = hit ? sg[v][i] : mine;
-                sc[v][i]       = hit && lane == owner ? -INFINITY : sc[v][i];
+                mine           = hit ? r.sg[v][i] : mine;
+                r.sc[v][i]     = hit && lane == owner ? -INFINITY : r.sc[v][i];
             }
-        max_val     = __builtin_bit_cast(float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, mine), owner));
-        topk_indice = lane == k ? max_idx : topk_indice;
-        topk_value  = lane == k ? max_val : topk_value;
-        sum += max_val;
+        max_val = __builtin_bit_cast(float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, mine), owner));
+        rid     = lane == k ? max_idx : rid;
+        rsig    = lane == k ? max_val : rsig;
     }
+}
+
+// The order the rounds pick in: the score (larger first), then the lane's rank in warp_reduce_max's DPP tree
+// (lane 63 first: a tie keeps the receiving lane's value), then the lane's scan order. A larger key ranks first.
+__device__ __forceinline__ uint32_t float_order_key(float v) {
+    const uint32_t bits = __builtin_bit_cast(uint32_t, v + 0.0f);
+    return (bits & 0x80000000u) ? ~bits : bits | 0x80000000u;
+}
+__device__ __forceinline__ int tie_rank(int e) {
+    const int v4    = e >> 2;
+    const int lane  = v4 & (WAVE - 1);
+    const int local = ((v4 >> 6) << 2) | (e & 3);
+    const int low2  = (lane & 3) ^ ((lane & 4) ? 3 : 0);
+    const int bit2  = (((lane >> 2) ^ (lane >> 3)) & 1) << 2;
+    return ((((~lane) & 0x38) | bit2 | low2) << 5) | local;
+}
+__device__ __forceinline__ uint64_t route_key(uint32_t k, int e) { return (uint64_t(k) << 32) | uint32_t(~tie_rank(e)); }
+
+struct WaveLds {
+    uint64_t rkey[WAVE];
+    int      id[WAVE];
+    float    sig[WAVE];
+    int      out_id[TOPK];
+    float    out_sig[TOPK];
+};
+
+__device__ __forceinline__ void wave_sync_lds() {
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+    __builtin_amdgcn_wave_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+}
+
+// One row's top 8 by one wave, as aiter's rounds pick them: the 8th largest lane maximum (by bisection over the
+// score keys, then over the full keys when ties leave more than a wave of candidates) bounds the candidates, which
+// are ranked by their full keys; with more than a wave of candidates even so, the rounds themselves. Lanes 0..7
+// return their rank's expert and weight (the ranked sigmoids renormalized x scale, summed in rank order).
+__device__ void topk_row(const RowScores &r, float scale, WaveLds &w, int &out_id, float &out_w) {
+    const int lane = threadIdx.x & (WAVE - 1);
+    uint32_t key[2][4];
+    uint32_t lmax = 0;
+#pragma unroll
+    for (int v = 0; v < 2; ++v)
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            key[v][i] = lane + WAVE * v < E / 4 ? float_order_key(r.sc[v][i]) : 0u;
+            lmax      = max(lmax, key[v][i]);
+        }
+    // run once a launch, so kept rolled: code size, not issue, sets the time of cold straight-line code
+    uint32_t pivot = 0;
+#pragma unroll 1
+    for (int b = 30; b >= 0; b -= 2) {
+        const uint32_t c1 = pivot | (1u << b), c2 = pivot | (2u << b), c3 = pivot | (3u << b);
+        const int      n1 = __popcll(__ballot(lmax >= c1)), n2 = __popcll(__ballot(lmax >= c2)),
+                       n3 = __popcll(__ballot(lmax >= c3));
+        pivot = n3 >= TOPK ? c3 : n2 >= TOPK ? c2 : n1 >= TOPK ? c1 : pivot;
+    }
+    auto expert = [&](int v, int i) { return (lane + WAVE * v) * 4 + i; };
+    auto collect = [&](auto take) {
+        int n = 0;
+#pragma unroll
+        for (int v = 0; v < 2; ++v)
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const bool     c   = take(v, i);
+                const uint64_t bal = __ballot(c);
+                const int      at  = n + __builtin_amdgcn_mbcnt_hi(uint32_t(bal >> 32),
+                                                                    __builtin_amdgcn_mbcnt_lo(uint32_t(bal), 0));
+                if (c && at < WAVE) {
+                    w.rkey[at] = route_key(key[v][i], expert(v, i));
+                    w.id[at]   = expert(v, i);
+                    w.sig[at]  = r.sg[v][i];
+                }
+                n += __popcll(bal);
+            }
+        return n;
+    };
+    int n = collect([&](int v, int i) { return key[v][i] >= pivot; });
+    if (n > WAVE) {
+        // score ties at the pivot: the pivot on the full keys (distinct for every expert) instead
+        uint64_t lmax64 = 0;
+#pragma unroll
+        for (int v = 0; v < 2; ++v)
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const uint64_t K = key[v][i] ? route_key(key[v][i], expert(v, i)) : 0ull;
+                lmax64           = K > lmax64 ? K : lmax64;
+            }
+        uint64_t pv = 0;
+#pragma unroll 1
+        for (int b = 62; b >= 0; b -= 2) {
+            const uint64_t c1 = pv | (1ull << b), c2 = pv | (2ull << b), c3 = pv | (3ull << b);
+            const int      n1 = __popcll(__ballot(lmax64 >= c1)), n2 = __popcll(__ballot(lmax64 >= c2)),
+                           n3 = __popcll(__ballot(lmax64 >= c3));
+            pv = n3 >= TOPK ? c3 : n2 >= TOPK ? c2 : n1 >= TOPK ? c1 : pv;
+        }
+        wave_sync_lds();
+        n = collect([&](int v, int i) { return key[v][i] && route_key(key[v][i], expert(v, i)) >= pv; });
+    }
+    wave_sync_lds();
+    int   rid  = 0;
+    float rsig = 0.0f;
+    if (n <= WAVE) {
+        const bool     live = lane < n;
+        const uint64_t K    = live ? w.rkey[lane] : 0ull;
+        const int      id   = live ? w.id[lane] : 0;
+        const float    sgv  = live ? w.sig[lane] : 0.0f;
+        int rank = 0;
+#pragma unroll 1
+        for (int j = 0; j < n; ++j) rank += w.rkey[j] > K ? 1 : 0;
+        wave_sync_lds();
+        if (live && rank < TOPK) {
+            w.out_id[rank]  = id;
+            w.out_sig[rank] = sgv;
+        }
+        wave_sync_lds();
+        rid  = lane < TOPK ? w.out_id[lane] : 0;
+        rsig = lane < TOPK ? w.out_sig[lane] : 0.0f;
+    } else {
+        topk_rounds(r, rid, rsig);
+    }
+    // aiter's renormalization: the sigmoids summed in rank order, then sigmoid x (scale / sum)
+    float sum = 0.0f;
+#pragma unroll
+    for (int k = 0; k < TOPK; ++k)
+        sum += __builtin_bit_cast(float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, rsig), k));
     sum    = sum > 0.0f ? scale / sum : 0.0f;
-    out_id = topk_indice;
-    out_w  = topk_value * sum;
+    out_id = rid;
+    out_w  = rsig * sum;
 }
 
 // ---- the sort ----
@@ -357,19 +503,22 @@ constexpr int RB_MAX = 4;                    // row tiles a router CTA
 
 union FrontLds {
     float   red[WAVES][RB_MAX][256];
+    WaveLds wave[WAVES];
     SortLds sort;
 };
 
-// 16 B at agent scope (sc1); the value is read only after vm_wait(value), which ties it to the wait
-typedef uint32_t u32x4 __attribute__((ext_vector_type(4)));
-__device__ __forceinline__ u32x4 ld_dev16(const void *ptr) {
-    u32x4 v;
-    asm volatile("global_load_dwordx4 %0, %1, off sc1" : "=v"(v) : "v"(ptr) : "memory");
-    return v;
+// 16 B at agent scope (sc1), as two 8 B loads the compiler waits for
+__device__ __forceinline__ uint4 ld_dev16(const void *ptr) {
+    const uint64_t *q = reinterpret_cast<const uint64_t *>(ptr);
+    const uint64_t  lo = __hip_atomic_load(q, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    const uint64_t  hi = __hip_atomic_load(q + 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    return make_uint4(uint32_t(lo), uint32_t(lo >> 32), uint32_t(hi), uint32_t(hi >> 32));
 }
-__device__ __forceinline__ void vm_wait(u32x4 &a) { asm volatile("s_waitcnt vmcnt(0)" : "+v"(a)::"memory"); }
-__device__ __forceinline__ void vm_wait(u32x4 &a, u32x4 &b) {
-    asm volatile("s_waitcnt vmcnt(0)" : "+v"(a), "+v"(b)::"memory");
+__device__ __forceinline__ void to_f32(uint4 v, float (&f)[4]) {
+    f[0] = __builtin_bit_cast(float, v.x);
+    f[1] = __builtin_bit_cast(float, v.y);
+    f[2] = __builtin_bit_cast(float, v.z);
+    f[3] = __builtin_bit_cast(float, v.w);
 }
 
 // Router CTA (g, n, s): row tiles g RB .. g RB + RB - 1, experts 16 n .., K slice s.
@@ -405,42 +554,33 @@ __device__ void router_cta(const Params &p, int b, FrontLds &lds, int &flag) {
         for (int i = 0; i < 4; ++i) lds.red[wave][j][((lane >> 4) * 4 + i) * 16 + (lane & 15)] = acc[i];
     }
     __syncthreads();
-    // the 8 waves' sums in wave order: element e = j 256 + row 16 + expert
+    // the 8 waves' sums in wave order -> this K slice's partial logits [s][row][expert]
     const int nel = RB * 256;
-    float *part = p.partial + int64_t(gn * KSPLIT) * nel;
     for (int e = tid; e < nel; e += THREADS) {
+        if (g * RB + (e >> 8) >= p.R) break; // the last group's row tiles past R
         float v = 0.0f;
 #pragma unroll
         for (int w = 0; w < WAVES; ++w) v += lds.red[w][e >> 8][e & 255];
-        st_dev(part + s * nel + e, v);
+        const int row = (g * RB + (e >> 8)) * 16 + ((e >> 4) & 15);
+        st_dev(p.partial + (int64_t(s) * p.R * 16 + row) * E + n * 16 + (e & 15), v);
     }
-    if (!last_arrival(p.counters + (C_RN + gn) * CL, KSPLIT, flag)) return;
-    // the last of the K slices: the slices in order -> logits
-    for (int e = tid; e < nel; e += THREADS) {
-        float q[KSPLIT];
-#pragma unroll
-        for (int k = 0; k < KSPLIT; ++k) q[k] = ld_dev(part + k * nel + e);
-        float v = 0.0f;
-#pragma unroll
-        for (int k = 0; k < KSPLIT; ++k) v += q[k];
-        const int r = g * RB + (e >> 8);
-        st_dev(p.logits + int64_t(r * 16 + ((e >> 4) & 15)) * E + n * 16 + (e & 15), v);
-    }
-    // the row tiles of the group have this expert tile's logits
+    // each row tile of the group counts this (expert tile, K slice)
     __builtin_amdgcn_s_waitcnt(0);
     __syncthreads();
     if (tid < RB && g * RB + tid < p.R)
         __hip_atomic_fetch_add(p.counters + (C_R + g * RB + tid) * CL, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 }
 
-// Top-k CTA tk: rows 8 tk .. 8 tk + 7, a wave a row, once their row tile's 18 expert tiles are in. The last top-k
-// CTA to finish sorts every route and publishes the sort.
+// Top-k CTA tk: rows 8 tk .. 8 tk + 7, a wave a row, once their row tile's 18 x 4 partial tiles are in: the K slices
+// summed in slice order are the logits. The last top-k CTA to finish sorts every route and publishes the sort.
 template <int K, int NE>
 __device__ void topk_cta(const Params &p, int tk, FrontLds &lds, int &flag) {
     const int tid = threadIdx.x, wave = tid / WAVE, lane = tid & (WAVE - 1);
     const int r = tk / 2;
+    float bias[2][4];
+    lane_bias(p.bias, bias); // in flight while the router runs
     if (tid == 0)
-        while (ld_dev(p.counters + (C_R + r) * CL) < NT) __builtin_amdgcn_s_sleep(1);
+        while (ld_dev(p.counters + (C_R + r) * CL) < NT * KSPLIT) __builtin_amdgcn_s_sleep(1);
     __syncthreads();
     const int valid = p.valid ? min(max(ld_dev(p.valid), 0), p.M) : p.M;
     const int t     = tk * WAVES + wave;
@@ -448,15 +588,30 @@ __device__ void topk_cta(const Params &p, int tk, FrontLds &lds, int &flag) {
         int   id = -1;
         float wt = 0.0f;
         if (t < valid) {
-            // the row's 288 logits: 72 x 16 B, lane l holds vectors l and l + 64
-            const float *lg = p.logits + int64_t(t) * E;
-            // unconditional loads (lanes past vector 71 reread it), so no register merges an in-flight load
-            u32x4 v0 = ld_dev16(lg + lane * 4);
-            u32x4 v1 = ld_dev16(lg + min(lane + WAVE, E / 4 - 1) * 4);
-            vm_wait(v0, v1);
-            const uint32_t w[2][4] = {{v0[0], v0[1], v0[2], v0[3]}, {v1[0], v1[1], v1[2], v1[3]}};
-            topk_row([&](int v, int i) { return bf16_f32(f32_bf16(__builtin_bit_cast(float, w[v][i]))); }, p.bias,
-                     p.scale, id, wt);
+            // lane l: logit vectors l and l + 64 (lanes past vector 71 reread it) of each K slice
+            const int vi[2] = {lane, min(lane + WAVE, E / 4 - 1)};
+            float q[KSPLIT][2][4];
+#pragma unroll
+            for (int k = 0; k < KSPLIT; ++k)
+#pragma unroll
+                for (int v = 0; v < 2; ++v)
+                    to_f32(ld_dev16(p.partial + (int64_t(k) * p.R * 16 + t) * E + vi[v] * 4), q[k][v]);
+            float lg[2][4];
+#pragma unroll
+            for (int v = 0; v < 2; ++v)
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    float x = 0.0f;
+#pragma unroll
+                    for (int k = 0; k < KSPLIT; ++k) x += q[k][v][i];
+                    lg[v][i] = x;
+                }
+            float *lrow = p.logits + int64_t(t) * E;
+            *reinterpret_cast<floatx4 *>(lrow + lane * 4) = floatx4{lg[0][0], lg[0][1], lg[0][2], lg[0][3]};
+            if (lane + WAVE < E / 4)
+                *reinterpret_cast<floatx4 *>(lrow + (lane + WAVE) * 4) = floatx4{lg[1][0], lg[1][1], lg[1][2], lg[1][3]};
+            const RowScores rs = row_scores([&](int v, int i) { return bf16_f32(f32_bf16(lg[v][i])); }, bias);
+            topk_row(rs, p.scale, lds.wave[wave], id, wt);
             if (K > TOPK && lane == TOPK) {
                 id = SHARED_ID;
                 wt = 1.0f;
@@ -549,12 +704,9 @@ __device__ void scale_cta(const Params &p, int sb, uint8_t *rows_lds, int &flag)
     for (int c = sb; c < chunks; c += p.scale_ctas) {
         if (tid < 256) { // row tid / 8, 16 B part tid % 8
             const int t = ld_dev(p.sorted_ids + c * 32 + tid / 8) & 0xFFFFFF;
-            u32x4 v = {0, 0, 0, 0};
-            if (t < p.M) {
-                v = ld_dev16(p.a1_scale + int64_t(t) * SCOLS + (tid % 8) * 16);
-                vm_wait(v);
-            }
-            reinterpret_cast<u32x4 *>(rows_lds)[tid] = v;
+            uint4 v = make_uint4(0, 0, 0, 0);
+            if (t < p.M) v = ld_dev16(p.a1_scale + int64_t(t) * SCOLS + (tid % 8) * 16);
+            reinterpret_cast<uint4 *>(rows_lds)[tid] = v;
         }
         __syncthreads();
         for (int d = tid; d < 1024; d += THREADS) {
@@ -598,7 +750,11 @@ __global__ __launch_bounds__(THREADS) void topk_kernel(const uint16_t *logits, i
     const uint16_t *lg = logits + int64_t(t) * stride;
     int   id;
     float wt;
-    topk_row([&](int v, int i) { return bf16_f32(lg[(lane + WAVE * v) * 4 + i]); }, bias, scale, id, wt);
+    __shared__ WaveLds lds[WAVES];
+    float b[2][4];
+    lane_bias(bias, b);
+    const RowScores rs = row_scores([&](int v, int i) { return bf16_f32(lg[min((lane + WAVE * v) * 4 + i, E - 1)]); }, b);
+    topk_row(rs, scale, lds[wave], id, wt);
     if (lane < TOPK) {
         ids[t * TOPK + lane] = id;
         w[t * TOPK + lane]   = wt;
@@ -629,7 +785,7 @@ void front(const at::Tensor &x, const at::Tensor &w, const at::Tensor &bias, dou
     const int R = int((M + 15) / 16), RB = row_tiles_per_cta(R), G = (R + RB - 1) / RB;
     check(w, at::kBFloat16, int64_t(E) * D, "w");
     check(bias, at::kBFloat16, E, "bias");
-    check(partial, at::kFloat, int64_t(G) * NT * KSPLIT * RB * 256, "partial");
+    check(partial, at::kFloat, int64_t(KSPLIT) * R * 16 * E, "partial");
     check(logits, at::kFloat, int64_t(R) * 16 * E, "logits");
     check(topk_ids, at::kInt, M * K, "topk_ids");
     check(topk_w, at::kFloat, M * K, "topk_w");
