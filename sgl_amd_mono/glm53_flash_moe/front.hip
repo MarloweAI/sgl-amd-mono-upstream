@@ -574,7 +574,8 @@ __device__ void topk_cta(const Params &p, int tk, FrontLds &lds, int &flag) {
     sort_routes<K, NE>(p, lds.sort);
     __builtin_amdgcn_s_waitcnt(0);
     __syncthreads();
-    if (tid == 0) st_dev(p.counters + C_SORTED * CL, 1);
+    // published for the scale CTAs only (they put it back to 0), so launches without them leave it 0
+    if (tid == 0 && p.a1_scale_sorted) st_dev(p.counters + C_SORTED * CL, 1);
 }
 
 // ---- the activation quant and the zeroed output ----

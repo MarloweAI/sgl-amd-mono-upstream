@@ -161,6 +161,21 @@ def check_front(rows, shared=False):
     return ok_all
 
 
+def check_mixed():
+    """Launches with and without the sorted scales, alternating: every counter and flag left for the next."""
+    g = torch.Generator(device=dev).manual_seed(6)
+    for m in (16, 128):
+        x, gw, bias = inputs(m, g)
+        ref = None
+        for i, ss in enumerate((False, True, False, True, True, False)):
+            f = fm.front(x, gw, bias, SCALE, shared=bool(i % 2), sorted_scale=ss)
+            torch.cuda.synchronize()
+            if ss:
+                ref = f["a1_scale_sorted"].clone() if ref is None else ref
+    print("front mixed launches: OK", flush=True)
+    return True
+
+
 def expert_weights(g, ne=E):
     """Synthetic shuffled MXFP4 experts in Quark's layout: w13 [ne, 2I, D/2], w2 [ne, D, I/2], e8m0 scales."""
     from aiter import dtypes
@@ -253,6 +268,7 @@ def time_all(rows, ws):
     for m in rows:
         x, gw, bias = inputs(m, g)
         t_front = graph_time(lambda: fm.front(x, gw, bias, SCALE))
+        t_front2 = graph_time(lambda: fm.front(x, gw, bias, SCALE, shared=True, sorted_scale=False))
         t_sfront = graph_time(lambda: stock_front(x, gw, bias))
 
         def stock_full():
@@ -266,8 +282,10 @@ def time_all(rows, ws):
         t_moe = graph_time(lambda: fm.moe_front_aiter(x, gw, bias, SCALE, w13, w2, s13, s2, LIMIT), iters=100)
         t_moe4 = graph_time(lambda: fm.moe_front_aiter(x, gw, bias, SCALE, w13, w2, s13, s2, LIMIT, fp4_inter=True),
                             iters=100)
-        res[m] = dict(front=t_front, stock_front=t_sfront, moe=t_moe, moe_fp4=t_moe4, stock_moe=t_smoe)
-        print(f"time m={m}: front {t_front:.1f} us (stock router+topk+sort+quant {t_sfront:.1f}); "
+        res[m] = dict(front=t_front, front_shared_no_sorted_scale=t_front2, stock_front=t_sfront, moe=t_moe,
+                      moe_fp4=t_moe4, stock_moe=t_smoe)
+        print(f"time m={m}: front {t_front:.1f} us, with the shared slot and no sorted scales {t_front2:.1f} "
+              f"(stock router+topk+sort+quant {t_sfront:.1f}); "
               f"routed MoE {t_moe:.1f} us, fp4 intermediate {t_moe4:.1f} (stock {t_smoe:.1f})", flush=True)
     return res
 
@@ -286,6 +304,7 @@ def main():
     if "topk" not in skip:
         ok &= check_topk(rows)
     if "front" not in skip:
+        ok &= check_mixed()
         ok &= check_front(rows)
         ok &= check_front(rows, shared=True)
     ws = expert_weights(torch.Generator(device=dev).manual_seed(5))
