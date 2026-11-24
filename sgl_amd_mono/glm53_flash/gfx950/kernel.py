@@ -2229,9 +2229,10 @@ def build_flash_kernel(key: FlashBuild):
             r_dtb = _rsrc(dt_bias)
             r_won = _rsrc(w_on)
             r_idx = _rsrc(state_idx)
-            for t in range(start("kda"), S * H, G):
+            # one task a (request, head), on consecutive CTAs
+            for t in range(start("kda"), NREQ * H, G):
                 t = fx.Int32(t)
-                s = t // H
+                s = (t // H) * VL
                 h = t % H
                 if (s % VL == 0) & (s < NREQ * VL):
                     idx = kda_slot(r_idx, s)
