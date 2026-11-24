@@ -77,6 +77,7 @@ struct Params {
     const int      *valid;  // or null: rows from *valid on are padding, routed nowhere
     const int      *given_ids; // [M, 8], with GIVEN: the routes the top-k CTAs write once their own top-k is done
     const float    *given_w;
+    int             given_stride; // their row stride (8 or more: a wider top-k's first 8 columns)
     float          *partial; // [KSPLIT, R * 16, E] f32 router partials
     float          *logits;  // [R * 16, E] f32
     int            *topk_ids; // [M, K]
@@ -108,6 +109,13 @@ __device__ __forceinline__ float ld_dev(const float *p) {
 }
 __device__ __forceinline__ uint32_t ld_dev(const uint32_t *p) {
     return __hip_atomic_load(p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+}
+
+typedef uint32_t u32x4 __attribute__((ext_vector_type(4)));
+constexpr int CPOL_SC1 = 16; // gfx950 cache policy: sc1, the device-coherent level
+// A raw buffer over p (4 GB range, gfx9 data format)
+__device__ __forceinline__ __amdgpu_buffer_rsrc_t rsrc(const void *p) {
+    return __builtin_amdgcn_make_buffer_rsrc(const_cast<void *>(p), 0, 0x7fffffff, 0x00020000);
 }
 
 __device__ __forceinline__ float bf16_f32(uint16_t v) { return __builtin_bit_cast(float, uint32_t(v) << 16); }
@@ -482,16 +490,27 @@ __device__ void sort_routes(const Params &p, SortLds &s) {
         if (dest[k] >= 0) s.row_route[dest[k]] = uint16_t(tid + k * THREADS);
     __syncthreads();
     for (int b = tid; b < run; b += THREADS) p.sorted_eids[b] = s.block_e[b];
-    for (int j = tid; j < nv; j += THREADS) {
-        const int ex = s.block_e[j / BM];
-        if (j - s.base[ex] * BM < s.cnt[ex]) {
-            const int q = s.row_route[j], t = q / K;
-            st_dev(p.sorted_ids + j, ((q % K) << 24) | t);
-            p.sorted_w[j] = s.w[q];
-        } else {
-            st_dev(p.sorted_ids + j, p.pad_id);
-            p.sorted_w[j] = 0.0f;
+    // 4 sorted rows a thread, one 16 B write-through store (sc1) of their ids and one of their weights
+    const __amdgpu_buffer_rsrc_t ids_r = rsrc(p.sorted_ids), w_r = rsrc(p.sorted_w);
+    for (int j0 = tid * 4; j0 < nv; j0 += THREADS * 4) {
+        const int ex = s.block_e[j0 / BM], first = j0 - s.base[ex] * BM;
+        int   id[4];
+        float wt[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            if (first + i < s.cnt[ex]) {
+                const int q = s.row_route[j0 + i];
+                id[i]       = ((q % K) << 24) | (q / K);
+                wt[i]       = s.w[q];
+            } else {
+                id[i] = p.pad_id;
+                wt[i] = 0.0f;
+            }
         }
+        __builtin_amdgcn_raw_buffer_store_b128(__builtin_bit_cast(u32x4, make_int4(id[0], id[1], id[2], id[3])), ids_r,
+                                               j0 * 4, 0, CPOL_SC1);
+        __builtin_amdgcn_raw_buffer_store_b128(__builtin_bit_cast(u32x4, make_float4(wt[0], wt[1], wt[2], wt[3])), w_r,
+                                               j0 * 4, 0, CPOL_SC1);
     }
     if (tid == 0) {
         st_dev(p.num_valid, nv);
@@ -631,8 +650,8 @@ __device__ void topk_cta(const Params &p, int tk, FrontLds &lds, int &flag) {
             const RowScores rs = row_scores([&](int v, int i) { return bf16_f32(f32_bf16(lg[v][i])); }, bias);
             topk_row(rs, p.scale, lds.wave[wave], id, wt);
             if (GIVEN && lane < TOPK) { // a measurement's fixed routes, after the same top-k work
-                id = p.given_ids[t * TOPK + lane];
-                wt = p.given_w[t * TOPK + lane];
+                id = p.given_ids[t * p.given_stride + lane];
+                wt = p.given_w[t * p.given_stride + lane];
             }
             if (K > TOPK && lane == TOPK) {
                 id = SHARED_ID;
@@ -854,10 +873,14 @@ void front(const at::Tensor &x, const at::Tensor &w, const at::Tensor &bias, dou
     p.pad_id      = (K << 24) | int(M);
     if (given_ids.has_value()) {
         TORCH_CHECK(given_w.has_value(), "given_ids and given_w together");
-        check(*given_ids, at::kInt, M * TOPK, "given_ids");
-        check(*given_w, at::kFloat, M * TOPK, "given_w");
-        p.given_ids = given_ids->data_ptr<int>();
-        p.given_w   = given_w->data_ptr<float>();
+        TORCH_CHECK(given_ids->is_cuda() && given_ids->scalar_type() == at::kInt && given_w->scalar_type() == at::kFloat &&
+                        given_ids->dim() == 2 && given_ids->size(0) == M && given_ids->size(1) >= TOPK &&
+                        given_ids->stride(1) == 1 && given_w->sizes() == given_ids->sizes() &&
+                        given_w->strides() == given_ids->strides(),
+                    "given routes: [M, >= 8] i32 ids and f32 weights, unit column stride, the same strides");
+        p.given_ids    = given_ids->data_ptr<int>();
+        p.given_w      = given_w->data_ptr<float>();
+        p.given_stride = int(given_ids->stride(0));
     }
     if (valid.has_value()) {
         TORCH_CHECK(valid->is_cuda() && valid->numel() == 1 && valid->scalar_type() == at::kInt,
