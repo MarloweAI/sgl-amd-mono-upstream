@@ -226,6 +226,7 @@ def _hook_parts(c, token_tile, slab):
             p = (order[r] == s).select(e[s], p)
         present.append(p != 0)
     present.append(e[TOPK] != 0)
+    pushed = []
     for i in range_constexpr(2):
         col = slab * 512 + (tid % 16) * 32 + i * 16
         parts = [
@@ -242,27 +243,32 @@ def _hook_parts(c, token_tile, slab):
             lo = (acc << 16).bitcast(fx.Float32) + (sh << 16).bitcast(fx.Float32)
             hi = (acc & -65536).bitcast(fx.Float32) + (sh & -65536).bitcast(fx.Float32)
             res.append(fx.Vector.from_elements([lo, hi], fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)[0])
-        bo.buffer_store(fx.Vector.from_elements(res, fx.Int32), ro, (row * (D * 2) + col) // 4)
-        if const_expr(c["push"]):
-            # the same 16 B to the peer's output, written through (sc0 sc1)
-            rpeer = rsrc(a["peer_out"], fx.Int64(c["m"]) * (D * 2))
-            bo.buffer_store(fx.Vector.from_elements(res, fx.Int32), rpeer, (row * (D * 2) + col) // 4,
-                            cache_modifier=CM_SYS)  # fmt: skip
+        out = fx.Vector.from_elements(res, fx.Int32)
+        bo.buffer_store(out, ro, (row * (D * 2) + col) // 4)
+        pushed.append((out, (row * (D * 2) + col) // 4))
     zero = fx.Vector.filled(4, 0, fx.Int32)
     for h in range_constexpr(3):
         bo.buffer_store(zero, rp, idw + h * 4, mask=tid % 16 == 0, cache_modifier=CM_DEV)
-    if const_expr(c["push"]):
-        # every thread's stores have landed, then the group's flag (the launch's epoch) goes to the peer
-        rocdl.s_waitcnt(vmcnt=0)
-        gpu.barrier()
-        _flag(c, token_tile * SLABS + slab)
+    return pushed
+
+
+def _push(c, token_tile, slab, pushed):
+    """The push build: this thread's output pieces to the peer's output (written through, sc0 sc1); once every
+    thread's stores have landed, thread 0 stores the launch's epoch to the peer's flag of the group."""
+    rpeer = rsrc(c["args"]["peer_out"], fx.Int64(c["m"]) * (D * 2))
+    for v, w in pushed:
+        bo.buffer_store(v, rpeer, w, cache_modifier=CM_SYS)
+    rocdl.s_waitcnt(vmcnt=0)
+    gpu.barrier()
+    _flag(c, token_tile * SLABS + slab)
 
 
 @flyc.jit
 def _flag(c, i):
     """Thread 0 stores the epoch to the peer's flag ``i`` (sc0 sc1)."""
     if c["tid"] == 0:
-        bo.buffer_store(c["epoch"], rsrc(c["args"]["peer_flags"]), i, cache_modifier=CM_SYS)
+        rf = rsrc(c["args"]["peer_flags"], TOKEN_TILES * SLABS * 4)
+        bo.buffer_store(c["epoch"], rf, i, cache_modifier=CM_SYS)
 
 
 def hook(c, token_tile, slab):
@@ -712,7 +718,10 @@ def _reduce(c, r):
                 v = _ld_agent(cnt)
             _st_agent(cnt, 0)
         gpu.barrier()
-        _hook_parts(c, tile, slab)
+        pushed = _hook_parts(c, tile, slab)
+        if const_expr(c["push"]):
+            if slab < c["push"]:  # the first push_slabs slabs only (a workgroup-uniform branch)
+                _push(c, tile, slab, pushed)
 
 
 @flyc.jit
@@ -742,11 +751,11 @@ def _run(c, bid):
 
 
 @functools.cache
-def build(kind: str, parts: bool = False, push: bool = False):
+def build(kind: str, parts: bool = False, push: int = 0):
     """The launch of ``kind`` (``PREFETCH``'s keys): G1 workgroups of 128 columns ("wide") or 64; ``parts``: the
-    atomic-free combine (``shared`` is then the parts buffer); ``push`` (with ``parts``): each reduce workgroup
-    also writes its output group to ``peer_out`` and then the epoch (read once from ``epoch_ptr``) to
-    ``peer_flags[16 t + s]`` (the other builds ignore those three arguments)."""
+    atomic-free combine (``shared`` is then the parts buffer); ``push`` (with ``parts``, 12 or 16): each reduce
+    workgroup of slab s < push also writes its output group to ``peer_out`` and then the epoch (read once from
+    ``epoch_ptr``) to ``peer_flags[16 t + s]`` (0: no push; the other builds ignore those three arguments)."""
     assert parts or not push
     wide = kind == "wide"
     keyed = (("sources", SOURCES), ("kind", kind), ("prefetch", PREFETCH[kind]), ("parts", parts, SLAB_MAJOR),
@@ -756,7 +765,7 @@ def build(kind: str, parts: bool = False, push: bool = False):
     class Lds:
         words: fx.Array[fx.Int32, LDS_WORDS + (BM * PART_ROW if parts else 0), 16]
 
-    name = "glm53f_moe_experts_" + kind + ("_parts" if parts else "") + ("_push" if push else "")
+    name = "glm53f_moe_experts_" + kind + ("_parts" if parts else "") + (f"_push{push}" if push else "")
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def kexperts(
@@ -847,6 +856,7 @@ def experts(
     swiglu_limit: float | None,
     tile_target: torch.Tensor,
     push: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    push_slabs: int = 16,
 ) -> torch.Tensor:
     """The experts on the front's outputs (``front``'s names): a1 [M, 2048] fp4x2 and its per-token e8m0 [M, 128],
     the same with even-rounded scales for the shared expert (``a1_even``, ``a1_even_scale``),
@@ -855,7 +865,8 @@ def experts(
     row-major), ``moe_buf`` [M, 4096] bf16 zeroed (added
     into), ``tile_target`` int32 [16] (the front's, or ``tile_targets``). ``push`` = (peer_out [M, 4096] bf16,
     peer_flags uint32 [256], epoch_ptr uint32 [1]), from PARTS_ROWS rows only: the push build also writes each
-    finished 16-token x 256-column output group to peer_out and then the epoch to its flag. Returns ``moe_buf``."""
+    finished 16-token x 256-column output group of the first ``push_slabs`` (12 or 16) 256-column slabs to peer_out
+    and then the epoch to its flag. Returns ``moe_buf``."""
     m = a1.shape[0]
     blocks = sorted_expert_ids.shape[0]
     assert 1 <= m <= MAX_ROWS and blocks <= MAX_BLOCKS and sorted_ids.shape[0] == blocks * BM
@@ -868,7 +879,9 @@ def experts(
     rows_out = parts if use_parts else shared_rows
     assert push is None or use_parts, "the push build covers the atomic-free combine only"
     peer_out, peer_flags, epoch = push if push is not None else (moe_buf, counters, counters)
-    build("wide" if m >= WIDE_ROWS else "narrow" if m >= DEEP_ROWS else "deep", use_parts, push is not None)(
+    assert push_slabs in (12, 16)
+    kind = "wide" if m >= WIDE_ROWS else "narrow" if m >= DEEP_ROWS else "deep"
+    build(kind, use_parts, push_slabs if push is not None else 0)(
         a1.data_ptr(), a1_scale.data_ptr(), a1_even.data_ptr(), a1_even_scale.data_ptr(), sorted_ids.data_ptr(),
         sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w13.data_ptr(),
         w2.data_ptr(), w13_scale.data_ptr(), w2_scale.data_ptr(), w13_shared.data_ptr(), w13_shared_scale.data_ptr(),

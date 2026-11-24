@@ -234,11 +234,12 @@ def moe_fused(
     valid: torch.Tensor | None = None,
     given: tuple[torch.Tensor, torch.Tensor] | None = None,
     push: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    push_slabs: int = 16,
 ) -> torch.Tensor:
     """The routed experts (weights [288, ...], aiter-shuffled) and the shared expert (its dense layers' own row-major
     weights, uint8 as SGLang holds them: ``shared_*``, as slot 288 of the sort) in two launches:
     ``front`` with the shared slot, then ``experts.experts`` (G1 + G2 in one launch; ``push``: its peer output,
-    flags and epoch). Returns [m, 4096] bf16."""
+    flags and epoch, for the first ``push_slabs`` slabs). Returns [m, 4096] bf16."""
     from .experts import experts
 
     f = front(x, gate_w, bias, scale, valid=valid, shared=True, sorted_scale=False, given=given)
@@ -263,4 +264,5 @@ def moe_fused(
         swiglu_limit,
         f["tile_target"],
         push=push,
+        push_slabs=push_slabs,
     )
