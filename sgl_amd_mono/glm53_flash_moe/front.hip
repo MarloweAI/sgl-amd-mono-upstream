@@ -75,6 +75,8 @@ struct Params {
     const uint16_t *bias;   // [E] bf16
     float           scale;  // routed_scaling_factor, folded into the routed weights
     const int      *valid;  // or null: rows from *valid on are padding, routed nowhere
+    const int      *given_ids; // [M, 8], with GIVEN: the routes the top-k CTAs write once their own top-k is done
+    const float    *given_w;
     float          *partial; // [KSPLIT, R * 16, E] f32 router partials
     float          *logits;  // [R * 16, E] f32
     int            *topk_ids; // [M, K]
@@ -83,6 +85,7 @@ struct Params {
     float          *sorted_w;
     int            *sorted_eids; // [cap / BM]
     int            *num_valid;   // [2]
+    int            *tile_target; // [16]: 2 x the sorted blocks holding a route of a token of each 16-token tile
     uint8_t        *a1;          // [M, D / 2] fp4x2
     uint8_t        *a1_scale;    // [M, SCOLS] e8m0, a token's own
     uint8_t        *a1_scale_sorted; // [cap rounded to 32, SCOLS] shuffled, or null
@@ -381,6 +384,7 @@ struct SortLds {
     int     base[E + 1];
     int16_t block_e[MAX_BLOCKS];
     int     wsum[WAVES];
+    int     tiles[MAX_ROWS / 16];
 };
 
 // Inclusive scan across a wave (row shifts, then row broadcasts).
@@ -493,6 +497,20 @@ __device__ void sort_routes(const Params &p, SortLds &s) {
         st_dev(p.num_valid, nv);
         st_dev(p.num_valid + 1, p.M);
     }
+    // each block's 16-token tiles, counted once a block (the row -> route map is final above)
+    if (tid < MAX_ROWS / 16) s.tiles[tid] = 0;
+    __syncthreads();
+    for (int b = tid; b < run; b += THREADS) {
+        const int ex = s.block_e[b], first = b * BM - s.base[ex] * BM, live = min(BM, s.cnt[ex] - first);
+        uint32_t seen = 0;
+        for (int j = 0; j < live; ++j) seen |= 1u << ((s.row_route[b * BM + j] / K) / 16);
+        while (seen) {
+            atomicAdd(&s.tiles[__builtin_ctz(seen)], 1);
+            seen &= seen - 1;
+        }
+    }
+    __syncthreads();
+    if (tid < MAX_ROWS / 16) p.tile_target[tid] = 2 * s.tiles[tid];
 }
 
 // ---- the router tiles, their top-k and the sort ----
@@ -573,7 +591,7 @@ __device__ void router_cta(const Params &p, int b, FrontLds &lds, int &flag) {
 
 // Top-k CTA tk: rows 8 tk .. 8 tk + 7, a wave a row, once their row tile's 18 x 4 partial tiles are in: the K slices
 // summed in slice order are the logits. The last top-k CTA to finish sorts every route and publishes the sort.
-template <int K, int NE>
+template <int K, int NE, bool GIVEN>
 __device__ void topk_cta(const Params &p, int tk, FrontLds &lds, int &flag) {
     const int tid = threadIdx.x, wave = tid / WAVE, lane = tid & (WAVE - 1);
     const int r = tk / 2;
@@ -612,6 +630,10 @@ __device__ void topk_cta(const Params &p, int tk, FrontLds &lds, int &flag) {
                 *reinterpret_cast<floatx4 *>(lrow + (lane + WAVE) * 4) = floatx4{lg[1][0], lg[1][1], lg[1][2], lg[1][3]};
             const RowScores rs = row_scores([&](int v, int i) { return bf16_f32(f32_bf16(lg[v][i])); }, bias);
             topk_row(rs, p.scale, lds.wave[wave], id, wt);
+            if (GIVEN && lane < TOPK) { // a measurement's fixed routes, after the same top-k work
+                id = p.given_ids[t * TOPK + lane];
+                wt = p.given_w[t * TOPK + lane];
+            }
             if (K > TOPK && lane == TOPK) {
                 id = SHARED_ID;
                 wt = 1.0f;
@@ -724,7 +746,7 @@ __device__ void scale_cta(const Params &p, int sb, uint8_t *rows_lds, int &flag)
     }
 }
 
-template <int K, int NE>
+template <int K, int NE, bool GIVEN>
 __global__ __launch_bounds__(THREADS) void front_kernel(Params p) {
     __shared__ FrontLds  lds;
     __shared__ uint8_t   scale_lds[32 * SCOLS];
@@ -736,7 +758,7 @@ __global__ __launch_bounds__(THREADS) void front_kernel(Params p) {
     else if (b < t0)
         quant_cta(p, b - q0, scale_lds);
     else if (b < s0)
-        topk_cta<K, NE>(p, b - t0, lds, flag);
+        topk_cta<K, NE, GIVEN>(p, b - t0, lds, flag);
     else
         scale_cta(p, b - s0, scale_lds, flag);
 }
@@ -772,9 +794,9 @@ int row_tiles_per_cta(int R) { return (R + 3) / 4; }
 void front(const at::Tensor &x, const at::Tensor &w, const at::Tensor &bias, double scale,
            const c10::optional<at::Tensor> &valid, at::Tensor &partial, at::Tensor &logits, at::Tensor &topk_ids,
            at::Tensor &topk_w, at::Tensor &sorted_ids, at::Tensor &sorted_w, at::Tensor &sorted_eids,
-           at::Tensor &num_valid, at::Tensor &a1, at::Tensor &a1_scale,
+           at::Tensor &num_valid, at::Tensor &tile_target, at::Tensor &a1, at::Tensor &a1_scale,
            const c10::optional<at::Tensor> &a1_scale_sorted, at::Tensor &out, at::Tensor &counters,
-           int64_t topk_total) {
+           int64_t topk_total, const c10::optional<at::Tensor> &given_ids, const c10::optional<at::Tensor> &given_w) {
     const int64_t M = x.size(0);
     TORCH_CHECK(x.dim() == 2 && x.size(1) == D && x.stride(1) == 1 && x.stride(0) % 8 == 0 &&
                     x.scalar_type() == at::kBFloat16 && reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0,
@@ -816,6 +838,8 @@ void front(const at::Tensor &x, const at::Tensor &w, const at::Tensor &bias, dou
     p.sorted_w    = sorted_w.data_ptr<float>();
     p.sorted_eids = sorted_eids.data_ptr<int>();
     p.num_valid   = num_valid.data_ptr<int>();
+    check(tile_target, at::kInt, MAX_ROWS / 16, "tile_target");
+    p.tile_target = tile_target.data_ptr<int>();
     p.a1          = reinterpret_cast<uint8_t *>(a1.data_ptr());
     p.a1_scale    = reinterpret_cast<uint8_t *>(a1_scale.data_ptr());
     p.out         = reinterpret_cast<uint4 *>(out.data_ptr());
@@ -828,6 +852,13 @@ void front(const at::Tensor &x, const at::Tensor &w, const at::Tensor &bias, dou
     p.quant_ctas  = int(std::min<int64_t>((M + 1) / 2, 64));
     p.scale_ctas  = 0;
     p.pad_id      = (K << 24) | int(M);
+    if (given_ids.has_value()) {
+        TORCH_CHECK(given_w.has_value(), "given_ids and given_w together");
+        check(*given_ids, at::kInt, M * TOPK, "given_ids");
+        check(*given_w, at::kFloat, M * TOPK, "given_w");
+        p.given_ids = given_ids->data_ptr<int>();
+        p.given_w   = given_w->data_ptr<float>();
+    }
     if (valid.has_value()) {
         TORCH_CHECK(valid->is_cuda() && valid->numel() == 1 && valid->scalar_type() == at::kInt,
                     "valid: one int32 on the GPU");
@@ -844,10 +875,15 @@ void front(const at::Tensor &x, const at::Tensor &w, const at::Tensor &bias, dou
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA guard(x.device());
     const hipStream_t stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA(x.device().index()).stream();
     const int grid = p.router_ctas + p.quant_ctas + p.topk_ctas + p.scale_ctas;
-    if (K == TOPK)
-        front_kernel<TOPK, E><<<grid, THREADS, 0, stream>>>(p);
+    const bool given = p.given_ids != nullptr;
+    if (K == TOPK && !given)
+        front_kernel<TOPK, E, false><<<grid, THREADS, 0, stream>>>(p);
+    else if (K == TOPK)
+        front_kernel<TOPK, E, true><<<grid, THREADS, 0, stream>>>(p);
+    else if (!given)
+        front_kernel<TOPK + 1, E + 1, false><<<grid, THREADS, 0, stream>>>(p);
     else
-        front_kernel<TOPK + 1, E + 1><<<grid, THREADS, 0, stream>>>(p);
+        front_kernel<TOPK + 1, E + 1, true><<<grid, THREADS, 0, stream>>>(p);
     C10_HIP_KERNEL_LAUNCH_CHECK();
 }
 
@@ -877,8 +913,9 @@ void topk(const at::Tensor &logits, const at::Tensor &bias, double scale, at::Te
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
     m.def("front(Tensor x, Tensor w, Tensor bias, float scale, Tensor? valid, Tensor(a!) partial, "
           "Tensor(b!) logits, Tensor(c!) topk_ids, Tensor(d!) topk_w, Tensor(e!) sorted_ids, Tensor(f!) sorted_w, "
-          "Tensor(g!) sorted_eids, Tensor(h!) num_valid, Tensor(i!) a1, Tensor(j!) a1_scale, "
-          "Tensor(k!)? a1_scale_sorted, Tensor(l!) out, Tensor(m!) counters, int topk_total) -> ()");
+          "Tensor(g!) sorted_eids, Tensor(h!) num_valid, Tensor(n!) tile_target, Tensor(i!) a1, Tensor(j!) a1_scale, "
+          "Tensor(k!)? a1_scale_sorted, Tensor(l!) out, Tensor(m!) counters, int topk_total, "
+          "Tensor? given_ids=None, Tensor? given_w=None) -> ()");
     m.impl("front", at::kCUDA, &front);
     m.def("topk(Tensor logits, Tensor bias, float scale, Tensor(a!) ids, Tensor(b!) w) -> ()");
     m.impl("topk", at::kCUDA, &topk);

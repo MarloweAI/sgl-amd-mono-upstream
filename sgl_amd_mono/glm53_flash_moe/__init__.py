@@ -90,11 +90,13 @@ def front(
     valid: torch.Tensor | None = None,
     shared: bool = False,
     sorted_scale: bool = True,
+    given: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> dict:
     """x [m, 4096] bf16, gate_w [288, 4096] bf16, bias [288] bf16, ``scale`` folded into the routed weights,
     ``valid`` (or None) int32 [1]: rows from it on are padding and routed nowhere. ``shared`` appends expert 288
     with weight 1.0 to every valid row; ``sorted_scale`` also writes the scales in the sorted, shuffled layout of
-    aiter's FlyDSL stage 1. Returns the outputs by name."""
+    aiter's FlyDSL stage 1. ``given`` (ids [m, 8] i32, weights [m, 8] f32), for measurements with fixed routes: the
+    top-k runs as always, then the routes written are these. Returns the outputs by name."""
     m = x.shape[0]
     k = TOPK + int(shared)
     dev = x.device
@@ -108,6 +110,7 @@ def front(
         sorted_weights=torch.empty(cap, dtype=f32, device=dev),
         sorted_expert_ids=torch.empty(cap // BM, dtype=i32, device=dev),
         num_valid_ids=torch.empty(2, dtype=i32, device=dev),
+        tile_target=torch.empty(MAX_ROWS // 16, dtype=i32, device=dev),
         a1=torch.empty(m, D // 2, dtype=u8, device=dev),
         a1_scale=torch.empty(m, SCALE_COLS, dtype=u8, device=dev),
         a1_scale_sorted=(
@@ -131,12 +134,15 @@ def front(
         out["sorted_weights"],
         out["sorted_expert_ids"],
         out["num_valid_ids"],
+        out["tile_target"],
         out["a1"],
         out["a1_scale"],
         out["a1_scale_sorted"],
         out["moe_buf"],
         _counters(dev),
         k,
+        given[0] if given is not None else None,
+        given[1] if given is not None else None,
     )
     out["partial"] = partial
     return out
@@ -164,6 +170,7 @@ def moe_front_aiter(
     valid: torch.Tensor | None = None,
     shared: bool = False,
     fp4_inter: bool = False,
+    given: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """The routed MoE (and the shared expert, as slot 288, when ``shared``): ``front`` then aiter's FlyDSL
     stage 1 / stage 2 on its sorted rows and MXFP4 activations. ``fp4_inter``: stage 1 writes the MXFP4
@@ -172,7 +179,7 @@ def moe_front_aiter(
     from aiter.fused_moe import fused_moe_2stages
     from aiter.ops.flydsl.moe_common import GateMode
 
-    f = front(x, gate_w, bias, scale, valid=valid, shared=shared, sorted_scale=True)
+    f = front(x, gate_w, bias, scale, valid=valid, shared=shared, sorted_scale=True, given=given)
     k = TOPK + int(shared)
     return fused_moe_2stages(
         x,
@@ -209,3 +216,38 @@ def _fp4_intermediate(metadata):
     name = s1.keywords["kernelName"]
     stage1 = functools.partial(s1.func, *s1.args, **{**s1.keywords, "kernelName": name + "_fp4"})
     return dataclasses.replace(metadata, stage1=stage1, fuse_quant="fp4")
+
+
+def moe_fused(
+    x: torch.Tensor,
+    gate_w: torch.Tensor,
+    bias: torch.Tensor,
+    scale: float,
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    swiglu_limit: float,
+    valid: torch.Tensor | None = None,
+    given: tuple[torch.Tensor, torch.Tensor] | None = None,
+) -> torch.Tensor:
+    """The routed and shared experts (weights [289, ...], the shared expert as expert 288) in two launches:
+    ``front`` with the shared slot, then ``experts.experts`` (G1 + G2 in one launch). Returns [m, 4096] bf16."""
+    from .experts import experts
+
+    f = front(x, gate_w, bias, scale, valid=valid, shared=True, sorted_scale=False, given=given)
+    return experts(
+        f["a1"],
+        f["a1_scale"],
+        f["sorted_ids"],
+        f["sorted_weights"],
+        f["sorted_expert_ids"],
+        f["num_valid_ids"],
+        w13,
+        w2,
+        w13_scale,
+        w2_scale,
+        f["moe_buf"],
+        swiglu_limit,
+        f["tile_target"],
+    )
