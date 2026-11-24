@@ -497,6 +497,8 @@ def build_flash_kernel(key: FlashBuild):
         S * KDA_DIM if kda else 0,
         S * MH * V_DIM // 2 // O_PASSES if dsa else 0,
         SPLIT_WORDS if dsa else 0,
+        # WIDE split: every head's q, the keys, the second head group's scores
+        (MH + SPLIT_KEYS) * QS + WAVES * 64 * 4 if dsa and WIDE else 0,
         SEL_BINS + 2 * 2048 if dsa else 0,
     )
     SEL_CAP = (X_WORDS - SEL_BINS) // 2
