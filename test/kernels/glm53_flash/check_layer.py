@@ -718,12 +718,49 @@ def check_keys(args, rank, tp, group, device) -> bool:
         return out[1].clone(), sel.view(rows, SEL_STRIDE, 2).clone(), c.idx_cache
 
     base, sel, idx = run(caches.kv_cache.clone())
+    cmp_ok = True
+    if args.compare_select:
+        # the one-CTA pool select on the same inputs: the same tokens and output
+        rt1 = FlashRuntime(replace(key, select_ctas=False), rank, group, device)
+        rt1.set_deadline(args.deadline)
+        op1 = FlashLayerOp(
+            rt1, ffn_weights(rank, tp, device), 0, dsa=dsa_weights(rank, tp, device)
+        )
+        c1 = replace(
+            caches,
+            kv_cache=caches.kv_cache.clone(),
+            idx_cache=caches.idx_cache.clone(),
+            tail_k=caches.tail_k.clone(),
+            tail_g=caches.tail_g.clone(),
+        )
+        out1 = op1.launch(x, res, post, comb, caches=c1, rows=table, page_table=pt)
+        torch.cuda.synchronize()
+        sel1 = rt1.scratch[rt1.sc["tok_sel"] :].view(torch.int32)
+        sel1 = sel1[: 2 * rows * SEL_STRIDE].view(rows, SEL_STRIDE, 2)
+        for r, n in enumerate(key_lens):
+            m = TOPK_TOKENS + n % KPOOL if n // KPOOL > TOPK_POOLS else 0
+            same_sel = torch.equal(sel[r, :m, 0], sel1[r, :m, 0])
+            same_row = torch.equal(base[r], out1[1][r])
+            print(
+                f"rank {rank} row {r} ({n} tokens): slices vs one-CTA select: "
+                f"tokens {same_sel}, output {same_row}",
+                flush=True,
+            )
+            if not same_sel:
+                bad = (sel[r, :m, 0] != sel1[r, :m, 0]).nonzero()[:8].flatten().tolist()
+                print(
+                    f"  first diffs at {bad}: {sel[r, bad, 0].tolist()} vs "
+                    f"{sel1[r, bad, 0].tolist()}",
+                    flush=True,
+                )
+            cmp_ok = cmp_ok and same_sel and same_row
+        rt1.close()
     pool_scores = index_scores(rt, rows, idx, pt)
     # (token, launch tag) pairs; kv_ready holds this launch's tag
     tags = rt.scratch[rt.sc["kv_ready"] :].view(torch.int32)[1 : 2 * rows : 2].clone()
     sel, sel_tags = sel[..., 0], sel[..., 1]
     g = _gen(30, device)
-    ok = True
+    ok = cmp_ok
     for r, n in enumerate(key_lens):
         bound, tail = n // KPOOL, n % KPOOL
         if bound <= TOPK_POOLS:
@@ -1399,6 +1436,11 @@ def main() -> int:
     ap.add_argument("--compare-shuffled", action="store_true")
     ap.add_argument("--check-routing", action="store_true")
     ap.add_argument("--check-keys", action="store_true")
+    ap.add_argument(
+        "--compare-select",
+        action="store_true",
+        help="with --check-keys: the pool select on slices equals the one-CTA one",
+    )
     ap.add_argument("--check-dense", action="store_true")
     ap.add_argument("--check-embed", action="store_true")
     ap.add_argument("--check-head", action="store_true")

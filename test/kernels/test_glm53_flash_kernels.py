@@ -4,7 +4,9 @@ each launch kind finishes on every rank with no error word and the same output,
 and writes exactly its valid rows' state or cache rows (none of a pad row's); a
 sparse-attention launch on AITER-shuffled FP8 projections equals the row-major one
 bitwise; the router's top-8 equals SGLang's on keys that tie in bf16; and rows past
-2048 tokens attend to their selected pools and then their tail, as SGLang selects; a
+2048 tokens attend to their selected pools and then their tail, as SGLang selects, and
+a row's pool select split across CTAs selects the pools of a one-CTA select in its
+order; a
 graph of several launches of each kind replays the eager step bitwise at every width
 the TP size builds. The dense launch's MLP output is within the spec's bound of an f32
 MLP on its own FFN input, on shuffled and row-major FP8 alike; the launch from the
@@ -73,7 +75,7 @@ class TestMonoGlm53FlashKernels(CustomTestCase):
         self._check("--kind", "ffn", "--rows", "4", "--check-routing")
 
     def test_long_rows_attend_their_tail(self):
-        self._check("--kind", "dsa", "--check-keys")
+        self._check("--kind", "dsa", "--check-keys", "--compare-select")
 
     def test_graph_replays_equal_the_eager_step(self):
         for kind, layers in (("kda", 4), ("dsa", 4), ("dense", 2), ("embed", 1)):
@@ -137,7 +139,15 @@ class TestMonoGlm53FlashKernels(CustomTestCase):
         for rows, args in (
             (4, ["--launches", "2", "--lens", "262148,650000,65537,0"]),
             (8, ["--launches", "2", "--lens", mixed]),
-            (4, ["--check-keys", "--lens", "331001,262149,650000,100003"]),
+            (
+                4,
+                [
+                    "--check-keys",
+                    "--compare-select",
+                    "--lens",
+                    "331001,262149,650000,100003",
+                ],
+            ),
         ):
             for tp in (2, 4, 8):
                 if tp > 2 or rows <= 4:

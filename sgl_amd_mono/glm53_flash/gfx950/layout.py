@@ -29,8 +29,28 @@ from .tiles import (
     BLOCKS,
     ROUTER_TILE,
     ROW_TILE,
+    THREADS,
     WAVES,
 )
+
+# the pool select's radix digits: a 256-bin histogram a slice a digit
+ISEL_DIGITS = 4
+ISEL_COUNTS = 8
+# rows with at most this many complete pools (100K tokens) select on one CTA: below
+# it the slices' histogram and count exchanges cost more than they split
+ISEL_ONE_POOLS = 25_000
+
+
+def isel_slices(samples: int, max_pools: int) -> tuple[int, int]:
+    """(keys a thread, slices a row) of the pool select: a row's scored pools in
+    slices of THREADS x keys, one CTA a slice, at most 32 slices a row and one task
+    a CTA."""
+    per_row = min(32, BLOCKS // samples)
+    n = max(max_pools, 1)
+    items = max(2, -(-n // (THREADS * per_row)))
+    items += items % 2
+    return items, -(-n // (THREADS * items))
+
 
 # rows of a projection task: one MFMA tile, or one tile a wave when K is 128
 IN_TILE = 16
@@ -258,6 +278,19 @@ def layout(
             ("q_lat", samples * H * KV_LORA // 2 * pair_bytes),
             ("kv_ready", samples * pair_bytes),
             ("iscores", samples * max(max_pools, 1) * pair_bytes),
+            # the select's slice histograms [row][digit][slice][256] and counts
+            (
+                "isel_h",
+                samples
+                * ISEL_DIGITS
+                * isel_slices(samples, max_pools)[1]
+                * 256
+                * pair_bytes,
+            ),
+            (
+                "isel_c",
+                samples * isel_slices(samples, max_pools)[1] * ISEL_COUNTS * pair_bytes,
+            ),
             ("tok_sel", samples * SEL_STRIDE * pair_bytes),
             ("sp_acc", samples * N_SPLIT * H * KV_LORA // 2 * pair_bytes),
             ("sp_m", samples * N_SPLIT * H * pair_bytes),

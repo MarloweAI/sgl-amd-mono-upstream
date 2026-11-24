@@ -118,6 +118,9 @@ from .layout import (
     GROUPED_SUM_TILE,
     HEAD_TILE,
     IN_TILE,
+    ISEL_COUNTS,
+    ISEL_DIGITS,
+    ISEL_ONE_POOLS,
     N_MIX,
     N_QKV,
     N_QKV_FP8,
@@ -148,6 +151,7 @@ from .layout import (
     down_prefetch_batch,
     down_x_words,
     grouped_units_max,
+    isel_slices,
     layout,
     sample_wave_batches,
     stage_tasks,
@@ -284,6 +288,10 @@ class FlashBuild(msgspec.Struct, frozen=True):
     # the expert-major MoE (not with dense or head): a task an expert's 16 picks, up
     # to 64 rows
     grouped: bool = False
+    # with dsa: a row's pool select on a CTA a slice of its pools (``isel_slices``)
+    # past ISEL_ONE_POOLS pools, else on one CTA; both select the same pools in the
+    # same order
+    select_ctas: bool = True
 
 
 def build_flash_kernel(key: FlashBuild):
@@ -340,7 +348,16 @@ def build_flash_kernel(key: FlashBuild):
     if head:
         name = kernel_symbol("glm53_flash_tail", s=S, tp=W)
     else:
-        extra = {k: 1 for k, on in (("n", dense), ("e", tokens), ("g", GROUPED)) if on}
+        extra = {
+            k: 1
+            for k, on in (
+                ("n", dense),
+                ("e", tokens),
+                ("g", GROUPED),
+                ("o", dsa and not key.select_ctas),
+            )
+            if on
+        }
         if VERIFY:
             extra["v"] = VL
         name = kernel_symbol(
@@ -408,6 +425,8 @@ def build_flash_kernel(key: FlashBuild):
         SEL_BINS + 2 * 2048 if dsa else 0,
     )
     SEL_CAP = (X_WORDS - SEL_BINS) // 2
+    ISEL_ITEMS, ISEL_K = isel_slices(S, max_pools)
+    assert not dsa or S * ISEL_K <= G
     # the routed up/gate tiles' sums go past the rows' MXFP8 input in X when they fit
     UG_RED_IN_X = X_WORDS - XQ_ROWS * HIDDEN // 4 >= UG_RED_WORDS
     RED_WORDS = WAVES * 64 * 4 if UG_RED_IN_X else UG_RED_WORDS
@@ -2739,13 +2758,176 @@ def build_flash_kernel(key: FlashBuild):
                 if tid == 0:
                     put(mb("kv_ready"), s, fx.Int32(1))
 
+            def block_sums(vals):
+                """``block_sum`` of each of ``vals`` with one pair of barriers."""
+                n = len(vals)
+                for i in range_constexpr(n):
+                    w = wave_sum(vals[i])
+                    if lane == 0:
+                        lds_st(red, i * WAVES + wave, w)
+                gpu.barrier()
+                out = []
+                for i in range_constexpr(n):
+                    t = lds_ld(red, i * WAVES)
+                    for w in range_constexpr(1, WAVES):
+                        t = t + lds_ld(red, i * WAVES + w)
+                    out.append(t)
+                gpu.barrier()
+                return out
+
+            def cache_chain(s0):
+                """``cache_row`` of a verify chain's VL rows (consecutive positions)
+                at once: one poll, the rows' norms together, then each completed
+                pool, its ring tokens from the chain's own rows or, before the
+                chain, from the ring as the launch found it."""
+                rs = [s0 + j for j in range(VL)]
+                pos = [row_word(r, ROW_POS) for r in rs]
+                slot = [row_word(r, ROW_SLOT) for r in rs]
+                pslot = [row_word(r, ROW_POOL_SLOT) for r in rs]
+                tslot = [row_word(r, ROW_TAIL_SLOT) for r in rs]
+                g = ld_bf16(r_gkv, tid)
+                d = fx.min(tid, INDEX_DIM - 1)
+                lk = tid < INDEX_DIM
+                lnw, lnb = ld_f32(r_lnw, d), ld_f32(r_lnb, d)
+                specs = []
+                for r in rs:
+                    specs += [
+                        (mb("kva"), r * KV_LORA + tid),
+                        (mb("ik"), r * INDEX_DIM + d),
+                        (mb("ig"), r * INDEX_DIM + d),
+                    ]
+                got = getf_many(specs)
+                kv = [got[3 * j] for j in range(VL)]
+                kraw = [got[3 * j + 1] for j in range(VL)]
+                graw = [got[3 * j + 2] for j in range(VL)]
+                # every row's ring rows: the chain's tail slot is its request's
+                tail_row = (
+                    fx.Int64(fx.max(tslot[0], 0) // KPOOL) * fx.Int64(TBE) * fx.Int64(2)
+                )
+                r_tail = _rsrc(tv["tail_k"] + tail_row)
+                r_gate = _rsrc(tv["tail_g"] + tail_row)
+                # the KPOOL - 1 ring tokens before the chain, before it writes any
+                old_g, old_k = [], []
+                for jj in range_constexpr(KPOOL - 1):
+                    p = fx.max(pos[0] - (KPOOL - 1) + jj, 0)
+                    ring = p % TAIL * INDEX_DIM + d
+                    old_g.append(ring_ld(r_gate, ring))
+                    old_k.append(ring_ld(r_tail, ring))
+                sums = block_sums(
+                    [v * v for v in kv] + [lk.select(k, fx.Float32(0.0)) for k in kraw]
+                )
+                cen = []
+                for j in range_constexpr(VL):
+                    mean = sums[VL + j] * (1.0 / INDEX_DIM)
+                    cen.append(lk.select(kraw[j] - mean, fx.Float32(0.0)))
+                var = block_sums([c * c for c in cen])
+                kn = []
+                for j in range_constexpr(VL):
+                    rstd = _rsq(sums[j] * (1.0 / KV_LORA) + EPS)
+                    live = (pos[j] >= 0) & (slot[j] > 0)
+                    if live:
+                        row_addr = tv["kv_cache"] + (
+                            fx.Int64(slot[j] // KVB) * KVE
+                            + fx.Int64((slot[j] % KVB) * KVR)
+                        ) * fx.Int64(2)
+                        bo.buffer_store(
+                            fx.Float32(kv[j] * rstd * g).to(fx.BFloat16),
+                            _rsrc(row_addr),
+                            tid,
+                            cache_modifier=CM_DEV,
+                        )
+                    kn.append(
+                        bf16_round(
+                            cen[j] * _rsq(var[j] * (1.0 / INDEX_DIM) + INDEX_EPS) * lnw
+                            + lnb
+                        )
+                    )
+                    if live & (tslot[j] >= 0) & lk:
+                        e = fx.max(pos[j], 0) % TAIL * INDEX_DIM + d
+                        bo.buffer_store(
+                            kn[j].to(fx.BFloat16), r_tail, e, cache_modifier=CM_DEV
+                        )
+                        bo.buffer_store(
+                            graw[j].to(fx.BFloat16), r_gate, e, cache_modifier=CM_DEV
+                        )
+                for j in range_constexpr(VL):
+                    live = (pos[j] >= 0) & (slot[j] > 0)
+                    phase = fx.max(pos[j], 0) % KPOOL
+                    complete = live & (pslot[j] >= 0) & (phase == KPOOL - 1)
+                    if complete:
+                        if lk:
+                            sj, kj = [], []
+                            for jj in range_constexpr(KPOOL - 1):
+                                c = j - (KPOOL - 1) + jj
+                                if const_expr(c >= 0):
+                                    sj.append(bf16_round(graw[c]))
+                                    kj.append(kn[c])
+                                else:
+                                    sj.append(old_g[c + KPOOL - 1])
+                                    kj.append(old_k[c + KPOOL - 1])
+                            sj.append(graw[j])
+                            kj.append(kn[j])
+                            sj = [
+                                sj[i] + ld_f32(r_ape, i * INDEX_DIM + d)
+                                for i in range(KPOOL)
+                            ]
+                            mx = sj[0]
+                            for i in range_constexpr(1, KPOOL):
+                                mx = fx.max(mx, sj[i])
+                            num = fx.Float32(0.0)
+                            den = fx.Float32(0.0)
+                            for i in range_constexpr(KPOOL):
+                                pe = _exp(sj[i] - mx)
+                                den = den + pe
+                                num = num + kj[i] * pe
+                            lds_st(xs, d, bf16_round(div(num, den)))
+                        gpu.barrier()
+                        if wave == 0:
+                            x0, x1 = fwht128(lds_ld(xs, lane), lds_ld(xs, lane + 64))
+                            q0, q1, kscale = ue8m0_quant(bf16_round(x0), bf16_round(x1))
+                            lds_st(xs, INDEX_DIM + lane, q0)
+                            lds_st(xs, INDEX_DIM + lane + 64, q1)
+                            if lane == 0:
+                                lds_st(misc, 0, kscale)
+                        gpu.barrier()
+                        r_icache = _rsrc(
+                            tv["idx_cache"] + fx.Int64(pslot[j] // IPB) * fx.Int64(IBB)
+                        )
+                        poff = pslot[j] % IPB
+                        if tid < INDEX_DIM // 4:
+                            d4 = tid * 4
+                            word = fp8_pack4(
+                                *[lds_ld(xs, INDEX_DIM + d4 + i) for i in range(4)]
+                            )
+                            byte = (
+                                (poff // 16) * (16 * INDEX_DIM)
+                                + (d4 // 16) * 256
+                                + (poff % 16) * 16
+                                + d4 % 16
+                            )
+                            bo.buffer_store(
+                                word, r_icache, byte // 4, cache_modifier=CM_DEV
+                            )
+                        if tid == 0:
+                            bo.buffer_store(
+                                lds_ld(misc, 0),
+                                r_icache,
+                                IPB * INDEX_DIM // 4 + poff,
+                                cache_modifier=CM_DEV,
+                            )
+                        gpu.barrier()
+                rocdl.s_waitcnt(vmcnt=0)
+                gpu.barrier()
+                if tid == 0:
+                    for r in rs:
+                        put(mb("kv_ready"), r, fx.Int32(1))
+
             gpu.barrier()
             for t in range(start("cache"), S, G):
                 s = fx.Int32(t)
                 if const_expr(VERIFY):
                     if (s % VL == 0) & (s < NREQ * VL):
-                        for j in range_constexpr(VL):
-                            cache_row(s + j)
+                        cache_chain(s)
                     if const_expr(NREQ * VL < S):
                         if s >= NREQ * VL:
                             cache_row(s)
@@ -3156,10 +3338,273 @@ def build_flash_kernel(key: FlashBuild):
                             )
                     gpu.barrier()
 
+        # ====== top-512 pools of a row on a CTA a slice of its pools: each slice keeps
+        # its keys in registers; four byte digits, each a 256-bin histogram a slice
+        # that every slice of the row sums, fix the 512th key T and the ties it takes;
+        # then each slice's counts place its pools where the one-CTA select puts them
+        # (``dsa_iselect_one``): the keys above T's bin at the level that select
+        # resolves (20, 8 or 0 bits, by T's bins against SEL_CAP), the rest of the
+        # keys above T, then the first ties, each in pool order. A slice writes its
+        # pools' tokens, slice 0 the row's tail tokens. Rows of at most ISEL_ONE_POOLS
+        # pools run the one-CTA select in their slice 0 task.
+        ISEL_SLICE = THREADS * ISEL_ITEMS
+        ISEL_GROUPS = THREADS // 128
+
+        def dsa_iselect_slices(tv, t32):
+            hist = fx.recast_iter(fx.Int32, xs)
+            part = fx.recast_iter(fx.Int32, xs + 256)
+            r_tok = _rsrc(mb("tok_sel"), S * SEL_STRIDE * 8)
+
+            def radix_key(bits):
+                return (bits >= 0).select(bits ^ fx.Int32(-(2**31)), ~bits)
+
+            def ones(flags):
+                n = fx.Int32(0)
+                for f in flags:
+                    n = n + f.select(fx.Int32(1), fx.Int32(0))
+                return n
+
+            def block_scan(vals):
+                """Exclusive block scans of int32 ``vals`` (thread order), totals."""
+                incl = [
+                    fx.coop.warp_inclusive_scan(v, fx.ReductionOp.ADD, width=64)
+                    for v in vals
+                ]
+                if lane == 63:
+                    for i in range_constexpr(len(vals)):
+                        lds_st(keys, 256 + i * WAVES + wave, incl[i])
+                gpu.barrier()
+                excl, tots = [], []
+                for i in range_constexpr(len(vals)):
+                    before, tot = fx.Int32(0), fx.Int32(0)
+                    for w in range_constexpr(WAVES):
+                        c = lds_ld(keys, 256 + i * WAVES + w)
+                        before = before + (wave > w).select(c, fx.Int32(0))
+                        tot = tot + c
+                    excl.append(before + incl[i] - vals[i])
+                    tots.append(tot)
+                gpu.barrier()
+                return excl, tots
+
+            def select_digit(shift, prefix, remain):
+                digit = 255 - fx.min(tid, 255)
+                cnt = (tid < 256).select(lds_ld(keys, digit), fx.Int32(0))
+                inclusive = fx.coop.warp_inclusive_scan(
+                    cnt, fx.ReductionOp.ADD, width=64
+                )
+                wave_total = read_lane_i32(inclusive, 63)
+                if (wave < 4) & (lane == 63):
+                    lds_st(keys, 256 + wave, wave_total)
+                gpu.barrier()
+                before_wave = fx.Int32(0)
+                for w in range_constexpr(4):
+                    before_wave = before_wave + (wave > w).select(
+                        lds_ld(keys, 256 + w), fx.Int32(0)
+                    )
+                above = before_wave + inclusive - cnt
+                hit = (tid < 256) & (above < remain) & (above + cnt >= remain)
+                gpu.barrier()
+                if hit:
+                    lds_st(keys, 256, fx.Int32(prefix | (fx.Uint32(digit) << shift)))
+                    lds_st(keys, 257, remain - above)
+                gpu.barrier()
+                return fx.Uint32(lds_ld(keys, 256)), lds_ld(keys, 257)
+
+            def store_tokens(take, s, slot, pool):
+                """Row ``s``'s selected slot ``slot``: the pool's KPOOL tokens, if
+                ``take`` (else past num_records, dropped)."""
+                for q in range_constexpr(0, KPOOL, 2):
+                    i = take.select(
+                        s * SEL_STRIDE + slot * KPOOL + q, fx.Int32(S * SEL_STRIDE)
+                    )
+                    bo.buffer_store(
+                        fx.Vector.from_elements(
+                            [pool * KPOOL + q, tag, pool * KPOOL + q + 1, tag],
+                            fx.Int32,
+                        ),
+                        r_tok,
+                        i * 2,
+                        cache_modifier=CM_DEV,
+                    )
+
+            # task s < S: row s's slice 0 (the one-CTA build's CTA for row s), then
+            # every row's slices 1 ..
+            for t in range(start("iselect"), S * ISEL_K, G):
+                t = fx.Int32(t)
+                u = fx.max(t - S, fx.Int32(0))
+                s = (t < S).select(t, u // max(ISEL_K - 1, 1))
+                sl = (t < S).select(fx.Int32(0), 1 + u % max(ISEL_K - 1, 1))
+                pos = row_word(s, ROW_POS)
+                bound, scored, _ = row_keys(pos)
+                n_sl = (bound + ISEL_SLICE - 1) // ISEL_SLICE
+                if scored & (bound <= ISEL_ONE_POOLS) & (sl == 0):
+                    dsa_iselect_one(tv, t32, row=s)
+                if scored & (bound > ISEL_ONE_POOLS) & (sl < n_sl):
+                    count = fx.Int32(TOPK_POOLS)
+                    first = sl * ISEL_SLICE + tid * ISEL_ITEMS
+                    items = [first + j for j in range(ISEL_ITEMS)]
+                    valid = [i < bound for i in items]
+                    got = poll(
+                        [
+                            (mb("iscores"), s * MAXP + fx.min(i, bound - 1), 1)
+                            for i in items
+                        ]
+                    )
+                    kk = [fx.Uint32(radix_key(v[0])) for v in got]
+                    prefix, remain = fx.Uint32(0), count
+                    digits = (
+                        (24, 0),
+                        (16, 0xFF000000),
+                        (8, 0xFFFF0000),
+                        (0, 0xFFFFFF00),
+                    )
+                    for lv in range_constexpr(ISEL_DIGITS):
+                        shift, pmask = digits[lv]
+                        if tid < 256:
+                            lds_st(hist, tid, fx.Int32(0))
+                        gpu.barrier()
+                        for j in range_constexpr(ISEL_ITEMS):
+                            k = kk[j]
+                            if valid[j] & ((k & fx.Uint32(pmask)) == prefix):
+                                fx.atomic_add(
+                                    hist + fx.Int32((k >> shift) & fx.Uint32(255)),
+                                    fx.Int32(1),
+                                    syncscope="workgroup",
+                                )
+                        gpu.barrier()
+                        h0 = (s * ISEL_DIGITS + lv) * ISEL_K
+                        if tid < 256:
+                            put(mb("isel_h"), (h0 + sl) * 256 + tid, lds_ld(hist, tid))
+                        # thread: bins 2 b, 2 b + 1 of every ISEL_GROUPS-th slice
+                        grp, b = tid // 128, tid % 128
+                        n_per = (ISEL_K + ISEL_GROUPS - 1) // ISEL_GROUPS
+                        sls = [grp + ISEL_GROUPS * i for i in range(n_per)]
+                        hv = poll(
+                            [
+                                (
+                                    mb("isel_h"),
+                                    (h0 + fx.min(j, n_sl - 1)) * 256 + 2 * b,
+                                    2,
+                                )
+                                for j in sls
+                            ]
+                        )
+                        c0, c1 = fx.Int32(0), fx.Int32(0)
+                        for i in range_constexpr(n_per):
+                            on = sls[i] < n_sl
+                            c0 = c0 + on.select(hv[i][0], fx.Int32(0))
+                            c1 = c1 + on.select(hv[i][1], fx.Int32(0))
+                        lds_st(part, grp * 256 + 2 * b, c0)
+                        lds_st(part, grp * 256 + 2 * b + 1, c1)
+                        gpu.barrier()
+                        if tid < 256:
+                            tot = lds_ld(part, tid)
+                            for g in range_constexpr(1, ISEL_GROUPS):
+                                tot = tot + lds_ld(part, g * 256 + tid)
+                            lds_st(keys, tid, tot)
+                        gpu.barrier()
+                        prefix, remain = select_digit(shift, prefix, remain)
+                    T = prefix
+                    above20 = [v & ((k >> 20) > (T >> 20)) for v, k in zip(valid, kk)]
+                    above8 = [v & ((k >> 8) > (T >> 8)) for v, k in zip(valid, kk)]
+                    above = [v & (k > T) for v, k in zip(valid, kk)]
+                    ties = [v & (k == T) for v, k in zip(valid, kk)]
+                    bin12 = [v & ((k >> 20) == (T >> 20)) for v, k in zip(valid, kk)]
+                    bin24 = [v & ((k >> 8) == (T >> 8)) for v, k in zip(valid, kk)]
+                    _, tots = block_scan(
+                        [
+                            ones(above20) + ones(above8) * 65536,
+                            ones(above) + ones(ties) * 65536,
+                            ones(bin12) + ones(bin24) * 65536,
+                        ]
+                    )
+                    # this slice's counts: above 20 / 8 / 0, ties, T's 12- and 24-bit bins
+                    mine = [
+                        tots[0] & 0xFFFF,
+                        tots[0] >> 16,
+                        tots[1] & 0xFFFF,
+                        tots[1] >> 16,
+                        tots[2] & 0xFFFF,
+                        tots[2] >> 16,
+                    ]
+                    c0 = (s * ISEL_K + sl) * ISEL_COUNTS
+                    if tid < len(mine):
+                        v = mine[0]
+                        for i in range_constexpr(1, len(mine)):
+                            v = (tid == i).select(mine[i], v)
+                        put(mb("isel_c"), c0 + tid, v)
+                    # wave 0, lane j: slice j's counts; the slices before this one's
+                    # sums and the row's totals -> LDS keys 288 ..
+                    if wave == 0:
+                        j = fx.min(lane, n_sl - 1)
+                        on = lane < n_sl
+                        cv = poll(
+                            [
+                                (
+                                    mb("isel_c"),
+                                    (s * ISEL_K + j) * ISEL_COUNTS + 2 * q,
+                                    2,
+                                )
+                                for q in range(3)
+                            ]
+                        )
+                        w = [
+                            on.select(cv[q // 2][q % 2], fx.Int32(0)) for q in range(6)
+                        ]
+                        inc = [
+                            fx.coop.warp_inclusive_scan(v, fx.ReductionOp.ADD, width=64)
+                            for v in w
+                        ]
+                        row_tot = [read_lane_i32(v, 63) for v in inc]
+                        if lane == sl:
+                            for q in range_constexpr(4):
+                                lds_st(keys, 288 + q, inc[q] - w[q])
+                        if lane == 0:
+                            for q in range_constexpr(6):
+                                lds_st(keys, 292 + q, row_tot[q])
+                    gpu.barrier()
+                    pre = [lds_ld(keys, 288 + q) for q in range(4)]
+                    tot = [lds_ld(keys, 292 + q) for q in range(6)]
+                    gpu.barrier()
+                    use20 = tot[4] <= SEL_CAP
+                    use8 = (tot[4] > SEL_CAP) & (tot[5] <= SEL_CAP)
+                    pa = use20.select(pre[0], use8.select(pre[1], pre[2]))
+                    ta = use20.select(tot[0], use8.select(tot[1], tot[2]))
+                    pb = pre[2] - pa
+                    pe = pre[3]
+                    tie0 = count - remain
+                    ga = [
+                        use20.select(a20, use8.select(a8, a0))
+                        for a20, a8, a0 in zip(above20, above8, above)
+                    ]
+                    # above T in T's bin at that level (none at level 0)
+                    gb = [
+                        a & use20.select(b12, use8.select(b24, ti))
+                        for a, b12, b24, ti in zip(above, bin12, bin24, ties)
+                    ]
+                    excl, _ = block_scan([ones(ga) + ones(gb) * 65536, ones(ties)])
+                    ra = pa + (excl[0] & 0xFFFF)
+                    rb = ta + pb + (excl[0] >> 16)
+                    re = pe + excl[1]
+                    for j in range_constexpr(ISEL_ITEMS):
+                        take_tie = ties[j] & (re < remain)
+                        slot = ga[j].select(ra, gb[j].select(rb, tie0 + re))
+                        store_tokens(ga[j] | gb[j] | take_tie, s, slot, items[j])
+                        ra = ra + ga[j].select(fx.Int32(1), fx.Int32(0))
+                        rb = rb + gb[j].select(fx.Int32(1), fx.Int32(0))
+                        re = re + ties[j].select(fx.Int32(1), fx.Int32(0))
+                    if (sl == 0) & (tid < (pos + 1) - bound * KPOOL):
+                        put(
+                            mb("tok_sel"),
+                            s * SEL_STRIDE + TOPK_TOKENS + tid,
+                            bound * KPOOL + tid,
+                        )
+
         # ====== top-512 pools of a row (one CTA a row), then the attended tokens:
         # the pools' 2048 tokens, then the row's tail tokens past its last complete
         # pool.
-        def dsa_iselect(tv, t32):
+        def dsa_iselect_one(tv, t32, row=None):
+            """Every row a task, or only ``row`` (in a task of the slice select)."""
             hist = fx.recast_iter(fx.Int32, xs)
             r_scores = _rsrc(mb("iscores"))
 
@@ -3190,7 +3635,7 @@ def build_flash_kernel(key: FlashBuild):
                 gpu.barrier()
                 return fx.Uint32(lds_ld(keys, 256)), lds_ld(keys, 257)
 
-            for t in range(start("iselect"), S, G):
+            def one_row(t):
                 s = fx.Int32(t)
                 pos = row_word(s, ROW_POS)
                 bound, scored, _ = row_keys(pos)
@@ -3587,6 +4032,12 @@ def build_flash_kernel(key: FlashBuild):
                         if c24 > SEL_CAP:
                             full_radix()
 
+            if const_expr(row is None):
+                for t in range(start("iselect"), S, G):
+                    one_row(t)
+            else:
+                one_row(row)
+
         # ================= sparse MLA split: 64 selected keys x HT heads a task
         # Scored rows attend to the tokens the index selected plus their tail, other
         # rows to every token. Splits past the row's keys do nothing (split 0
@@ -3980,7 +4431,10 @@ def build_flash_kernel(key: FlashBuild):
             dsa_iq_quant(tv, t32)
             dsa_uk(tv, t32)
             dsa_iscore(tv, t32)
-            dsa_iselect(tv, t32)
+            if const_expr(key.select_ctas):
+                dsa_iselect_slices(tv, t32)
+            else:
+                dsa_iselect_one(tv, t32)
             dsa_split(tv, t32)
             dsa_uv(tv, t32)
             dsa_oproj(tv, t32)
