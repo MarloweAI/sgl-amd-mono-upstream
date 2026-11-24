@@ -423,11 +423,15 @@ def build_flash_kernel(key: FlashBuild):
     O_PASSES = HG if dsa and S * MH * V_DIM // 2 > 32768 else 1
     # and the dense MLP's down its rows' mid one half of K at a time
     DN_PASSES = 2 if dense and S * SH.dense_inter // 2 > 32768 else 1
+    # the launch runs the routed MoE (its MXFP8 rows and mids take LDS)
+    MOE = not (dense or head)
     X_WORDS = max(
         HIDDEN // 2 + 64,
-        XQ_ROWS * HIDDEN // 4,
+        XQ_ROWS * HIDDEN // 4 if MOE else 0,
         S * ROW_TILE * (1 + 2 * HC_MULT) + HC_MULT * N_MIX * (ROW_TILE + 4),
-        (UNIT_ROWS * expert_inter // 4 if GROUPED else down_x_words(S, expert_inter)),
+        (UNIT_ROWS * expert_inter // 4 if GROUPED else down_x_words(S, expert_inter))
+        if MOE
+        else 0,
         S * HIDDEN // 2 if whole or head else 0,
         S * SH.dense_inter // 2 // DN_PASSES if dense else 0,
         S * P // 2 if kda else 0,
@@ -455,8 +459,11 @@ def build_flash_kernel(key: FlashBuild):
             8 + UNIT_ROWS * (expert_inter // 32),
             S * HC_MULT * (1 + HC_MULT),
         )
-    else:
+    elif MOE:
         MISC_WORDS = max(8 + S * XQ_GROUPS, S * MOE_SLOTS * (expert_inter // 32))
+    else:
+        # the seam's mix sums, the gate's mix scales and biases, a row's rstd
+        MISC_WORDS = max(S * HC_MULT * (1 + HC_MULT), 128)
     KEYS_OFF = MISC_OFF + MISC_WORDS
     DNW_OFF = KEYS_OFF + LDS_KEYS
     RED_OFF = DNW_OFF + S * MOE_SLOTS
