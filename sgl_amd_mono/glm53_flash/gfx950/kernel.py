@@ -296,6 +296,14 @@ class FlashBuild(msgspec.Struct, frozen=True):
     # scale): a row is written as its bf16 normed values cast to E4M3, and read
     # back exactly into the bf16 key tile
     kv_fp8: bool = False
+    # with kda and verify: the verify on SGLang's fold-in-verify contract
+    # (--enable-kda-fold-verify): the kept tokens of a request's ring are folded
+    # into its state, this step's raw inputs stored in the ring; no snapshots.
+    # The launch's inter_rec argument is then the layer's fold table (``KdaFold``)
+    fold: bool = False
+    # tests only: with fold, the KDA output reaches o_proj as is (no gated RMSNorm),
+    # so a check reads the verify's output o from the o_proj input
+    kda_raw_o: bool = False
 
 
 def build_flash_kernel(key: FlashBuild):
@@ -339,6 +347,9 @@ def build_flash_kernel(key: FlashBuild):
     assert not dsa or (S <= 16 and max_pools % POOLS_PER_TASK == 0)
     KV_FP8 = key.kv_fp8
     assert not KV_FP8 or dsa
+    FOLD = key.fold
+    assert not FOLD or (kda and key.verify > 1 and not key.conv_dim_first)
+    assert not key.kda_raw_o or FOLD
     SH = FlashShard(W)
     P, H, IN_ROWS = SH.kda_proj, SH.kda_heads, SH.kda_in_rows
     MH = SH.mla_heads
@@ -362,6 +373,8 @@ def build_flash_kernel(key: FlashBuild):
                 ("g", GROUPED),
                 ("o", dsa and not key.select_ctas),
                 ("f", KV_FP8),
+                ("y", FOLD),
+                ("r", key.kda_raw_o),
             )
             if on
         }
@@ -2142,6 +2155,433 @@ def build_flash_kernel(key: FlashBuild):
                             )
                             y0 = o0 * rstd * won[0] * sigmoid(lds_ld(xs, G2O + e0))
                             y1 = o1 * rstd * won[1] * sigmoid(lds_ld(xs, G2O + e0 + 1))
+                            put(
+                                mb("o_in"),
+                                (row * P + h * KD + e0) // 2,
+                                bf16_pair(y0, y1),
+                            )
+                            signal("box_o_in", row * H + h)
+                        gpu.barrier()
+                if const_expr(NREQ * VL < S):
+                    if s >= NREQ * VL:
+                        if wave == 0:
+                            put(
+                                mb("o_in"),
+                                (s * P + h * KD + 2 * lane) // 2,
+                                bf16_pair(fx.Float32(0.0), fx.Float32(0.0)),
+                            )
+                            signal("box_o_in", t)
+
+        # ===================== 5'. fold-in-verify (SGLang's --enable-kda-fold-verify)
+        # A verify step on fork K's contract (kda_fold_verify_gfx950, ecf7118910):
+        # a request's ring row keeps the raw inputs (pre-conv q | k | v, gate input
+        # a, beta input b) of its last verify window, and fold_len[slot] how many
+        # of them the accept kept. This step folds those into the slot's state and
+        # conv window (written once, when any were kept), stores its own window in
+        # the ring, then verifies its rows; no per-draft snapshots. Every per-token
+        # quantity and recurrence step is that kernel's arithmetic bit for bit
+        # (conv FMA chain from 0, IEEE division and sqrt, __expf as the hardware
+        # exp2 of x * log2(e), unfused squares, even / odd FMA chains a lane and
+        # the pairwise lane tree), so a request's steps can alternate between this
+        # launch and SGLang's. Kept tokens fold at the width they were verified at
+        # (``ring_half``); this step verifies at the stock width of its bucket of
+        # requests (half at <= 2) and records it.
+        FV_HALF = NREQ <= 2
+        FV_TOK = 2 * VL  # token slots: [VL kept (fold) | VL verify]
+        # LDS words of a task: its rows' raw q | k | v of the head, their a | g_b
+        # gate inputs, then q (verify slots), k, decay and v of every slot, o
+        FV_XR, FV_GR = 0, 4 * 3 * KD
+        FV_Q = FV_GR + 4 * 2 * KD
+        FV_K = FV_Q + VL * KD
+        FV_D = FV_K + FV_TOK * KD
+        FV_V = FV_D + FV_TOK * KD
+        FV_O = FV_V + FV_TOK * KD
+        assert not (FOLD and VL != 4), "the fold ring holds 4 verify tokens"
+        assert not FOLD or FV_O + KD <= X_WORDS
+
+        def fv_table(i):
+            """Word i (int64, uniform) of the layer's fold table (``KdaFold``)."""
+            w = fx.Vector(
+                bo.buffer_load(_rsrc(inter_rec), i * 2, vec_width=2, dtype=T.i32)
+            )
+            return (fx.Int64(_uniform(w[1])) << 32) | fx.Int64(fx.Uint32(_uniform(w[0])))
+
+        def fv_exp(x):
+            # HIP's __expf: the hardware exp2 of x * log2(e)
+            return _exp(x)
+
+        def fv_conv_silu(c, wt):
+            acc = fmath.fma(c[0], wt[0], fx.Float32(0.0))
+            for i in range_constexpr(1, CONV_TAPS):
+                acc = fmath.fma(c[i], wt[i], acc)
+            return acc / (fx.Float32(1.0) + fv_exp(-acc))
+
+        def fv_group(v, lanes):
+            """A sum over ``lanes`` consecutive lanes as the DPP tree (pairs, then
+            quads, ...): every lane gets the same bits."""
+            for off in (1, 2, 4, 8):
+                if const_expr(off < lanes):
+                    v = _xred(v, off, lambda a, b: a + b)
+            return v
+
+        def fv_step(hm, j, sbase, half_full, sv, beta, q_off=None):
+            """One recurrence step on this lane's 16 K rows (16 j ..) of a column:
+            h *= decay, u = h . k (the stock lane partials at width 8, or at width 4
+            as two 8-row partials summed: ``half_full`` = None for width 8, True
+            for width 4, or a runtime flag choosing), vn = (v - u) beta, h += k vn;
+            with ``q_off`` the output h . q over the same tree."""
+            r0 = 16 * j
+            kk = [lds_ld(xs, FV_K + sbase * KD + r0 + i) for i in range(16)]
+            dd = [lds_ld(xs, FV_D + sbase * KD + r0 + i) for i in range(16)]
+            for i in range_constexpr(16):
+                hm[i] = hm[i] * dd[i]
+
+            def chains(vals, other):
+                full_e, full_o = fx.Float32(0.0), fx.Float32(0.0)
+                parts = []
+                for q in range_constexpr(2):
+                    e, o = fx.Float32(0.0), fx.Float32(0.0)
+                    for i in range_constexpr(8 * q, 8 * q + 8, 2):
+                        e = fmath.fma(vals[i], other[i], e)
+                        o = fmath.fma(vals[i + 1], other[i + 1], o)
+                    parts.append(e + o)
+                for i in range_constexpr(0, 16, 2):
+                    full_e = fmath.fma(vals[i], other[i], full_e)
+                    full_o = fmath.fma(vals[i + 1], other[i + 1], full_o)
+                full = full_e + full_o
+                half = parts[0] + parts[1]
+                if const_expr(half_full is None):
+                    return full
+                if const_expr(half_full is True):
+                    return half
+                return half_full.select(half, full)
+
+            u = fv_group(chains(hm, kk), 8)
+            vn = (sv - u) * beta
+            for i in range_constexpr(16):
+                hm[i] = fmath.fma(kk[i], vn, hm[i])
+            if const_expr(q_off is None):
+                return None
+            qq = [lds_ld(xs, FV_Q + q_off * KD + r0 + i) for i in range(16)]
+            return fv_group(chains(hm, qq), 8)
+
+        def run_kda_fold_verify():
+            """A verify step folding the kept tokens: one task a (request, head);
+            pad requests (state index not positive) write nothing and output
+            zeros, as do the width's rows past its whole requests."""
+            r_cw = _rsrc(conv_w)
+            r_alog = _rsrc(a_log)
+            r_dtb = _rsrc(dt_bias)
+            r_won = _rsrc(w_on)
+            r_idx = _rsrc(state_idx)
+            for t in range(start("kda"), S * H, G):
+                t = fx.Int32(t)
+                s = t // H
+                h = t % H
+                if (s % VL == 0) & (s < NREQ * VL):
+                    req = s // VL
+                    idx = kda_slot(r_idx, s)
+                    valid = idx > 0
+                    slot = fx.Int64(fx.max(idx, fx.Int32(0)))
+                    ring_x, ring_a = fv_table(0), fv_table(1)
+                    ring_b, ring_half = fv_table(2), fv_table(3)
+                    rx_row, ra_row, rb_row = fv_table(6), fv_table(7), fv_table(8)
+                    rr = _uniform(
+                        fx.Int32(
+                            bo.buffer_load(
+                                _rsrc(fv_table(5)), req, vec_width=1, dtype=T.i32
+                            )
+                        )
+                    )
+                    kept = _uniform(
+                        fx.Int32(
+                            bo.buffer_load(
+                                _rsrc(fv_table(4)),
+                                fx.max(idx, fx.Int32(0)),
+                                vec_width=1,
+                                dtype=T.i32,
+                            )
+                        )
+                    )
+                    n = (valid & (rr >= 0)).select(
+                        fx.min(fx.max(kept, fx.Int32(0)), fx.Int32(VL)), fx.Int32(0)
+                    )
+                    rrc = fx.Int64(fx.max(rr, fx.Int32(0)))
+                    r_cs = _rsrc(conv_state + slot * conv_stride * fx.Int64(2))
+                    r_rx = _rsrc(ring_x + rrc * rx_row * fx.Int64(2))
+                    r_ra = _rsrc(ring_a + rrc * ra_row * fx.Int64(2))
+                    r_rb = _rsrc(ring_b + rrc * rb_row * fx.Int64(2))
+                    r_rh = _rsrc(ring_half + rrc * fx.Int64(H * 4))
+                    fold_half = (n > 0) & (
+                        _uniform(
+                            fx.Int32(bo.buffer_load(r_rh, h, vec_width=1, dtype=T.i32))
+                        )
+                        != 0
+                    )
+                    # ---- the rows' raw inputs of this head -> LDS
+                    specs = []
+                    for i in range_constexpr(3):
+                        e = tid + i * THREADS
+                        rw, c = e // (3 * KD), e % (3 * KD)
+                        ch = (c // KD) * P + h * KD + c % KD
+                        specs.append((mb("proj"), (s + rw) * IN_ROWS + ch))
+                    for i in range_constexpr(2):
+                        e = tid + i * THREADS
+                        rw, gi = e // (2 * KD), e % (2 * KD)
+                        specs.append(
+                            (
+                                mb("gates"),
+                                (s + rw) * 2 * P + (gi // KD) * P + h * KD + gi % KD,
+                            )
+                        )
+                    specs.append(
+                        (mb("proj"), (s + fx.min(tid, VL - 1)) * IN_ROWS + 3 * P + h)
+                    )
+                    got = getf_many(specs)
+                    for i in range_constexpr(3):
+                        lds_st(xs, FV_XR + tid + i * THREADS, got[i])
+                    for i in range_constexpr(2):
+                        lds_st(xs, FV_GR + tid + i * THREADS, got[3 + i])
+                    if tid < VL:
+                        lds_st(misc, tid, got[5])
+                    # this thread's two state columns (c, c + 64), rows 16 j ..
+                    c = tid // 8
+                    j = tid % 8
+                    r_rs = _rsrc(
+                        rec_state
+                        + (slot * rec_stride + fx.Int64(h * KD * KD)) * fx.Int64(4)
+                    )
+                    hs = []
+                    for m in range_constexpr(2):
+                        hm = []
+                        for q in range_constexpr(4):
+                            w4 = fx.Vector(
+                                bo.buffer_load(
+                                    r_rs,
+                                    (c + 64 * m) * KD + 16 * j + 4 * q,
+                                    vec_width=4,
+                                    dtype=T.f32,
+                                )
+                            )
+                            hm += [w4[e] for e in range(4)]
+                        hs.append(hm)
+                    gpu.barrier()
+
+                    def seq8(pos, ch, lc):
+                        """Raw inputs of channels ch .. ch + 7 (local lc ..) at position
+                        pos of [conv window (3 rows), n kept tokens, the verify rows]."""
+                        cw_ = fx.Vector(
+                            bo.buffer_load(
+                                r_cs,
+                                (fx.min(pos, fx.Int32(2)) * (3 * P) + ch) // 2,
+                                vec_width=4,
+                                dtype=T.i32,
+                            )
+                        )
+                        rg = fx.Vector(
+                            bo.buffer_load(
+                                r_rx,
+                                (fx.min(fx.max(pos - 3, 0), fx.Int32(VL - 1)) * (3 * P) + ch)
+                                // 2,
+                                vec_width=4,
+                                dtype=T.i32,
+                            )
+                        )
+                        xr = fx.min(fx.max(pos - 3 - n, 0), fx.Int32(VL - 1))
+                        in_conv = pos < 3
+                        in_ring = pos < 3 + n
+                        out = []
+                        for e in range_constexpr(8):
+                            a_, b_ = bf2_f32(cw_[e // 2]), bf2_f32(rg[e // 2])
+                            xv = lds_ld(xs, FV_XR + xr * (3 * KD) + lc + e)
+                            out.append(
+                                in_conv.select(
+                                    a_[e % 2], in_ring.select(b_[e % 2], xv)
+                                )
+                            )
+                        return out
+
+                    def seq1(pos, ch, lc):
+                        cv = ld_bf16(r_cs, fx.min(pos, fx.Int32(2)) * (3 * P) + ch)
+                        rv = ld_bf16(
+                            r_rx,
+                            fx.min(fx.max(pos - 3, 0), fx.Int32(VL - 1)) * (3 * P) + ch,
+                        )
+                        xr = fx.min(fx.max(pos - 3 - n, 0), fx.Int32(VL - 1))
+                        xv = lds_ld(xs, FV_XR + xr * (3 * KD) + lc)
+                        return (pos < 3).select(cv, (pos < 3 + n).select(rv, xv))
+
+                    # ---- phase 1: per token slot, state independent
+                    # q / k: 16 lanes x 8 channels a (q or k, slot); threads 0..255
+                    qrow = fx.min(tid, 255) >> 4
+                    conv_s = qrow & 7
+                    is_k = qrow >= 8
+                    c8 = (tid & 15) * 8
+                    qk_ch = is_k.select(fx.Int32(P), fx.Int32(0)) + h * KD + c8
+                    qk_lc = is_k.select(fx.Int32(KD), fx.Int32(0)) + c8
+                    w0 = conv_s - VL + n
+                    hist = [seq8(fx.max(w0, 0) + i, qk_ch, qk_lc) for i in range(4)]
+                    y = []
+                    for e in range_constexpr(8):
+                        wt = [ld_f32(r_cw, (qk_ch + e) * CONV_TAPS + i) for i in range(4)]
+                        y.append(
+                            bf16_round(fv_conv_silu([hist[i][e] for i in range(4)], wt))
+                        )
+                    ss = y[0] * y[0]
+                    for e in range_constexpr(1, 8):
+                        ss = ss + y[e] * y[e]
+                    rn = fx.Float32(1.0) / fmath.sqrt(fv_group(ss, 16) + L2_EPS)
+                    rn = is_k.select(rn, rn * (KD**-0.5))
+                    if (tid < 256) & (w0 >= 0):
+                        if is_k:
+                            for e in range_constexpr(8):
+                                lds_st(xs, FV_K + conv_s * KD + c8 + e, y[e] * rn)
+                        if (qrow < 8) & (conv_s >= VL):
+                            for e in range_constexpr(8):
+                                lds_st(xs, FV_Q + (conv_s - VL) * KD + c8 + e, y[e] * rn)
+                    # v: a (slot, column) a thread and iteration
+                    v_new = []
+                    for it in range_constexpr(2):
+                        e = tid + it * THREADS
+                        vs, col = e // KD, e % KD
+                        vch = 2 * P + h * KD + col
+                        vw0 = fx.max(vs - VL + n, 0)
+                        hv_ = [seq1(vw0 + i, vch, 2 * KD + col) for i in range(4)]
+                        wt = [ld_f32(r_cw, vch * CONV_TAPS + i) for i in range(4)]
+                        lds_st(xs, FV_V + vs * KD + col, bf16_round(fv_conv_silu(hv_, wt)))
+                        v_new.append(hv_[1:])
+                    # decay: slot (tid // 64), K rows 2 (tid % 64) ..
+                    exp_a_log = fv_exp(ld_f32(r_alog, h))
+                    gs = tid // 64
+                    gf = gs - VL + n
+                    for i in range_constexpr(2):
+                        k = 2 * (tid % 64) + i
+                        av = (gf < n).select(
+                            ld_bf16(r_ra, fx.max(gf, 0) * P + h * KD + k),
+                            lds_ld(xs, FV_GR + fx.max(gf - n, 0) * 2 * KD + k),
+                        )
+                        x_ = av + ld_f32(r_dtb, h * KD + k)
+                        sg = fx.Float32(1.0) / (fx.Float32(1.0) + fv_exp(-(exp_a_log * x_)))
+                        if gf >= 0:
+                            lds_st(xs, FV_D + gs * KD + k, fv_exp(KDA_LOWER_BOUND * sg))
+                    # beta of every slot
+                    if tid < FV_TOK:
+                        bf = fx.max(tid - VL + n, 0)
+                        bv = (bf < n).select(
+                            ld_bf16(r_rb, bf * H + h),
+                            lds_ld(misc, fx.min(fx.max(bf - n, 0), fx.Int32(VL - 1))),
+                        )
+                        lds_st(
+                            misc,
+                            VL + tid,
+                            fx.Float32(1.0) / (fx.Float32(1.0) + fv_exp(-bv)),
+                        )
+                    gpu.barrier()
+                    # ---- writes: conv window (kept tokens), this step's ring rows
+                    if valid & (n > 0):
+                        if (tid < 256) & (conv_s == VL - 1):
+                            for i in range_constexpr(3):
+                                for e in range_constexpr(8):
+                                    bo.buffer_store(
+                                        fx.Float32(hist[i + 1][e]).to(fx.BFloat16),
+                                        r_cs,
+                                        i * (3 * P) + qk_ch + e,
+                                    )
+                        for it in range_constexpr(2):
+                            e = tid + it * THREADS
+                            if e // KD == VL - 1:
+                                for i in range_constexpr(3):
+                                    bo.buffer_store(
+                                        fx.Float32(v_new[it][i]).to(fx.BFloat16),
+                                        r_cs,
+                                        i * (3 * P) + 2 * P + h * KD + e % KD,
+                                    )
+                    if valid & (rr >= 0):
+                        for i in range_constexpr(3):
+                            e = tid + i * THREADS
+                            rw, c3 = e // (3 * KD), e % (3 * KD)
+                            bo.buffer_store(
+                                fx.Float32(lds_ld(xs, FV_XR + e)).to(fx.BFloat16),
+                                r_rx,
+                                rw * (3 * P) + (c3 // KD) * P + h * KD + c3 % KD,
+                            )
+                        rw, k = tid // KD, tid % KD
+                        bo.buffer_store(
+                            fx.Float32(lds_ld(xs, FV_GR + rw * 2 * KD + k)).to(
+                                fx.BFloat16
+                            ),
+                            r_ra,
+                            rw * P + h * KD + k,
+                        )
+                        if tid < VL:
+                            bo.buffer_store(
+                                fx.Float32(lds_ld(misc, tid)).to(fx.BFloat16),
+                                r_rb,
+                                tid * H + h,
+                            )
+                        if tid == 0:
+                            bo.buffer_store(
+                                fx.Int32(1 if FV_HALF else 0), r_rh, h
+                            )
+                    # ---- phase 2: fold the kept tokens, store the state, verify
+                    for fs in range_constexpr(VL):
+                        act = fs >= VL - n
+                        sv_s = lds_ld(misc, VL + fs)
+                        for m in range_constexpr(2):
+                            old = list(hs[m])
+                            fv_step(
+                                hs[m],
+                                j,
+                                fs,
+                                fold_half,
+                                lds_ld(xs, FV_V + fs * KD + c + 64 * m),
+                                sv_s,
+                            )
+                            hs[m] = [act.select(hs[m][i], old[i]) for i in range(16)]
+                    if valid & (n > 0):
+                        for m in range_constexpr(2):
+                            for q in range_constexpr(4):
+                                bo.buffer_store(
+                                    fx.Vector.from_elements(
+                                        hs[m][4 * q : 4 * q + 4], fx.Float32
+                                    ),
+                                    r_rs,
+                                    (c + 64 * m) * KD + 16 * j + 4 * q,
+                                )
+                    won = [ld_f32(r_won, 2 * lane + e) for e in range(2)]
+                    for vt in range_constexpr(VL):
+                        row = s + vt
+                        for m in range_constexpr(2):
+                            o = fv_step(
+                                hs[m],
+                                j,
+                                VL + vt,
+                                True if FV_HALF else None,
+                                lds_ld(xs, FV_V + (VL + vt) * KD + c + 64 * m),
+                                lds_ld(misc, 2 * VL + vt),
+                                q_off=vt,
+                            )
+                            if j == 0:
+                                lds_st(
+                                    xs,
+                                    FV_O + c + 64 * m,
+                                    valid.select(bf16_round(o), fx.Float32(0.0)),
+                                )
+                        gpu.barrier()
+                        if wave == 0:
+                            e0 = 2 * lane
+                            o0 = lds_ld(xs, FV_O + e0)
+                            o1 = lds_ld(xs, FV_O + e0 + 1)
+                            g0 = lds_ld(xs, FV_GR + vt * 2 * KD + KD + e0)
+                            g1 = lds_ld(xs, FV_GR + vt * 2 * KD + KD + e0 + 1)
+                            if const_expr(key.kda_raw_o):
+                                y0, y1 = o0, o1
+                            else:
+                                rstd = _rsq(
+                                    wave_sum(o0 * o0 + o1 * o1) * (1.0 / KD) + O_NORM_EPS
+                                )
+                                y0 = o0 * rstd * won[0] * sigmoid(g0)
+                                y1 = o1 * rstd * won[1] * sigmoid(g1)
                             put(
                                 mb("o_in"),
                                 (row * P + h * KD + e0) // 2,
@@ -4689,7 +5129,9 @@ def build_flash_kernel(key: FlashBuild):
 
             # a CTA with a kda task (at most one) runs its o_proj task inside it
             assert S * H <= G
-            if const_expr(VERIFY):
+            if const_expr(FOLD):
+                run_kda_fold_verify()
+            elif const_expr(VERIFY):
                 run_kda_verify()
             else:
                 run_kda(kda_oproj)

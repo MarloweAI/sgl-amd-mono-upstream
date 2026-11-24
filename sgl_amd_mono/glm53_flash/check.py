@@ -22,6 +22,8 @@ SGLANG_READS = {
     "kernels/ops/layernorm/mhc.py": ("hc_contract",),
     "srt/distributed/parallel_state.py": ("device_group",),
     "srt/layers/attention/hybrid_linear_attn_backend.py": (
+        "state_layer",
+        "replayssm_ring_indices",
         "linear_attn_backend",
         "state_layer_cache",
     ),
@@ -33,6 +35,8 @@ SGLANG_READS = {
     "srt/layers/logits_processor.py": ("LogitsMetadata", "from_forward_batch"),
     "srt/layers/layernorm.py": ("variance_epsilon",),
     "srt/models/glm5_next.py": ("model", "norm", "lm_head"),
+    # a KDA layer's ring index (its state view's layer)
+    "srt/mem_cache/kv/router.py": ("view_layer_id",),
     "srt/mem_cache/memory_pool.py": (
         "conv",
         "temporal",
@@ -42,6 +46,13 @@ SGLANG_READS = {
         "get_index_k_with_scale_buffer",
         "get_compress_tail_buffers",
     ),
+    "srt/layers/attention/linear/kda_fold_state.py": (
+        "ring_x",
+        "ring_a",
+        "ring_b",
+        "ring_half",
+    ),
+    "srt/layers/attention/linear/kda_backend.py": ("kda_fold",),
     "srt/model_executor/forward_batch_info.py": ("out_cache_loc", "req_pool_indices"),
     "srt/model_executor/forward_context.py": (
         "get_attn_backend",
@@ -100,7 +111,24 @@ def _regions(L, forward_batch, S: int, state_idx, verify: int = 1) -> dict:
     )
 
     if L.kda:
-        cache = get_attn_backend().linear_attn_backend.state_layer_cache(L.i)
+        kda = get_attn_backend().linear_attn_backend
+        cache = kda.state_layer_cache(L.i)
+        fs = getattr(kda, "kda_fold", None)
+        if verify > 1 and fs is not None:
+            # fold-in-verify: the folded state and conv window by slot, and the
+            # step's ring rows (the verify's raw inputs) by request
+            sel = state_idx[state_idx > 0].long().unique()
+            i = kda.state_layer(L.i).view_layer_id
+            rr = kda.forward_metadata.replayssm_ring_indices[: S // verify].long()
+            rr = rr[rr >= 0]
+            return {
+                "conv": (cache.conv[0], sel),
+                "state": (cache.temporal, sel),
+                "ring_x": (fs.ring_x[i], rr),
+                "ring_a": (fs.ring_a[i], rr),
+                "ring_b": (fs.ring_b[i], rr),
+                "ring_half": (fs.ring_half[i], rr),
+            }
         if verify > 1:
             req = torch.arange(S // verify, device=state_idx.device)
             return {
@@ -228,7 +256,7 @@ def dense_mlp_fp32(L, W: int, S: int) -> torch.Tensor:
 
 # the outputs each kind's check reports (``<kind>.<output>.<metric>``)
 REPORTED = {
-    "kda": ("streams", "conv", "state"),
+    "kda": ("streams", "conv", "state", "ring_x", "ring_a", "ring_b", "ring_half"),
     "dense": ("streams", "conv", "state", "x_vs_fp32", "mlp_in"),
     "dsa": ("streams", "kv", "index", "tail_k", "tail_g"),
     "head": ("logits", "logits_vs_fp32"),

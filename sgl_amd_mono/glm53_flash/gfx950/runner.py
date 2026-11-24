@@ -155,6 +155,49 @@ class FlashKdaState(msgspec.Struct, frozen=True):
     rec_state: torch.Tensor
     inter_rec: Optional[torch.Tensor] = None
     inter_conv: Optional[torch.Tensor] = None
+    # fold-in-verify (``FlashBuild.fold``): the layer's fold table, in place of
+    # the verify scratch
+    fold: Optional["FlashKdaFold"] = None
+
+
+class FlashKdaFold(msgspec.Struct, frozen=True):
+    """One KDA layer's fold-in-verify buffers (SGLang's ``KdaFoldState``, ring
+    layer i), as the launch reads them: an int64 table on the device of the
+    layer's ring rows (raw pre-conv q | k | v [R, 4, 3P], gate input a [R, 4, P],
+    beta input b [R, 4, H], all bf16; the width bit [R, H] int32), the kept counts
+    by state slot (int32), the step's ring row a request (int32, an
+    address-stable buffer) and the three rings' row strides in elements."""
+
+    table: torch.Tensor
+
+    @staticmethod
+    def make(ring_x, ring_a, ring_b, ring_half, fold_len, ring_rows) -> "FlashKdaFold":
+        R = ring_x.shape[0]
+        for name, t, dt, shape in (
+            ("ring_x", ring_x, torch.bfloat16, (R, 4, ring_x.shape[2])),
+            ("ring_a", ring_a, torch.bfloat16, (R, 4, ring_a.shape[2])),
+            ("ring_b", ring_b, torch.bfloat16, (R, 4, ring_b.shape[2])),
+            ("ring_half", ring_half, torch.int32, (R, ring_b.shape[2])),
+        ):
+            if t.dtype != dt or tuple(t.shape) != shape or not t.is_contiguous():
+                raise ValueError(
+                    f"fold-in-verify {name}: {t.dtype} {tuple(t.shape)}, needs "
+                    f"contiguous {dt} {shape}"
+                )
+        for name, t in (("fold_len", fold_len), ("ring_rows", ring_rows)):
+            if t.dtype != torch.int32 or t.dim() != 1 or t.stride(0) != 1:
+                raise ValueError(f"fold-in-verify {name}: needs int32 [n] contiguous")
+        host = [
+            *(t.data_ptr() for t in (ring_x, ring_a, ring_b, ring_half)),
+            fold_len.data_ptr(),
+            ring_rows.data_ptr(),
+            ring_x.stride(0),
+            ring_a.stride(0),
+            ring_b.stride(0),
+        ]
+        return FlashKdaFold(
+            table=torch.tensor(host, dtype=torch.int64, device=ring_x.device)
+        )
 
 
 # Rows of SGLang's DSA page table an index block spans: an index page holds 64
@@ -465,7 +508,11 @@ class FlashLayerOp:
             _check("state_idx", state_idx, (n,), torch.int32)
             k = self.kda
             inter = [0, 0, 0, 0]
-            if self.rt.key.verify > 1:
+            if self.rt.key.fold:
+                if state.fold is None:
+                    raise ValueError("a fold-in-verify launch needs the fold table")
+                inter = [p(state.fold.table), 0, 0, 0]
+            elif self.rt.key.verify > 1:
                 ir, ic = state.inter_rec, state.inter_conv
                 if ir is None or ic is None:
                     raise ValueError("a verify launch needs the verify scratch")

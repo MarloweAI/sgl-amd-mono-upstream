@@ -110,6 +110,8 @@ SGLANG_READS = {
     "srt/layers/attention/dsa/utils.py": ("aiter_can_use_preshuffle_paged_mqa",),
     "srt/layers/attention/dsa_backend.py": ("forward_metadata", "real_page_table"),
     "srt/layers/attention/hybrid_linear_attn_backend.py": (
+        "replayssm_ring_indices",
+        "state_layer",
         "full_attn_backend",
         "linear_attn_backend",
         "_track_mamba_state_decode",
@@ -122,7 +124,20 @@ SGLANG_READS = {
     ),
     "srt/layers/attention/mamba/mamba2_metadata.py": ("mamba_cache_indices",),
     # fused accept: the verify kernel seeds from the accepted step, not the state
-    "srt/layers/attention/linear/kda_backend.py": ("accept_lens_pool",),
+    "srt/layers/attention/linear/kda_backend.py": (
+        "accept_lens_pool",
+        # fold-in-verify (--enable-kda-fold-verify): its buffers, the layers the
+        # track fold reads, and a layer's ring index
+        "kda_fold",
+        "kda_fold_layers",
+    ),
+    "srt/layers/attention/linear/kda_fold_state.py": (
+        "ring_x",
+        "ring_a",
+        "ring_b",
+        "ring_half",
+        "fold_len",
+    ),
     "srt/layers/layer_boundary/__init__.py": ("get_attn_tp_context",),
     "srt/layers/layer_boundary/adapters/attention.py": ("maybe_input_scattered",),
     "srt/layers/layer_boundary/residual/batch.py": ("start", "clear"),
@@ -139,6 +154,8 @@ SGLANG_READS = {
         "logit_scale",
         "final_logit_softcapping",
     ),
+    # a KDA layer's ring index (its state view's layer)
+    "srt/mem_cache/kv/router.py": ("view_layer_id",),
     "srt/mem_cache/memory_pool.py": (
         "conv",
         "temporal",
@@ -192,6 +209,7 @@ SGLANG_READS = {
     "srt/arg_groups/speculative_hook.py": ('"EAGLE"', '"NEXTN"'),
     "srt/runtime_context.py": (
         "get_device",
+        "get_exec",
         "get_model",
         "get_parallel",
         "get_spec",
@@ -443,6 +461,7 @@ class _Built:
         verify: int = 1,
         max_position: int = 0,
         kv_fp8: bool = False,
+        fold: bool = False,
     ):
         from sgl_amd_mono.glm53_flash.gfx950.config import (
             HC_MULT,
@@ -461,6 +480,12 @@ class _Built:
         self.verify, self.max_position = verify, max_position
         # the MLA latent cache's dtype the sparse-attention launches were built for
         self.kv_fp8 = kv_fp8
+        # fold-in-verify KDA: a verify step's ring row a request, in one
+        # address-stable buffer every layer's fold table names
+        self.fold = fold
+        self.ring_rows = torch.full(
+            (max(WIDTHS),), -1, dtype=torch.int32, device=device
+        )
         # the launch checks run SGLang's layer on the launch's input: a decode step,
         # or a verify step (its KDA layers' per-draft-row states)
         self.check_layers = os.environ.get("SGLANG_AMD_MONO_CHECK") == "1"
@@ -594,6 +619,13 @@ class _Built:
             )
             rpi = forward_batch.req_pool_indices[: S // V]
             pos = positions[:S]
+            if V > 1 and self.fold:
+                ring = backend.linear_attn_backend.forward_metadata.replayssm_ring_indices
+                if ring is None:
+                    raise RuntimeError(
+                        "GLM-5.3-Flash monokernel: a fold-in-verify step without ring rows"
+                    )
+                self.ring_rows[: S // V].copy_(ring[: S // V])
             if V > 1:
                 if backend.linear_attn_backend.accept_lens_pool is not None:
                     raise RuntimeError(
@@ -632,7 +664,7 @@ class _Built:
             hidden = self.model.embed_tokens(input_ids[:S]) if L.i == 0 else streams
             ref = check.reference(L, positions, hidden, forward_batch, S, idx[:S], V)
         if L.kda:
-            self._bind_kda(L, backend.linear_attn_backend, V)
+            self._bind_kda(L, backend.linear_attn_backend, V, self.ring_rows, self.fold)
             out = op.launch(*ins, state=L.state, state_idx=idx, step=step)
             # a verify step's states are committed after it, with their radix copy
             if V == 1:
@@ -653,17 +685,19 @@ class _Built:
         return _Owed(*out)
 
     @staticmethod
-    def _bind_kda(L: _Layer, kda, verify: int) -> None:
+    def _bind_kda(L: _Layer, kda, verify: int, ring_rows, fold: bool) -> None:
         """The layer's KDA state, and with MTP (``verify`` rows a request) its
-        verify scratch."""
+        verify scratch, or with fold-in-verify its ring and kept counts (and the
+        layer, for SGLang's track fold, as its own verify registers it)."""
         from sgl_amd_mono.glm53_flash.gfx950.runner import (
+            FlashKdaFold,
             FlashKdaState,
         )
 
         cache = kda.state_layer_cache(L.i)
         conv, rec = cache.conv[0], cache.temporal
         ir = ic = None
-        if verify > 1:
+        if verify > 1 and not fold:
             ir, ic = cache.intermediate_ssm, cache.intermediate_conv_window[0]
         bound = (conv, rec, ir, ic)
         if L.state is not None and all(
@@ -696,7 +730,7 @@ class _Built:
                 f"{rec.dtype} {tuple(rec.shape)} {rec.stride()}; needs bf16 "
                 f"[slots, 3, {P3}] and f32 [slots, {H}, {D}, {D}]"
             )
-        if verify > 1 and not (
+        if verify > 1 and not fold and not (
             ir is not None
             and ir.dtype == torch.float32
             and tuple(ir.shape[1:]) == (verify, H, D, D)
@@ -712,8 +746,21 @@ class _Built:
                 f"[rows, {verify}, {H}, {D}, {D}] and dense bf16 "
                 f"[rows, {verify}, 3, {P3}]"
             )
+        fold_tab = None
+        if verify > 1 and fold:
+            fs = kda.kda_fold
+            i = kda.state_layer(L.i).view_layer_id
+            fold_tab = FlashKdaFold.make(
+                fs.ring_x[i],
+                fs.ring_a[i],
+                fs.ring_b[i],
+                fs.ring_half[i],
+                fs.fold_len,
+                ring_rows,
+            )
+            kda.kda_fold_layers[i] = (L.module.self_attn.attn, cache)
         L.state = FlashKdaState(
-            conv_state=conv, rec_state=rec, inter_rec=ir, inter_conv=ic
+            conv_state=conv, rec_state=rec, inter_rec=ir, inter_conv=ic, fold=fold_tab
         )
 
     @staticmethod
@@ -796,6 +843,7 @@ def _deadline(key, deadline_s: float, longest_s: int) -> float:
 
 def _build(model, hf_config, ctx) -> _Built:
     from sglang.srt.runtime_context import (
+        get_exec,
         get_model,
         get_parallel,
         get_spec,
@@ -889,6 +937,11 @@ def _build(model, hf_config, ctx) -> _Built:
     )
     # the MLA latent cache: bf16, or SGLang's raw E4M3 rows (no scale)
     kv_fp8 = get_model().kv_cache_dtype == "fp8_e4m3"
+    # the KDA verify contract: SGLang's fold-in-verify (fork branches with
+    # --enable-kda-fold-verify), else the committed state and per-draft snapshots
+    fold = verify > 1 and bool(
+        getattr(get_exec().mamba, "enable_kda_fold_verify", False)
+    )
     runtimes, heads = {}, {}
     cap = TP_MAX_ROWS.get(tp, max(WIDTHS))
     widths = sorted({_width(r) for r in ctx.widths if r <= cap})
@@ -931,6 +984,7 @@ def _build(model, hf_config, ctx) -> _Built:
                 verify=verify,
                 grouped=w >= GROUPED_FROM and kind not in ("dense", "embed"),
                 kv_fp8=kv_fp8 and kind == "dsa",
+                fold=fold and kind != "dsa",
                 fault_site=fault_site,
                 fault_after=fault_after,
             )
@@ -964,7 +1018,16 @@ def _build(model, hf_config, ctx) -> _Built:
             if rw == w:
                 rt.precompile()
     return _Built(
-        model, layers, runtimes, heads, tp, device, verify, context_len - 1, kv_fp8
+        model,
+        layers,
+        runtimes,
+        heads,
+        tp,
+        device,
+        verify,
+        context_len - 1,
+        kv_fp8,
+        fold,
     )
 
 
