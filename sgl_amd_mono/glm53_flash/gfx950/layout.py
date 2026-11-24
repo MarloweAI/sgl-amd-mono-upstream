@@ -306,6 +306,12 @@ def layout(
         if uv_rows(samples):
             # each (row, head)'s merged latent (bf16 pairs)
             items += [("o_lat", samples * H * KV_LORA // 2 * pair_bytes)]
+        if samples > 16:
+            # o as plain bf16 pairs, released by the W_UV tasks' box
+            items += [
+                ("o_plain", samples * H * V_DIM // 2 * 4),
+                ("box_o_dsa", BLOCKS * box_lines(H * (V_DIM // UV_TILE)) * BOX_LINE),
+            ]
     items += [
         ("rnew", samples * HC_MULT * HIDDEN // 2 * pair_bytes),
         ("pmix", samples * N_ROW_TILES * PMIX * pair_bytes),

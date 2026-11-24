@@ -422,6 +422,11 @@ def build_flash_kernel(key: FlashBuild):
         SC["_prof_marks"] = PROF_NAMES
     # producers of each box: the gates' rows and the kda heads
     BOXES = {"box_a_in": S, "box_a": S, "box_o_in": S * H}
+    # WIDE sparse attention: the W_UV tasks (a head's 64 v rows each) release o as
+    # plain words
+    O_PLAIN = dsa and S > 16
+    if O_PLAIN:
+        BOXES["box_o_dsa"] = MH * (V_DIM // UV_TILE)
     assert not kda or S * H % BOX_WORDS == 0
     # the dense MLP's down task: one MFMA tile of output rows at every width
     DN_TILE = HIDDEN // BLOCKS if dense else dn_tile(S)
@@ -2645,8 +2650,24 @@ def build_flash_kernel(key: FlashBuild):
                 elif const_expr(WIDE):
                     # every row group's MFMA a unit; the part's rows K / passes apart
                     accs = None
+                    if const_expr(O_PLAIN):
+                        # wave w waits for lines w, w + WAVES, .. of the CTA's box (16
+                        # W_UV tasks' words a line)
+                        O_LINES = box_lines(BOXES["box_o_dsa"])
+                        for li in range_constexpr((O_LINES + WAVES - 1) // WAVES):
+                            if _uniform(wave) + li * WAVES < O_LINES:
+                                await_box(
+                                    "box_o_dsa",
+                                    [(_uniform(wave) + li * WAVES, 0, BOX_WORDS)],
+                                )
+                        gpu.barrier()
                     for p in range_constexpr(passes):
-                        stage_rows_part(mb("o_in"), K, K // passes, p)
+                        if const_expr(O_PLAIN):
+                            if const_expr(p > 0):
+                                gpu.barrier()
+                            stage_plain_part(mb("o_plain"), K, K // passes, p)
+                        else:
+                            stage_rows_part(mb("o_in"), K, K // passes, p)
                         gpu.barrier()
                         accs = run_units_rg(
                             lambda c, p=p: u_o(c, p),
@@ -5201,12 +5222,30 @@ def build_flash_kernel(key: FlashBuild):
                     if tid < GN * UV_TILE // 4:
                         n = tid // (UV_TILE // 4)
                         r = (tid % (UV_TILE // 4)) * 4
-                        put_bf(
-                            mb("o_in"),
-                            ((n + 16 * g) * MH + head) * V_DIM + tile * UV_TILE + r,
-                            [lds_ld(outs, n * UV_TILE + r + i) for i in range(4)],
-                        )
+                        o4 = [lds_ld(outs, n * UV_TILE + r + i) for i in range(4)]
+                        oi = ((n + 16 * g) * MH + head) * V_DIM + tile * UV_TILE + r
+                        if const_expr(O_PLAIN):
+                            bo.buffer_store(
+                                fx.Vector.from_elements(
+                                    [
+                                        bf16_pair(o4[0], o4[1]).bitcast(fx.Int32),
+                                        bf16_pair(o4[2], o4[3]).bitcast(fx.Int32),
+                                    ],
+                                    fx.Int32,
+                                ),
+                                _rsrc(mb("o_plain")),
+                                oi // 2,
+                                cache_modifier=CM_DEV,
+                            )
+                        else:
+                            put_bf(mb("o_in"), oi, o4)
                     gpu.barrier()
+                if const_expr(O_PLAIN):
+                    # the task's word in every o_proj CTA's box, after its stores
+                    rocdl.s_waitcnt(vmcnt=0)
+                    gpu.barrier()
+                    if _uniform(wave) == 0:
+                        signal("box_o_dsa", t)
 
         # ===== split merge + W_UV: 64 v rows of one (row, head) a task
         def dsa_uv(tv, t32):
