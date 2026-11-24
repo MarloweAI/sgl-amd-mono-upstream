@@ -5,9 +5,11 @@ combine into the zeroed output (G2), for the 288 routed experts and the shared e
 
 Workgroups (256 threads, 4 waves), in id order:
 
-- G1 (block b, tile n) for b < blocks, n < 16: the block's 32 sorted rows x intermediate columns 64 n .. 64 n + 63
-  (w13 gate rows 64 n .., up rows 1024 + 64 n ..) over K = 4096. Wave (g, h) = (wave // 2, wave % 2) takes the
-  32 columns 32 g .. and the K half h; the halves are summed through LDS (h 0 + h 1). Activations: a1 rows gathered
+- G1 (block b, tile n) for b < blocks, n < 1024 / N: the block's 32 sorted rows x intermediate columns N n ..
+  N n + N - 1 (w13 gate rows N n .., up rows 1024 + N n ..) over K = 4096, N = 64 below 32 rows (more workgroups),
+  else 128. Wave w takes N / 4 columns over all of K: one accumulator an output, K ascending in 128-deep scaled
+  MFMAs, as aiter's stage 1 (at N = 64 a 32-column quant group's amax joins two waves' through LDS). Activations: a1
+  rows gathered
   by token id with their per-token e8m0 scales. The epilogue is stock's stage 1 then its separate MXFP4 quant:
   gate <= limit, |up| <= limit, gate * sigmoid(gate) * up, rounded to bf16, then a scale per 32 columns
   (RCEIL e8m0 of amax / 6, amax from 1e-10) and v_cvt_scalef32_pk_fp4_f32. It stores the fp4 row-major [cap, 512 B]
@@ -58,9 +60,8 @@ THREADS = 256
 NE = 288  # routed experts
 SHARED = 288  # the shared expert's id in the sort
 I = 1024  # a rank's intermediate
-G1_N = 64  # intermediate columns of a G1 workgroup
-G1_WGS = I // G1_N  # G1 workgroups of a block
-G1_STEPS = D // 128 // 2  # 128-deep MFMA steps of a wave's K half
+WIDE_ROWS = 32  # from this many rows on, G1 workgroups take 128 columns (32 a wave), else 64 (16 a wave)
+G1_STEPS = D // 128  # 128-deep MFMA steps of G1
 G1_PREFETCH = 4  # G1 steps of loads a wave has in flight
 G2_N = 128  # output columns of a G2 tile
 G2_SPAN = 4  # G2 tiles of a G2 workgroup
@@ -68,7 +69,6 @@ G2_WGS = D // (G2_N * G2_SPAN)  # G2 workgroups of a block
 G2_SLABS = G2_SPAN * G2_N // 256  # 256-column output slabs of a G2 workgroup
 G2_STEPS = I // 128  # 128-deep MFMA steps of a G2 tile
 G2_PREFETCH = 8  # G2 steps of w2 loads a wave has in flight
-WGS = G1_WGS + G2_WGS  # workgroups of a block
 LOG2E = 1.4426950408889634
 # weights and e8m0 scales of an expert (aiter's (16, 16) shuffle and e8m0_shuffle)
 W13_BYTES = 2 * I * D // 2
@@ -82,11 +82,11 @@ MID_ROW = I // 2
 MID_SCALES = I // 32
 MID_SCALE_AT = MAX_CAP * MID_ROW
 MID_BYTES = MAX_CAP * (MID_ROW + MID_SCALES)
-# LDS (dwords): a G1 wave pair's K-half sums, or a G2 block's intermediate (rows padded so 16 rows hit distinct
+# LDS (dwords): a G2 block's intermediate (rows padded so 16 rows hit distinct
 # banks) and its e8m0
 XL_ROW = MID_ROW // 4 + 4
 XL_SCALES = BM * XL_ROW
-LDS_WORDS = max(2 * 8 * 64 * 4, XL_SCALES + BM * MID_SCALES // 4)
+LDS_WORDS = XL_SCALES + BM * MID_SCALES // 4
 # counters, a 128 B line each: the blocks', then the output groups' (16-token tile x 256 columns)
 LINE = 128
 TOKEN_TILES = MAX_ROWS // 16
@@ -218,75 +218,79 @@ def _s_word(c, rg, kc, k):
     return word
 
 
+def _s_word1(c, rg, kc, k):
+    """The e8m0 of row group rg at K steps kc, kc + 1 (kc even) in bytes 0 and 2 of a dword."""
+    if const_expr(not c["sh"]):
+        return _s_word(c, rg - rg % 2, kc, k) >> ((rg % 2) * 8)
+    lane = c["lane"]
+    v = fx.Vector(bo.buffer_load(c["rs"], (rg * 16 + lane % 16) * (k // 128) + kc // 2 * 2, 2, T.i32))
+    shift = (lane // 16) * 8
+    return ((v[0] >> shift) & 0xFF) | (((v[1] >> shift) & 0xFF) << 16)
+
+
+def _g1n(c):
+    """Intermediate columns of a G1 workgroup."""
+    return 128 if c["wide"] else 64
+
+
+def _g1_wgs(c):
+    return I // _g1n(c)
+
+
 def _g1_loads(c, step):
-    """One wave's operands of G1 step ``step`` of its K half: gate / up weights (j = 0, 1), the rows' activations and
-    their scales, and (even steps) the gate / up scale dwords of the step pair."""
-    lane, kc = c["lane"], c["k0"] + step
-    w = [
-        _w_load(c, c["rg"] + u * (I // 16) + j, kc, D)
-        for u in range(2)
-        for j in range(2)
-    ]
+    """One wave's operands of G1 K step ``step``: gate / up weights, the rows' activations and their scales, and
+    (even steps) the gate / up scale dwords of the step pair."""
+    lane, kc = c["lane"], step
+    nj = 2 if c["wide"] else 1
+    w = [_w_load(c, c["rg"] + u * (I // 16) + j, kc, D) for u in range(2) for j in range(nj)]
     x = [_load(c["ra"], t * (D // 8) + kc * 16 + (lane // 16) * 4) for t in c["toks"]]
     xs = [_load_byte(c["ras"], t * (D // 32) + kc * 4 + lane // 16) for t in c["toks"]]
     s = None
     if const_expr(step % 2 == 0):
-        s = [_s_word(c, c["rg"] + u * (I // 16), kc, D) for u in range(2)]
+        word = _s_word if c["wide"] else _s_word1
+        s = [word(c, c["rg"] + u * (I // 16), kc, D) for u in range(2)]
     return w, x, xs, s
 
 
 def _g1_epilogue(c, blk, nt, acc):
-    """Rows of the block x this wave pair's 32 columns: activation, bf16, MXFP4 with its e8m0, written through."""
-    lane, g = c["lane"], c["wave"] // 2
+    """Rows of the block x this wave's columns (acc [gate / up][j][row tile][4]): activation, bf16, MXFP4 with the
+    e8m0 of its 32-column group (at N = 64 shared with the partner wave w ^ 1: every wave meets here), written
+    through."""
+    lane, w, lds, wide = c["lane"], c["wave"], c["lds"], c["wide"]
+    nj = 2 if wide else 1
     neg = -c["limit"]
     rm = rsrc(c["args"]["mid"], MID_BYTES)
     sh = c["sh"]
     act = (lambda g_, u_: _silu_shared(g_, u_, c["limit"])) if sh else (lambda g_, u_: _silu(g_, u_, neg))
+    vals, amax = [], []
+    for rt in range_constexpr(2):
+        v = [[bf16_round(act(acc[0][j][rt][i], acc[1][j][rt][i])) for i in range(4)] for j in range(nj)]
+        a = fx.Float32(0.0 if sh else 1e-10)
+        for j in range_constexpr(nj):
+            for i in range_constexpr(4):
+                a = fx.max(a, fx.max(v[j][i], -v[j][i]))
+        a = xred(xred(a, 16, fx.max), 32, fx.max)
+        if const_expr(not wide):
+            fx.ptr_store(a.bitcast(fx.Int32), lds + ((w * 2 + rt) * 16 + lane % 16))
+        vals.append(v)
+        amax.append(a)
+    if const_expr(not wide):
+        gpu.barrier()
     for rt in range_constexpr(2):
         row = blk * BM + rt * 16 + lane % 16
-        vals = [[bf16_round(act(acc[0][j][rt][i], acc[1][j][rt][i])) for i in range(4)] for j in range(2)]
-        amax = fx.Float32(0.0 if sh else 1e-10)
-        for j in range_constexpr(2):
-            for i in range_constexpr(4):
-                amax = fx.max(amax, fx.max(vals[j][i], -vals[j][i]))
-        amax = xred(xred(amax, 16, fx.max), 32, fx.max)
-        e = _e8m0_even(amax) if const_expr(sh) else _e8m0_ceil(amax)
+        a = amax[rt]
+        if const_expr(not wide):
+            a = fx.max(a, fx.ptr_load(lds + (((w ^ 1) * 2 + rt) * 16 + lane % 16)).bitcast(fx.Float32))
+        e = _e8m0_even(a) if const_expr(sh) else _e8m0_ceil(a)
         scale = (e << 23).bitcast(fx.Float32)
-        for j in range_constexpr(2):
-            off = row * MID_ROW + nt * (G1_N // 2) + g * 16 + j * 8 + (lane // 16) * 2
-            bo.buffer_store(_fp4x4(vals[j], scale), rm, off, cache_modifier=CM_SYS, offset_is_bytes=True)
+        for j in range_constexpr(nj):
+            off = row * MID_ROW + nt * (_g1n(c) // 2) + w * (8 * nj) + j * 8 + (lane // 16) * 2
+            bo.buffer_store(_fp4x4(vals[rt][j], scale), rm, off, cache_modifier=CM_SYS, offset_is_bytes=True)
+        writer = (lane < 16) if wide else ((lane < 16) & (w % 2 == 0))
         bo.buffer_store(
-            e.to(fx.Int8), rm, MID_SCALE_AT + row * MID_SCALES + nt * (G1_N // 32) + g,
-            mask=lane < 16, cache_modifier=CM_SYS, offset_is_bytes=True,
+            e.to(fx.Int8), rm, MID_SCALE_AT + row * MID_SCALES + nt * (_g1n(c) // 32) + (w if wide else w // 2),
+            mask=writer, cache_modifier=CM_SYS, offset_is_bytes=True,
         )  # fmt: skip
-
-
-def _red_at(c, n):
-    """LDS dword of accumulator ``n`` of this lane's wave pair."""
-    return ((c["wave"] // 2 * 8 + n) * 64 + c["lane"]) * 4
-
-
-@flyc.jit
-def _g1_reduce(c, blk, nt, acc):
-    """The K-half-1 wave hands its sums over LDS; the K-half-0 wave adds them (h 0 + h 1) and runs the epilogue."""
-    flat = [acc[u][j][rt] for u in range(2) for j in range(2) for rt in range(2)]
-    h = c["wave"] % 2
-    if h == 1:
-        for n in range_constexpr(8):
-            fx.ptr_store(flat[n].bitcast(fx.Int32), c["lds"] + _red_at(c, n))
-    gpu.barrier()
-    if h == 0:
-        _g1_epilogue(c, blk, nt, _g1_sum(c, flat))
-
-
-def _g1_sum(c, flat):
-    """[gate / up][j][row tile][4]: this wave's sums plus its partner's from LDS."""
-    v4i = fx.Vector.make_type(4, fx.Int32)
-    tot = []
-    for n in range_constexpr(8):
-        o = fx.Vector(fx.ptr_load(c["lds"] + _red_at(c, n), result_type=v4i)).bitcast(fx.Float32)
-        tot.append([flat[n][i] + o[i] for i in range(4)])
-    return [[[tot[u * 4 + j * 2 + rt] for rt in range(2)] for j in range(2)] for u in range(2)]
 
 
 @flyc.jit
@@ -299,8 +303,7 @@ def _count_block(c, cnt):
 def _g1_tile(c, blk, nt, e, sh):
     """G1 tile (block ``blk``, intermediate columns 64 ``nt`` .., expert ``e``; ``sh``: the shared expert's path),
     then its count on the block's counter."""
-    a, lane, wave = c["args"], c["lane"], c["wave"]
-    g, h = wave // 2, wave % 2
+    a, lane, w = c["args"], c["lane"], c["wave"]
     k = {**c, "sh": sh}
     k = {
         **k,
@@ -309,27 +312,27 @@ def _g1_tile(c, blk, nt, e, sh):
         "ra": rsrc(a["a1e"] if sh else a["a1"], fx.Int64(c["m"]) * (D // 2)),
         "ras": rsrc(a["a1es"] if sh else a["a1s"], fx.Int64(c["m"]) * (D // 32)),
         "toks": [ld_i32(a["sids"], blk * BM + rt * 16 + lane % 16) & 0xFFFFFF for rt in range(2)],
-        "rg": nt * (G1_N // 16) + 2 * g,  # the gate row group of j = 0 (16 weight rows)
-        "k0": h * G1_STEPS,
+        "rg": nt * (_g1n(c) // 16) + (2 if c["wide"] else 1) * w,  # the wave's first gate row group
     }
     zero = fx.Vector.filled(4, 0.0, fx.Float32)
-    acc = [[[zero, zero] for _ in range(2)] for _ in range(2)]  # [gate / up][j][row tile]
+    nj = 2 if c["wide"] else 1
+    acc = [[[zero, zero] for _ in range(nj)] for _ in range(2)]  # [gate / up][j][row tile]
     pend = [_g1_loads(k, s) for s in range(G1_PREFETCH)]
     sc = None
     for step in range_constexpr(G1_STEPS):
-        w, x, xs, s = pend.pop(0)
+        wv, x, xs, s = pend.pop(0)
         if const_expr(step + G1_PREFETCH < G1_STEPS):
             pend.append(_g1_loads(k, step + G1_PREFETCH))
         if const_expr(s is not None):
             sc = s
         for u in range_constexpr(2):
-            for j in range_constexpr(2):
+            for j in range_constexpr(nj):
                 for rt in range_constexpr(2):
                     acc[u][j][rt] = mfma_scaled(
-                        w[u * 2 + j], x[rt], acc[u][j][rt], sc[u], xs[rt], FP4, FP4, (step % 2) * 2 + j, 0
+                        wv[u * nj + j], x[rt], acc[u][j][rt], sc[u], xs[rt], FP4, FP4, (step % 2) * 2 + j, 0
                     )
         rocdl.sched_barrier(0)
-    _g1_reduce(k, blk, nt, acc)
+    _g1_epilogue(k, blk, nt, [[[[v[i] for i in range(4)] for v in a2] for a2 in a1] for a1 in acc])
     _store_done()
     _count_block(c, a["ws"] + fx.Int64(blk * LINE))
 
@@ -353,10 +356,10 @@ def _await_block(c, cnt):
     block's last G2 workgroup zeroes it); the workgroup then meets."""
     if c["tid"] == 0:
         v = _ld_agent(cnt)
-        while v < G1_WGS:
+        while v < _g1_wgs(c):
             rocdl.s_sleep(1)
             v = _ld_agent(cnt)
-        if _add_agent(cnt) == G1_WGS + G2_WGS - 1:
+        if _add_agent(cnt) == _g1_wgs(c) + G2_WGS - 1:
             _st_agent(cnt, 0)
     gpu.barrier()
 
@@ -515,22 +518,23 @@ def _block_order(c, b):
 
 @flyc.jit
 def _run(c, bid):
-    g1 = c["blocks"] * G1_WGS
+    g1 = c["blocks"] * _g1_wgs(c)
     if bid < g1:
-        gemm1(c, _block_order(c, bid // G1_WGS), bid % G1_WGS)
+        gemm1(c, _block_order(c, bid // _g1_wgs(c)), bid % _g1_wgs(c))
     else:
         gemm2(c, _block_order(c, (bid - g1) // G2_WGS), (bid - g1) % G2_WGS)
 
 
 @functools.cache
-def build():
-    keyed = (("sources", SOURCES),)
+def build(wide: bool):
+    """The launch with G1 workgroups of 128 columns (``wide``) or 64."""
+    keyed = (("sources", SOURCES), ("wide", wide))
 
     @fx.struct
     class Lds:
         words: fx.Array[fx.Int32, LDS_WORDS, 16]
 
-    @flyc.kernel(name="glm53f_moe_experts", known_block_size=[THREADS, 1, 1])
+    @flyc.kernel(name="glm53f_moe_experts" + ("_n128" if wide else "_n64"), known_block_size=[THREADS, 1, 1])
     def kexperts(
         a1: Int64, a1s: Int64, a1e: Int64, a1es: Int64, sids: Int64, sw: Int64, seids: Int64, nvalid: Int64,
         w13: Int64, w2: Int64, s13: Int64, s2: Int64, w13sh: Int64, s13sh: Int64, w2sh: Int64, s2sh: Int64,
@@ -547,7 +551,7 @@ def build():
         }  # fmt: skip
         c = {
             "args": args, "tid": tid, "lane": tid % 64, "wave": uniform(tid // 64), "m": m, "blocks": blocks,
-            "limit": limit, "nv": uniform(ld_i32(nvalid, 0)), "lds": lds.words.ptr,
+            "limit": limit, "nv": uniform(ld_i32(nvalid, 0)), "lds": lds.words.ptr, "wide": wide,
         }  # fmt: skip
         _run(c, fx.Int32(fx.block_idx.x))
 
@@ -562,7 +566,7 @@ def build():
         kexperts(
             a1, a1s, a1e, a1es, sids, sw, seids, nvalid, w13, w2, s13, s2, w13sh, s13sh, w2sh, s2sh, out, shared, mid,
             ws, target, m, blocks, limit,
-        ).launch(grid=(blocks * WGS,), block=(THREADS,), stream=stream)
+        ).launch(grid=(blocks * (I // (128 if wide else 64) + G2_WGS),), block=(THREADS,), stream=stream)
 
     return launch
 
@@ -625,7 +629,7 @@ def experts(
     assert w13_shared.numel() * w13_shared.element_size() == W13_BYTES and w13_shared_scale.numel() == S13_BYTES
     assert w2_shared.numel() * w2_shared.element_size() == W2_BYTES and w2_shared_scale.numel() == S2_BYTES
     counters, mid, shared_rows = workspace(a1.device)
-    build()(
+    build(m >= WIDE_ROWS)(
         a1.data_ptr(), a1_scale.data_ptr(), a1_even.data_ptr(), a1_even_scale.data_ptr(), sorted_ids.data_ptr(),
         sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w13.data_ptr(),
         w2.data_ptr(), w13_scale.data_ptr(), w2_scale.data_ptr(), w13_shared.data_ptr(), w13_shared_scale.data_ptr(),

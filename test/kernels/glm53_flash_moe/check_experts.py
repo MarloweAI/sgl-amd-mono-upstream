@@ -25,9 +25,12 @@ import sgl_amd_mono.glm53_flash_moe as fm
 from sgl_amd_mono.glm53_flash_moe import experts as ex
 
 I = ex.I
-dev = torch.device("cuda")
+dev = torch.device("cuda", torch.cuda.current_device())  # indexed: the key of the experts' workspace
 # bytes of a touched expert: w13 4 MB + w2 2 MB fp4 and their e8m0 scales
 EXPERT_BYTES = (2 * I * fm.D + fm.D * I) // 2 + (2 * I * fm.D + fm.D * I) // 32
+
+
+SCALES = (118, 122)  # e8m0 range of the synthetic weights (--scales: wider makes the f32 sums round)
 
 
 def weights(g):
@@ -38,15 +41,15 @@ def weights(g):
     u8 = torch.uint8
     w13 = torch.randint(0, 256, (fm.E, 2 * I, fm.D // 2), dtype=u8, device=dev, generator=g).view(dtypes.fp4x2)
     w2 = torch.randint(0, 256, (fm.E, fm.D, I // 2), dtype=u8, device=dev, generator=g).view(dtypes.fp4x2)
-    s13 = torch.randint(118, 122, (fm.E, 2 * I, fm.D // 32), dtype=u8, device=dev, generator=g).view(dtypes.fp8_e8m0)
-    s2 = torch.randint(118, 122, (fm.E, fm.D, I // 32), dtype=u8, device=dev, generator=g).view(dtypes.fp8_e8m0)
+    s13 = torch.randint(*SCALES, (fm.E, 2 * I, fm.D // 32), dtype=u8, device=dev, generator=g).view(dtypes.fp8_e8m0)
+    s2 = torch.randint(*SCALES, (fm.E, fm.D, I // 32), dtype=u8, device=dev, generator=g).view(dtypes.fp8_e8m0)
     for t in (w13, w2):
         t.is_shuffled = True
     raw = (
         torch.randint(0, 256, (2 * I, fm.D // 2), dtype=u8, device=dev, generator=g),
-        torch.randint(118, 122, (2 * I, fm.D // 32), dtype=u8, device=dev, generator=g),
+        torch.randint(*SCALES, (2 * I, fm.D // 32), dtype=u8, device=dev, generator=g),
         torch.randint(0, 256, (fm.D, I // 2), dtype=u8, device=dev, generator=g),
-        torch.randint(118, 122, (fm.D, I // 32), dtype=u8, device=dev, generator=g),
+        torch.randint(*SCALES, (fm.D, I // 32), dtype=u8, device=dev, generator=g),
     )
     return (w13, w2, s13, s2), raw
 
@@ -111,6 +114,55 @@ def shared_only(f, m):
     return g
 
 
+def stock_intermediate(x, gw, bias, ws):
+    """Stock's routed MXFP4 intermediate as aiter's stage 1 + ``fused_dynamic_mxfp4_quant_moe_sort`` write it:
+    {(token, slot): (512 fp4 bytes, 32 e8m0 bytes)} for every route."""
+    import aiter.fused_moe as afm
+
+    from sgl_amd_mono.common.mx import scale_index
+
+    f = fm.front(x, gw, bias, SCALE, shared=False, sorted_scale=True)
+    cap = {}
+    orig = afm.fused_dynamic_mxfp4_quant_moe_sort
+
+    def keep(*args, **kw):
+        out = orig(*args, **kw)
+        cap["q"], cap["s"] = out
+        return out
+
+    afm.fused_dynamic_mxfp4_quant_moe_sort = keep
+    try:
+        stock_routed(x, f, ws)
+    finally:
+        afm.fused_dynamic_mxfp4_quant_moe_sort = orig
+    m = x.shape[0]
+    q = cap["q"].view(torch.uint8).view(m, fm.TOPK, I // 2).cpu()
+    sc = cap["s"].view(torch.uint8).reshape(-1).cpu()
+    nv = int(f["num_valid_ids"][0].item())
+    sid = f["sorted_ids"][:nv].cpu().tolist()
+    out = {}
+    for r, v in enumerate(sid):
+        t, slot = v & 0xFFFFFF, v >> 24
+        if t < m:
+            idx = torch.tensor([scale_index(r, k, I // 32) for k in range(I // 32)])
+            out[(t, slot)] = (q[t, slot], sc[idx])
+    return out
+
+
+def ours_intermediate(f):
+    """{(token, slot): (fp4 row, e8m0 row)} of the last ``experts`` launch's intermediate (``f``: its front)."""
+    mid = ex.workspace(dev)[1].cpu()
+    m = f["a1"].shape[0]
+    nv = int(f["num_valid_ids"][0].item())
+    out = {}
+    for r, v in enumerate(f["sorted_ids"][:nv].cpu().tolist()):
+        t, slot = v & 0xFFFFFF, v >> 24
+        if t < m and slot < fm.TOPK:
+            out[(t, slot)] = (mid[r * ex.MID_ROW : (r + 1) * ex.MID_ROW],
+                              mid[ex.MID_SCALE_AT + r * ex.MID_SCALES : ex.MID_SCALE_AT + (r + 1) * ex.MID_SCALES])
+    return out
+
+
 def rel(a, b):
     return ((a.float() - b.float()).norm() / b.float().norm()).item()
 
@@ -135,6 +187,11 @@ def check(rows, ws, raw):
             if counters_left():
                 msgs.append(f"{counters_left()} counters not back to 0")
         err, err2 = rel(outs[0], ref), rel(outs[1], ref)
+        mine, theirs = ours_intermediate(f), stock_intermediate(x, gw, bias, ws)
+        qbad = sum(int((mine[k][0] != theirs[k][0]).sum()) for k in theirs)
+        sbad = sum(int((mine[k][1] != theirs[k][1]).sum()) for k in theirs)
+        if qbad or sbad:
+            msgs.append(f"intermediate differs from stock's: {qbad} fp4 bytes, {sbad} scales of {len(theirs)} routes")
         sh_ref = stock_shared(x, raw)
         g1 = shared_only(f, m)
         buf = torch.zeros(m, fm.D, dtype=torch.bfloat16, device=dev)
@@ -150,7 +207,8 @@ def check(rows, ws, raw):
         if err_sh > 5e-3:
             msgs.append("shared rows")
         ok &= not msgs
-        print(f"experts m={m}: rel-L2 vs stock {err:.2e} / {err2:.2e} (stock run-to-run {floor:.2e}, ours run-to-run "
+        print(f"experts m={m}: intermediate {'bitwise = stock' if not (qbad or sbad) else 'DIFFERS'}; "
+              f"rel-L2 vs stock {err:.2e} / {err2:.2e} (stock run-to-run {floor:.2e}, ours run-to-run "
               f"{rel(outs[1], outs[0]):.2e}); shared rows alone vs stock's shared path {err_sh:.2e} "
               f"({bits:.1%} of bf16 values differ) {'OK' if not msgs else '; '.join(msgs)}", flush=True)
     return ok
@@ -183,7 +241,10 @@ def main():
     ap.add_argument("--time-rows", default="1,4,8,16,32,64,128,256")
     ap.add_argument("--skip", default="")
     ap.add_argument("--json")
+    ap.add_argument("--scales", default="118,122")
     a = ap.parse_args()
+    global SCALES
+    SCALES = tuple(int(v) for v in a.scales.split(","))
     skip = set(a.skip.split(","))
     ws, raw = weights(torch.Generator(device=dev).manual_seed(5))
     ok = check([int(v) for v in a.rows.split(",")], ws, raw) if "check" not in skip else True
