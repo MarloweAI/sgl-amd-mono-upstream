@@ -508,7 +508,10 @@ def build_flash_kernel(key: FlashBuild):
     assert not dsa or S * ISEL_K <= G
     # the routed up/gate tiles' sums go past the rows' MXFP8 input in X when they fit
     UG_RED_IN_X = X_WORDS - XQ_ROWS * HIDDEN // 4 >= UG_RED_WORDS
-    RED_WORDS = WAVES * 64 * 4 if UG_RED_IN_X else UG_RED_WORDS
+    # (a launch without the routed MoE needs no up/gate sums past 16 rows)
+    RED_WORDS = (
+        WAVES * 64 * 4 if UG_RED_IN_X or (WIDE and not MOE) else UG_RED_WORDS
+    )
     MISC_OFF = X_WORDS
     if GROUPED:
         # a unit's activation or mid exponents (from word 8), the seam's mix sums
