@@ -17,7 +17,8 @@
 // Bit for bit what aiter writes, given the same inputs:
 // - top-k: aiter's grouped_topk_kernel (topk_softmax_kernels_group.cu; biased, one group, f32x4 lanes) on the
 //   logits rounded to bf16, SGLang's logits dtype: sigmoid rcpf(1 + exp2f(-C_LOG2E x)) with C_LOG2E a double
-//   literal, + bias, eight rounds of the same DPP arg-max, the pre-bias sigmoids renormalized x scale;
+//   literal, + bias, the eight its DPP arg-max rounds pick (in their order, by an exact key), the pre-bias sigmoids
+//   renormalized x scale;
 // - quant: aiter's fused_mx_quant_moe_sort_kernel for fp4 (RCEIL e8m0 of the group amax, cvt_scalef32_pk_fp4).
 // The sort is Opus's layout (experts ascending, an expert's routes in token order, pad rows (k << 24) | M with
 // weight 0), in a capacity of M k + min(E, M k) (BM - 1) rows.
@@ -143,34 +144,6 @@ __device__ bool last_arrival(int *counter, int target, int &flag_lds) {
 // ---- top-k: aiter's grouped_topk_kernel, one group, biased, f32x4 lanes, a wave a row ----
 
 
-// aiter::wave_reduce<kvp, arg_max, 64, false> of warpReduceMax, then lane 63's pair
-__device__ __forceinline__ void warp_reduce_max(float &val_o, int &idx) {
-    float v = val_o;
-    int   k = idx;
-    auto step = [&](float rv, int rk) {
-        // arg_max(a = the moved pair, b = this lane's): a.value > b.value ? a : b
-        if (rv > v) {
-            v = rv;
-            k = rk;
-        }
-    };
-#define AITER_DPP_STEP(CTRL)                                                                              \
-    {                                                                                                     \
-        const float rv = __builtin_bit_cast(                                                              \
-            float, __builtin_amdgcn_mov_dpp(__builtin_bit_cast(int, v), CTRL, 0xf, 0xf, false));          \
-        const int rk = __builtin_amdgcn_mov_dpp(k, CTRL, 0xf, 0xf, false);                                \
-        step(rv, rk);                                                                                     \
-    }
-    AITER_DPP_STEP(0xb1)  // quad_perm:[1,0,3,2]
-    AITER_DPP_STEP(0x4e)  // quad_perm:[2,3,0,1]
-    AITER_DPP_STEP(0x141) // row_half_mirror
-    AITER_DPP_STEP(0x140) // row_mirror
-    AITER_DPP_STEP(0x142) // row_bcast:15
-    AITER_DPP_STEP(0x143) // row_bcast:31
-#undef AITER_DPP_STEP
-    val_o = __builtin_bit_cast(float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, v), WAVE - 1));
-    idx   = __builtin_amdgcn_readlane(k, WAVE - 1);
-}
 
 // A row's scores in registers: lane l holds expert vectors l and l + 64 (4 experts each), the vectors aiter's
 // 64-thread block scans in the same order.
@@ -212,42 +185,9 @@ __device__ __forceinline__ void lane_bias(const uint16_t *bias, float (&b)[2][4]
     }
 }
 
-// aiter's eight rounds: the wave's arg-max (each lane's first best in scan order, then warp_reduce_max), its
-// pre-bias sigmoid, the expert out of the race. Lane k returns rank k's expert and sigmoid.
-__device__ void topk_rounds(RowScores r, int &rid, float &rsig) {
-    const int lane = threadIdx.x & (WAVE - 1);
-#pragma unroll 1
-    for (int k = 0; k < TOPK; ++k) {
-        float max_val = -INFINITY;
-        int   max_idx = k;
-#pragma unroll
-        for (int v = 0; v < 2; ++v)
-#pragma unroll
-            for (int i = 0; i < 4; i++) {
-                if (r.sc[v][i] > max_val) {
-                    max_val = r.sc[v][i];
-                    max_idx = (lane + WAVE * v) * 4 + i;
-                }
-            }
-        warp_reduce_max(max_val, max_idx);
-        const int owner = (max_idx >> 2) & (WAVE - 1), vv = max_idx >> 8, ii = max_idx & 3;
-        float mine = 0.0f;
-#pragma unroll
-        for (int v = 0; v < 2; ++v)
-#pragma unroll
-            for (int i = 0; i < 4; i++) {
-                const bool hit = v == vv && i == ii;
-                mine           = hit ? r.sg[v][i] : mine;
-                r.sc[v][i]     = hit && lane == owner ? -INFINITY : r.sc[v][i];
-            }
-        max_val = __builtin_bit_cast(float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, mine), owner));
-        rid     = lane == k ? max_idx : rid;
-        rsig    = lane == k ? max_val : rsig;
-    }
-}
-
-// The order the rounds pick in: the score (larger first), then the lane's rank in warp_reduce_max's DPP tree
-// (lane 63 first: a tie keeps the receiving lane's value), then the lane's scan order. A larger key ranks first.
+// The order aiter's eight rounds pick in (each round: a lane's first best in scan order, then aiter's warpReduceMax,
+// a DPP tree read at lane 63 in which a tie keeps the receiving lane's value): the score (larger first), then the
+// lane's rank in that tree (lane 63 first), then the lane's scan order. A larger key ranks first.
 __device__ __forceinline__ uint32_t float_order_key(float v) {
     const uint32_t bits = __builtin_bit_cast(uint32_t, v + 0.0f);
     return (bits & 0x80000000u) ? ~bits : bits | 0x80000000u;
@@ -276,94 +216,65 @@ __device__ __forceinline__ void wave_sync_lds() {
     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
 }
 
-// One row's top 8 by one wave, as aiter's rounds pick them: the 8th largest lane maximum (by bisection over the
-// score keys, then over the full keys when ties leave more than a wave of candidates) bounds the candidates, which
-// are ranked by their full keys; with more than a wave of candidates even so, the rounds themselves. Lanes 0..7
-// return their rank's expert and weight (the ranked sigmoids renormalized x scale, summed in rank order).
+// One row's top 8 by one wave, as aiter's rounds pick them (by the full key above): each lane's best full key is
+// ranked among the 64 through LDS; the 8th of them is the pivot, every expert of the top 8 has a key at least that,
+// and those candidates sit in the 8 best lanes (8 experts a lane at most), so they fit a wave. The candidates are
+// ranked by their full keys. Lanes 0..7 return their rank's expert and weight (the ranked sigmoids renormalized x
+// scale, summed in rank order).
 __device__ void topk_row(const RowScores &r, float scale, WaveLds &w, int &out_id, float &out_w) {
     const int lane = threadIdx.x & (WAVE - 1);
-    uint32_t key[2][4];
-    uint32_t lmax = 0;
+    auto expert = [&](int v, int i) { return (lane + WAVE * v) * 4 + i; };
+    uint64_t key[2][4];
+    uint64_t lmax = 0;
 #pragma unroll
     for (int v = 0; v < 2; ++v)
 #pragma unroll
         for (int i = 0; i < 4; i++) {
-            key[v][i] = lane + WAVE * v < E / 4 ? float_order_key(r.sc[v][i]) : 0u;
-            lmax      = max(lmax, key[v][i]);
+            key[v][i] = lane + WAVE * v < E / 4 ? route_key(float_order_key(r.sc[v][i]), expert(v, i)) : 0ull;
+            lmax      = key[v][i] > lmax ? key[v][i] : lmax;
         }
-    // run once a launch, so kept rolled: code size, not issue, sets the time of cold straight-line code
-    uint32_t pivot = 0;
-#pragma unroll 1
-    for (int b = 30; b >= 0; b -= 2) {
-        const uint32_t c1 = pivot | (1u << b), c2 = pivot | (2u << b), c3 = pivot | (3u << b);
-        const int      n1 = __popcll(__ballot(lmax >= c1)), n2 = __popcll(__ballot(lmax >= c2)),
-                       n3 = __popcll(__ballot(lmax >= c3));
-        pivot = n3 >= TOPK ? c3 : n2 >= TOPK ? c2 : n1 >= TOPK ? c1 : pivot;
-    }
-    auto expert = [&](int v, int i) { return (lane + WAVE * v) * 4 + i; };
-    auto collect = [&](auto take) {
-        int n = 0;
+    w.rkey[lane] = lmax;
+    wave_sync_lds();
+    int lrank = 0;
+#pragma unroll 8
+    for (int j = 0; j < WAVE; ++j) lrank += w.rkey[j] > lmax ? 1 : 0;
+    const uint64_t at  = __ballot(lrank == TOPK - 1);
+    const int      src = __builtin_ctzll(at);
+    const uint64_t pivot = (uint64_t(uint32_t(__builtin_amdgcn_readlane(int(lmax >> 32), src))) << 32) |
+                           uint32_t(__builtin_amdgcn_readlane(int(uint32_t(lmax)), src));
+    wave_sync_lds();
+    int n = 0;
 #pragma unroll
-        for (int v = 0; v < 2; ++v)
+    for (int v = 0; v < 2; ++v)
 #pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                const bool     c   = take(v, i);
-                const uint64_t bal = __ballot(c);
-                const int      at  = n + __builtin_amdgcn_mbcnt_hi(uint32_t(bal >> 32),
-                                                                    __builtin_amdgcn_mbcnt_lo(uint32_t(bal), 0));
-                if (c && at < WAVE) {
-                    w.rkey[at] = route_key(key[v][i], expert(v, i));
-                    w.id[at]   = expert(v, i);
-                    w.sig[at]  = r.sg[v][i];
-                }
-                n += __popcll(bal);
+        for (int i = 0; i < 4; ++i) {
+            const bool     c   = key[v][i] >= pivot;
+            const uint64_t bal = __ballot(c);
+            const int      pos = n + __builtin_amdgcn_mbcnt_hi(uint32_t(bal >> 32),
+                                                               __builtin_amdgcn_mbcnt_lo(uint32_t(bal), 0));
+            if (c) {
+                w.rkey[pos] = key[v][i];
+                w.id[pos]   = expert(v, i);
+                w.sig[pos]  = r.sg[v][i];
             }
-        return n;
-    };
-    int n = collect([&](int v, int i) { return key[v][i] >= pivot; });
-    if (n > WAVE) {
-        // score ties at the pivot: the pivot on the full keys (distinct for every expert) instead
-        uint64_t lmax64 = 0;
-#pragma unroll
-        for (int v = 0; v < 2; ++v)
-#pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                const uint64_t K = key[v][i] ? route_key(key[v][i], expert(v, i)) : 0ull;
-                lmax64           = K > lmax64 ? K : lmax64;
-            }
-        uint64_t pv = 0;
-#pragma unroll 1
-        for (int b = 62; b >= 0; b -= 2) {
-            const uint64_t c1 = pv | (1ull << b), c2 = pv | (2ull << b), c3 = pv | (3ull << b);
-            const int      n1 = __popcll(__ballot(lmax64 >= c1)), n2 = __popcll(__ballot(lmax64 >= c2)),
-                           n3 = __popcll(__ballot(lmax64 >= c3));
-            pv = n3 >= TOPK ? c3 : n2 >= TOPK ? c2 : n1 >= TOPK ? c1 : pv;
+            n += __popcll(bal);
         }
-        wave_sync_lds();
-        n = collect([&](int v, int i) { return key[v][i] && route_key(key[v][i], expert(v, i)) >= pv; });
+    wave_sync_lds();
+    const bool     live = lane < n;
+    const uint64_t K    = live ? w.rkey[lane] : 0ull;
+    const int      id   = live ? w.id[lane] : 0;
+    const float    sgv  = live ? w.sig[lane] : 0.0f;
+    int rank = 0;
+#pragma unroll 1
+    for (int j = 0; j < n; ++j) rank += w.rkey[j] > K ? 1 : 0;
+    wave_sync_lds();
+    if (live && rank < TOPK) {
+        w.out_id[rank]  = id;
+        w.out_sig[rank] = sgv;
     }
     wave_sync_lds();
-    int   rid  = 0;
-    float rsig = 0.0f;
-    if (n <= WAVE) {
-        const bool     live = lane < n;
-        const uint64_t K    = live ? w.rkey[lane] : 0ull;
-        const int      id   = live ? w.id[lane] : 0;
-        const float    sgv  = live ? w.sig[lane] : 0.0f;
-        int rank = 0;
-#pragma unroll 1
-        for (int j = 0; j < n; ++j) rank += w.rkey[j] > K ? 1 : 0;
-        wave_sync_lds();
-        if (live && rank < TOPK) {
-            w.out_id[rank]  = id;
-            w.out_sig[rank] = sgv;
-        }
-        wave_sync_lds();
-        rid  = lane < TOPK ? w.out_id[lane] : 0;
-        rsig = lane < TOPK ? w.out_sig[lane] : 0.0f;
-    } else {
-        topk_rounds(r, rid, rsig);
-    }
+    const int   rid  = lane < TOPK ? w.out_id[lane] : 0;
+    const float rsig = lane < TOPK ? w.out_sig[lane] : 0.0f;
     // aiter's renormalization: the sigmoids summed in rank order, then sigmoid x (scale / sum)
     float sum = 0.0f;
 #pragma unroll
