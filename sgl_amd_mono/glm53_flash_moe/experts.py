@@ -1,0 +1,520 @@
+# SPDX-License-Identifier: Apache-2.0
+"""GLM-5.3-Flash's MoE experts at TP2 (gfx950) in one FlyDSL launch, on the front's BM = 32 sort: the gate+up GEMM
+with the clamped SiLU and the MXFP4 intermediate (G1), then the down GEMM with the route weight and the bf16 atomic
+combine into the zeroed output (G2), for the 288 routed experts and the shared expert as expert 288.
+
+Workgroups (256 threads, 4 waves), in id order:
+
+- G1 (block b, tile n) for b < blocks, n < 16: the block's 32 sorted rows x intermediate columns 64 n .. 64 n + 63
+  (w13 gate rows 64 n .., up rows 1024 + 64 n ..) over K = 4096. Wave (g, h) = (wave // 2, wave % 2) takes the
+  32 columns 32 g .. and the K half h; the halves are summed through LDS (h 0 + h 1). Activations: a1 rows gathered
+  by token id with their per-token e8m0 scales. The epilogue is stock's stage 1 then its separate MXFP4 quant:
+  gate <= limit, |up| <= limit, gate * sigmoid(gate) * up, rounded to bf16, then a scale per 32 columns
+  (RCEIL e8m0 of amax / 6, amax from 1e-10) and v_cvt_scalef32_pk_fp4_f32. It stores the fp4 row-major [cap, 512 B]
+  and its e8m0 [cap, 32] written through (sc0 sc1), waits for the stores, and adds 1 to block b's counter.
+- G2 (block b, quarter q) for q < 4: output columns 512 q .. 512 q + 511 (four 128-column tiles, one after another)
+  over K = 1024; each wave takes 32 columns of a tile. Its first w2 loads go out, then thread 0 polls until block
+  b's counter reaches 16 (every G1 workgroup has a lower id and never waits); the workgroup reads the block's
+  intermediate once into LDS (sc1 loads) and adds weight x sum as bf16 pairs into the output (buffer atomics; rows
+  whose token is past M fall outside the output's buffer range). Its departure counts on the same counter; the
+  block's 4th zeroes it.
+- Blocks from num_valid_ids[0] / 32 on exit at once and touch no counter.
+
+Weights are read nontemporal (streamed once). Output groups: after its atomics land, a G2 workgroup adds 2 on
+``count[i][s]`` for every 16-token tile i among its block's rows and every 256-column slab s it covers. The
+workgroup that brings it to ``tile_target[i]`` (2 x the sorted blocks holding a token of tile i: the front's sort
+gives it) zeroes it and runs ``hook(i, s)`` once rows 16 i .. 16 i + 15, columns 256 s .. + 255 have every route
+added (read them with sc1 loads). Every counter is 0 between launches."""
+
+import functools
+
+import flydsl.compiler as flyc
+import flydsl.expr as fx
+import torch
+from aiter.ops.flydsl.kernels import buffer_ops as bo
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr.typing import Float32, Int32, Int64, T
+
+from sgl_amd_mono.common.mx import FP4, mfma_scaled
+from sgl_amd_mono.common.ops import CM_DEV, CM_NT, CM_SYS, bf16_round, global_ptr, hw_exp2, hw_rcp, ld_i32, rsrc
+from sgl_amd_mono.common.ops import uniform, xred
+from sgl_amd_mono.common.plan import kernel_sources
+
+from . import BM, D, MAX_ROWS, TOPK, capacity
+
+SOURCES = kernel_sources(__name__)
+_STREAM = fx.Stream(None)
+
+THREADS = 256
+NE = 289  # 288 routed + the shared expert
+I = 1024  # a rank's intermediate
+G1_N = 64  # intermediate columns of a G1 workgroup
+G1_WGS = I // G1_N  # G1 workgroups of a block
+G1_STEPS = D // 128 // 2  # 128-deep MFMA steps of a wave's K half
+G1_PREFETCH = 4  # G1 steps of loads a wave has in flight
+G2_N = 128  # output columns of a G2 tile
+G2_SPAN = 4  # G2 tiles of a G2 workgroup
+G2_WGS = D // (G2_N * G2_SPAN)  # G2 workgroups of a block
+G2_SLABS = G2_SPAN * G2_N // 256  # 256-column output slabs of a G2 workgroup
+G2_STEPS = I // 128  # 128-deep MFMA steps of a G2 tile
+G2_PREFETCH = 8  # G2 steps of w2 loads a wave has in flight
+WGS = G1_WGS + G2_WGS  # workgroups of a block
+LOG2E = 1.4426950408889634
+# weights and e8m0 scales of an expert (aiter's (16, 16) shuffle and e8m0_shuffle)
+W13_BYTES = 2 * I * D // 2
+W2_BYTES = D * I // 2
+S13_BYTES = 2 * I * D // 32
+S2_BYTES = D * I // 32
+# the intermediate: fp4 rows, then their e8m0, for the largest sort
+MAX_CAP = capacity(MAX_ROWS, TOPK + 1)
+MAX_BLOCKS = MAX_CAP // BM
+MID_ROW = I // 2
+MID_SCALES = I // 32
+MID_SCALE_AT = MAX_CAP * MID_ROW
+MID_BYTES = MAX_CAP * (MID_ROW + MID_SCALES)
+# LDS (dwords): a G1 wave pair's K-half sums, or a G2 block's intermediate (rows padded so 16 rows hit distinct
+# banks) and its e8m0
+XL_ROW = MID_ROW // 4 + 4
+XL_SCALES = BM * XL_ROW
+LDS_WORDS = max(2 * 8 * 64 * 4, XL_SCALES + BM * MID_SCALES // 4)
+# counters, a 128 B line each: the blocks', then the output groups' (16-token tile x 256 columns)
+LINE = 128
+TOKEN_TILES = MAX_ROWS // 16
+SLABS = D // 256
+GROUP_AT = MAX_BLOCKS * LINE
+COUNTER_WORDS = (MAX_BLOCKS + TOKEN_TILES * SLABS) * LINE // 4
+
+
+def _ld_agent(addr):
+    return fx.generic_load(
+        global_ptr(addr), dtype=fx.Int32, memory_order=fx.AtomicOrdering.Monotonic, syncscope="agent"
+    )
+
+
+def _st_agent(addr, v):
+    fx.generic_store(global_ptr(addr), fx.Int32(v), memory_order=fx.AtomicOrdering.Monotonic, syncscope="agent")
+
+
+def _add_agent(addr, v=1):
+    """The old value, after an agent-scope add of ``v``."""
+    return fx.Int32(fx.llvm.atomic_add(global_ptr(addr), fx.Int32(v), syncscope="agent"))
+
+
+def _load(r, i, cm=0):
+    return fx.Vector(bo.buffer_load(r, i, vec_width=4, dtype=T.i32, cache_modifier=cm))
+
+
+def _load_word(r, i, cm=0):
+    return fx.Int32(bo.buffer_load(r, i, vec_width=1, dtype=T.i32, cache_modifier=cm))
+
+
+def _load_byte(r, i):
+    return fx.Int32(bo.buffer_load(r, i, vec_width=1, dtype=T.i8))
+
+
+def _store_done():
+    """Every wave's stores and atomics have landed, then the workgroup meets."""
+    rocdl.s_waitcnt(vmcnt=0)
+    gpu.barrier()
+
+
+def _silu(gate, up, neg_limit):
+    """Stock's clamped SiLU: gate <= limit, |up| <= limit, gate * sigmoid(gate) * up (exp2 / rcp)."""
+    g = -fx.max(-gate, neg_limit)
+    u = fx.max(-fx.max(-up, neg_limit), neg_limit)
+    s = hw_rcp(fx.Float32(1.0) + hw_exp2(g * fx.Float32(-LOG2E)))
+    return g * s * u
+
+
+def _e8m0_ceil(amax):
+    """RCEIL: the biased exponent of the smallest power of two >= amax / 6."""
+    u = (amax * fx.Float32(1.0 / 6.0)).bitcast(fx.Int32)
+    e = (u >> 23) & 0xFF
+    return e + ((e < 0xFF) & ((u & 0x7FFFFF) != 0)).select(fx.Int32(1), fx.Int32(0))
+
+
+def _fp4x4(v, scale):
+    """Four f32 -> four E2M1 (two bytes) at the dequant ``scale``."""
+    q = rocdl.cvt_scalef32_pk_fp4_f32(T.i32, fx.Int32(0), v[0], v[1], scale, 0)
+    q = rocdl.cvt_scalef32_pk_fp4_f32(T.i32, q, v[2], v[3], scale, 1)
+    return fx.Int32(q).to(fx.Int16)
+
+
+def hook(c, token_tile, slab):
+    """Runs on the workgroup that completed output rows 16 token_tile .., columns 256 slab ..: nothing yet."""
+
+
+# ---- G1 ----
+
+
+def _g1_loads(c, step):
+    """One wave's operands of G1 step ``step`` of its K half: gate / up weights (j = 0, 1), the rows' activations and
+    their scales, and (even steps) the gate / up scale dwords of the step pair."""
+    lane, kc = c["lane"], c["k0"] + step
+    w = [
+        _load(c["rw"], (c["rg"] + u * (I // 16) + j) * (2 * D) + kc * 256 + lane * 4, cm=CM_NT)
+        for u in range(2)
+        for j in range(2)
+    ]
+    x = [_load(c["ra"], t * (D // 8) + kc * 16 + (lane // 16) * 4) for t in c["toks"]]
+    xs = [_load_byte(c["ras"], t * (D // 32) + kc * 4 + lane // 16) for t in c["toks"]]
+    s = None
+    if const_expr(step % 2 == 0):
+        s = [_load_word(c["rs"], ((c["rp"] + u * (I // 32)) * (D // 256) + kc // 2) * 64 + lane) for u in range(2)]
+    return w, x, xs, s
+
+
+def _g1_epilogue(c, blk, nt, acc):
+    """Rows of the block x this wave pair's 32 columns: activation, bf16, MXFP4 with its e8m0, written through."""
+    lane, g = c["lane"], c["wave"] // 2
+    neg = -c["limit"]
+    rm = rsrc(c["args"]["mid"], MID_BYTES)
+    for rt in range_constexpr(2):
+        row = blk * BM + rt * 16 + lane % 16
+        vals = [[bf16_round(_silu(acc[0][j][rt][i], acc[1][j][rt][i], neg)) for i in range(4)] for j in range(2)]
+        amax = fx.Float32(1e-10)
+        for j in range_constexpr(2):
+            for i in range_constexpr(4):
+                amax = fx.max(amax, fx.max(vals[j][i], -vals[j][i]))
+        amax = xred(xred(amax, 16, fx.max), 32, fx.max)
+        e = _e8m0_ceil(amax)
+        scale = (e << 23).bitcast(fx.Float32)
+        for j in range_constexpr(2):
+            off = row * MID_ROW + nt * (G1_N // 2) + g * 16 + j * 8 + (lane // 16) * 2
+            bo.buffer_store(_fp4x4(vals[j], scale), rm, off, cache_modifier=CM_SYS, offset_is_bytes=True)
+        bo.buffer_store(
+            e.to(fx.Int8), rm, MID_SCALE_AT + row * MID_SCALES + nt * (G1_N // 32) + g,
+            mask=lane < 16, cache_modifier=CM_SYS, offset_is_bytes=True,
+        )  # fmt: skip
+
+
+def _red_at(c, n):
+    """LDS dword of accumulator ``n`` of this lane's wave pair."""
+    return ((c["wave"] // 2 * 8 + n) * 64 + c["lane"]) * 4
+
+
+@flyc.jit
+def _g1_reduce(c, blk, nt, acc):
+    """The K-half-1 wave hands its sums over LDS; the K-half-0 wave adds them (h 0 + h 1) and runs the epilogue."""
+    flat = [acc[u][j][rt] for u in range(2) for j in range(2) for rt in range(2)]
+    h = c["wave"] % 2
+    if h == 1:
+        for n in range_constexpr(8):
+            fx.ptr_store(flat[n].bitcast(fx.Int32), c["lds"] + _red_at(c, n))
+    gpu.barrier()
+    if h == 0:
+        _g1_epilogue(c, blk, nt, _g1_sum(c, flat))
+
+
+def _g1_sum(c, flat):
+    """[gate / up][j][row tile][4]: this wave's sums plus its partner's from LDS."""
+    v4i = fx.Vector.make_type(4, fx.Int32)
+    tot = []
+    for n in range_constexpr(8):
+        o = fx.Vector(fx.ptr_load(c["lds"] + _red_at(c, n), result_type=v4i)).bitcast(fx.Float32)
+        tot.append([flat[n][i] + o[i] for i in range(4)])
+    return [[[tot[u * 4 + j * 2 + rt] for rt in range(2)] for j in range(2)] for u in range(2)]
+
+
+@flyc.jit
+def _count_block(c, cnt):
+    """Thread 0 adds the G1 tile to its block's counter."""
+    if c["tid"] == 0:
+        _add_agent(cnt)
+
+
+def _g1_tile(c, blk, nt):
+    """G1 tile (block ``blk``, intermediate columns 64 ``nt`` ..), then its count on the block's counter."""
+    a, lane, wave = c["args"], c["lane"], c["wave"]
+    e = fx.Int64(uniform(ld_i32(a["seids"], blk)))
+    g, h = wave // 2, wave % 2
+    k = {
+        **c,
+        "rw": rsrc(a["w13"] + e * W13_BYTES),
+        "rs": rsrc(a["s13"] + e * S13_BYTES),
+        "ra": rsrc(a["a1"], fx.Int64(c["m"]) * (D // 2)),
+        "ras": rsrc(a["a1s"], fx.Int64(c["m"]) * (D // 32)),
+        "toks": [ld_i32(a["sids"], blk * BM + rt * 16 + lane % 16) & 0xFFFFFF for rt in range(2)],
+        "rg": nt * (G1_N // 16) + 2 * g,  # the gate row group of j = 0 (16 weight rows)
+        "rp": nt * (G1_N // 32) + g,  # its e8m0 row-group pair
+        "k0": h * G1_STEPS,
+    }
+    zero = fx.Vector.filled(4, 0.0, fx.Float32)
+    acc = [[[zero, zero] for _ in range(2)] for _ in range(2)]  # [gate / up][j][row tile]
+    pend = [_g1_loads(k, s) for s in range(G1_PREFETCH)]
+    sc = None
+    for step in range_constexpr(G1_STEPS):
+        w, x, xs, s = pend.pop(0)
+        if const_expr(step + G1_PREFETCH < G1_STEPS):
+            pend.append(_g1_loads(k, step + G1_PREFETCH))
+        if const_expr(s is not None):
+            sc = s
+        for u in range_constexpr(2):
+            for j in range_constexpr(2):
+                for rt in range_constexpr(2):
+                    acc[u][j][rt] = mfma_scaled(
+                        w[u * 2 + j], x[rt], acc[u][j][rt], sc[u], xs[rt], FP4, FP4, (step % 2) * 2 + j, 0
+                    )
+        rocdl.sched_barrier(0)
+    _g1_reduce(k, blk, nt, acc)
+    _store_done()
+    _count_block(c, a["ws"] + fx.Int64(blk * LINE))
+
+
+@flyc.jit
+def gemm1(c, blk, nt):
+    if blk * BM < c["nv"]:
+        _g1_tile(c, blk, nt)
+
+
+# ---- G2 ----
+
+
+@flyc.jit
+def _await_block(c, cnt):
+    """Thread 0 polls the block's counter until its G1 tiles are in, then counts this workgroup's departure (the
+    block's last G2 workgroup zeroes it); the workgroup then meets."""
+    if c["tid"] == 0:
+        v = _ld_agent(cnt)
+        while v < G1_WGS:
+            rocdl.s_sleep(1)
+            v = _ld_agent(cnt)
+        if _add_agent(cnt) == G1_WGS + G2_WGS - 1:
+            _st_agent(cnt, 0)
+    gpu.barrier()
+
+
+def _group_rows(c, blk):
+    """Thread t < 32: (token tile of sorted row t, whether row t starts that tile among the block's live rows, the
+    tile's target). Loaded ahead of the wait."""
+    a, tid = c["args"], c["tid"]
+    row = blk * BM + fx.min(tid, BM - 1)
+    tok = ld_i32(a["sids"], row) & 0xFFFFFF
+    prev = ld_i32(a["sids"], row - (tid > 0).select(fx.Int32(1), fx.Int32(0))) & 0xFFFFFF
+    tile = tok // 16
+    # a block's rows are one expert's routes in token order, padding last: a tile's first row starts it
+    first = (tid < BM) & (tok < c["m"]) & ((tid == 0) | (prev // 16 != tile))
+    return tile, first, ld_i32(a["target"], fx.min(tile, TOKEN_TILES - 1))
+
+
+@flyc.jit
+def _arrive_groups(c, q, rows):
+    """Counts this G2 workgroup on the output group of every token tile among the block's rows, for each slab it
+    covers (2 a slab: two 128-column tiles); the group's last arrival zeroes the count and the workgroup runs
+    ``hook`` for it."""
+    tid, flags = c["tid"], c["lds"]
+    tile, first, target = rows
+    for h in range_constexpr(G2_SLABS):
+        done = fx.Int32(-1)
+        if first:
+            cnt = c["args"]["ws"] + fx.Int64(GROUP_AT + (tile * SLABS + q * G2_SLABS + h) * LINE)
+            if _add_agent(cnt, 2) == target - 2:
+                _st_agent(cnt, 0)
+                done = tile
+        if tid < BM:
+            fx.ptr_store(done, flags + (h * BM + tid))
+    gpu.barrier()
+    for h in range_constexpr(G2_SLABS):
+        for t in range_constexpr(BM):
+            i = fx.ptr_load(flags + (h * BM + t))
+            if i >= 0:
+                hook(c, i, q * G2_SLABS + h)
+
+
+def _g2_loads(c, step):
+    """One wave's w2 operands of G2 step ``step`` (tile step // 8 of the quarter, K step step % 8): rows j = 0, 1, and
+    (even K steps) the scale dword of the K step pair."""
+    lane, n, kc = c["lane"], step // G2_STEPS, step % G2_STEPS
+    rg = c["rg"] + n * (G2_N // 16)
+    w = [_load(c["rw"], (rg + j) * (2 * I) + kc * 256 + lane * 4, cm=CM_NT) for j in range(2)]
+    s = None
+    if const_expr(kc % 2 == 0):
+        s = _load_word(c["rs"], ((rg // 2) * (I // 256) + kc // 2) * 64 + lane)
+    return w, s
+
+
+def _g2_stage(c, blk):
+    """The block's 32 intermediate rows and their e8m0, read once (sc1) into LDS."""
+    tid, lds = c["tid"], c["lds"]
+    rm = rsrc(c["args"]["mid"], MID_BYTES)
+    got = [_load(rm, blk * (BM * MID_ROW // 4) + (tid + THREADS * i) * 4, cm=CM_DEV) for i in range(4)]
+    sw = _load(rm, MID_SCALE_AT // 4 + blk * (BM * MID_SCALES // 4) + fx.min(tid, 63) * 4, cm=CM_DEV)
+    for i in range_constexpr(4):
+        u = tid + THREADS * i
+        fx.ptr_store(got[i], lds + ((u // 32) * XL_ROW + (u % 32) * 4))
+    fx.ptr_store(sw, lds + (XL_SCALES + fx.min(tid, 63) * 4))
+    gpu.barrier()
+
+
+def _g2_x(c, rt, kc):
+    """This lane's intermediate operand (row tile rt, K step kc) and its e8m0 (low byte), from LDS."""
+    lane, lds = c["lane"], c["lds"]
+    r = rt * 16 + lane % 16
+    v4i = fx.Vector.make_type(4, fx.Int32)
+    x = fx.Vector(fx.ptr_load(lds + (r * XL_ROW + kc * 16 + (lane // 16) * 4), result_type=v4i))
+    return x, fx.ptr_load(lds + (XL_SCALES + r * (MID_SCALES // 4) + kc)) >> ((lane // 16) * 8)
+
+
+def _g2_combine(c, acc, toks, tws, ro, n):
+    """weight x sum of tile ``n`` as bf16 pairs added into the output."""
+    for rt in range_constexpr(2):
+        for j in range_constexpr(2):
+            col = (c["rg"] + n * (G2_N // 16) + j) * 16 + (c["lane"] // 16) * 4
+            for p in range_constexpr(2):
+                pair = fx.Vector.from_elements(
+                    [acc[j][rt][2 * p] * tws[rt], acc[j][rt][2 * p + 1] * tws[rt]], fx.Float32
+                ).to(fx.BFloat16)
+                rocdl.raw_ptr_buffer_atomic_fadd(pair, ro, toks[rt] * (D * 2) + (col + 2 * p) * 2, 0)
+
+
+def _g2_tile(c, blk, q):
+    """G2 workgroup (block ``blk``, output columns 512 ``q`` ..) once the block's G1 tiles are in."""
+    a, lane, wave = c["args"], c["lane"], c["wave"]
+    e = fx.Int64(uniform(ld_i32(a["seids"], blk)))
+    k = {
+        **c,
+        "rw": rsrc(a["w2"] + e * W2_BYTES),
+        "rs": rsrc(a["s2"] + e * S2_BYTES),
+        "rg": q * (G2_SPAN * G2_N // 16) + 2 * wave,  # the wave's first w2 row group (16 output columns)
+    }
+    steps = G2_SPAN * G2_STEPS
+    pend = [_g2_loads(k, s) for s in range(G2_PREFETCH)]
+    rows = [blk * BM + rt * 16 + lane % 16 for rt in range(2)]
+    toks = [ld_i32(a["sids"], r) & 0xFFFFFF for r in rows]
+    tws = [fx.Float32(bo.buffer_load(rsrc(a["sw"]), r, 1, T.f32)) for r in rows]
+    groups = _group_rows(c, blk)
+    _await_block(c, a["ws"] + fx.Int64(blk * LINE))
+    _g2_stage(c, blk)
+    ro = rsrc(a["out"], fx.Int64(c["m"]) * (D * 2))
+    zero = fx.Vector.filled(4, 0.0, fx.Float32)
+    acc = [[zero, zero] for _ in range(2)]  # [j][row tile]
+    sc = None
+    for step in range_constexpr(steps):
+        w, s = pend.pop(0)
+        if const_expr(step + G2_PREFETCH < steps):
+            pend.append(_g2_loads(k, step + G2_PREFETCH))
+        if const_expr(s is not None):
+            sc = s
+        kc = step % G2_STEPS
+        for rt in range_constexpr(2):
+            xv, xsc = _g2_x(c, rt, kc)
+            for j in range_constexpr(2):
+                acc[j][rt] = mfma_scaled(w[j], xv, acc[j][rt], sc, xsc, FP4, FP4, (kc % 2) * 2 + j, 0)
+        if const_expr(kc == G2_STEPS - 1):
+            _g2_combine(k, acc, toks, tws, ro, step // G2_STEPS)
+            acc = [[zero, zero] for _ in range(2)]
+        rocdl.sched_barrier(0)
+    _store_done()
+    _arrive_groups(c, q, groups)
+
+
+@flyc.jit
+def gemm2(c, blk, q):
+    if blk * BM < c["nv"]:
+        _g2_tile(c, blk, q)
+
+
+@flyc.jit
+def _run(c, bid):
+    g1 = c["blocks"] * G1_WGS
+    if bid < g1:
+        gemm1(c, bid // G1_WGS, bid % G1_WGS)
+    else:
+        gemm2(c, (bid - g1) // G2_WGS, (bid - g1) % G2_WGS)
+
+
+@functools.cache
+def build():
+    keyed = (("sources", SOURCES),)
+
+    @fx.struct
+    class Lds:
+        words: fx.Array[fx.Int32, LDS_WORDS, 16]
+
+    @flyc.kernel(name="glm53f_moe_experts", known_block_size=[THREADS, 1, 1])
+    def kexperts(
+        a1: Int64, a1s: Int64, sids: Int64, sw: Int64, seids: Int64, nvalid: Int64, w13: Int64, w2: Int64,
+        s13: Int64, s2: Int64, out: Int64, mid: Int64, ws: Int64, target: Int64, m: Int32, blocks: Int32,
+        limit: Float32,
+    ):  # fmt: skip
+        _ = keyed
+        tid = fx.Int32(fx.thread_idx.x)
+        lds = fx.SharedAllocator().allocate(Lds).peek()
+        args = {
+            "a1": a1, "a1s": a1s, "sids": sids, "sw": sw, "seids": seids, "w13": w13, "w2": w2, "s13": s13,
+            "s2": s2, "out": out, "mid": mid, "ws": ws, "target": target,
+        }  # fmt: skip
+        c = {
+            "args": args, "tid": tid, "lane": tid % 64, "wave": uniform(tid // 64), "m": m, "blocks": blocks,
+            "limit": limit, "nv": uniform(ld_i32(nvalid, 0)), "lds": lds.words.ptr,
+        }  # fmt: skip
+        _run(c, fx.Int32(fx.block_idx.x))
+
+    @flyc.jit
+    def launch(
+        a1: Int64, a1s: Int64, sids: Int64, sw: Int64, seids: Int64, nvalid: Int64, w13: Int64, w2: Int64,
+        s13: Int64, s2: Int64, out: Int64, mid: Int64, ws: Int64, target: Int64, m: Int32, blocks: Int32,
+        limit: Float32, stream: fx.Stream = _STREAM,
+    ):  # fmt: skip
+        _ = keyed
+        kexperts(
+            a1, a1s, sids, sw, seids, nvalid, w13, w2, s13, s2, out, mid, ws, target, m, blocks, limit
+        ).launch(grid=(blocks * WGS,), block=(THREADS,), stream=stream)
+
+    return launch
+
+
+@functools.cache
+def workspace(device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    """(counters, zeroed and left zeroed by every launch; the intermediate). Made once a device, outside graph
+    capture (SGLang warms up eagerly first)."""
+    return (
+        torch.zeros(COUNTER_WORDS, dtype=torch.int32, device=device),
+        torch.empty(MID_BYTES, dtype=torch.uint8, device=device),
+    )
+
+
+def tile_targets(sorted_ids: torch.Tensor, num_valid_ids: torch.Tensor, m: int) -> torch.Tensor:
+    """int32 [16]: 2 x the sorted blocks holding a route of a token of each 16-token tile (static shapes, so it
+    captures in a graph)."""
+    rows = sorted_ids.view(-1, BM)
+    tok = rows & 0xFFFFFF
+    blk = torch.arange(rows.shape[0], device=rows.device).unsqueeze(1)
+    live = (tok < m) & (blk * BM < num_valid_ids[0])
+    tile = torch.where(live, tok // 16, TOKEN_TILES).long()
+    hit = torch.zeros(rows.shape[0], TOKEN_TILES + 1, dtype=torch.int32, device=rows.device).scatter_(1, tile, 1)
+    return (hit[:, :TOKEN_TILES].sum(0) * 2).to(torch.int32)
+
+
+def experts(
+    a1: torch.Tensor,
+    a1_scale: torch.Tensor,
+    sorted_ids: torch.Tensor,
+    sorted_weights: torch.Tensor,
+    sorted_expert_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    moe_buf: torch.Tensor,
+    swiglu_limit: float | None,
+    tile_target: torch.Tensor,
+) -> torch.Tensor:
+    """The experts on the front's outputs (``front``'s names): a1 [M, 2048] fp4x2 and its per-token e8m0 [M, 128],
+    the sort, Quark's w4a4 weights [289, ...] as aiter shuffles them, ``moe_buf`` [M, 4096] bf16 zeroed (added
+    into), ``tile_target`` int32 [16] (the front's, or ``tile_targets``). Returns ``moe_buf``."""
+    m = a1.shape[0]
+    blocks = sorted_expert_ids.shape[0]
+    assert 1 <= m <= MAX_ROWS and blocks <= MAX_BLOCKS and sorted_ids.shape[0] == blocks * BM
+    assert w13.shape[0] == NE and w13.numel() * w13.element_size() == NE * W13_BYTES
+    assert w2.numel() * w2.element_size() == NE * W2_BYTES and moe_buf.shape == (m, D)
+    counters, mid = workspace(a1.device)
+    build()(
+        a1.data_ptr(), a1_scale.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(),
+        sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w13.data_ptr(), w2.data_ptr(),
+        w13_scale.data_ptr(), w2_scale.data_ptr(), moe_buf.data_ptr(), mid.data_ptr(), counters.data_ptr(),
+        tile_target.data_ptr(), m, blocks, float(swiglu_limit) if swiglu_limit else float("inf"),
+        torch.cuda.current_stream(),
+    )  # fmt: skip
+    return moe_buf
