@@ -2457,7 +2457,10 @@ def build_flash_kernel(key: FlashBuild):
                     for i in range_constexpr(2):
                         k = 2 * (tid % 64) + i
                         av = (gf < n).select(
-                            ld_bf16(r_ra, fx.max(gf, 0) * P + h * KD + k),
+                            ld_bf16(
+                                r_ra,
+                                fx.min(fx.max(gf, 0), fx.Int32(VL - 1)) * P + h * KD + k,
+                            ),
                             lds_ld(xs, FV_GR + fx.max(gf - n, 0) * 2 * KD + k),
                         )
                         x_ = av + ld_f32(r_dtb, h * KD + k)
@@ -2468,7 +2471,7 @@ def build_flash_kernel(key: FlashBuild):
                     if tid < FV_TOK:
                         bf = fx.max(tid - VL + n, 0)
                         bv = (bf < n).select(
-                            ld_bf16(r_rb, bf * H + h),
+                            ld_bf16(r_rb, fx.min(bf, fx.Int32(VL - 1)) * H + h),
                             lds_ld(misc, fx.min(fx.max(bf - n, 0), fx.Int32(VL - 1))),
                         )
                         lds_st(
