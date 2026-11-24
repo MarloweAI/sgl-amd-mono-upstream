@@ -257,7 +257,17 @@ def dense_mlp_fp32(L, W: int, S: int) -> torch.Tensor:
 # the outputs each kind's check reports (``<kind>.<output>.<metric>``)
 REPORTED = {
     "kda": ("streams", "conv", "state", "ring_x", "ring_a", "ring_b", "ring_half"),
-    "dense": ("streams", "conv", "state", "x_vs_fp32", "mlp_in"),
+    "dense": (
+        "streams",
+        "conv",
+        "state",
+        "ring_x",
+        "ring_a",
+        "ring_b",
+        "ring_half",
+        "x_vs_fp32",
+        "mlp_in",
+    ),
     "dsa": ("streams", "kv", "index", "tail_k", "tail_g"),
     "head": ("logits", "logits_vs_fp32"),
 }
