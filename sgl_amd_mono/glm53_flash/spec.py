@@ -78,6 +78,7 @@ def _width(rows: int) -> int:
 SGLANG_READS = {
     "srt/arg_groups/fields/*.py": (
         "page_size",
+        "kv_cache_dtype",
         "enable_linear_replayssm",
         "enable_linear_replayssm_spec",
         "speculative_algorithm",
@@ -191,6 +192,7 @@ SGLANG_READS = {
     "srt/arg_groups/speculative_hook.py": ('"EAGLE"', '"NEXTN"'),
     "srt/runtime_context.py": (
         "get_device",
+        "get_model",
         "get_parallel",
         "get_spec",
         "process_model_config",
@@ -440,6 +442,7 @@ class _Built:
         device,
         verify: int = 1,
         max_position: int = 0,
+        kv_fp8: bool = False,
     ):
         from sgl_amd_mono.glm53_flash.gfx950.config import (
             HC_MULT,
@@ -456,10 +459,11 @@ class _Built:
         self.max_rows = TP_MAX_ROWS.get(tp, max(WIDTHS))
         # a step's rows a request: the verify step's draft tokens with MTP, else 1
         self.verify, self.max_position = verify, max_position
-        # the launch checks run SGLang's decode layer: decode steps only
-        self.check_layers = (
-            os.environ.get("SGLANG_AMD_MONO_CHECK") == "1" and verify == 1
-        )
+        # the MLA latent cache's dtype the sparse-attention launches were built for
+        self.kv_fp8 = kv_fp8
+        # the launch checks run SGLang's layer on the launch's input: a decode step,
+        # or a verify step (its KDA layers' per-draft-row states)
+        self.check_layers = os.environ.get("SGLANG_AMD_MONO_CHECK") == "1"
         # layer 0's input besides its tokens: every stream a copy of the embedding row
         # (x = the row, post 1, comb 0, residual 0)
         n = max(WIDTHS)
@@ -626,7 +630,7 @@ class _Built:
             streams = _written(L.module, *(t[:S] for t in ins)) if checking else None
         if checking:
             hidden = self.model.embed_tokens(input_ids[:S]) if L.i == 0 else streams
-            ref = check.reference(L, positions, hidden, forward_batch, S, idx[:S])
+            ref = check.reference(L, positions, hidden, forward_batch, S, idx[:S], V)
         if L.kda:
             self._bind_kda(L, backend.linear_attn_backend, V)
             out = op.launch(*ins, state=L.state, state_idx=idx, step=step)
@@ -636,14 +640,16 @@ class _Built:
                     forward_batch, L.state.conv_state, L.state.rec_state, slots, L.i
                 )
         else:
-            self._bind_dsa(L, V)
+            self._bind_dsa(L, V, self.kv_fp8)
             rows, page_table = plan.state["dsa_rows"]
             out = op.launch(*ins, caches=L.caches, rows=rows, page_table=page_table)
         if checking:
             written = _written(L.module, *(t[:S] for t in out))
             if L.i == self.last:
                 written = check.contract(written)
-            check.compare(L, ref, written, out, positions, forward_batch, S, idx[:S])
+            check.compare(
+                L, ref, written, out, positions, forward_batch, S, idx[:S], V
+            )
         return _Owed(*out)
 
     @staticmethod
@@ -711,7 +717,7 @@ class _Built:
         )
 
     @staticmethod
-    def _bind_dsa(L: _Layer, verify: int) -> None:
+    def _bind_dsa(L: _Layer, verify: int, kv_fp8: bool) -> None:
         from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 
         from sgl_amd_mono.glm53_flash.gfx950.runner import (
@@ -738,10 +744,11 @@ class _Built:
         ):
             return
         reasons = []
-        if kv.dtype != torch.bfloat16 or kv.shape[1] < 512 or kv.stride(1) != 1:
+        kv_dtype = torch.float8_e4m3fn if kv_fp8 else torch.bfloat16
+        if kv.dtype != kv_dtype or kv.shape[1] < 512 or kv.stride(1) != 1:
             reasons.append(
-                f"MLA cache {kv.dtype} {tuple(kv.shape)} {kv.stride()}, needs bf16 "
-                "[slots, >= 512] with unit stride"
+                f"MLA cache {kv.dtype} {tuple(kv.shape)} {kv.stride()}, needs "
+                f"{kv_dtype} [slots, >= 512] with unit stride"
             )
         if (
             idx.dtype != torch.uint8
@@ -788,7 +795,12 @@ def _deadline(key, deadline_s: float, longest_s: int) -> float:
 
 
 def _build(model, hf_config, ctx) -> _Built:
-    from sglang.srt.runtime_context import get_parallel, get_spec, process_model_config
+    from sglang.srt.runtime_context import (
+        get_model,
+        get_parallel,
+        get_spec,
+        process_model_config,
+    )
 
     from sgl_amd_mono.common import guard
     from sgl_amd_mono.glm53_flash.gfx950.config import (
@@ -875,6 +887,8 @@ def _build(model, hf_config, ctx) -> _Built:
         if sp.speculative_algorithm is not None
         else 1
     )
+    # the MLA latent cache: bf16, or SGLang's raw E4M3 rows (no scale)
+    kv_fp8 = get_model().kv_cache_dtype == "fp8_e4m3"
     runtimes, heads = {}, {}
     cap = TP_MAX_ROWS.get(tp, max(WIDTHS))
     widths = sorted({_width(r) for r in ctx.widths if r <= cap})
@@ -916,6 +930,7 @@ def _build(model, hf_config, ctx) -> _Built:
                 tokens=kind == "embed",
                 verify=verify,
                 grouped=w >= GROUPED_FROM and kind not in ("dense", "embed"),
+                kv_fp8=kv_fp8 and kind == "dsa",
                 fault_site=fault_site,
                 fault_after=fault_after,
             )
@@ -948,7 +963,9 @@ def _build(model, hf_config, ctx) -> _Built:
         for (rw, _), rt in runtimes.items():
             if rw == w:
                 rt.precompile()
-    return _Built(model, layers, runtimes, heads, tp, device, verify, context_len - 1)
+    return _Built(
+        model, layers, runtimes, heads, tp, device, verify, context_len - 1, kv_fp8
+    )
 
 
 SPEC = MonoSpec(
@@ -963,7 +980,8 @@ SPEC = MonoSpec(
         dtypes=frozenset({"bfloat16"}),
         attention_backends=frozenset({"dsa"}),
         server_args={
-            "kv_cache_dtype": frozenset({"auto", "bfloat16"}),
+            # bf16, or E4M3 latent rows (the index cache is FP8 either way)
+            "kv_cache_dtype": frozenset({"auto", "bfloat16", "fp8_e4m3"}),
             "moe_runner_backend": frozenset({"auto", "aiter"}),
             # the launch updates the KDA state in place; ReplaySSM defers it to a ring
             "enable_linear_replayssm": frozenset({False}),

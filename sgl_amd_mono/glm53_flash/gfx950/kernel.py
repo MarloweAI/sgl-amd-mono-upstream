@@ -292,6 +292,10 @@ class FlashBuild(msgspec.Struct, frozen=True):
     # past ISEL_ONE_POOLS pools, else on one CTA; both select the same pools in the
     # same order
     select_ctas: bool = True
+    # with dsa: the MLA latent cache holds E4M3 bytes (SGLang's raw FP8 layout, no
+    # scale): a row is written as its bf16 normed values cast to E4M3, and read
+    # back exactly into the bf16 key tile
+    kv_fp8: bool = False
 
 
 def build_flash_kernel(key: FlashBuild):
@@ -333,6 +337,8 @@ def build_flash_kernel(key: FlashBuild):
     assert not head or not (kda or dsa)
     assert not tokens or (kda and W > 1)
     assert not dsa or (S <= 16 and max_pools % POOLS_PER_TASK == 0)
+    KV_FP8 = key.kv_fp8
+    assert not KV_FP8 or dsa
     SH = FlashShard(W)
     P, H, IN_ROWS = SH.kda_proj, SH.kda_heads, SH.kda_in_rows
     MH = SH.mla_heads
@@ -355,6 +361,7 @@ def build_flash_kernel(key: FlashBuild):
                 ("e", tokens),
                 ("g", GROUPED),
                 ("o", dsa and not key.select_ctas),
+                ("f", KV_FP8),
             )
             if on
         }
@@ -425,6 +432,11 @@ def build_flash_kernel(key: FlashBuild):
         SEL_BINS + 2 * 2048 if dsa else 0,
     )
     SEL_CAP = (X_WORDS - SEL_BINS) // 2
+    # FP8 KV write: a verify chain's rows of bf16 normed values, past the kpool
+    # compress's words
+    KVX = 2 * INDEX_DIM
+    KV_BYTES = 1 if KV_FP8 else 2
+    assert not KV_FP8 or KVX + VL * KV_LORA <= X_WORDS
     ISEL_ITEMS, ISEL_K = isel_slices(S, max_pools)
     assert not dsa or S * ISEL_K <= G
     # the routed up/gate tiles' sums go past the rows' MXFP8 input in X when they fit
@@ -2624,6 +2636,13 @@ def build_flash_kernel(key: FlashBuild):
             KVB = t32["kv_block_tokens"]
             KVE = tv["kv_block_elems"]
             KVR = t32["kv_row_elems"]
+
+            def kv_addr(blk, off):
+                """A latent row's byte address (caches can be views of pools past
+                4 GB: 64-bit)."""
+                return tv["kv_cache"] + (
+                    fx.Int64(blk) * KVE + fx.Int64(off * KVR)
+                ) * fx.Int64(KV_BYTES)
             IPB = t32["idx_block_pools"]
             IBB = t32["idx_block_bytes"]
             TBE = t32["tail_block_elems"]
@@ -2642,6 +2661,40 @@ def build_flash_kernel(key: FlashBuild):
                         bo.buffer_load(r, i, vec_width=1, dtype=T.bf16, **ring_cm)
                     )
                 )
+
+            def kv_write(rows):
+                """Each of ``rows`` (MLA slot, live, this thread's normed value of
+                latent element ``tid``) to its cache row, bf16 or E4M3 (the bf16
+                value cast to E4M3, round to nearest even, saturating at 448)."""
+                if const_expr(KV_FP8):
+                    for j in range_constexpr(len(rows)):
+                        v = bf16_round(rows[j][2])
+                        lds_st(
+                            xs,
+                            KVX + j * KV_LORA + tid,
+                            fx.min(fx.max(v, -FP8_MAX), FP8_MAX),
+                        )
+                    gpu.barrier()
+                    for j in range_constexpr(len(rows)):
+                        slot, live = rows[j][0], rows[j][1]
+                        if live & (tid < KV_LORA // 4):
+                            e = KVX + j * KV_LORA + tid * 4
+                            bo.buffer_store(
+                                fp8_pack4(*[lds_ld(xs, e + i) for i in range(4)]),
+                                _rsrc(kv_addr(slot // KVB, slot % KVB)),
+                                tid,
+                                cache_modifier=CM_DEV,
+                            )
+                else:
+                    for j in range_constexpr(len(rows)):
+                        slot, live, v = rows[j]
+                        if live:
+                            bo.buffer_store(
+                                fx.Float32(v).to(fx.BFloat16),
+                                _rsrc(kv_addr(slot // KVB, slot % KVB)),
+                                tid,
+                                cache_modifier=CM_DEV,
+                            )
 
             def cache_row(s):
                 pos = row_word(s, ROW_POS)
@@ -2663,16 +2716,7 @@ def build_flash_kernel(key: FlashBuild):
                 # a padding row (position < 0, or MLA slot 0: SGLang's reserved
                 # dummy, which its graph runner gives pad rows) writes nothing
                 live = (pos >= 0) & (slot > 0)
-                if live:
-                    row_addr = tv["kv_cache"] + (
-                        fx.Int64(slot // KVB) * KVE + fx.Int64((slot % KVB) * KVR)
-                    ) * fx.Int64(2)
-                    bo.buffer_store(
-                        fx.Float32(kv * rstd * g).to(fx.BFloat16),
-                        _rsrc(row_addr),
-                        tid,
-                        cache_modifier=CM_DEV,
-                    )
+                kv_write([(slot, live, kv * rstd * g)])
                 mean = block_sum(lk.select(kraw, fx.Float32(0.0))) * (1.0 / INDEX_DIM)
                 cen = lk.select(kraw - mean, fx.Float32(0.0))
                 var = block_sum(cen * cen) * (1.0 / INDEX_DIM)
@@ -2821,21 +2865,19 @@ def build_flash_kernel(key: FlashBuild):
                     mean = sums[VL + j] * (1.0 / INDEX_DIM)
                     cen.append(lk.select(kraw[j] - mean, fx.Float32(0.0)))
                 var = block_sums([c * c for c in cen])
+                kv_write(
+                    [
+                        (
+                            slot[j],
+                            (pos[j] >= 0) & (slot[j] > 0),
+                            kv[j] * _rsq(sums[j] * (1.0 / KV_LORA) + EPS) * g,
+                        )
+                        for j in range(VL)
+                    ]
+                )
                 kn = []
                 for j in range_constexpr(VL):
-                    rstd = _rsq(sums[j] * (1.0 / KV_LORA) + EPS)
                     live = (pos[j] >= 0) & (slot[j] > 0)
-                    if live:
-                        row_addr = tv["kv_cache"] + (
-                            fx.Int64(slot[j] // KVB) * KVE
-                            + fx.Int64((slot[j] % KVB) * KVR)
-                        ) * fx.Int64(2)
-                        bo.buffer_store(
-                            fx.Float32(kv[j] * rstd * g).to(fx.BFloat16),
-                            _rsrc(row_addr),
-                            tid,
-                            cache_modifier=CM_DEV,
-                        )
                     kn.append(
                         bf16_round(
                             cen[j] * _rsq(var[j] * (1.0 / INDEX_DIM) + INDEX_EPS) * lnw
@@ -4048,6 +4090,13 @@ def build_flash_kernel(key: FlashBuild):
             KVB = t32["kv_block_tokens"]
             KVE = tv["kv_block_elems"]
             KVR = t32["kv_row_elems"]
+
+            def kv_addr(blk, off):
+                """A latent row's byte address (caches can be views of pools past
+                4 GB: 64-bit)."""
+                return tv["kv_cache"] + (
+                    fx.Int64(blk) * KVE + fx.Int64(off * KVR)
+                ) * fx.Int64(KV_BYTES)
             KPW = SPLIT_KEYS // WAVES
             HPW = HT // WAVES
             N_TAIL = S * HG
@@ -4076,18 +4125,28 @@ def build_flash_kernel(key: FlashBuild):
                         lds_st(keys, SPLIT_KEYS + lane, tok % KVB)
 
                     def kv_row(blk, off):
-                        return fx.Vector(
-                            bo.buffer_load(
-                                _rsrc(
-                                    tv["kv_cache"]
-                                    + (fx.Int64(blk) * KVE + fx.Int64(off * KVR))
-                                    * fx.Int64(2)
-                                ),
-                                lane * 4,
-                                vec_width=4,
-                                dtype=T.i32,
+                        """The lane's 8 latent values of a key, bf16 (E4M3 bytes
+                        converted exactly)."""
+                        if const_expr(KV_FP8):
+                            raw = fx.Vector(
+                                bo.buffer_load(
+                                    _rsrc(kv_addr(blk, off)),
+                                    lane * 2,
+                                    vec_width=2,
+                                    dtype=T.i32,
+                                )
                             )
-                        )
+                            row = _fp8_to_bf16x8(raw[0], raw[1])
+                        else:
+                            row = fx.Vector(
+                                bo.buffer_load(
+                                    _rsrc(kv_addr(blk, off)),
+                                    lane * 4,
+                                    vec_width=4,
+                                    dtype=T.i32,
+                                )
+                            )
+                        return row
 
                     kidx = t * SPLIT_KEYS + lane
                     # A task that reads the selection waits for it: wave 0 polls its 64
