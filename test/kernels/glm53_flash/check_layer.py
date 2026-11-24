@@ -18,6 +18,11 @@ torch tail and an f32 tail; ``--replays N``: a graph of ``--layers`` launches
 replays the eager step bitwise; ``--verify L`` (``kda`` or ``dsa``): an MTP verify
 launch of L rows a request equals its tokens' L decode launches bitwise;
 ``--kv-fp8`` (``dsa``): every sparse-attention launch on an E4M3 MLA cache;
+``--fold-cycles N`` (``kda``, needs SGLang's fold-in-verify kernel on the path):
+N verify cycles of a few requests on the fold-in-verify contract, each step taken
+at random by the monokernel (one request) or by SGLang's ``kda_fold_verify_gfx950``
+(1-3 requests, padded buckets), against every step taken by SGLang's kernel on
+the same raw inputs: outputs, states, conv windows and rings bitwise;
 ``--compare-kv-fp8``: a sparse-attention launch on an E4M3 MLA cache against the
 bf16 launch on the same keys in bf16: it writes its rows as the bf16 launch's cast
 to E4M3, and the index cache and kpool rings bitwise."""
@@ -588,6 +593,220 @@ def compare_kv_fp8(args, rank, tp, group, device) -> bool:
         flush=True,
     )
     return same_kv and wrote and same_rest and finite and rel < 5e-2
+
+
+def check_fold(args, rank, tp, group, device) -> bool:
+    """Monokernel verify steps (one request, width 4) and SGLang's fold-in-verify
+    steps interleaved on the same requests (arm "mix"), against SGLang's kernel
+    taking every step on the same raw inputs (arm "ref"): after every cycle the
+    verify output, every state, conv window and ring row bitwise equal. The
+    monokernel's raw inputs (pre-conv q | k | v, a, b) are read from its
+    mailboxes; SGLang's steps take random ones. Accept lengths 1-4 a request a
+    cycle; requests join fresh (nothing kept) and leave."""
+    from sglang.kernels.ops.attention.linear.kda_fold_verify_gfx950 import (
+        kda_fold_verify_gfx950,
+    )
+
+    from sgl_amd_mono.common import guard
+    from sgl_amd_mono.glm53_flash.gfx950.config import (
+        KDA_DIM,
+        KDA_HEADS,
+        KDA_LOWER_BOUND,
+        KDA_PROJ,
+    )
+    from sgl_amd_mono.glm53_flash.gfx950.kernel import FlashBuild
+    from sgl_amd_mono.glm53_flash.gfx950.runner import (
+        FlashKdaFold,
+        FlashKdaState,
+        FlashLayerOp,
+        FlashRuntime,
+    )
+
+    from sgl_amd_mono.glm53_flash.gfx950.config import FlashShard
+
+    T, D = 4, KDA_DIM
+    P, H = KDA_PROJ // tp, KDA_HEADS // tp
+    IN_ROWS = FlashShard(tp=tp).kda_in_rows
+    NR, SLOTS = 4, 6  # ring rows (requests 0..3), state slots 1..4 (+0 pad, spare)
+    key = FlashBuild(
+        rows=T,
+        tp=tp,
+        launches_per_step=1,
+        inter=GLOBAL_INTER // tp,
+        kda=True,
+        verify=T,
+        fold=True,
+        kda_raw_o=True,
+        stop=False,
+    )
+    rt = FlashRuntime(key, rank, group, device)
+    rt.set_deadline(args.deadline)
+    ffn, w = ffn_weights(rank, tp, device), kda_weights(rank, tp, device)
+    op = FlashLayerOp(rt, ffn, 0, kda=w)
+    g = torch.Generator(device=device).manual_seed(1234 + args.seed)
+    gc = torch.Generator().manual_seed(77 + args.seed)
+
+    def rnd(*shape, scale=1.0):
+        return torch.randn(*shape, generator=g, device=device) * scale
+
+    def arm():
+        return {
+            "conv": torch.zeros(SLOTS, 3, 3 * P, dtype=torch.bfloat16, device=device),
+            "rec": torch.zeros(SLOTS, H, D, D, dtype=torch.float32, device=device),
+            "rx": torch.zeros(NR, T, 3 * P, dtype=torch.bfloat16, device=device),
+            "ra": torch.zeros(NR, T, P, dtype=torch.bfloat16, device=device),
+            "rb": torch.zeros(NR, T, H, dtype=torch.bfloat16, device=device),
+            "rh": torch.zeros(NR, H, dtype=torch.int32, device=device),
+            "fl": torch.zeros(SLOTS, dtype=torch.int32, device=device),
+            "flr": torch.zeros(16, dtype=torch.int32, device=device),
+            "arr": torch.zeros(16 * H, dtype=torch.int32, device=device),
+        }
+
+    mix, ref = arm(), arm()
+    ring_rows = torch.full((16,), -1, dtype=torch.int32, device=device)
+    fold = FlashKdaFold.make(
+        mix["rx"], mix["ra"], mix["rb"], mix["rh"], mix["fl"], ring_rows
+    )
+    state = FlashKdaState(conv_state=mix["conv"], rec_state=mix["rec"], fold=fold)
+
+    def k_step(a_, rows, slots, rrs, x, a, b):
+        cache = torch.tensor(slots, dtype=torch.int32, device=device)
+        ring = torch.tensor(rrs, dtype=torch.int32, device=device)
+        return kda_fold_verify_gfx950(
+            mixed_qkv=x,
+            conv_weight=w.conv_w,
+            conv_state=a_["conv"].transpose(-1, -2),
+            cache_indices=cache,
+            ring_rows=ring,
+            fold_len=a_["fl"],
+            fold_len_rows=a_["flr"],
+            first_layer=True,
+            ring_x=a_["rx"],
+            ring_a=a_["ra"],
+            ring_b=a_["rb"],
+            ring_half=a_["rh"],
+            a=a,
+            b=b,
+            A_log=w.a_log,
+            dt_bias=w.dt_bias,
+            ssm_states=a_["rec"],
+            arrivals=a_["arr"],
+            scale=D**-0.5,
+            T=T,
+            num_heads=H,
+            lower_bound=KDA_LOWER_BOUND,
+        ).view(rows * T, H, D)
+
+    sc = rt.scratch.view(torch.int32)
+
+    def box(name, n_pairs):
+        """A mailbox's first n_pairs value words (f32 bits)."""
+        o = rt.sc[name] // 4
+        return sc[o : o + 2 * n_pairs : 2].clone().view(torch.float32)
+
+    live = {}  # request (ring row) -> slot
+    kinds = {}  # monokernel steps by (kept tokens, the kept tokens' width)
+    o_abs = []
+    ok, counts = True, {"mono": 0, "sglang": 0, "o": 0, "state": 0}
+    for cyc in range(args.fold_cycles):
+        # joins and leaves
+        for r in range(NR):
+            if r not in live and torch.rand(1, generator=gc).item() < 0.5:
+                slot = r + 1
+                live[r] = slot
+                st = rnd(H, D, D, scale=0.05)
+                cv = rnd(3, 3 * P).bfloat16()
+                for a_ in (mix, ref):
+                    a_["rec"][slot] = st
+                    a_["conv"][slot] = cv
+                    a_["fl"][slot] = 0
+            elif r in live and torch.rand(1, generator=gc).item() < 0.15:
+                del live[r]
+        if not live:
+            continue
+        reqs = sorted(live)
+        mono = torch.rand(1, generator=gc).item() < 0.5
+        if mono:
+            r = reqs[int(torch.randint(len(reqs), (1,), generator=gc))]
+            slot = live[r]
+            kept = int(mix["fl"][slot])
+            wide = kept > 0 and int(mix["rh"][r].min()) == 0
+            kinds[(kept, "w8" if wide else "w4")] = kinds.get((kept, "w8" if wide else "w4"), 0) + 1
+            ring_rows.fill_(-1)
+            ring_rows[0] = r
+            x0, res, post, comb = layer_inputs(T, device)
+            x0 = rnd(T, HIDDEN).bfloat16()
+            idx = torch.full((T,), slot, dtype=torch.int32, device=device)
+            op.launch(x0, res, post, comb, state=state, state_idx=idx)
+            rt.advance_step()
+            torch.cuda.synchronize()
+            words = rt.epoch[guard.ERR_DEADLINE : guard.ERR_FAULT + 1].tolist()
+            if any(words):
+                print(f"rank {rank}: error words {words}", flush=True)
+                return False
+            proj = box("proj", T * IN_ROWS).view(T, IN_ROWS)
+            x = proj[:, : 3 * P].bfloat16().contiguous()
+            b = proj[:, 3 * P : 3 * P + H].bfloat16().contiguous()
+            a = box("gates", T * 2 * P).view(T, 2 * P)[:, :P].bfloat16().contiguous()
+            o_mono = (
+                box("o_in", T * P // 2).view(torch.int32).view(torch.bfloat16)
+            ).view(T, H, D)
+            o_ref = k_step(ref, 1, [slot], [r], x, a, b)
+            torch.cuda.synchronize()
+            same_o = torch.equal(o_mono.view(torch.int16), o_ref.view(torch.int16))
+            o_abs.append(o_ref.float().abs().mean().item())
+            counts["mono"] += 1
+            accepted = {r: int(torch.randint(1, 5, (1,), generator=gc))}
+        else:
+            k = min(len(reqs), int(torch.randint(1, 4, (1,), generator=gc)))
+            pick = torch.randperm(len(reqs), generator=gc)[:k].tolist()
+            chosen = [reqs[i] for i in pick]
+            pad = int(torch.randint(0, 2, (1,), generator=gc))
+            rows = k + pad
+            slots = [live[r] for r in chosen] + [-1] * pad
+            rrs = chosen + [-1] * pad
+            x = rnd(rows * T, 3 * P).bfloat16()
+            a = rnd(rows * T, P).bfloat16()
+            b = rnd(rows * T, H).bfloat16()
+            o_mix = k_step(mix, rows, slots, rrs, x, a, b)
+            o_ref = k_step(ref, rows, slots, rrs, x, a, b)
+            torch.cuda.synchronize()
+            same_o = torch.equal(
+                o_mix[: k * T].view(torch.int16), o_ref[: k * T].view(torch.int16)
+            )
+            counts["sglang"] += 1
+            accepted = {r: int(torch.randint(1, 5, (1,), generator=gc)) for r in chosen}
+        counts["o"] += int(same_o)
+        for r, n in accepted.items():
+            for a_ in (mix, ref):
+                a_["fl"][live[r]] = n
+        same = all(
+            torch.equal(mix[n].view(torch.int16), ref[n].view(torch.int16))
+            for n in ("conv", "rx", "ra", "rb")
+        ) and all(
+            torch.equal(mix[n].view(torch.int32), ref[n].view(torch.int32))
+            for n in ("rec", "rh")
+        )
+        counts["state"] += int(same)
+        if not (same_o and same):
+            diffs = {
+                n: (mix[n].float() - ref[n].float()).abs().max().item()
+                for n in ("conv", "rec", "rx", "ra", "rb", "rh")
+            }
+            print(
+                f"rank {rank} cycle {cyc} ({'mono' if mono else 'sglang'}): o same "
+                f"{same_o}, buffers same {same} {diffs}",
+                flush=True,
+            )
+            ok = False
+    print(
+        f"rank {rank}: fold hand-off over {args.fold_cycles} cycles {counts}; "
+        f"monokernel steps by (kept, kept width) {dict(sorted(kinds.items()))}; "
+        f"mean |o| {sum(o_abs) / max(len(o_abs), 1):.3g}; ok {ok}",
+        flush=True,
+    )
+    rt.close()
+    return ok
 
 
 # router weights and biases whose keys tie after bf16 rounding (see tie_router)
@@ -1532,6 +1751,8 @@ def main() -> int:
     )
     ap.add_argument("--kv-fp8", action="store_true", help="dsa: an E4M3 MLA cache")
     ap.add_argument("--compare-kv-fp8", action="store_true")
+    ap.add_argument("--fold-cycles", type=int, default=0)
+    ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
     MAX_LEN = args.max_len
     args.max_pools = args.max_pools or MAX_LEN // 4
@@ -1543,6 +1764,7 @@ def main() -> int:
     for flag, check in (
         (args.compare_shuffled, compare_shuffled),
         (args.compare_kv_fp8, compare_kv_fp8),
+        (args.fold_cycles, check_fold),
         (args.check_routing, check_routing),
         (args.check_keys, check_keys),
         (args.check_dense, check_dense),
