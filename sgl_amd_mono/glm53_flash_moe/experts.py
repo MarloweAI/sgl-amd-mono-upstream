@@ -63,7 +63,6 @@ SHARED = 288  # the shared expert's id in the sort
 I = 1024  # a rank's intermediate
 WIDE_ROWS = 32  # from this many rows on, G1 workgroups take 128 columns (32 a wave), else 64 (16 a wave)
 G1_STEPS = D // 128  # 128-deep MFMA steps of G1
-G1_PREFETCH = 4  # G1 steps of loads a wave has in flight
 G2_N = 128  # output columns of a G2 tile
 G2_SPAN = 2  # G2 tiles of a G2 workgroup
 G2_WGS = D // (G2_N * G2_SPAN)  # G2 workgroups of a block
@@ -71,7 +70,11 @@ SH_SPAN = 1  # G2 tiles of a shared-expert G2 workgroup (its dense layout stream
 SH_WGS = D // (G2_N * SH_SPAN)  # G2 workgroups of a shared-expert block
 SH_SLOTS = MAX_ROWS // BM * SH_WGS  # their slots, after the G1 workgroups (the shared blocks are the sort's last)
 G2_STEPS = I // 128  # 128-deep MFMA steps of a G2 tile
-G2_PREFETCH = 8  # G2 steps of w2 loads a wave has in flight
+# Launch kinds by rows: G1 workgroups of 128 columns from WIDE_ROWS, else 64; below DEEP_ROWS so few blocks stream
+# that a block's G1 -> G2 chain sets the time, and each wave keeps more of its loads in flight. G1 / G2 steps of
+# loads a wave has in flight, by kind:
+DEEP_ROWS = 8
+PREFETCH = {"deep": (16, 16), "narrow": (4, 8), "wide": (4, 8)}
 LOG2E = 1.4426950408889634
 # weights and e8m0 scales of an expert (aiter's (16, 16) shuffle and e8m0_shuffle)
 W13_BYTES = 2 * I * D // 2
@@ -320,7 +323,8 @@ def _g1_tile(c, blk, nt, e, sh):
     zero = fx.Vector.filled(4, 0.0, fx.Float32)
     nj = 2 if c["wide"] else 1
     acc = [[[zero, zero] for _ in range(nj)] for _ in range(2)]  # [gate / up][j][row tile]
-    pend = [_g1_loads(k, s) for s in range(G1_PREFETCH)]
+    pf = c["pf"][0]
+    pend = [_g1_loads(k, s) for s in range(pf)]
     sc = None
     # the shared expert's dense rows: both K steps of a row's 128 B line go out together
     burst = 2 if sh else 1
@@ -328,8 +332,8 @@ def _g1_tile(c, blk, nt, e, sh):
         wv, x, xs, s = pend.pop(0)
         if const_expr(step % burst == 0):
             for b in range_constexpr(burst):
-                if const_expr(step + G1_PREFETCH + b < G1_STEPS):
-                    pend.append(_g1_loads(k, step + G1_PREFETCH + b))
+                if const_expr(step + pf + b < G1_STEPS):
+                    pend.append(_g1_loads(k, step + pf + b))
         if const_expr(s is not None):
             sc = s
         for u in range_constexpr(2):
@@ -478,7 +482,8 @@ def _g2_tile(c, blk, q, e, sh):
         "rg": q * (span * G2_N // 16) + 2 * wave,  # the wave's first w2 row group (16 output columns)
     }
     steps = span * G2_STEPS
-    pend = [_g2_loads(k, s) for s in range(G2_PREFETCH)]
+    pf = c["pf"][1]
+    pend = [_g2_loads(k, s) for s in range(pf)]
     rows = [blk * BM + rt * 16 + lane % 16 for rt in range(2)]
     toks = [ld_i32(a["sids"], r) & 0xFFFFFF for r in rows]
     tws = [fx.Float32(bo.buffer_load(rsrc(a["sw"]), r, 1, T.f32)) for r in rows]
@@ -491,8 +496,8 @@ def _g2_tile(c, blk, q, e, sh):
     sc = None
     for step in range_constexpr(steps):
         w, s = pend.pop(0)
-        if const_expr(step + G2_PREFETCH < steps):
-            pend.append(_g2_loads(k, step + G2_PREFETCH))
+        if const_expr(step + pf < steps):
+            pend.append(_g2_loads(k, step + pf))
         if const_expr(s is not None):
             sc = s
         kc = step % G2_STEPS
@@ -554,15 +559,16 @@ def _run(c, bid):
 
 
 @functools.cache
-def build(wide: bool):
-    """The launch with G1 workgroups of 128 columns (``wide``) or 64."""
-    keyed = (("sources", SOURCES), ("wide", wide))
+def build(kind: str):
+    """The launch of ``kind`` (``PREFETCH``'s keys): G1 workgroups of 128 columns ("wide") or 64."""
+    wide = kind == "wide"
+    keyed = (("sources", SOURCES), ("kind", kind), ("prefetch", PREFETCH[kind]))
 
     @fx.struct
     class Lds:
         words: fx.Array[fx.Int32, LDS_WORDS, 16]
 
-    @flyc.kernel(name="glm53f_moe_experts" + ("_n128" if wide else "_n64"), known_block_size=[THREADS, 1, 1])
+    @flyc.kernel(name="glm53f_moe_experts_" + kind, known_block_size=[THREADS, 1, 1])
     def kexperts(
         a1: Int64, a1s: Int64, a1e: Int64, a1es: Int64, sids: Int64, sw: Int64, seids: Int64, nvalid: Int64,
         w13: Int64, w2: Int64, s13: Int64, s2: Int64, w13sh: Int64, s13sh: Int64, w2sh: Int64, s2sh: Int64,
@@ -580,6 +586,7 @@ def build(wide: bool):
         c = {
             "args": args, "tid": tid, "lane": tid % 64, "wave": uniform(tid // 64), "m": m, "blocks": blocks,
             "limit": limit, "nv": uniform(ld_i32(nvalid, 0)), "lds": lds.words.ptr, "wide": wide,
+            "pf": PREFETCH[kind],
         }  # fmt: skip
         _run(c, fx.Int32(fx.block_idx.x))
 
@@ -657,7 +664,7 @@ def experts(
     assert w13_shared.numel() * w13_shared.element_size() == W13_BYTES and w13_shared_scale.numel() == S13_BYTES
     assert w2_shared.numel() * w2_shared.element_size() == W2_BYTES and w2_shared_scale.numel() == S2_BYTES
     counters, mid, shared_rows = workspace(a1.device)
-    build(m >= WIDE_ROWS)(
+    build("wide" if m >= WIDE_ROWS else "narrow" if m >= DEEP_ROWS else "deep")(
         a1.data_ptr(), a1_scale.data_ptr(), a1_even.data_ptr(), a1_even_scale.data_ptr(), sorted_ids.data_ptr(),
         sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w13.data_ptr(),
         w2.data_ptr(), w13_scale.data_ptr(), w2_scale.data_ptr(), w13_shared.data_ptr(), w13_shared_scale.data_ptr(),
