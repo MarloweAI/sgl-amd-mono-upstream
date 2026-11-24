@@ -137,6 +137,7 @@ SGLANG_READS = {
         "ring_b",
         "ring_half",
         "fold_len",
+        "layers",
     ),
     "srt/layers/layer_boundary/__init__.py": ("get_attn_tp_context",),
     "srt/layers/layer_boundary/adapters/attention.py": ("maybe_input_scattered",),
@@ -758,7 +759,9 @@ class _Built:
                 fs.fold_len,
                 ring_rows,
             )
-            kda.kda_fold_layers[i] = (L.module.self_attn.attn, cache)
+            # SGLang's readers outside verify (track fold, flush before a retraction
+            # backup or a no-buffer checkpoint) fold every layer a verify registered
+            kda.kda_fold_layers[i] = fs.layers[i] = (L.module.self_attn.attn, cache)
         L.state = FlashKdaState(
             conv_state=conv, rec_state=rec, inter_rec=ir, inter_conv=ic, fold=fold_tab
         )
