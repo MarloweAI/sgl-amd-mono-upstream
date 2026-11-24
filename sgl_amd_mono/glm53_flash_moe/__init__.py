@@ -94,7 +94,8 @@ def front(
 ) -> dict:
     """x [m, 4096] bf16, gate_w [288, 4096] bf16, bias [288] bf16, ``scale`` folded into the routed weights,
     ``valid`` (or None) int32 [1]: rows from it on are padding and routed nowhere. ``shared`` appends expert 288
-    with weight 1.0 to every valid row; ``sorted_scale`` also writes the scales in the sorted, shuffled layout of
+    with weight 1.0 to every valid row and also quantizes x as the shared expert's own quant does (``a1_even``,
+    ``a1_even_scale``); ``sorted_scale`` also writes the scales in the sorted, shuffled layout of
     aiter's FlyDSL stage 1. ``given`` (ids [m, 8] i32, weights [m, 8] f32), for measurements with fixed routes: the
     top-k runs as always, then the routes written are these. Returns the outputs by name."""
     m = x.shape[0]
@@ -116,6 +117,9 @@ def front(
         a1_scale_sorted=(
             torch.empty((cap + 31) // 32 * 32, SCALE_COLS, dtype=u8, device=dev) if sorted_scale else None
         ),
+        # the shared expert's activations with its own quant (aiter's dynamic_mxfp4_quant, "even" scales)
+        a1_even=torch.empty(m, D // 2, dtype=u8, device=dev) if shared else None,
+        a1_even_scale=torch.empty(m, SCALE_COLS, dtype=u8, device=dev) if shared else None,
         moe_buf=torch.empty(m, D, dtype=torch.bfloat16, device=dev),
         logits=torch.empty(r * 16, E, dtype=f32, device=dev),
     )
@@ -138,6 +142,8 @@ def front(
         out["a1"],
         out["a1_scale"],
         out["a1_scale_sorted"],
+        out["a1_even"],
+        out["a1_even_scale"],
         out["moe_buf"],
         _counters(dev),
         k,

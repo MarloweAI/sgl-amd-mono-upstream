@@ -4,13 +4,11 @@
 // as slot 288 when SHARED), the rows' MXFP4 activation quant and the zeroed MoE output.
 //
 // CTA roles, in id order (a CTA waits only on CTAs with lower ids):
-// - router (g, n, s): row tiles g RB .. (RB = ceil(R / 4)), experts 16 n.., K slice s of 4; its 8 waves' MFMA sums
-//   added in wave order. The last of the 4 slices of (g, n) (by counter) adds them in slice order -> f32 logits and
-//   counts the expert tile done for each of its row tiles. Never waits.
-// - quant: x (bf16) -> MXFP4 a1 [M, 2048 B] and its per-token e8m0 scales [M, 128]; zeroes the MoE output. Never
-//   waits.
-// - top-k: a wave a row, once its row tile's 18 expert tiles are counted; the last top-k CTA to finish sorts every
-//   route and publishes the sort.
+// - router (g, n, s): row tiles g RB .. (RB = ceil(R / 4)), experts 16 n.., K slice s of 4: its 8 waves' MFMA sums
+//   added in wave order -> f32 partial logits; counts itself on each of its row tiles. Never waits.
+// - top-k (8 rows each): quantizes its rows (x bf16 -> MXFP4 a1 [M, 2048 B] and per-token e8m0 scales [M, 128]) and
+//   zeroes their MoE output while the router runs; then, once its row tile's 72 router tiles are counted, sums the
+//   K slices in order and picks each row's top 8, a wave a row. The last top-k CTA to finish sorts every route.
 // - scale (with a1_scale_sorted only): once the sort and the quant are done, the per-token scales in the sorted,
 //   shuffled layout aiter's FlyDSL stage 1 reads (aiter::mx_scale_shuffle_idx).
 //
@@ -91,9 +89,11 @@ struct Params {
     uint8_t        *a1;          // [M, D / 2] fp4x2
     uint8_t        *a1_scale;    // [M, SCOLS] e8m0, a token's own
     uint8_t        *a1_scale_sorted; // [cap rounded to 32, SCOLS] shuffled, or null
+    uint8_t        *a1_even;         // [M, D / 2] fp4x2 with the shared expert's scales (even rounding), or null
+    uint8_t        *a1_even_scale;   // [M, SCOLS]
     uint4          *out;         // the MoE output, zeroed: M x D bf16
     int            *counters;    // [N_COUNTERS * CL], 0 between launches
-    int             M, R, RB, router_ctas, quant_ctas, topk_ctas, scale_ctas, pad_id;
+    int             M, R, RB, router_ctas, topk_ctas, scale_ctas, pad_id;
 };
 
 __device__ __forceinline__ void st_dev(int *p, int v) {
@@ -513,14 +513,99 @@ __device__ void router_cta(const Params &p, int b, FrontLds &lds, int &flag) {
         __hip_atomic_fetch_add(p.counters + (C_R + g * RB + tid) * CL, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 }
 
-// Top-k CTA tk: rows 8 tk .. 8 tk + 7, a wave a row, once their row tile's 18 x 4 partial tiles are in: the K slices
-// summed in slice order are the logits. The last top-k CTA to finish sorts every route and publishes the sort.
+// ---- the activation quant and the zeroed output ----
+
+// Rows first .. last - 1: x (bf16) -> MXFP4 a1 and its per-token e8m0 scales; the MoE output rows zeroed.
+__device__ void quant_rows(const Params &p, int first, int last, uint8_t *scale_lds) {
+    const int tid = threadIdx.x, half = tid >> 8, t = tid & 255; // 2 rows a pass, 16 values a thread
+    for (int row0 = first; row0 < last; row0 += 2) {
+        const int row = row0 + half;
+        if (row < last) {
+            const uint16_t *xr = p.x + int64_t(row) * p.x_stride + t * 16;
+            const uint4 lo = *reinterpret_cast<const uint4 *>(xr);
+            const uint4 hi = *reinterpret_cast<const uint4 *>(xr + 8);
+            const uint32_t words[8] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
+            float f[16];
+            float amax = 1e-10f;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                f[2 * i]     = __builtin_bit_cast(float, words[i] << 16);
+                f[2 * i + 1] = __builtin_bit_cast(float, words[i] & 0xFFFF0000u);
+            }
+#pragma unroll
+            for (int i = 0; i < 16; ++i) amax = max(amax, abs(f[i]));
+            // multithread_reduce over the group's 2 threads: quad_perm [1,0,3,2]
+            const float other = __builtin_bit_cast(
+                float, __builtin_amdgcn_mov_dpp(__builtin_bit_cast(int, amax), 0xb1, 0xf, 0xf, false));
+            amax = other > amax ? other : amax;
+            // RCEIL: ceil_pow2(amax / 6)
+            const uint32_t u   = __builtin_bit_cast(uint32_t, amax * (1.0f / 6.0f));
+            uint32_t       exp = (u >> 23) & 0xFFu;
+            if (exp < 0xFFu && (u & 0x7FFFFFu)) exp += 1;
+            const float scale = __builtin_bit_cast(float, exp << 23);
+            if ((t & 1) == 0) scale_lds[half * SCOLS + t / 2] = uint8_t(exp);
+            if (p.a1_even) {
+                // the shared expert's quant (aiter's dynamic_mxfp4_quant, "even"): amax of |x| from 0, + half an
+                // fp4 mantissa step, the exponent less 2 (at least 0)
+                float am = 0.0f;
+#pragma unroll
+                for (int i = 0; i < 16; ++i) am = max(am, abs(f[i]));
+                const float am2 = __builtin_bit_cast(
+                    float, __builtin_amdgcn_mov_dpp(__builtin_bit_cast(int, am), 0xb1, 0xf, 0xf, false));
+                am = am2 > am ? am2 : am;
+                const uint32_t raw = ((__builtin_bit_cast(uint32_t, am) + 0x200000u) & 0xFF800000u) >> 23;
+                const uint32_t ex  = raw >= 2 ? raw - 2 : 0;
+                const float    sc  = __builtin_bit_cast(float, ex << 23);
+                uint32_t e0 = 0, e1 = 0;
+                e0 = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(e0, f[0], f[1], sc, 0);
+                e0 = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(e0, f[2], f[3], sc, 1);
+                e0 = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(e0, f[4], f[5], sc, 2);
+                e0 = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(e0, f[6], f[7], sc, 3);
+                e1 = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(e1, f[8], f[9], sc, 0);
+                e1 = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(e1, f[10], f[11], sc, 1);
+                e1 = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(e1, f[12], f[13], sc, 2);
+                e1 = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(e1, f[14], f[15], sc, 3);
+                *reinterpret_cast<uint2 *>(p.a1_even + int64_t(row) * (D / 2) + t * 8) = make_uint2(e0, e1);
+                if ((t & 1) == 0) p.a1_even_scale[int64_t(row) * SCOLS + t / 2] = uint8_t(ex);
+            }
+            uint32_t q0 = 0, q1 = 0;
+            q0 = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(q0, f[0], f[1], scale, 0);
+            q0 = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(q0, f[2], f[3], scale, 1);
+            q0 = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(q0, f[4], f[5], scale, 2);
+            q0 = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(q0, f[6], f[7], scale, 3);
+            q1 = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(q1, f[8], f[9], scale, 0);
+            q1 = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(q1, f[10], f[11], scale, 1);
+            q1 = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(q1, f[12], f[13], scale, 2);
+            q1 = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(q1, f[14], f[15], scale, 3);
+            *reinterpret_cast<uint2 *>(p.a1 + int64_t(row) * (D / 2) + t * 8) = make_uint2(q0, q1);
+            p.out[int64_t(row) * (D * 2 / 16) + t]       = make_uint4(0, 0, 0, 0);
+            p.out[int64_t(row) * (D * 2 / 16) + 256 + t] = make_uint4(0, 0, 0, 0);
+        }
+        __syncthreads();
+        if (t < SCOLS / 4 && row < last)
+            __hip_atomic_store(reinterpret_cast<uint32_t *>(p.a1_scale + int64_t(row) * SCOLS) + t,
+                               reinterpret_cast<const uint32_t *>(scale_lds + half * SCOLS)[t], __ATOMIC_RELAXED,
+                               __HIP_MEMORY_SCOPE_AGENT);
+        __syncthreads();
+    }
+    if (p.a1_scale_sorted) { // counted for the scale CTAs (a top-k CTA's rows), which put the count back to 0
+        __builtin_amdgcn_s_waitcnt(0);
+        __syncthreads();
+        if (threadIdx.x == 0)
+            __hip_atomic_fetch_add(p.counters + C_QUANT * CL, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    }
+}
+
+// Top-k CTA tk: rows 8 tk .. 8 tk + 7. While the router runs it quantizes those rows (and zeroes their output);
+// then, a wave a row, once their row tile's 18 x 4 partial tiles are in: the K slices summed in slice order are the
+// logits. The last top-k CTA to finish sorts every route and publishes the sort.
 template <int K, int NE, bool GIVEN>
-__device__ void topk_cta(const Params &p, int tk, FrontLds &lds, int &flag) {
+__device__ void topk_cta(const Params &p, int tk, FrontLds &lds, uint8_t *scale_lds, int &flag) {
     const int tid = threadIdx.x, wave = tid / WAVE, lane = tid & (WAVE - 1);
     const int r = tk / 2;
     float bias[2][4];
     lane_bias(p.bias, bias); // in flight while the router runs
+    quant_rows(p, tk * WAVES, min(tk * WAVES + WAVES, p.M), scale_lds);
     if (tid == 0)
         while (ld_dev(p.counters + (C_R + r) * CL) < NT * KSPLIT) __builtin_amdgcn_s_sleep(1);
     __syncthreads();
@@ -578,64 +663,6 @@ __device__ void topk_cta(const Params &p, int tk, FrontLds &lds, int &flag) {
     if (tid == 0 && p.a1_scale_sorted) st_dev(p.counters + C_SORTED * CL, 1);
 }
 
-// ---- the activation quant and the zeroed output ----
-
-__device__ void quant_cta(const Params &p, int qb, uint8_t *scale_lds) {
-    const int tid = threadIdx.x, half = tid >> 8, t = tid & 255; // 2 rows a pass, 16 values a thread
-    for (int row0 = qb * 2; row0 < p.M; row0 += p.quant_ctas * 2) {
-        const int row = row0 + half;
-        if (row < p.M) {
-            const uint16_t *xr = p.x + int64_t(row) * p.x_stride + t * 16;
-            const uint4 lo = *reinterpret_cast<const uint4 *>(xr);
-            const uint4 hi = *reinterpret_cast<const uint4 *>(xr + 8);
-            const uint32_t words[8] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
-            float f[16];
-            float amax = 1e-10f;
-#pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                f[2 * i]     = __builtin_bit_cast(float, words[i] << 16);
-                f[2 * i + 1] = __builtin_bit_cast(float, words[i] & 0xFFFF0000u);
-            }
-#pragma unroll
-            for (int i = 0; i < 16; ++i) amax = max(amax, abs(f[i]));
-            // multithread_reduce over the group's 2 threads: quad_perm [1,0,3,2]
-            const float other = __builtin_bit_cast(
-                float, __builtin_amdgcn_mov_dpp(__builtin_bit_cast(int, amax), 0xb1, 0xf, 0xf, false));
-            amax = other > amax ? other : amax;
-            // RCEIL: ceil_pow2(amax / 6)
-            const uint32_t u   = __builtin_bit_cast(uint32_t, amax * (1.0f / 6.0f));
-            uint32_t       exp = (u >> 23) & 0xFFu;
-            if (exp < 0xFFu && (u & 0x7FFFFFu)) exp += 1;
-            const float scale = __builtin_bit_cast(float, exp << 23);
-            if ((t & 1) == 0) scale_lds[half * SCOLS + t / 2] = uint8_t(exp);
-            uint32_t q0 = 0, q1 = 0;
-            q0 = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(q0, f[0], f[1], scale, 0);
-            q0 = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(q0, f[2], f[3], scale, 1);
-            q0 = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(q0, f[4], f[5], scale, 2);
-            q0 = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(q0, f[6], f[7], scale, 3);
-            q1 = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(q1, f[8], f[9], scale, 0);
-            q1 = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(q1, f[10], f[11], scale, 1);
-            q1 = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(q1, f[12], f[13], scale, 2);
-            q1 = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(q1, f[14], f[15], scale, 3);
-            *reinterpret_cast<uint2 *>(p.a1 + int64_t(row) * (D / 2) + t * 8) = make_uint2(q0, q1);
-            p.out[int64_t(row) * (D * 2 / 16) + t]       = make_uint4(0, 0, 0, 0);
-            p.out[int64_t(row) * (D * 2 / 16) + 256 + t] = make_uint4(0, 0, 0, 0);
-        }
-        __syncthreads();
-        if (t < SCOLS / 4 && row < p.M)
-            __hip_atomic_store(reinterpret_cast<uint32_t *>(p.a1_scale + int64_t(row) * SCOLS) + t,
-                               reinterpret_cast<const uint32_t *>(scale_lds + half * SCOLS)[t], __ATOMIC_RELAXED,
-                               __HIP_MEMORY_SCOPE_AGENT);
-        __syncthreads();
-    }
-    if (p.a1_scale_sorted) { // counted for the scale CTAs, which put the count back to 0
-        __builtin_amdgcn_s_waitcnt(0);
-        __syncthreads();
-        if (threadIdx.x == 0)
-            __hip_atomic_fetch_add(p.counters + C_QUANT * CL, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    }
-}
-
 // ---- the sorted, shuffled scales (aiter::mx_scale_shuffle_idx with 128 scale columns) ----
 
 // A 32-row chunk at a time: its token ids and the tokens' 128 scale bytes into LDS, then 1024 dwords out, dword d
@@ -643,7 +670,7 @@ __device__ void quant_cta(const Params &p, int qb, uint8_t *scale_lds) {
 __device__ void scale_cta(const Params &p, int sb, uint8_t *rows_lds, int &flag) {
     const int tid = threadIdx.x;
     if (tid == 0) {
-        while (ld_dev(p.counters + C_SORTED * CL) == 0 || ld_dev(p.counters + C_QUANT * CL) < p.quant_ctas)
+        while (ld_dev(p.counters + C_SORTED * CL) == 0 || ld_dev(p.counters + C_QUANT * CL) < p.topk_ctas)
             __builtin_amdgcn_s_sleep(2);
     }
     __syncthreads();
@@ -677,13 +704,11 @@ __global__ __launch_bounds__(THREADS) void front_kernel(Params p) {
     __shared__ uint8_t   scale_lds[32 * SCOLS];
     __shared__ int       flag;
     const int b = blockIdx.x;
-    const int q0 = p.router_ctas, t0 = q0 + p.quant_ctas, s0 = t0 + p.topk_ctas;
-    if (b < q0)
+    const int t0 = p.router_ctas, s0 = t0 + p.topk_ctas;
+    if (b < t0)
         router_cta(p, b, lds, flag);
-    else if (b < t0)
-        quant_cta(p, b - q0, scale_lds);
     else if (b < s0)
-        topk_cta<K, NE, GIVEN>(p, b - t0, lds, flag);
+        topk_cta<K, NE, GIVEN>(p, b - t0, lds, scale_lds, flag);
     else
         scale_cta(p, b - s0, scale_lds, flag);
 }
@@ -720,7 +745,8 @@ void front(const at::Tensor &x, const at::Tensor &w, const at::Tensor &bias, dou
            const c10::optional<at::Tensor> &valid, at::Tensor &partial, at::Tensor &logits, at::Tensor &topk_ids,
            at::Tensor &topk_w, at::Tensor &sorted_ids, at::Tensor &sorted_w, at::Tensor &sorted_eids,
            at::Tensor &num_valid, at::Tensor &tile_target, at::Tensor &a1, at::Tensor &a1_scale,
-           const c10::optional<at::Tensor> &a1_scale_sorted, at::Tensor &out, at::Tensor &counters,
+           const c10::optional<at::Tensor> &a1_scale_sorted, const c10::optional<at::Tensor> &a1_even,
+           const c10::optional<at::Tensor> &a1_even_scale, at::Tensor &out, at::Tensor &counters,
            int64_t topk_total, const c10::optional<at::Tensor> &given_ids, const c10::optional<at::Tensor> &given_w) {
     const int64_t M = x.size(0);
     TORCH_CHECK(x.dim() == 2 && x.size(1) == D && x.stride(1) == 1 && x.stride(0) % 8 == 0 &&
@@ -774,9 +800,17 @@ void front(const at::Tensor &x, const at::Tensor &w, const at::Tensor &bias, dou
     p.RB          = RB;
     p.router_ctas = G * NT * KSPLIT;
     p.topk_ctas   = int((M + WAVES - 1) / WAVES);
-    p.quant_ctas  = int(std::min<int64_t>((M + 1) / 2, 64));
     p.scale_ctas  = 0;
     p.pad_id      = (K << 24) | int(M);
+    if (a1_even.has_value()) {
+        TORCH_CHECK(a1_even_scale.has_value(), "a1_even and a1_even_scale together");
+        TORCH_CHECK(a1_even->is_cuda() && a1_even->is_contiguous() && a1_even->numel() * a1_even->element_size() == M * D / 2 &&
+                        a1_even_scale->is_cuda() && a1_even_scale->is_contiguous() &&
+                        a1_even_scale->numel() * a1_even_scale->element_size() == M * SCOLS,
+                    "a1_even [M, 2048] fp4x2 and a1_even_scale [M, 128] e8m0");
+        p.a1_even       = reinterpret_cast<uint8_t *>(a1_even->data_ptr());
+        p.a1_even_scale = reinterpret_cast<uint8_t *>(a1_even_scale->data_ptr());
+    }
     if (given_ids.has_value()) {
         TORCH_CHECK(given_w.has_value(), "given_ids and given_w together");
         TORCH_CHECK(given_ids->is_cuda() && given_ids->scalar_type() == at::kInt && given_w->scalar_type() == at::kFloat &&
@@ -803,7 +837,7 @@ void front(const at::Tensor &x, const at::Tensor &w, const at::Tensor &bias, dou
     }
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA guard(x.device());
     const hipStream_t stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA(x.device().index()).stream();
-    const int grid = p.router_ctas + p.quant_ctas + p.topk_ctas + p.scale_ctas;
+    const int grid = p.router_ctas + p.topk_ctas + p.scale_ctas;
     const bool given = p.given_ids != nullptr;
     if (K == TOPK && !given)
         front_kernel<TOPK, E, false><<<grid, THREADS, 0, stream>>>(p);
@@ -843,7 +877,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
     m.def("front(Tensor x, Tensor w, Tensor bias, float scale, Tensor? valid, Tensor(a!) partial, "
           "Tensor(b!) logits, Tensor(c!) topk_ids, Tensor(d!) topk_w, Tensor(e!) sorted_ids, Tensor(f!) sorted_w, "
           "Tensor(g!) sorted_eids, Tensor(h!) num_valid, Tensor(n!) tile_target, Tensor(i!) a1, Tensor(j!) a1_scale, "
-          "Tensor(k!)? a1_scale_sorted, Tensor(l!) out, Tensor(m!) counters, int topk_total, "
+          "Tensor(k!)? a1_scale_sorted, Tensor(o!)? a1_even, Tensor(p!)? a1_even_scale, Tensor(l!) out, "
+          "Tensor(m!) counters, int topk_total, "
           "Tensor? given_ids=None, Tensor? given_w=None) -> ()");
     m.impl("front", at::kCUDA, &front);
     m.def("topk(Tensor logits, Tensor bias, float scale, Tensor(a!) ids, Tensor(b!) w) -> ()");

@@ -154,6 +154,14 @@ def check_front(rows, shared=False):
 
         if not torch.equal(f["tile_target"], tile_targets(f["sorted_ids"], f["num_valid_ids"], m)):
             msgs.append(f"tile_target {f['tile_target'].tolist()}")
+        if shared:
+            from aiter.ops.triton.quant import dynamic_mxfp4_quant
+
+            q, sc = dynamic_mxfp4_quant(x)
+            if not torch.equal(q.view(torch.uint8), f["a1_even"]):
+                msgs.append(f"a1_even differs: {(q.view(torch.uint8) != f['a1_even']).sum().item()} bytes")
+            if not torch.equal(sc.view(torch.uint8).contiguous(), f["a1_even_scale"]):
+                msgs.append(f"a1_even_scale differs: {(sc.view(torch.uint8).contiguous() != f['a1_even_scale']).sum().item()}")
         if f["moe_buf"].abs().sum().item() != 0:
             msgs.append("moe_buf not zeroed")
         print(f"front m={m} shared={shared}: {'OK' if not msgs else '; '.join(sorted(set(msgs)))}", flush=True)
