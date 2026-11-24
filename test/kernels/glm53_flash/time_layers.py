@@ -319,8 +319,6 @@ def main() -> int:
     dist.init_process_group("gloo")
     group = dist.new_group(backend="gloo")
     for rows in map(int, args.rows.split(",")):
-        if tp == 2 and rows > 4:
-            continue  # TP2 builds no launch wider than 4 rows
         _time(args, rows, rank, tp, group, device)
     dist.destroy_process_group()
     return 0
