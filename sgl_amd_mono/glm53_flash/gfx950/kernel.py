@@ -4793,6 +4793,345 @@ def build_flash_kernel(key: FlashBuild):
                 lds_st(xs, tid, bf16_pair(o0, o1))
             gpu.barrier()
 
+        def dsa_split_wide(tv, t32):
+            """WIDE: a task all MH heads of a row's 64 keys (two 16-head MFMA column
+            groups), so each key is gathered once a row, not once a head group."""
+            HTW = MH
+            NHG = HTW // 16
+            KVB = t32["kv_block_tokens"]
+            KVE = tv["kv_block_elems"]
+            KVR = t32["kv_row_elems"]
+
+            def kv_addr(blk, off):
+                """A latent row's byte address (caches can be views of pools past
+                4 GB: 64-bit)."""
+                return tv["kv_cache"] + (
+                    fx.Int64(blk) * KVE + fx.Int64(off * KVR)
+                ) * fx.Int64(KV_BYTES)
+            KPW = SPLIT_KEYS // WAVES
+            HPW = HTW // WAVES
+            N_TAIL = S
+            ktile = xs + HTW * QS
+            # the second head group's scores, past the keys
+            red2 = ktile + SPLIT_KEYS * QS
+            pl = xs  # q is dead once the scores are in ``red``
+            for tt in range(start("split"), S * N_SPLIT, G):
+                tt = fx.Int32(tt)
+                is_tail = tt < N_TAIL
+                rt = tt - N_TAIL
+                s = is_tail.select(tt, rt // BASE_SPLITS)
+                hg = fx.Int32(0)
+                t = is_tail.select(fx.Int32(BASE_SPLITS), rt % BASE_SPLITS)
+                pos = row_word(s, ROW_POS)
+                bound, long_row, nk = row_keys(pos)
+                picked_keys = long_row & (t < BASE_SPLITS)
+                n_used = fx.max((nk + SPLIT_KEYS - 1) // SPLIT_KEYS, fx.Int32(1))
+                if t < n_used:
+                    bt = row_word(s, ROW_BT)
+                    r_bt = _rsrc(
+                        page_table + fx.Int64(bt) * fx.Int64(pt_stride) * fx.Int64(4)
+                    )
+
+                    def resolve(tok):
+                        """Wave 0: lane's key's latent block and offset -> LDS keys."""
+                        lds_st(keys, lane, ld_i32(r_bt, tok // KVB))
+                        lds_st(keys, SPLIT_KEYS + lane, tok % KVB)
+
+                    def kv_row(blk, off):
+                        """The lane's 8 latent values of a key, bf16 (E4M3 bytes
+                        converted exactly)."""
+                        if const_expr(KV_FP8):
+                            raw = fx.Vector(
+                                bo.buffer_load(
+                                    _rsrc(kv_addr(blk, off)),
+                                    lane * 2,
+                                    vec_width=2,
+                                    dtype=T.i32,
+                                )
+                            )
+                            row = _fp8_to_bf16x8(raw[0], raw[1])
+                        else:
+                            row = fx.Vector(
+                                bo.buffer_load(
+                                    _rsrc(kv_addr(blk, off)),
+                                    lane * 4,
+                                    vec_width=4,
+                                    dtype=T.i32,
+                                )
+                            )
+                        return row
+
+                    kidx = t * SPLIT_KEYS + lane
+                    # A task that reads the selection waits for it: wave 0 polls its 64
+                    # tagged tokens and the cache's flag together, then acquires; the
+                    # barrier below orders the other waves' loads after it. Any other task
+                    # knows its tokens and gathers them at once; of those only the row's
+                    # own token (its last key) is written by this launch's cache task, and
+                    # it is read again once kv_ready is in.
+                    if picked_keys:
+                        if wave == 0:
+                            picked = poll(
+                                [(mb("tok_sel"), s * SEL_STRIDE + kidx, 1)]
+                                + chain_ready(s)
+                            )[0][0]
+                            fx.memory_fence(
+                                ordering=fx.AtomicOrdering.Acquire, syncscope="agent"
+                            )
+                            resolve((kidx < nk).select(picked, fx.Int32(0)))
+                    else:
+                        if wave == 0:
+                            if const_expr(VERIFY):
+                                # the chain's earlier rows' keys are among the
+                                # task's: wait for all of them first
+                                poll(chain_ready(s))
+                                fx.memory_fence(
+                                    ordering=fx.AtomicOrdering.Acquire,
+                                    syncscope="agent",
+                                )
+                            # a scored row's tail follows its last complete pool; keys
+                            # past the row's address its first token (masked)
+                            own = long_row.select(
+                                kidx - TOPK_TOKENS + bound * KPOOL, kidx
+                            )
+                            resolve((kidx < nk).select(own, fx.Int32(0)))
+                    gpu.barrier()
+                    # the wave's latent rows: every load issued before any store
+                    locs = [
+                        (
+                            _uniform(lds_ld(keys, wave * KPW + jj)),
+                            _uniform(lds_ld(keys, SPLIT_KEYS + wave * KPW + jj)),
+                        )
+                        for jj in range(KPW)
+                    ]
+                    rows_kv = [kv_row(blk, off) for blk, off in locs]
+                    for jj in range_constexpr(KPW):
+                        fx.ptr_store(
+                            rows_kv[jj].bitcast(fx.Float32),
+                            ktile + ((wave * KPW + jj) * QS + lane * 4),
+                        )
+                    # q_lat of the task's HT heads -> Q[h] (words h * QS ..)
+                    NQ = HTW * KV_LORA // 4 // THREADS
+                    qv = poll(
+                        [
+                            (
+                                mb("q_lat"),
+                                ((s * MH) * KV_LORA + (tid + i * THREADS) * 4)
+                                // 2,
+                                2,
+                            )
+                            for i in range(NQ)
+                        ]
+                    )
+                    for i in range_constexpr(NQ):
+                        q4 = tid + i * THREADS
+                        qw = (q4 // (KV_LORA // 4)) * QS + (q4 % (KV_LORA // 4)) * 2
+                        lds_st(xs, qw, qv[i][0].bitcast(fx.Float32))
+                        lds_st(xs, qw + 1, qv[i][1].bitcast(fx.Float32))
+                    gpu.barrier()
+                    # (a verify row waited for its chain's keys before loading them)
+                    own_j = (
+                        fx.Int32(-1)
+                        if VERIFY
+                        else picked_keys.select(fx.Int32(-1), nk - 1 - t * SPLIT_KEYS)
+                    )
+                    if (own_j >= 0) & (own_j < SPLIT_KEYS):
+                        if wave == 0:
+                            if lane == 0:
+                                get(mb("kv_ready"), s)
+                            fx.memory_fence(
+                                ordering=fx.AtomicOrdering.Acquire, syncscope="agent"
+                            )
+                            own_row = kv_row(
+                                _uniform(lds_ld(keys, own_j)),
+                                _uniform(lds_ld(keys, SPLIT_KEYS + own_j)),
+                            )
+                            fx.ptr_store(
+                                own_row.bitcast(fx.Float32),
+                                ktile + (own_j * QS + lane * 4),
+                            )
+                        gpu.barrier()
+                    # scores = K Q^T: wave (16-key row group wave % 4, K half wave / 4)
+                    rgk = wave % 4
+                    for g in range_constexpr(NHG):
+                        hn = lane % 16 + 16 * g
+                        c = fx.Vector.filled(4, 0.0, fx.Float32)
+                        for st in range_constexpr(KV_LORA // 32 // 2):
+                            kst = (wave // 4) * (KV_LORA // 32 // 2) + st
+                            key = rgk * 16 + lane % 16
+                            a = fx.ptr_load(
+                                ktile + (key * QS + kst * 16 + (lane // 16) * 4),
+                                result_type=v4f,
+                            ).bitcast(fx.BFloat16)
+                            b = fx.ptr_load(
+                                xs + (hn * QS + kst * 16 + (lane // 16) * 4),
+                                result_type=v4f,
+                            ).bitcast(fx.BFloat16)
+                            c = fx.Vector(
+                                rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b, c])
+                            )
+                        fx.ptr_store(
+                            c, (red if g == 0 else red2) + (wave * 64 + lane) * 4
+                        )
+                    gpu.barrier()
+                    # split-local softmax: heads wave + WAVES j, lane = key
+                    valid = (t * SPLIT_KEYS + lane) < nk
+                    r16 = lane % 16
+                    krg = lane // 16
+                    m_l = []
+                    for j in range_constexpr(HPW):
+                        hj = WAVES * j  # + wave: head wave + WAVES j
+                        rb = red if hj < 16 else red2
+                        cl = wave + hj % 16 + 16 * (r16 // 4)
+                        raw_s = lds_ld(rb, (krg * 64 + cl) * 4 + r16 % 4) + lds_ld(
+                            rb, ((krg + 4) * 64 + cl) * 4 + r16 % 4
+                        )
+                        sc_v = valid.select(raw_s * MLA_SCALE, fx.Float32(NEG))
+                        m = wave_max(sc_v)
+                        p = valid.select(_exp(sc_v - m), fx.Float32(0.0))
+                        m_l.append((m, wave_sum(p)))
+                        p_n = _xshfl(p, 1)
+                        if lane % 2 == 0:
+                            lds_st(
+                                pl,
+                                (wave + WAVES * j) * (SPLIT_KEYS // 2) + lane // 2,
+                                bf16_pair(p, p_n),
+                            )
+                    gpu.barrier()
+                    # O = P V: heads M, keys K, latent dim pairs N (even / odd MFMAs)
+                    for gq in range_constexpr(KV_LORA // 32 // WAVES * NHG):
+                        g = gq % NHG
+                        hn = lane % 16 + 16 * g
+                        dw = (wave * (KV_LORA // 32 // WAVES) + gq // NHG) * 16 + lane % 16
+                        c0 = fx.Vector.filled(4, 0.0, fx.Float32)
+                        c1 = fx.Vector.filled(4, 0.0, fx.Float32)
+                        for js in range_constexpr(SPLIT_KEYS // 32):
+                            a = fx.ptr_load(
+                                pl
+                                + (hn * (SPLIT_KEYS // 2) + js * 16 + (lane // 16) * 4),
+                                result_type=v4f,
+                            ).bitcast(fx.BFloat16)
+                            ws = [
+                                fx.ptr_load(
+                                    ktile + ((js * 32 + (lane // 16) * 8 + i) * QS + dw)
+                                ).bitcast(fx.Int32)
+                                for i in range(8)
+                            ]
+                            w_lo = [
+                                (ws[2 * i] & 0xFFFF) | (ws[2 * i + 1] << 16)
+                                for i in range(4)
+                            ]
+                            w_hi = [
+                                fx.Int32(fx.Uint32(ws[2 * i]) >> 16)
+                                | (ws[2 * i + 1] & -65536)
+                                for i in range(4)
+                            ]
+                            b0 = fx.Vector.from_elements(w_lo, fx.Int32).bitcast(
+                                fx.BFloat16
+                            )
+                            b1 = fx.Vector.from_elements(w_hi, fx.Int32).bitcast(
+                                fx.BFloat16
+                            )
+                            c0 = fx.Vector(
+                                rocdl.mfma_f32_16x16x32_bf16(
+                                    T.vec(4, T.f32), [a, b0, c0]
+                                )
+                            )
+                            c1 = fx.Vector(
+                                rocdl.mfma_f32_16x16x32_bf16(
+                                    T.vec(4, T.f32), [a, b1, c1]
+                                )
+                            )
+                        if lane < 64:
+                            for e in range_constexpr(4):
+                                hh = 16 * g + (lane // 16) * 4 + e
+                                put_bf(
+                                    mb("sp_acc"),
+                                    ((s * N_SPLIT + t) * MH + hh) * KV_LORA + dw * 2,
+                                    [c0[e], c1[e]],
+                                )
+                    if lane == 0:
+                        for j in range_constexpr(HPW):
+                            ml = (s * N_SPLIT + t) * MH + wave + WAVES * j
+                            put(mb("sp_m"), ml, m_l[j][0])
+                            put(mb("sp_l"), ml, m_l[j][1])
+                    gpu.barrier()
+
+        def merge_split(s, head, n_used, SPH):
+            """The (row, head)'s split partials merged: bf16 pairs in LDS words
+            0 .. KV_LORA / 2."""
+            if wave == 0:  # split weights exp(m - M) / L -> misc[split]
+                spi = fx.min(lane, n_used - 1)
+                sp_ml = (s * N_SPLIT + spi) * MH + head
+                mlv = poll([(mb("sp_m"), sp_ml, 1), (mb("sp_l"), sp_ml, 1)])
+                ok_sp = lane < n_used
+                m_sp = ok_sp.select(mlv[0][0].bitcast(fx.Float32), fx.Float32(NEG))
+                l_sp = ok_sp.select(mlv[1][0].bitcast(fx.Float32), fx.Float32(0.0))
+                m_all = wave_max(m_sp)
+                w_sp = _exp(m_sp - m_all)
+                den = wave_sum(l_sp * w_sp)
+                if lane < N_SPLIT:
+                    lds_st(
+                        misc,
+                        lane,
+                        ok_sp.select(
+                            w_sp * (den > 0.0).select(_rcp(den), fx.Float32(0.0)),
+                            fx.Float32(0.0),
+                        ),
+                    )
+            gpu.barrier()
+            dp = tid % (KV_LORA // 2)
+            hf = tid // (KV_LORA // 2)
+            got = poll(
+                [
+                    (
+                        mb("sp_acc"),
+                        (
+                            (s * N_SPLIT + fx.min(hf * SPH + q, n_used - 1)) * MH
+                            + head
+                        )
+                        * (KV_LORA // 2)
+                        + dp,
+                        1,
+                    )
+                    for q in range(SPH)
+                ]
+            )
+            o0 = fx.Float32(0.0)
+            o1 = fx.Float32(0.0)
+            for q in range_constexpr(SPH):
+                wj = lds_ld(misc, hf * SPH + q)
+                a0, a1 = bf2_f32(got[q][0])
+                o0 = o0 + a0 * wj
+                o1 = o1 + a1 * wj
+            # the split past the first BASE_SPLITS (the tail's keys) joins the
+            # second half
+            if (n_used > BASE_SPLITS) & (hf == 1):
+                last = poll(
+                    [
+                        (
+                            mb("sp_acc"),
+                            ((s * N_SPLIT + BASE_SPLITS) * MH + head)
+                            * (KV_LORA // 2)
+                            + dp,
+                            1,
+                        )
+                    ]
+                )[0][0]
+                wj = lds_ld(misc, BASE_SPLITS)
+                a0, a1 = bf2_f32(last)
+                o0 = o0 + a0 * wj
+                o1 = o1 + a1 * wj
+            lds_st(red, (hf * (KV_LORA // 2) + dp) * 2, o0)
+            lds_st(red, (hf * (KV_LORA // 2) + dp) * 2 + 1, o1)
+            gpu.barrier()
+            if tid < KV_LORA // 2:
+                o0 = lds_ld(red, tid * 2) + lds_ld(red, (KV_LORA // 2 + tid) * 2)
+                o1 = lds_ld(red, tid * 2 + 1) + lds_ld(
+                    red, (KV_LORA // 2 + tid) * 2 + 1
+                )
+                lds_st(xs, tid, bf16_pair(o0, o1))
+            gpu.barrier()
+
         # ===== split merge, one (row, head) a task -> mailbox ``o_lat``; then W_UV,
         # 64 v rows of one head a task, every row (each row's values as dsa_uv's)
         def dsa_uv_rows(tv, t32):
@@ -4978,7 +5317,10 @@ def build_flash_kernel(key: FlashBuild):
             else:
                 dsa_iselect_one(tv, t32)
             mark("iselect")
-            dsa_split(tv, t32)
+            if const_expr(WIDE):
+                dsa_split_wide(tv, t32)
+            else:
+                dsa_split(tv, t32)
             mark("split")
             if const_expr(uv_rows(S)):
                 dsa_uv_rows(tv, t32)
