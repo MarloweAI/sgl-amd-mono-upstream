@@ -6,11 +6,9 @@ Every layer is one launch for the whole decoder layer (``gfx950/kernel.py``); th
 dense layers 0 to 2 run the FP8 SwiGLU MLP in place of the MoE. Layer 0 takes the
 step's tokens (SGLang's embedding is not run) and writes the step's tables. Between
 layers the forward hands on ``_Owed`` (x, residual, post, comb): the kernel owes
-each layer's FFN post to the next layer's seam. After the last layer the tail launch
-runs the owed post, the stream mean, the final norm, the LM head and the logits'
-all-gather; SGLang's final norm is not run, and its logits processor returns the
-tail's logits (``_get_logits``) and stores the final norm's rows only when the step
-captures hidden states.
+each layer's FFN post to the next layer's seam. After the last layer SGLang's
+hc_post, stream mean and final norm run on the owed output, and the logits processor
+takes their rows as on SGLang's path.
 
 A KDA pad row (state index not positive) keeps every state; a sparse-attention pad
 row (SGLang's padding slot 0) writes no cache. After each KDA launch the forward runs
@@ -141,19 +139,6 @@ SGLANG_READS = {
     "srt/layers/layer_boundary/__init__.py": ("get_attn_tp_context",),
     "srt/layers/layer_boundary/adapters/attention.py": ("maybe_input_scattered",),
     "srt/layers/layer_boundary/residual/batch.py": ("start", "clear"),
-    # the logits, replaced on a routed step by the tail's
-    "srt/layers/logits_processor.py": (
-        "_get_logits",
-        "_get_logits(hidden_states)",
-        "_get_logits(lm_head)",
-        "_get_logits(logits_metadata)",
-        "do_tensor_parallel_all_gather",
-        "do_tensor_parallel_all_gather_dp_attn",
-        "use_attn_tp_group",
-        "use_fp32_lm_head",
-        "logit_scale",
-        "final_logit_softcapping",
-    ),
     # a KDA layer's ring index (its state view's layer)
     "srt/mem_cache/kv/router.py": ("view_layer_id",),
     "srt/mem_cache/memory_pool.py": (
@@ -168,11 +153,6 @@ SGLANG_READS = {
     "srt/model_executor/forward_batch_info.py": (
         "out_cache_loc",
         "req_pool_indices",
-        "capture_hidden_mode",
-    ),
-    # ForwardMode and CaptureHiddenMode, in forward_batch_info.py before forward_mode.py
-    "srt/model_executor/forward_mode.py|srt/model_executor/forward_batch_info.py": (
-        "need_capture",
     ),
     "srt/model_executor/forward_context.py": (
         "get_attn_backend",
@@ -249,15 +229,6 @@ NUMERICS = Numerics(
         # the launch's FFN input against the input of SGLang's MLP (serving max
         # 6.2e-3 at TP2 and TP4)
         "dense.mlp_in.rel": 2e-2,
-        # the tail's logits (f32 of bf16, as SGLang's LM head and all-gather leave
-        # them): in one row of a few the two bf16 roundings part (median 3e-5, max
-        # 5.8e-4 over 270 inputs; launch and SGLang equally far from an f32 tail)
-        "head.logits.rel": 1.8e-3,
-        # the bound that catches errors in the tail: against an f32 tail on the same
-        # input (hc_post, the stream mean, RMSNorm and the LM head in f32), each row's
-        # distance in excess of SGLang's, relative to SGLang's (median 1.7e-5, max
-        # 1.95e-2 over 270 inputs)
-        "head.logits_vs_fp32.rel": 0.06,
     },
 )
 
@@ -345,36 +316,16 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
         dense_weights,
         embed_weights,
         experts_reason,
-        head_weights,
     )
 
     tp = get_parallel().tp_size
     reasons = []
     if model.is_mrope_enabled:
         reasons.append("multimodal rotary positions: the kernels take one per row")
-    lp = model.logits_processor
-    if (
-        not lp.do_tensor_parallel_all_gather
-        or lp.do_tensor_parallel_all_gather_dp_attn
-        or lp.use_attn_tp_group
-    ):
-        reasons.append(
-            "the tail all-gathers the logits over the TP group, as the logits "
-            "processor does without DP attention or a DP LM head"
-        )
-    if lp.use_fp32_lm_head:
-        reasons.append("the tail runs the LM head in bf16, not f32")
-    for name, value in (
-        ("logit_scale", lp.logit_scale),
-        ("final_logit_softcapping", lp.final_logit_softcapping),
-    ):
-        if value:
-            reasons.append(f"the tail does not apply the logits processor's {name}")
-    for name, weights in (("LM head", head_weights), ("embedding", embed_weights)):
-        try:
-            weights(model, tp)
-        except ValueError as e:
-            reasons.append(f"{name}: {e}")
+    try:
+        embed_weights(model, tp)
+    except ValueError as e:
+        reasons.append(f"embedding: {e}")
     for i in _covered_layers(hf_config):
         layer = model.model.layers[i]
         if _dense(hf_config, i):
@@ -447,15 +398,14 @@ class _Layer:
 
 
 class _Built:
-    """One rank's monokernels: the runtimes per (width, kind), each layer's ops, the
-    tail's ops, and the forward."""
+    """One rank's monokernels: the runtimes per (width, kind), each layer's ops, and
+    the forward."""
 
     def __init__(
         self,
         lm,
         layers: dict,
         runtimes: dict,
-        heads: dict,
         tp: int,
         device,
         verify: int = 1,
@@ -473,7 +423,7 @@ class _Built:
         )
 
         self.lm, self.model = lm, lm.model
-        self._layers, self.runtimes, self.heads = layers, runtimes, heads
+        self._layers, self.runtimes = layers, runtimes
         self.last = max(layers)
         self.max_rows = MAX_ROWS
         # a step's rows a request: the verify step's draft tokens with MTP, else 1
@@ -513,19 +463,6 @@ class _Built:
         self.verify_in = {
             w: torch.zeros(2, w, dtype=torch.int64, device=device) for w, _ in runtimes
         }
-        # the logits processor returns the tail's logits on a routed step
-        lp = lm.logits_processor
-        self._own_logits, self._logits = lp._get_logits, None
-        lp._get_logits = self._get_logits
-
-    def _get_logits(self, hidden_states, lm_head, logits_metadata, *args, **kwargs):
-        """The logits processor's logits: the tail's on a routed step (f32 [rows,
-        vocab], as SGLang's LM head and all-gather leave them), else its own."""
-        if self._logits is None:
-            return self._own_logits(
-                hidden_states, lm_head, logits_metadata, *args, **kwargs
-            )
-        return self._logits[: hidden_states.shape[0]]
 
     def forward(
         self,
@@ -550,47 +487,27 @@ class _Built:
         from sglang.srt.layers.layer_boundary import get_attn_tp_context
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
-            owed, self._logits = self._backbone(
-                plan, input_ids, positions, forward_batch
-            )
-        S = plan.key.rows
-        # the logits processor stores its hidden states only when the step captures
-        # them (fixed per decode graph): then the final norm's rows, else any rows
-        mode = forward_batch.capture_hidden_mode
-        if mode is not None and mode.need_capture():
-            hidden = normed_rows(lm, owed, S)
-        else:
-            hidden = owed.x[:S]
-        try:
-            return lm.logits_processor(
-                input_ids, hidden, lm.lm_head, forward_batch, None
-            )
-        finally:
-            self._logits = None
+            owed = self._backbone(plan, input_ids, positions, forward_batch)
+        hidden = normed_rows(lm, owed, plan.key.rows)
+        return lm.logits_processor(input_ids, hidden, lm.lm_head, forward_batch, None)
 
     def _backbone(self, plan, input_ids, positions, forward_batch):
         """``Glm5NextModel.forward`` with every layer a launch, layer 0 from the
-        tokens, then the tail: the last layer's ``_Owed`` and the gathered logits."""
+        tokens: the last layer's ``_Owed``."""
         from sglang.srt.layers.layer_boundary.residual.batch import clear, start
 
-        from sgl_amd_mono.glm53_flash import check
-
         start(forward_batch)
-        S = plan.key.rows
-        W = _width(S)
+        W = _width(plan.key.rows)
         owed = None
         for i in sorted(self._layers):
             owed = self._layer(
                 self._layers[i], plan, input_ids, positions, owed, forward_batch
             )
-        logits = self.heads[W].launch(owed.x, owed.residual, owed.post, owed.comb)
-        if self.check_layers and not torch.cuda.is_current_stream_capturing():
-            check.tail(self.lm, self._own_logits, owed, logits, forward_batch, S)
         for (w, _), rt in self.runtimes.items():
             if w == W:
                 rt.advance_step()
         clear(forward_batch)
-        return owed, logits
+        return owed
 
     def _layer(self, L: _Layer, plan, input_ids, positions, owed, forward_batch):
         """Layer 0 from the step's tokens, or the previous launch's ``_Owed``; returns
@@ -864,7 +781,6 @@ def _build(model, hf_config, ctx) -> _Built:
         POOLS_PER_TASK,
     )
     from sgl_amd_mono.glm53_flash.gfx950.runner import (
-        FlashHeadOp,
         FlashLayerOp,
         FlashRuntime,
     )
@@ -872,7 +788,6 @@ def _build(model, hf_config, ctx) -> _Built:
         dense_weights,
         dsa_weights,
         embed_weights,
-        head_weights,
         kda_weights,
         layer_weights,
     )
@@ -896,7 +811,7 @@ def _build(model, hf_config, ctx) -> _Built:
             attn = dsa_weights(module, i, tp, copies)
         layers[i] = _Layer(i, module, kind, attn)
         weights[i] = (ffn, attn)
-    embedding, head = embed_weights(model, tp), head_weights(model, tp)
+    embedding = embed_weights(model, tp)
     dsa_formats = {
         (weights[i][1].fp8, weights[i][1].shuffled)
         for i in layers
@@ -944,7 +859,7 @@ def _build(model, hf_config, ctx) -> _Built:
     fold = verify > 1 and bool(
         getattr(get_exec().mamba, "enable_kda_fold_verify", False)
     )
-    runtimes, heads = {}, {}
+    runtimes = {}
     cap = MAX_ROWS
     widths = sorted({_width(r) for r in ctx.widths if r <= cap})
     if not widths:
@@ -1001,17 +916,6 @@ def _build(model, hf_config, ctx) -> _Built:
                     dsa=attn if kind == "dsa" else None,
                     embedding=embedding if kind == "embed" else None,
                 )
-        key = FlashBuild(
-            rows=w,
-            tp=tp,
-            launches_per_step=1,
-            inter=inter,
-            head=True,
-            fault_site=fault_site,
-            fault_after=fault_after,
-        )
-        runtimes[w, "head"] = rt = runtime(key)
-        heads[w] = FlashHeadOp(rt, head)
     # Every rank builds every width. FlyDSL's disk cache hands a rank the kernels
     # another rank built (a lock per kernel), so each rank starts at its own share.
     start = len(widths) * rank // tp
@@ -1023,7 +927,6 @@ def _build(model, hf_config, ctx) -> _Built:
         model,
         layers,
         runtimes,
-        heads,
         tp,
         device,
         verify,

@@ -1,9 +1,9 @@
 """The GLM-5.3-Flash gfx950 monokernel spec on CPU (RFC #43949): the layers its
 forward covers on the GLM-5.3-Flash layer structure, its row routing and TP2 row
-cap, its verify page-table check, the tail's logits in place of the logits
-processor's, its registry entry, its config and model refusal reasons, and the
-dense, embedding and LM-head views. SGLang checks its declared requirements, the
-same way for every spec."""
+cap, its verify page-table check, the final norm's rows it hands the logits
+processor, its registry entry, its config and model refusal reasons, and the dense
+and embedding views. SGLang checks its declared requirements, the same way for
+every spec."""
 
 import math
 from types import SimpleNamespace
@@ -58,19 +58,11 @@ def test_the_plugin_registers_the_spec():
     assert found is None and "gfx942" in why
 
 
-class _Logits:
-    """A logits processor whose own logits are the rows' sums."""
-
-    def _get_logits(self, hidden_states, lm_head, logits_metadata, **kw):
-        return hidden_states.sum(-1, keepdim=True)
-
-
 class _Lm:
     """A model whose own forward records that it ran."""
 
     def __init__(self):
         self.model, self.ran = SimpleNamespace(), []
-        self.logits_processor = _Logits()
 
     def forward(self, *args):
         self.ran.append(args)
@@ -79,10 +71,10 @@ class _Lm:
 
 def _built(tp=4, widths=(2, 4, 8), verify=1):
     lm = _Lm()
-    kinds = ("embed", "dense", "kda", "dsa", "head")
+    kinds = ("embed", "dense", "kda", "dsa")
     runtimes = {(w, k): None for w in widths for k in kinds}
     layers = {i: SimpleNamespace(i=i) for i in range(45)}
-    built = flash._Built(lm, layers, runtimes, {}, tp=tp, device="cpu", verify=verify)
+    built = flash._Built(lm, layers, runtimes, tp=tp, device="cpu", verify=verify)
     return lm, built
 
 
@@ -138,16 +130,6 @@ def test_a_step_from_embeddings_runs_the_model_s_forward():
     lm, built = _built()
     out = built.forward(_plan(2), "ids", "positions", "batch", input_embeds="emb")
     assert out == "the model's forward" and lm.ran[0][3] == "emb"
-
-
-def test_the_logits_processor_returns_the_tail_s_logits_on_a_routed_step():
-    lm, built = _built()
-    lp, h = lm.logits_processor, torch.ones(3, 5)
-    # not routed: the processor's own logits
-    assert torch.equal(lp._get_logits(h, None, None), torch.full((3, 1), 5.0))
-    # routed: the tail's, the step's rows of the width's
-    built._logits = torch.arange(8.0).view(4, 2)
-    assert torch.equal(lp._get_logits(h, None, None), torch.arange(6.0).view(3, 2))
 
 
 def _cfg(**kw):
@@ -292,21 +274,6 @@ def _layer(kda=True, shuffled=True, scale_dims=3, fused=True, indexer=True):
     )
 
 
-def _lp(**kw):
-    """A logits processor as SGLang's TP4 one (bf16 head, TP all-gather)."""
-    return SimpleNamespace(
-        **{
-            "do_tensor_parallel_all_gather": True,
-            "do_tensor_parallel_all_gather_dp_attn": False,
-            "use_attn_tp_group": False,
-            "use_fp32_lm_head": False,
-            "logit_scale": None,
-            "final_logit_softcapping": None,
-            **kw,
-        }
-    )
-
-
 def test_model_reasons(monkeypatch):
     import sglang.srt.runtime_context as runtime_context
 
@@ -324,7 +291,6 @@ def test_model_reasons(monkeypatch):
 
         return f
 
-    monkeypatch.setattr(weights, "head_weights", view("head"))
     monkeypatch.setattr(weights, "embed_weights", view("embed"))
     monkeypatch.setattr(weights, "dense_weights", view("dense"))
     kda = TEXT.linear_attn_config["kda_layers"]
@@ -332,7 +298,6 @@ def test_model_reasons(monkeypatch):
     model = SimpleNamespace(
         model=SimpleNamespace(layers=layers),
         is_mrope_enabled=False,
-        logits_processor=_lp(),
     )
     assert flash.SPEC.model_disable_reasons(model, FLASH, {}) == []
     # layer 4's experts are not shuffled, layer 5's are GU-interleaved (2-D
@@ -353,7 +318,7 @@ def test_model_reasons(monkeypatch):
     assert "shuffled" in reasons[1] and "GU-interleaved" in reasons[2]
 
 
-def test_model_reasons_of_the_tail_the_embedding_and_the_dense_layers(monkeypatch):
+def test_model_reasons_of_the_embedding_and_the_dense_layers(monkeypatch):
     import sglang.srt.runtime_context as runtime_context
 
     import sgl_amd_mono.glm53_flash.gfx950.weights as weights
@@ -368,35 +333,23 @@ def test_model_reasons_of_the_tail_the_embedding_and_the_dense_layers(monkeypatc
 
         return f
 
-    monkeypatch.setattr(weights, "head_weights", refuse("an fp8 LM head"))
     monkeypatch.setattr(weights, "embed_weights", refuse("padded rows"))
     monkeypatch.setattr(weights, "dense_weights", refuse("needs block FP8"))
     kda = TEXT.linear_attn_config["kda_layers"]
     model = SimpleNamespace(
         model=SimpleNamespace(layers=[_layer(kda=i in kda) for i in range(45)]),
         is_mrope_enabled=False,
-        logits_processor=_lp(
-            use_attn_tp_group=True,
-            use_fp32_lm_head=True,
-            logit_scale=0.5,
-            final_logit_softcapping=30.0,
-        ),
     )
     reasons = flash.SPEC.model_disable_reasons(model, FLASH, {})
     joined = " | ".join(reasons)
     for want in (
-        "all-gathers the logits",
-        "LM head in bf16",
-        "logit_scale",
-        "final_logit_softcapping",
-        "LM head: an fp8 LM head",
         "embedding: padded rows",
         "layer 0: needs block FP8",
         "layer 1: needs block FP8",
         "layer 2: needs block FP8",
     ):
         assert want in joined, joined
-    assert len(reasons) == 9, reasons
+    assert len(reasons) == 4, reasons
 
 
 def _fp8_linear(rows, cols, shuffled=True, dtype=torch.float8_e4m3fn):
@@ -472,24 +425,21 @@ def _vocab_module(tp, rank=1, padding=0, added=0, method="UnquantizedEmbeddingMe
     )
 
 
-def test_the_embedding_and_the_lm_head_are_plain_vocab_shards():
+def test_the_embedding_is_a_plain_vocab_shard():
     import pytest
 
-    from sgl_amd_mono.glm53_flash.gfx950.config import HIDDEN, VOCAB
-    from sgl_amd_mono.glm53_flash.gfx950.weights import embed_weights, head_weights
+    from sgl_amd_mono.glm53_flash.gfx950.config import VOCAB
+    from sgl_amd_mono.glm53_flash.gfx950.weights import embed_weights
 
     tp = 4
 
-    def model(emb, head):
-        norm = SimpleNamespace(weight=torch.zeros(HIDDEN, dtype=torch.bfloat16))
-        return SimpleNamespace(
-            model=SimpleNamespace(embed_tokens=emb, norm=norm), lm_head=head
-        )
+    def model(emb):
+        return SimpleNamespace(model=SimpleNamespace(embed_tokens=emb))
 
-    m = model(_vocab_module(tp), _vocab_module(tp))
+    m = model(_vocab_module(tp))
     e = embed_weights(m, tp)
     assert (e.start, e.end) == (VOCAB // tp, 2 * VOCAB // tp)
-    assert head_weights(m, tp).w_head.data_ptr() == m.lm_head.weight.data_ptr()
+    assert e.weight.data_ptr() == m.model.embed_tokens.weight.data_ptr()
     for bad, match in (
         (_vocab_module(tp, padding=64), "no added or padded rows"),
         (_vocab_module(tp, added=8), "no added or padded rows"),
@@ -497,9 +447,7 @@ def test_the_embedding_and_the_lm_head_are_plain_vocab_shards():
         (_vocab_module(2), "sharded over the TP group"),
     ):
         with pytest.raises(ValueError, match=match):
-            embed_weights(model(bad, _vocab_module(tp)), tp)
-        with pytest.raises(ValueError, match=match):
-            head_weights(model(_vocab_module(tp), bad), tp)
+            embed_weights(model(bad), tp)
 
 
 def test_every_bound_names_an_output_the_check_reports():
@@ -562,15 +510,6 @@ class _Op:
         return (x + 1, residual, post, comb)
 
 
-class _Head:
-    def __init__(self, calls):
-        self.calls = calls
-
-    def launch(self, x, residual, post, comb):
-        self.calls.append(("head", {}))
-        return torch.cat([x[:, :1], x[:, :1] * 2], 1).float()
-
-
 class _Rt:
     def __init__(self):
         self.steps = 0
@@ -581,17 +520,14 @@ class _Rt:
 
 class _Processor:
     """SGLang's logits processor's call: records the hidden rows it is handed and
-    returns its logits of them."""
+    returns their first column."""
 
     def __init__(self):
         self.hidden = None
 
-    def _get_logits(self, hidden_states, lm_head, logits_metadata, **kw):
-        raise AssertionError("a routed step returns the tail's logits")
-
     def __call__(self, input_ids, hidden, lm_head, forward_batch, aux):
         self.hidden = hidden
-        return self._get_logits(hidden, lm_head, forward_batch)
+        return hidden[:, :1].float()
 
 
 # SGLang's layer_boundary import reaches torch.cuda.get_device_properties
@@ -600,10 +536,10 @@ _needs_gpu = pytest.mark.skipif(
 )
 
 
-def _routed_step(monkeypatch, capture=None):
+def _routed_step(monkeypatch):
     """One routed decode step of 1 row on fake launches: every layer adds 1 to x; the
     last layer's hc_post adds 100 to x, the stream mean keeps it, the final norm
-    doubles it. ``capture``: the step's ``capture_hidden_mode.need_capture()``."""
+    doubles it."""
     import contextlib
 
     import sglang.srt.layers.layer_boundary as boundary
@@ -620,14 +556,14 @@ def _routed_step(monkeypatch, capture=None):
         layers[i] = flash._Layer(i, None, kind, None)
         layers[i].ops[2] = _Op(i, calls)
         layers[i].state = SimpleNamespace(conv_state=f"conv{i}", rec_state=f"rec{i}")
-    runtimes = {(w, k): _Rt() for w in (2, 4, 8) for k in ("embed", "kda", "head")}
+    runtimes = {(w, k): _Rt() for w in (2, 4, 8) for k in ("embed", "kda")}
     lm = _Lm()
     lm.logits_processor = _Processor()
     lm.lm_head = "lm_head"
     last = SimpleNamespace(hc_post=lambda x, residual, comb, post: x + 100)
     lm.model = SimpleNamespace(layers=[last], norm=lambda h: h * 2)
     monkeypatch.setattr(check, "contract", lambda streams: streams)
-    built = flash._Built(lm, layers, runtimes, {2: _Head(calls)}, tp=4, device="cpu")
+    built = flash._Built(lm, layers, runtimes, tp=4, device="cpu")
     monkeypatch.setattr(
         flash._Built, "_bind_kda", staticmethod(lambda L, kda, verify: None)
     )
@@ -646,12 +582,10 @@ def _routed_step(monkeypatch, capture=None):
     monkeypatch.setattr(forward_context, "get_attn_backend", lambda: backend)
     ctx = SimpleNamespace(maybe_input_scattered=lambda fb: contextlib.nullcontext())
     monkeypatch.setattr(boundary, "get_attn_tp_context", lambda: ctx)
-    mode = None if capture is None else SimpleNamespace(need_capture=lambda: capture)
     fb = SimpleNamespace(
         out_cache_loc=torch.tensor([300]),
         req_pool_indices=torch.tensor([7]),
         residual_stream=None,
-        capture_hidden_mode=mode,
     )
     ids, pos = torch.tensor([11]), torch.tensor([42])
     out = built.forward(_plan(1), ids, pos, fb)
@@ -668,12 +602,14 @@ def _routed_step(monkeypatch, capture=None):
 
 
 @_needs_gpu
-def test_a_routed_step_runs_every_layer_and_the_tail(monkeypatch):
+def test_a_routed_step_runs_every_layer_and_hands_on_the_normed_rows(monkeypatch):
+    from sgl_amd_mono.glm53_flash.gfx950.config import HIDDEN
+
     r = _routed_step(monkeypatch)
     calls, built = r.calls, r.built
-    # every layer in order, then the tail; layer 0 from the step's tokens, writing the
-    # width's tables, which the later KDA and sparse-attention launches read
-    assert [c[0] for c in calls] == list(range(45)) + ["head"]
+    # every layer in order; layer 0 from the step's tokens, writing the width's
+    # tables, which the later KDA and sparse-attention launches read
+    assert [c[0] for c in calls] == list(range(45))
     step = calls[0][1]["step"]
     assert step["ids"].tolist() == [11] and step["slots"] is built.kda_idx[2]
     assert calls[0][1]["state_idx"].tolist() == [5]
@@ -681,27 +617,12 @@ def test_a_routed_step_runs_every_layer_and_the_tail(monkeypatch):
     assert calls[3][1]["rows"] is built.rows[2]
     # SGLang's track-state copy after each KDA launch (dense layers included)
     assert [t[1] for t in r.tracked] == [i for i, k in r.kinds.items() if k != "dsa"]
-    # the logits processor returns the tail's logits: x (0, one added per layer) of
-    # the step's row, and twice it
-    assert torch.equal(r.out, torch.tensor([[45.0, 90.0]]))
-    assert built._logits is None and r.fb.residual_stream is None
+    # the logits processor takes the final norm's rows of the last layer's output,
+    # (45 + 100) x 2, as on SGLang's path
+    assert r.hidden.shape == (1, HIDDEN)
+    assert torch.equal(r.hidden.float()[:, 0], torch.tensor([290.0]))
+    assert torch.equal(r.out, torch.tensor([[290.0]]))
+    assert r.fb.residual_stream is None
     # this width's runtimes moved to the next step, once
-    assert [rt.steps for (w, _), rt in r.runtimes.items() if w == 2] == [1, 1, 1]
+    assert [rt.steps for (w, _), rt in r.runtimes.items() if w == 2] == [1, 1]
     assert all(rt.steps == 0 for (w, _), rt in r.runtimes.items() if w != 2)
-
-
-@_needs_gpu
-def test_a_step_that_captures_hidden_states_hands_on_the_normed_rows(monkeypatch):
-    # capture on: the final norm's rows of the last layer's output, (45 + 100) x 2,
-    # which the logits processor stores as the step's hidden states
-    from sgl_amd_mono.glm53_flash.gfx950.config import HIDDEN
-
-    on = _routed_step(monkeypatch, capture=True)
-    assert on.hidden.shape == (1, HIDDEN)
-    assert torch.equal(on.hidden.float()[:, 0], torch.tensor([290.0]))
-    # capture off: the logits processor stores nothing; the last layer's x stands in
-    for capture in (False, None):
-        off = _routed_step(monkeypatch, capture=capture)
-        assert torch.equal(off.hidden.float()[:, 0], torch.tensor([45.0]))
-    # the logits are the tail's either way
-    assert torch.equal(on.out, off.out)

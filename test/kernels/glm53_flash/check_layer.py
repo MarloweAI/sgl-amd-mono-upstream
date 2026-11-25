@@ -2,7 +2,7 @@
 torchrun (TP 2, 4 or 8): ``torchrun --nproc-per-node 4
 test/kernels/glm53_flash/check_layer.py --kind dsa --rows 4``. Kinds: ``ffn`` (the
 MoE alone), ``kda``, ``dsa``, ``dense`` (KDA and the dense FP8 MLP), ``embed`` (the
-dense layer 0 from the step's tokens) and ``head`` (the tail). Every rank must
+dense layer 0 from the step's tokens). Every rank must
 finish with no error word set and the same output (the TP sums run in rank order);
 ``--writes``: the launch changes exactly its valid rows' state or cache rows;
 ``--compare-shuffled``: a sparse-attention or dense launch on AITER-shuffled FP8
@@ -13,8 +13,7 @@ kpool top-k selects;
 ``--check-dense``: the dense MLP's output against an f32 MLP on the launch's own FFN
 input; ``--check-embed``: the launch from the tokens equals the dense launch on the
 gathered embedding rows, and writes the spec's step tables (``--step-rows``: the
-step's rows, fewer than the width); ``--check-head``: the tail's logits against a
-torch tail and an f32 tail; ``--replays N``: a graph of ``--layers`` launches
+step's rows, fewer than the width); ``--replays N``: a graph of ``--layers`` launches
 replays the eager step bitwise; ``--verify L`` (``kda`` or ``dsa``): an MTP verify
 launch of L rows a request equals its tokens' L decode launches bitwise;
 ``--kv-fp8`` (``dsa``): every sparse-attention launch on an E4M3 MLA cache;
@@ -40,7 +39,6 @@ from sgl_amd_mono.glm53_flash.gfx950.config import (
     HC_MULT,
     HIDDEN,
     N_EXPERTS,
-    VOCAB,
 )
 from sgl_amd_mono.glm53_flash.spec import GROUPED_FROM
 
@@ -433,22 +431,6 @@ def spec_tables(step: dict, slots: torch.Tensor, width: int):
     ).int()
     rows[:n, ROW_BT] = torch.arange(n, dtype=torch.int32, device=slots.device)
     return kda, rows
-
-
-def head_weights(rank: int, tp: int, device):
-    """The tail's random final-norm weight and this rank's LM-head rows (every rank
-    builds the same whole head)."""
-    from sgl_amd_mono.glm53_flash.gfx950.runner import FlashHeadWeights
-
-    g = _gen(9, device)
-    rows = VOCAB // tp
-    w = torch.empty(rows, HIDDEN, dtype=torch.bfloat16, device=device)
-    for r in range(tp):  # this rank's rows of the same random head, a shard at a time
-        part = (torch.randn(rows, HIDDEN, generator=g, device=device) * 0.02).bfloat16()
-        if r == rank:
-            w.copy_(part)
-    norm = (1 + 0.1 * torch.randn(HIDDEN, generator=g, device=device)).bfloat16()
-    return FlashHeadWeights(g_norm=norm, w_head=w)
 
 
 def shuffled_copy(w):
@@ -1225,7 +1207,7 @@ def off_top_pools(ref, ids):
     return missed, worse
 
 
-KINDS = ("ffn", "kda", "dsa", "dense", "embed", "head")
+KINDS = ("ffn", "kda", "dsa", "dense", "embed")
 
 
 def build(args, kind, rank, tp, group, device, layers=1, shuffled=False):
@@ -1234,11 +1216,7 @@ def build(args, kind, rank, tp, group, device, layers=1, shuffled=False):
     launches write, and the step's input. An ``embed`` step has ``args.step_rows``
     rows (default: the width)."""
     from sgl_amd_mono.glm53_flash.gfx950.kernel import FlashBuild
-    from sgl_amd_mono.glm53_flash.gfx950.runner import (
-        FlashHeadOp,
-        FlashLayerOp,
-        FlashRuntime,
-    )
+    from sgl_amd_mono.glm53_flash.gfx950.runner import FlashLayerOp, FlashRuntime
 
     kda, dsa = kind in ("kda", "dense", "embed"), kind == "dsa"
     dense = kind in ("dense", "embed")
@@ -1256,18 +1234,13 @@ def build(args, kind, rank, tp, group, device, layers=1, shuffled=False):
         dense=dense,
         dense_shuffled=shuffled and dense,
         tokens=kind == "embed",
-        head=kind == "head",
-        grouped=args.rows >= GROUPED_FROM and not dense and kind != "head",
+        grouped=args.rows >= GROUPED_FROM and not dense,
         kv_fp8=args.kv_fp8 and dsa,
         stop=False,
     )
     rt = FlashRuntime(key, rank, group, device)
     rt.set_deadline(args.deadline)
     x, res, post, comb = layer_inputs(args.rows, device)
-    if kind == "head":
-        w = head_weights(rank, tp, device)
-        ops = [FlashHeadOp(rt, w, n) for n in range(layers)]
-        return rt, [(op, {}) for op in ops], [], (x, res, post, comb)
     ffn = dense_weights(rank, tp, device, shuffled) if dense else None
     ffn = ffn or ffn_weights(rank, tp, device)
     attn = kda_weights(rank, tp, device) if kda else None
@@ -1318,10 +1291,10 @@ def build(args, kind, rank, tp, group, device, layers=1, shuffled=False):
 
 def run_step(kind, launches, ins):
     """One step: the launches in order, each on the previous one's outputs (the FFN
-    and the tail launches each on the step's input)."""
+    launch on the step's input)."""
     h = ins
     for op, kw in launches:
-        if kind in ("ffn", "head"):
+        if kind == "ffn":
             h = op.launch(*ins, **kw)
         else:
             h = op.launch(*h, **kw)
@@ -1332,8 +1305,7 @@ def check_replays(args, rank, tp, group, device) -> bool:
     """A step of ``--layers`` launches of one kind on one runtime (each layer its own
     state or caches, inputs chained), captured in a graph after an eager step: from the
     same state, each of ``--replays`` replays gives the eager step's outputs and writes
-    bitwise, with no error word set, and every rank the same output. A step of tails
-    runs them back to back (each tail's logits in the other slot of the last)."""
+    bitwise, with no error word set, and every rank the same output."""
     from sgl_amd_mono.common import guard
 
     rt, launches, held, ins = build(
@@ -1483,54 +1455,6 @@ def check_embed(args, rank, tp, group, device) -> bool:
     return same and writes and tables
 
 
-def check_head(args, rank, tp, group, device) -> bool:
-    """The tail's logits against a torch tail on the same input (the four streams
-    rounded to bf16 as hc_post rounds them, their mean in bf16, the RMSNorm'd rows in
-    bf16, the LM head, bf16 logits) and an f32 tail; ``--launches`` back-to-back tails give the same
-    logits; with the final norm x 1.01 the logits must move well past the launch's
-    own distance (negative control)."""
-    import msgspec
-
-    from sgl_amd_mono.glm53_flash.gfx950.config import EPS
-
-    torch.backends.cuda.matmul.allow_tf32 = False
-    rt, launches, _, ins = build(args, "head", rank, tp, group, device)
-    op, _ = launches[0]
-    x, res, post, comb = ins
-    outs = []
-    for _ in range(args.launches):
-        outs.append(op.launch(*ins).clone())
-        rt.advance_step()
-    torch.cuda.synchronize()
-    repeat = all(torch.equal(outs[0], o) for o in outs)
-    S = x.shape[0]
-    streams = post.reshape(S, -1, 1) * x.float()[:, None] + torch.einsum(
-        "sij,sih->sjh", comb, res.float()
-    )
-
-    def tail(h, bf16):
-        n = h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + EPS) * op.w.g_norm.float()
-        shard = (n.bfloat16().float() if bf16 else n) @ op.w.w_head.float().T
-        parts = [torch.empty_like(shard) for _ in range(tp)]
-        dist.all_gather(parts, shard.contiguous())
-        out = torch.cat(parts, -1)
-        return out.bfloat16().float() if bf16 else out
-
-    ref = tail(streams.bfloat16().float().mean(1).bfloat16().float(), True)
-    ref32 = tail(streams.mean(1), False)
-    rel, rel32 = _rel(outs[0], ref), _rel(outs[0], ref32)
-    op.w = msgspec.structs.replace(op.w, g_norm=(op.w.g_norm.float() * 1.01).bfloat16())
-    bad = _rel(op.launch(*ins), ref)
-    torch.cuda.synchronize()
-    caught = bad > 4 * rel
-    print(
-        f"rank {rank}: logits vs torch tail rel {rel:.3e}, vs f32 tail {rel32:.3e}; "
-        f"{args.launches} back-to-back tails equal {repeat}; final norm x1.01: rel "
-        f"{bad:.3e} (caught {caught})",
-        flush=True,
-    )
-    rt.close()
-    return rel < 2e-3 and rel32 < 1e-2 and repeat and caught
 
 
 def _max_diff(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -1811,7 +1735,6 @@ def main() -> int:
     )
     ap.add_argument("--check-dense", action="store_true")
     ap.add_argument("--check-embed", action="store_true")
-    ap.add_argument("--check-head", action="store_true")
     ap.add_argument("--replays", type=int, default=0, help="graph replays of a step")
     ap.add_argument("--layers", type=int, default=1, help="launches a step (--replays)")
     ap.add_argument("--pad-rows", type=int, default=0, help="trailing pad rows")
@@ -1845,7 +1768,6 @@ def main() -> int:
         (args.check_keys, check_keys),
         (args.check_dense, check_dense),
         (args.check_embed, check_embed),
-        (args.check_head, check_head),
         (args.replays, check_replays),
         (args.verify, check_verify),
     ):

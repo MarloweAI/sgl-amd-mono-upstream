@@ -13,10 +13,10 @@ request's draft rows on one state, with the verify scratch). ``--kv-fp8``: the
 sparse-attention launches on an E4M3 MLA cache. ``--kind model`` is the served
 step: layers 3 to 43 in model order (30 KDA, 11 sparse attention) on one runtime a
 kind; ``--kind full`` the whole served step as the spec builds it: layer 0 from the
-step's tokens, the dense layers 1 and 2, layers 3 to 44, then the tail. ``kda``,
-``dsa``, ``dense``, ``embed`` (layer 0 from the tokens) and ``head`` (the tail) run
-``--layers`` launches of one kind; each ``embed`` and ``head`` launch takes the step's
-input, the others the previous launch's output. FP8 projections are read in place (AITER's (16, 16) layout), or row-major with
+step's tokens, the dense layers 1 and 2, then layers 3 to 44. ``kda``, ``dsa``,
+``dense`` and ``embed`` (layer 0 from the tokens) run ``--layers`` launches of one
+kind; each ``embed`` launch takes the step's input, the others the previous launch's
+output. FP8 projections are read in place (AITER's (16, 16) layout), or row-major with
 ``--row-major``. After an eager step and 20 warm-up replays, each of ``--trials``
 trials replays the graph ``--reps`` times; rank 0 prints per-launch microseconds
 (trial time / (reps x launches)): the median, minimum and maximum over trials, the
@@ -49,7 +49,7 @@ def _kinds(args) -> list:
         return ["dsa" if i % 4 == 3 else "kda" for i in range(3, 44)]
     if args.kind == "full":
         layers = ["dsa" if i % 4 == 3 else "kda" for i in range(3, 45)]
-        return ["embed", "dense", "dense", *layers, "head"]
+        return ["embed", "dense", "dense", *layers]
     return [args.kind] * args.layers
 
 
@@ -151,23 +151,19 @@ def _build(args, kinds: list, rows: int, rank: int, tp: int, group, device):
     """The runtimes (one a kind), each layer's op and launch arguments."""
     from sgl_amd_mono.glm53_flash.gfx950.config import GLOBAL_INTER
     from sgl_amd_mono.glm53_flash.gfx950.kernel import FlashBuild
-    from sgl_amd_mono.glm53_flash.gfx950.runner import (
-        FlashHeadOp,
-        FlashLayerOp,
-        FlashRuntime,
-    )
+    from sgl_amd_mono.glm53_flash.gfx950.runner import FlashLayerOp, FlashRuntime
 
     shuffled = not args.row_major
     runtimes = {}
     for kind in sorted(set(kinds)):
-        dsa, head = kind == "dsa", kind == "head"
+        dsa = kind == "dsa"
         dense = kind in ("dense", "embed")
         key = FlashBuild(
             rows=rows,
             tp=tp,
             launches_per_step=kinds.count(kind),
             inter=GLOBAL_INTER // tp,
-            kda=not (dsa or head),
+            kda=not dsa,
             dsa=dsa,
             max_pools=args.max_pools if dsa else 0,
             qkv_shuffled=shuffled and dsa,
@@ -176,10 +172,7 @@ def _build(args, kinds: list, rows: int, rank: int, tp: int, group, device):
             dense=dense,
             dense_shuffled=shuffled and dense,
             tokens=kind == "embed",
-            head=head,
-            grouped=not args.per_row_moe
-            and rows >= GROUPED_FROM
-            and not (dense or head),
+            grouped=not args.per_row_moe and rows >= GROUPED_FROM and not dense,
             verify=args.verify if kind in ("kda", "dsa") else 1,
             kv_fp8=args.kv_fp8 and dsa,
             fold=args.fold >= 0 and kind == "kda" and args.verify > 1,
@@ -192,12 +185,6 @@ def _build(args, kinds: list, rows: int, rank: int, tp: int, group, device):
         _seed_layer(layer)
         n = ordinal[kind]
         ordinal[kind] += 1
-        if kind == "head":
-            ops.append(
-                FlashHeadOp(runtimes[kind], cl.head_weights(rank, tp, device), n)
-            )
-            extra.append({})
-            continue
         if kind in ("dense", "embed"):
             ffn = cl.dense_weights(rank, tp, device, shuffled)
             attn = cl.kda_weights(rank, tp, device)
@@ -284,8 +271,6 @@ def _time(args, rows: int, rank: int, tp: int, group, device) -> None:
         for op, kw, kind in zip(ops, extra, kinds):
             if kind == "embed":
                 h = op.launch(*entry, **kw)
-            elif kind == "head":
-                op.launch(*(h if args.kind == "full" else (x, res, post, comb)))
             else:
                 h = op.launch(*h, **kw)
         for rt in runtimes.values():
@@ -348,7 +333,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument(
         "--kind",
-        choices=("kda", "dsa", "dense", "embed", "head", "model", "full"),
+        choices=("kda", "dsa", "dense", "embed", "model", "full"),
         default="model",
     )
     ap.add_argument("--rows", default="2,4,8", help="comma-separated widths")

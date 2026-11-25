@@ -3,10 +3,9 @@
 layer on its input (layer 0: SGLang's embedding of the step's tokens), on the caches
 as they were, and checks the kernel's outputs against it: the written streams (the
 last layer's contracted), and the state or cache rows the layer writes; a dense
-layer's MLP output also against an f32 MLP on the launch's own FFN input. The tail's
-logits are checked against SGLang's final norm and logits, and against an f32 tail.
-Each value against its ``spec.NUMERICS`` bound. Every check is logged; a miss is
-logged as a violation."""
+layer's MLP output also against an f32 MLP on the launch's own FFN input. Each value
+against its ``spec.NUMERICS`` bound. Every check is logged; a miss is logged as a
+violation."""
 
 from __future__ import annotations
 
@@ -32,9 +31,6 @@ SGLANG_READS = {
         "take_output",
         "set_written",
     ),
-    "srt/layers/logits_processor.py": ("LogitsMetadata", "from_forward_batch"),
-    "srt/layers/layernorm.py": ("variance_epsilon",),
-    "srt/models/glm5_next.py": ("model", "norm", "lm_head"),
     # a KDA layer's ring index (its state view's layer)
     "srt/mem_cache/kv/router.py": ("view_layer_id",),
     "srt/mem_cache/memory_pool.py": (
@@ -269,7 +265,6 @@ REPORTED = {
         "mlp_in",
     ),
     "dsa": ("streams", "kv", "index", "tail_k", "tail_g"),
-    "head": ("logits", "logits_vs_fp32"),
 }
 METRICS = ("cosine", "rel", "max_abs")
 
@@ -336,56 +331,3 @@ def compare(
         values,
     )
 
-
-def tail_fp32(owed, g_norm, eps: float, w_head) -> torch.Tensor:
-    """The tail in f32 on the last layer's owed (x, residual, post, comb): the four
-    streams (post_j x + sum_i comb_ij R_i), their mean, RMSNorm and the logits of
-    this rank's LM-head rows."""
-    s = owed.x.shape[0]
-    x, r, post, comb = (
-        t.float() for t in (owed.x, owed.residual, owed.post, owed.comb)
-    )
-    streams = post.reshape(s, -1, 1) * x[:, None] + torch.einsum(
-        "sij,sih->sjh", comb, r
-    )
-    h = streams.mean(1)
-    h = h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + eps) * g_norm.float()
-    tf32 = torch.backends.cuda.matmul.allow_tf32
-    torch.backends.cuda.matmul.allow_tf32 = False
-    try:
-        return h @ w_head.float().T
-    finally:
-        torch.backends.cuda.matmul.allow_tf32 = tf32
-
-
-def tail(lm, own_get_logits, owed, logits, forward_batch, S: int) -> None:
-    """The tail's logits against SGLang's final norm and logits on the last layer's
-    contracted output, and against an f32 tail: per row, the launch's distance to it
-    in excess of SGLang's, relative to SGLang's (collective)."""
-    from sglang.srt.layers.logits_processor import LogitsMetadata
-    from sglang.srt.runtime_context import get_parallel
-
-    from sgl_amd_mono.glm53_flash.spec import normed_rows
-
-    p = get_parallel()
-    normed = normed_rows(lm, owed, S)
-    owed = type(owed)(*(t[:S] for t in (owed.x, owed.residual, owed.post, owed.comb)))
-    meta = LogitsMetadata.from_forward_batch(forward_batch)
-    ref = own_get_logits(normed, lm.lm_head, meta).float()
-    norm = lm.model.norm
-    shard = tail_fp32(owed, norm.weight, norm.variance_epsilon, lm.lm_head.weight)
-    parts = [torch.empty_like(shard) for _ in range(p.tp_size)]
-    torch.distributed.all_gather(parts, shard, group=p.tp_group.device_group)
-    f32 = torch.cat(parts, -1)
-    if p.tp_rank != 0:
-        return
-    got = logits[:S].float()
-    values = {f"head.logits.{k}": v for k, v in _metrics(got, ref).items()}
-    nf = f32.norm(dim=-1)
-    eg, es = (got - f32).norm(dim=-1) / nf, (ref - f32).norm(dim=-1) / nf
-    ratio = eg / es.clamp_min(torch.finfo(torch.float32).tiny)
-    finite = bool(torch.isfinite(got).all())
-    values["head.logits_vs_fp32.rel"] = (
-        ratio.max().item() - 1 if finite else float("inf")
-    )
-    _report(f"tail ({S} rows)", values)

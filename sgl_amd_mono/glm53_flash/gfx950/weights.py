@@ -460,24 +460,6 @@ def _vocab_shard(name: str, module, tp: int) -> None:
         )
 
 
-def head_weights(model, tp: int):
-    """The tail: the final RMSNorm weight and this rank's rows of the vocab-parallel
-    LM head, both views."""
-    from .runner import FlashHeadWeights
-
-    head = model.lm_head
-    _unquantized("LM head", head)
-    _vocab_shard("LM head", head, tp)
-    return FlashHeadWeights(
-        g_norm=_need(
-            "model.norm.weight", model.model.norm.weight, (HIDDEN,), (torch.bfloat16,)
-        ),
-        w_head=_need(
-            "lm_head.weight", head.weight, (VOCAB // tp, HIDDEN), (torch.bfloat16,)
-        ),
-    )
-
-
 def embed_weights(model, tp: int):
     """The input embedding as the step's first launch reads it: this rank's rows of
     the vocab-parallel table (a view) and the vocabulary ids they hold."""

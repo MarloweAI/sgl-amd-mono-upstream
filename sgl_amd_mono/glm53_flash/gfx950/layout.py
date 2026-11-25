@@ -22,7 +22,6 @@ from .config import (
     TOP_K,
     TOPK_TOKENS,
     V_DIM,
-    VOCAB,
     FlashShard,
 )
 from .tiles import (
@@ -58,8 +57,6 @@ FGB_TILE = 16 * WAVES
 O_TILE = 16
 # a dense up/gate task: 16 gate rows and the same 16 up rows, the whole K
 DUG_TILE = 16
-# an LM-head tile: 16 vocabulary rows, the whole K
-HEAD_TILE = 16
 
 # sparse attention: q_a | kv_a (FP8) then wk | weights_proj | kpool gate (bf16)
 QKV_TILE = 16
@@ -218,7 +215,6 @@ def layout(
     dsa: bool = False,
     max_pools: int = 0,
     dense: bool = False,
-    head: bool = False,
     x_in: bool = False,
     grouped: bool = False,
 ):
@@ -229,29 +225,6 @@ def layout(
 
     pair_bytes = 8
     shard = FlashShard(npes)
-    if head:
-        # the contracted rows (bf16 pairs) and their tiles' sums of squares; every
-        # rank's logits (bf16 pairs, [S, VOCAB]) in the symmetric buffer, in two slots
-        # by launch parity: a peer's next tail never writes the slot a slow rank
-        # still gathers
-        scratch, offset = {}, 0
-        for name, size in (
-            ("hc", samples * HIDDEN // 2 * pair_bytes),
-            ("hss", samples * N_ROW_TILES * pair_bytes),
-        ):
-            scratch[name] = offset
-            offset += _align(size)
-        scratch["_bytes"] = offset
-        logits = _align(samples * VOCAB // 2 * pair_bytes)
-        return scratch, {
-            "logits": 0,
-            "_logits_stride": logits,
-            "attn": 0,
-            "ffn": 0,
-            "_part_stride": 0,
-            "flags": 2 * logits,
-            "_bytes": 2 * logits + FLAG_BYTES,
-        }
     items = []
     if kda or dsa:
         items = [
@@ -371,7 +344,6 @@ def stage_tasks(
     kda: bool = False,
     dsa: bool = False,
     dense: bool = False,
-    head: bool = False,
     grouped: bool = False,
 ):
     """``(stage name, CTA slots)`` pairs in execution order: a stage's first task runs
@@ -381,8 +353,6 @@ def stage_tasks(
     of 8-head tasks (tasks of 16 heads use the first half). The grouped MoE's up/gate
     and down tasks are counted at run time and split over every CTA."""
     shard = FlashShard(npes)
-    if head:
-        return [("hpost", N_ROW_TILES), ("lmhead", BLOCKS), ("gather", BLOCKS)]
     attention = []
     if dsa:
         H = shard.mla_heads

@@ -5,7 +5,7 @@ path, and requests join and leave a running batch that steps past 16 rows and ba
 (4 to 16 rows) on the kernels (GSM8K and the draft's accept length), and eager
 verify steps that check each request's page-table row is repeated; the tokens of
 covered steps scored again by the normal prefill path (KL consistency); each layer's launch against SGLang's own
-layer, and the tail's logits against SGLang's, under SGLANG_AMD_MONO_CHECK; the
+layer under SGLANG_AMD_MONO_CHECK; the
 hidden states a covered step returns; and a fault on one rank that stops the server
 before any token of the failed step is sent."""
 
@@ -158,10 +158,9 @@ class TestMonokernelMtpEager(CustomTestCase):
 class TestMonokernelCheck(CustomTestCase):
     def test_each_covered_layer_within_its_numerics(self):
         # SGLANG_AMD_MONO_CHECK (eager) runs the normal layer next to each layer's
-        # launch, and SGLang's final norm and logits next to the tail; 1, 3, 8, 11
-        # and 16 rows run at widths 2, 4, 8, 12 and 16 (pad rows at 1, 3 and 11),
-        # and the long prompt's positions pass 2048, where the sparse attention
-        # selects keys
+        # launch; 1, 3, 8, 11 and 16 rows run at widths 2, 4, 8, 12 and 16 (pad rows
+        # at 1, 3 and 11), and the long prompt's positions pass 2048, where the
+        # sparse attention selects keys
         para = "The river valley archive lists the flood height of every year. "
         with (
             tempfile.NamedTemporaryFile("w+", suffix=".out") as out,
@@ -205,8 +204,6 @@ class TestMonokernelCheck(CustomTestCase):
         covered = (1, 3, 8, 11, 16)
         want = {(kind, rows) for kind in ("kda", "dsa", "dense") for rows in covered}
         self.assertTrue(want <= seen, seen)
-        tails = re.findall(r"monokernel check tail \((\d+) rows\): (.*)", log)
-        self.assertEqual({int(rows) for rows, _ in tails} & set(covered), set(covered))
         self.assertTrue(any(k == "dsa" and int(hi) >= 2048 for k, _, hi, _ in checks))
         violations = re.findall(r"monokernel check violation: .*", log)
         self.assertEqual(violations, [], "\n".join(violations[:20]))

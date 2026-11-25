@@ -106,7 +106,6 @@ from .config import (
     TOPK_POOLS,
     TOPK_TOKENS,
     V_DIM,
-    VOCAB,
     FlashShard,
 )
 from .layout import (
@@ -117,7 +116,6 @@ from .layout import (
     DUG_TILE,
     FGB_TILE,
     GROUPED_SUM_TILE,
-    HEAD_TILE,
     IN_TILE,
     ISEL_COUNTS,
     ISEL_DIGITS,
@@ -278,8 +276,6 @@ class FlashBuild(msgspec.Struct, frozen=True):
     # down in AITER's (16, 16) preshuffled layout with dense_shuffled
     dense: bool = False
     dense_shuffled: bool = False
-    # the model's tail instead of a layer
-    head: bool = False
     # with kda: the step's first launch, from the step's tokens
     tokens: bool = False
     # an MTP verify step's rows a request (its draft chain; 1: decode): request r
@@ -287,7 +283,7 @@ class FlashBuild(msgspec.Struct, frozen=True):
     verify: int = 1
     # False: a failed wait keeps the launch running and leaves its error words (tests)
     stop: bool = True
-    # the expert-major MoE (not with dense or head): a task an expert's 16 picks, up
+    # the expert-major MoE (not with dense): a task an expert's 16 picks, up
     # to 64 rows
     grouped: bool = False
     # with dsa: a row's pool select on a CTA a slice of its pools (``isel_slices``)
@@ -322,19 +318,16 @@ def build_flash_kernel(key: FlashBuild):
     tensors, so it may be fused into them or stored apart.
 
     With ``dense`` (and ``kda``) the FFN is the dense FP8 SwiGLU MLP of layers 0-2.
-    With ``head`` the launch is the model's tail: the owed mHC post, the stream mean,
-    the final RMSNorm (``g_norm``), this rank's LM-head rows (``w_r``) and the logits'
-    all-gather into ``x_out`` (f32 [S, VOCAB]). With ``tokens`` (and ``kda``) the
-    launch takes the step's tokens (``dsa_tab``: ``STEP_TAB``; ``state_idx``: SGLang's
-    KDA slots of the step's rows) instead of x, sums the ranks' embedding rows, and
-    writes the step's KDA slot and row tables; the width's rows past the step's are
-    pads.
+    With ``tokens`` (and ``kda``) the launch takes the step's tokens (``dsa_tab``:
+    ``STEP_TAB``; ``state_idx``: SGLang's KDA slots of the step's rows) instead of x,
+    sums the ranks' embedding rows, and writes the step's KDA slot and row tables; the
+    width's rows past the step's are pads.
     """
     S, W, launches_per_step = key.rows, key.tp, key.launches_per_step
     kda, dsa, max_pools = key.kda, key.dsa, key.max_pools
     conv_dim_first = key.conv_dim_first
     fault_site, fault_after = key.fault_site, key.fault_after
-    dense, head, tokens = key.dense, key.head, key.tokens
+    dense, tokens = key.dense, key.tokens
     # a verify step: VL rows a request, NREQ whole requests in the width
     VL = key.verify
     VERIFY = VL > 1
@@ -342,16 +335,15 @@ def build_flash_kernel(key: FlashBuild):
     GROUPED = key.grouped
     assert 1 <= VL <= S
     assert 2 <= S <= (64 if GROUPED else 32) and 1 <= launches_per_step <= LAYER_SLOTS
-    assert not GROUPED or not (dense or head)
+    assert not GROUPED or not dense
     assert key.inter % 128 == 0
     assert not kda or S <= 32
     assert not (kda and dsa)
     assert not dense or kda
-    assert not head or not (kda or dsa)
     assert not tokens or (kda and W > 1)
     assert not dsa or (S <= 32 and max_pools % POOLS_PER_TASK == 0)
     # past 16 rows (two MFMA column groups) the routed MoE runs expert-major
-    assert S <= 16 or GROUPED or dense or head
+    assert S <= 16 or GROUPED or dense
     KV_FP8 = key.kv_fp8
     assert not KV_FP8 or dsa
     FOLD = key.fold
@@ -369,44 +361,41 @@ def build_flash_kernel(key: FlashBuild):
     DENSE_SH = key.dense_shuffled
     whole = kda or dsa
     assert W <= guard.FLAG_WORDS
-    if head:
-        name = kernel_symbol("glm53_flash_tail", s=S, tp=W)
-    else:
-        extra = {
-            k: 1
-            for k, on in (
-                ("n", dense),
-                ("e", tokens),
-                ("g", GROUPED),
-                ("o", dsa and not key.select_ctas),
-                ("f", KV_FP8),
-                ("y", FOLD),
-                ("r", key.kda_raw_o),
-            )
-            if on
-        }
-        if VERIFY:
-            extra["v"] = VL
-        name = kernel_symbol(
-            "glm53_flash_layer",
-            s=S,
-            tp=W,
-            k=int(kda),
-            d=int(dsa),
-            q=int(QKV8),
-            h=int(QKV_SH or QB_SH or O_SH or DENSE_SH),
-            **extra,
+    extra = {
+        k: 1
+        for k, on in (
+            ("n", dense),
+            ("e", tokens),
+            ("g", GROUPED),
+            ("o", dsa and not key.select_ctas),
+            ("f", KV_FP8),
+            ("y", FOLD),
+            ("r", key.kda_raw_o),
         )
+        if on
+    }
+    if VERIFY:
+        extra["v"] = VL
+    name = kernel_symbol(
+        "glm53_flash_layer",
+        s=S,
+        tp=W,
+        k=int(kda),
+        d=int(dsa),
+        q=int(QKV8),
+        h=int(QKV_SH or QB_SH or O_SH or DENSE_SH),
+        **extra,
+    )
     keyed = key_tuple(key, SOURCES)
     # the KDA and sparse-attention layers read their prologue's loads only before the
-    # first stage (the dense, the token and the tail launches keep theirs)
+    # first stage (the dense and the token launches keep theirs)
     PRO = whole and not dense and not tokens
     EARLY = PRO and S <= 4
     expert_inter = key.inter
     SHARED = SHARED_EXPERT
     G = BLOCKS
     SC, SY = layout(
-        S, W, expert_inter, kda, dsa, max_pools, dense, head, tokens, GROUPED
+        S, W, expert_inter, kda, dsa, max_pools, dense, tokens, GROUPED
     )
     PROF = key.prof
     PROF_MARKS = 48
@@ -500,7 +489,7 @@ def build_flash_kernel(key: FlashBuild):
     # KDA o_proj's K parts
     KO_PASSES = k_parts(P) if (kda and WIDE) else 1
     # the launch runs the routed MoE (its MXFP8 rows and mids take LDS)
-    MOE = not (dense or head)
+    MOE = not dense
     X_WORDS = max(
         HIDDEN // 2 + 64,
         XQ_ROWS * HIDDEN // 4 if MOE else 0,
@@ -509,7 +498,6 @@ def build_flash_kernel(key: FlashBuild):
         if MOE
         else 0,
         S * HIDDEN // 2 // XH if whole else 0,
-        min(S, 16) * HIDDEN // 2 if head else 0,
         S * SH.dense_inter // 2 // DN_PASSES if dense else 0,
         S * P // 2 // KO_PASSES if kda else 0,
         S * KDA_DIM if kda else 0,
@@ -574,7 +562,7 @@ def build_flash_kernel(key: FlashBuild):
     WORK_WORDS = ROWS_OFF + (S * ROW_WORDS if dsa else 0)
     assert WORK_WORDS <= 40960, "keep static LDS below the MI355X per-workgroup budget"
 
-    order = stage_tasks(S, expert_inter, W, kda, dsa, dense, head, GROUPED)
+    order = stage_tasks(S, expert_inter, W, kda, dsa, dense, GROUPED)
     base, acc = {}, 0
     for stage, n in order:
         base[stage] = acc % G
@@ -5816,244 +5804,6 @@ def build_flash_kernel(key: FlashBuild):
             dsa_oproj(tv, t32)
             mark("oproj")
 
-        # ===================== the model's tail: mHC post, stream mean, final norm, LM head
-        # hpost: one task a 32-column tile, every row: the four streams as the terminal
-        # layer's hc_post rounds them, their mean (hc_contract) to mailbox ``hc``, and the
-        # tile's sum of squares of it to ``hss``. lmhead: every CTA normalizes the rows
-        # (rstd from the tiles' sums in a fixed order; bf16 as SGLang's RMSNorm stores
-        # them), then runs 16-row tiles of this rank's vocabulary and pushes the bf16
-        # logits to every rank. gather: each CTA turns its slice of the gathered logits
-        # into f32.
-        VR = SH.vocab
-        N_VT = VR // HEAD_TILE
-        HD_CPW = HIDDEN // 64 // WAVES
-        HD_AHEAD = HD_CPW if S <= 4 else HD_CPW // 2
-        HD_ROUNDS = (N_VT + G - 1) // G
-        G_PAIRS = S * VOCAB // 2
-        G_PER = (G_PAIRS + G - 1) // G
-        assert VR % HEAD_TILE == 0 and N_ROW_TILES <= 2 * 64
-
-        def normalize_rows(n_rows, r0, gam):
-            """In place: LDS rows 0 .. n_rows (the rows r0 ..) times their rstd and
-            the norm weight; thread tid holds columns tid * CPT .."""
-            for s in range_constexpr(n_rows):
-                rstd = lds_ld(misc, r0 + s)
-                for q in range_constexpr(CPT // 2):
-                    wd = s * (HIDDEN // 2) + tid * (CPT // 2) + q
-                    v0, v1 = bf2_f32(lds_ld(xs, wd).bitcast(fx.Int32))
-                    lds_st(
-                        xs,
-                        wd,
-                        bf16_pair(
-                            (v0 * rstd) * gam[2 * q], (v1 * rstd) * gam[2 * q + 1]
-                        ),
-                    )
-
-        def head_narrow(t0, pre, tile_task, gam):
-            stage_rows(mb("hc"), HIDDEN)
-            gpu.barrier()
-            normalize_rows(S, 0, gam)
-            gpu.barrier()
-            tile_task(0, t0, pre)
-
-        def stage_rows_sub(box, K, r0, nr):
-            """``stage_rows`` of rows r0 .. r0 + nr into LDS rows 0 .. nr."""
-            nq = nr * K // 4
-            n = nq // THREADS
-            assert n * THREADS == nq
-            for g0 in range_constexpr(0, n, STAGE_GROUP):
-                group = range(g0, min(g0 + STAGE_GROUP, n))
-                got = poll(
-                    [(box, r0 * (K // 2) + (tid + i * THREADS) * 2, 2) for i in group]
-                )
-                for k, i in enumerate(group):
-                    for j in range_constexpr(2):
-                        lds_st(
-                            xs,
-                            (tid + i * THREADS) * 2 + j,
-                            got[k][j].bitcast(fx.Float32),
-                        )
-
-        def head_wide(t0, u_h, logits_base, gam):
-            """Past 16 rows: the LM head a row group at a time (its 16 rows staged,
-            normalized, every vocabulary tile; the weights stream once a group)."""
-            for g in range_constexpr(NG):
-                GN = min(16, S - 16 * g)
-                if const_expr(g > 0):
-                    gpu.barrier()
-                stage_rows_sub(mb("hc"), HIDDEN, 16 * g, GN)
-                gpu.barrier()
-                normalize_rows(GN, 16 * g, gam)
-                gpu.barrier()
-
-                def ug(row0, c, GN=GN):
-                    kc = wave * HD_CPW + c
-                    return unit_rm(
-                        _rsrc(w_r),
-                        row0,
-                        kc,
-                        HIDDEN,
-                        VR,
-                        n_sel(GN) * (HIDDEN // 2) + kc * 32,
-                    )
-
-                for k in range_constexpr(HD_ROUNDS):
-                    tile = t0 + k * G
-                    if tile < N_VT:
-                        acc = run_units(
-                            lambda c, tile=tile: ug(tile * HEAD_TILE, c),
-                            HD_CPW,
-                            HD_AHEAD,
-                        )
-                        reduce_rows(1, acc, emit_out(HEAD_TILE), GN)
-                        gpu.barrier()
-                        if wave < W:
-                            for li in range_constexpr((GN * HEAD_TILE // 2 + 63) // 64):
-                                pq = lane + li * 64
-                                if pq < GN * HEAD_TILE // 2:
-                                    si = pq // (HEAD_TILE // 2)
-                                    ri = (pq % (HEAD_TILE // 2)) * 2
-                                    put_bf(
-                                        peer_dst + logits_base,
-                                        (si + 16 * g) * VOCAB
-                                        + rank * VR
-                                        + tile * HEAD_TILE
-                                        + ri,
-                                        [
-                                            bf16_round(
-                                                lds_ld(outs, si * HEAD_TILE + ri)
-                                            ),
-                                            bf16_round(
-                                                lds_ld(outs, si * HEAD_TILE + ri + 1)
-                                            ),
-                                        ],
-                                        CM_SYS,
-                                    )
-                        gpu.barrier()
-
-        def run_head():
-            r_x, r_res = _rsrc(attn_part), _rsrc(res_in)
-            r_post, r_comb = _rsrc(post_in), _rsrc(comb_in)
-            for t in range(start("hpost"), N_ROW_TILES, G):
-                t = fx.Int32(t)
-                col0 = t * ROW_TILE
-                if tid < S * (ROW_TILE // 2):
-                    s = tid // (ROW_TILE // 2)
-                    c = (tid % (ROW_TILE // 2)) * 2
-                    x0, x1 = ld_pair(r_x, s * HIDDEN + col0 + c)
-                    rs = [
-                        ld_pair(r_res, (s * HC_MULT + i) * HIDDEN + col0 + c)
-                        for i in range(HC_MULT)
-                    ]
-                    h = []
-                    for e in range_constexpr(2):
-                        xe = x0 if e == 0 else x1
-                        tot = fx.Float32(0.0)
-                        for j in range_constexpr(HC_MULT):
-                            acc = fx.Float32(0.0)
-                            for i in range_constexpr(HC_MULT):
-                                acc = (
-                                    acc
-                                    + ld_f32(r_comb, (s * HC_MULT + i) * HC_MULT + j)
-                                    * rs[i][e]
-                                )
-                            tot = tot + bf16_round(
-                                acc + ld_f32(r_post, s * HC_MULT + j) * xe
-                            )
-                        h.append(bf16_round(tot * (1.0 / HC_MULT)))
-                    put(mb("hc"), (s * HIDDEN + col0 + c) // 2, bf16_pair(h[0], h[1]))
-                    ss = h[0] * h[0] + h[1] * h[1]
-                    for off in (1, 2, 4, 8):
-                        ss = _xred(ss, off, lambda a, b: a + b)
-                    if c == 0:
-                        put(mb("hss"), s * N_ROW_TILES + t, ss)
-                gpu.barrier()
-            r_wh, r_g = _rsrc(w_r), _rsrc(g_norm)
-            logits_base = fx.Int64(SY["logits"]) + fx.Int64(peer_slot) * fx.Int64(
-                SY["_logits_stride"]
-            )
-            t0 = start("lmhead")
-
-            def u_h(row0, c):
-                kc = wave * HD_CPW + c
-                return unit_rm(
-                    r_wh, row0, kc, HIDDEN, VR, n_sel() * (HIDDEN // 2) + kc * 32
-                )
-
-            def ahead(tile):
-                # past the last tile: the last row only (dropped)
-                row0 = (tile < N_VT).select(tile * HEAD_TILE, fx.Int32(VR))
-                return [u_h(row0, c) for c in range(HD_AHEAD)]
-
-            def tile_task(k, tile, pre):
-                acc = run_units(
-                    lambda c: u_h(tile * HEAD_TILE, c), HD_CPW, HD_AHEAD, pre
-                )
-                nxt = ahead(tile + G) if k + 1 < HD_ROUNDS else None
-                reduce_rows(1, acc, emit_out(HEAD_TILE))
-                gpu.barrier()
-                if wave < W:
-                    for li in range_constexpr((S * HEAD_TILE // 2 + 63) // 64):
-                        pq = lane + li * 64
-                        if pq < S * HEAD_TILE // 2:
-                            si = pq // (HEAD_TILE // 2)
-                            ri = (pq % (HEAD_TILE // 2)) * 2
-                            put_bf(
-                                peer_dst + logits_base,
-                                si * VOCAB + rank * VR + tile * HEAD_TILE + ri,
-                                [
-                                    bf16_round(lds_ld(outs, si * HEAD_TILE + ri)),
-                                    bf16_round(lds_ld(outs, si * HEAD_TILE + ri + 1)),
-                                ],
-                                CM_SYS,
-                            )
-                gpu.barrier()
-                if const_expr(k + 1 < HD_ROUNDS):
-                    if tile + G < N_VT:
-                        tile_task(k + 1, tile + G, nxt)
-
-            pre = None if WIDE else ahead(t0)
-            gam = ld_bf16s(r_g, tid * CPT, CPT)
-            # the rows' rstd: wave w sums rows w, w + WAVES, ..'s tile sums (lanes l,
-            # l + 64), then the wave in a fixed order
-            for wi in range_constexpr((S + WAVES - 1) // WAVES):
-                sw = wave + wi * WAVES
-                if sw < S:
-                    parts = getf_many(
-                        [
-                            (
-                                mb("hss"),
-                                sw * N_ROW_TILES
-                                + fx.min(lane + 64 * i, N_ROW_TILES - 1),
-                            )
-                            for i in range(2)
-                        ]
-                    )
-                    tot = parts[0] + (lane + 64 < N_ROW_TILES).select(
-                        parts[1], fx.Float32(0.0)
-                    )
-                    tot = wave_sum(tot)
-                    if lane == 0:
-                        lds_st(misc, sw, _rsq(tot * (1.0 / HIDDEN) + EPS))
-            if const_expr(WIDE):
-                head_wide(t0, u_h, logits_base, gam)
-            else:
-                head_narrow(t0, pre, tile_task, gam)
-            own = sym + logits_base
-            r_out = _rsrc(x_out)
-            n_g = (G_PER + THREADS - 1) // THREADS
-            qs = [
-                fx.min(bid * G_PER + fx.min(tid + i * THREADS, G_PER - 1), G_PAIRS - 1)
-                for i in range(n_g)
-            ]
-            got = poll([(own, q, 1) for q in qs], "one-as")
-            for i in range_constexpr(n_g):
-                if tid + i * THREADS < G_PER:
-                    v0, v1 = bf2_f32(got[i][0])
-                    bo.buffer_store(
-                        fx.Vector.from_elements([v0, v1], fx.Float32), r_out, qs[i] * 2
-                    )
-
         # ------------------------------------------------------------ the epoch
         # The first stage's loads that wait for nothing go out with the prologue's, then
         # the prologue's are read.
@@ -6066,9 +5816,6 @@ def build_flash_kernel(key: FlashBuild):
             peer_dst = read_peer(pv)
             launch_guard = new_guard()
 
-        if const_expr(head):
-            run_head()
-            return
         if const_expr(kda):
             r_wo_kda = _rsrc(w_o)
             O_CPW = P // 64 // WAVES

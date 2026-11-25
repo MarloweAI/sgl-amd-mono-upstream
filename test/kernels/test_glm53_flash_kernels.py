@@ -64,7 +64,7 @@ class TestMonoGlm53FlashKernels(CustomTestCase):
 
     def test_each_launch_kind(self):
         # 4 rows (TP2 builds no wider launch), the last a pad row
-        for kind in ("ffn", "kda", "dsa", "dense", "embed", "head"):
+        for kind in ("ffn", "kda", "dsa", "dense", "embed"):
             self._check("--kind", kind, "--rows", "4", "--pad-rows", "1", "--writes")
 
     def test_shuffled_fp8_projections_match_row_major(self):
@@ -88,10 +88,6 @@ class TestMonoGlm53FlashKernels(CustomTestCase):
                 "20",
                 widths=(2, 4, 8),
             )
-        # back-to-back tails: each writes its logits in the slot the last did not
-        self._check(
-            "--kind", "head", "--layers", "4", "--replays", "20", widths=(2, 4, 8)
-        )
 
     def test_dense_mlp_matches_an_fp32_mlp(self):
         self._check("--kind", "dense", "--check-dense", widths=(2, 4, 8))
@@ -152,9 +148,6 @@ class TestMonoGlm53FlashKernels(CustomTestCase):
             for tp in (2, 4, 8):
                 if tp > 2 or rows <= 4:
                     self._run(tp, *long, "--rows", str(rows), *args)
-
-    def test_the_tail_matches_a_torch_tail(self):
-        self._check("--kind", "head", "--check-head", widths=(2, 4, 8))
 
 
 if __name__ == "__main__":

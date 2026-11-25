@@ -17,7 +17,7 @@ from typing import Optional, Union
 import msgspec
 import torch
 
-from .config import HC_MULT, HIDDEN, KPOOL, VOCAB
+from .config import HC_MULT, HIDDEN, KPOOL
 from .layout import DSA_TAB, ROW_WORDS, STEP_TAB
 
 
@@ -55,14 +55,6 @@ class FlashDenseWeights(msgspec.Struct, frozen=True):
     hc_base: torch.Tensor
     g_norm: torch.Tensor
     shuffled: bool = False
-
-
-class FlashHeadWeights(msgspec.Struct, frozen=True):
-    """The model's tail: the final RMSNorm weight [HIDDEN] bf16 and this rank's rows
-    of the vocab-parallel LM head [VOCAB / TP, HIDDEN] bf16, row-major."""
-
-    g_norm: torch.Tensor
-    w_head: torch.Tensor
 
 
 class FlashEmbedding(msgspec.Struct, frozen=True):
@@ -256,29 +248,17 @@ class FlashRuntime:
         self._scratch = PeerBuffer(self.sc["_bytes"], group, rank, 1, device)
         self.scratch = self._scratch.bytes
         self.epoch = torch.zeros(guard.GUARD_WORDS, dtype=torch.int32, device=device)
-        # the tail's gathered logits; a layer's two output sets, by layer parity: a
-        # layer never writes what it reads
+        # a layer's two output sets, by layer parity: a layer never writes what it reads
         w = key.rows
-        self.logits = (
-            torch.empty(w, VOCAB, dtype=torch.float32, device=device)
-            if key.head
-            else None
-        )
-        self.outs = []
-        if not key.head:
-            self.outs = [
-                (
-                    torch.empty(w, HIDDEN, dtype=torch.bfloat16, device=device),
-                    torch.empty(
-                        w, HC_MULT, HIDDEN, dtype=torch.bfloat16, device=device
-                    ),
-                    torch.empty(w, HC_MULT, 1, dtype=torch.float32, device=device),
-                    torch.empty(
-                        w, HC_MULT, HC_MULT, dtype=torch.float32, device=device
-                    ),
-                )
-                for _ in range(2)
-            ]
+        self.outs = [
+            (
+                torch.empty(w, HIDDEN, dtype=torch.bfloat16, device=device),
+                torch.empty(w, HC_MULT, HIDDEN, dtype=torch.bfloat16, device=device),
+                torch.empty(w, HC_MULT, 1, dtype=torch.float32, device=device),
+                torch.empty(w, HC_MULT, HC_MULT, dtype=torch.float32, device=device),
+            )
+            for _ in range(2)
+        ]
 
     def set_deadline(self, seconds: float) -> None:
         """Every wait's deadline (below the server's watchdog timeout)."""
@@ -564,52 +544,3 @@ class FlashLayerOp:
             torch.cuda.current_stream(),
         )
         return x_out, res_out, post_out, comb_out
-
-
-class FlashHeadOp:
-    """The tail launch: the terminal layer's pending mHC post, the mean of the four
-    streams, the final norm, the LM head and the logits' all-gather; ``layer`` is its
-    ordinal among the runtime's launches a step."""
-
-    def __init__(
-        self, runtime: FlashRuntime, weights: FlashHeadWeights, layer: int = 0
-    ):
-        if not runtime.key.head:
-            raise ValueError("the tail needs a head runtime")
-        self.rt, self.w, self.layer = runtime, weights, layer
-
-    def launch(self, x, residual, post, comb) -> torch.Tensor:
-        """The terminal layer's (x, residual, post, comb); returns the gathered f32
-        logits [S, VOCAB] (the runtime's buffer)."""
-        rt, w, S = self.rt, self.w, self.rt.width
-        _check("x", x, (S, HIDDEN), torch.bfloat16)
-        _check("residual", residual, (S, HC_MULT, HIDDEN), torch.bfloat16)
-        _check("post", post, (S, HC_MULT, 1), torch.float32)
-        _check("comb", comb, (S, HC_MULT, HC_MULT), torch.float32)
-        p = lambda t: t.data_ptr()  # noqa: E731
-        rt.dispatch(
-            p(x),
-            p(residual),
-            p(post),
-            p(comb),
-            0,
-            0,
-            0,
-            p(w.g_norm),
-            0,
-            0,
-            0,
-            p(rt.logits),
-            p(w.w_head),
-            *[0] * 9,
-            *[0] * KDA_ARGS,
-            *[0] * 4,
-            p(rt.scratch),
-            rt.peer.local,
-            p(rt.peer.addresses),
-            p(rt.epoch),
-            rt.rank,
-            self.layer,
-            torch.cuda.current_stream(),
-        )
-        return rt.logits
