@@ -56,15 +56,15 @@ from sgl_amd_mono.glm53_flash import (
 )
 
 # kernel widths; a step of fewer rows runs at the next width, the rest pad rows
-# (12: two MTP5 or three MTP3 requests; 24 and 32 rows at TP2 only)
+# (12: two MTP5 or three MTP3 requests; widths past MAX_ROWS are not served)
 WIDTHS = (2, 4, 8, 12, 16, 24, 32)
 # above this width the MoE runs expert-major (``FlashBuild.grouped``)
 GROUPED_FROM = 9
 ROWS = tuple(range(1, max(WIDTHS) + 1))
 TP_SIZES = (2, 4, 8)
-# the rows a step runs on the kernels at most at this TP size; wider steps run the
-# model's forward
-TP_MAX_ROWS = {2: 32, 4: 16, 8: 16}
+# the rows a verify step runs on the kernels at most (every TP size); wider steps run
+# the model's forward
+MAX_ROWS = 16
 # SGLang's DSA cache: 256-token KV pages (an index page holds 64 kpool pools)
 PAGE_SIZE = 256
 
@@ -475,7 +475,7 @@ class _Built:
         self.lm, self.model = lm, lm.model
         self._layers, self.runtimes, self.heads = layers, runtimes, heads
         self.last = max(layers)
-        self.max_rows = TP_MAX_ROWS.get(tp, max(WIDTHS))
+        self.max_rows = MAX_ROWS
         # a step's rows a request: the verify step's draft tokens with MTP, else 1
         self.verify, self.max_position = verify, max_position
         # the MLA latent cache's dtype the sparse-attention launches were built for
@@ -945,7 +945,7 @@ def _build(model, hf_config, ctx) -> _Built:
         getattr(get_exec().mamba, "enable_kda_fold_verify", False)
     )
     runtimes, heads = {}, {}
-    cap = TP_MAX_ROWS.get(tp, max(WIDTHS))
+    cap = MAX_ROWS
     widths = sorted({_width(r) for r in ctx.widths if r <= cap})
     if not widths:
         raise ValueError(
