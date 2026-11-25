@@ -87,16 +87,12 @@ def _plan(rows, tokens=1):
     return registry.Plan(key=key)
 
 
-def test_a_step_runs_at_the_next_width_and_tp2_takes_four_rows():
+def test_a_step_runs_at_the_next_width_up_to_max_rows():
     # a step of fewer rows than a width runs at the next width, the rest pad rows
-    assert [flash._width(r) for r in flash.ROWS] == [2, 2, 4, 4] + [8] * 4 + [
-        12
-    ] * 4 + [16] * 4
-    # TP2 builds no 8-row launch: a wider step runs the model's own forward
+    assert [flash._width(r) for r in flash.ROWS] == [2, 2, 4, 4] + [8] * 4 + [12] * 4
+    # SGLang routes steps of up to MAX_ROWS rows; wider steps run the model's forward
+    assert flash.SPEC.widths("gfx950") == tuple(range(1, flash.MAX_ROWS + 1))
     lm, built = _built(tp=2, widths=(2, 4))
-    out = built.forward(_plan(8), "ids", "positions", "batch")
-    assert out == "the model's forward"
-    assert lm.ran == [("ids", "positions", "batch", None, None)]
     # layer 0's input besides its tokens: every stream a copy of the embedding row
     assert not built.zero_x.any() and not built.zero_res.any()
     assert (built.one_post == 1).all() and not built.zero_comb.any()
@@ -108,10 +104,6 @@ def test_a_verify_step_of_other_draft_chains_runs_the_model_s_forward():
     # the launches are built for one draft-chain length (the server's draft tokens)
     lm, built = _built(verify=4)
     out = built.forward(_plan(8, tokens=2), "ids", "positions", "batch")
-    assert out == "the model's forward" and len(lm.ran) == 1
-    # TP2: a verify step past 4 rows runs the model's forward too
-    lm, built = _built(tp=2, widths=(2, 4), verify=4)
-    out = built.forward(_plan(8, tokens=4), "ids", "positions", "batch")
     assert out == "the model's forward" and len(lm.ran) == 1
 
 

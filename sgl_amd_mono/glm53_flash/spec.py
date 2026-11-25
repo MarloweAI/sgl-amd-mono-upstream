@@ -54,15 +54,17 @@ from sgl_amd_mono.glm53_flash import (
 )
 
 # kernel widths; a step of fewer rows runs at the next width, the rest pad rows
-# (12: two MTP5 or three MTP3 requests; widths past MAX_ROWS are not served)
+# (12: two MTP5 or three MTP3 requests)
 WIDTHS = (2, 4, 8, 12, 16, 24, 32)
 # above this width the MoE runs expert-major (``FlashBuild.grouped``)
 GROUPED_FROM = 9
-ROWS = tuple(range(1, max(WIDTHS) + 1))
 TP_SIZES = (2, 4, 8)
-# the rows a verify step runs on the kernels at most (every TP size); wider steps run
-# the model's forward
+# the rows a step runs on the kernels at most (every TP size); wider steps run the
+# model's forward
 MAX_ROWS = 12
+# the step rows SGLang routes: its graphs' rows up to MAX_ROWS that are whole
+# requests, so the build makes only the widths those rows run at
+ROWS = tuple(range(1, MAX_ROWS + 1))
 # SGLang's DSA cache: 256-token KV pages (an index page holds 64 kpool pools)
 PAGE_SIZE = 256
 
@@ -425,7 +427,6 @@ class _Built:
         self.lm, self.model = lm, lm.model
         self._layers, self.runtimes = layers, runtimes
         self.last = max(layers)
-        self.max_rows = MAX_ROWS
         # a step's rows a request: the verify step's draft tokens with MTP, else 1
         self.verify, self.max_position = verify, max_position
         # the MLA latent cache's dtype the sparse-attention launches were built for
@@ -433,15 +434,13 @@ class _Built:
         # fold-in-verify KDA: a verify step's ring row a request, in one
         # address-stable buffer every layer's fold table names
         self.fold = fold
-        self.ring_rows = torch.full(
-            (max(WIDTHS),), -1, dtype=torch.int32, device=device
-        )
+        n = _width(MAX_ROWS)
+        self.ring_rows = torch.full((n,), -1, dtype=torch.int32, device=device)
         # the launch checks run SGLang's layer on the launch's input: a decode step,
         # or a verify step (its KDA layers' per-draft-row states)
         self.check_layers = os.environ.get("SGLANG_AMD_MONO_CHECK") == "1"
         # layer 0's input besides its tokens: every stream a copy of the embedding row
         # (x = the row, post 1, comb 0, residual 0)
-        n = max(WIDTHS)
         self.zero_x = torch.zeros(n, HIDDEN, dtype=torch.bfloat16, device=device)
         self.zero_res = torch.zeros(
             n, HC_MULT, HIDDEN, dtype=torch.bfloat16, device=device
@@ -476,11 +475,7 @@ class _Built:
         """``Glm5NextForConditionalGeneration.forward`` for a routed decode or MTP
         verify step (a verify step's rows are its requests' draft chains)."""
         lm = self.lm
-        if (
-            plan.key.rows > self.max_rows
-            or plan.key.tokens_per_request != self.verify
-            or input_embeds is not None
-        ):
+        if plan.key.tokens_per_request != self.verify or input_embeds is not None:
             return type(lm).forward(
                 lm, input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
             )
@@ -860,13 +855,7 @@ def _build(model, hf_config, ctx) -> _Built:
         getattr(get_exec().mamba, "enable_kda_fold_verify", False)
     )
     runtimes = {}
-    cap = MAX_ROWS
-    widths = sorted({_width(r) for r in ctx.widths if r <= cap})
-    if not widths:
-        raise ValueError(
-            f"GLM-5.3-Flash monokernel: TP{tp} runs at most {cap} rows on the kernels, "
-            f"and this server's decode graphs route {sorted(ctx.widths)}"
-        )
+    widths = sorted({_width(r) for r in ctx.widths})
 
     def runtime(key):
         rt = FlashRuntime(key, rank, p.tp_group.cpu_group, device)
