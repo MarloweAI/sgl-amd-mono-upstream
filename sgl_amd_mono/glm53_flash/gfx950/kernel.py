@@ -2412,7 +2412,7 @@ def build_flash_kernel(key: FlashBuild):
                             signal("box_o_in", t)
 
         # ===================== 5'. fold-in-verify (SGLang's --enable-kda-fold-verify)
-        # A verify step on fork K's contract (kda_fold_verify_gfx950, ecf7118910):
+        # A verify step on SGLang's fold-in-verify contract (kda_fold_verify_gfx950):
         # a request's ring row keeps the raw inputs (pre-conv q | k | v, gate input
         # a, beta input b) of its last verify window, and fold_len[slot] how many
         # of them the accept kept. This step folds those into the slot's state and

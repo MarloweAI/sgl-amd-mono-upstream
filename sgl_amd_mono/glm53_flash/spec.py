@@ -939,8 +939,8 @@ def _build(model, hf_config, ctx) -> _Built:
     )
     # the MLA latent cache: bf16, or SGLang's raw E4M3 rows (no scale)
     kv_fp8 = get_model().kv_cache_dtype == "fp8_e4m3"
-    # the KDA verify contract: SGLang's fold-in-verify (fork branches with
-    # --enable-kda-fold-verify), else the committed state and per-draft snapshots
+    # the KDA verify contract: SGLang's fold-in-verify when the server runs with
+    # --enable-kda-fold-verify, else the committed state and per-draft snapshots
     fold = verify > 1 and bool(
         getattr(get_exec().mamba, "enable_kda_fold_verify", False)
     )
