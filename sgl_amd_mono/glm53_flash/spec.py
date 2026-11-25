@@ -64,7 +64,7 @@ ROWS = tuple(range(1, max(WIDTHS) + 1))
 TP_SIZES = (2, 4, 8)
 # the rows a verify step runs on the kernels at most (every TP size); wider steps run
 # the model's forward
-MAX_ROWS = 16
+MAX_ROWS = 12
 # SGLang's DSA cache: 256-token KV pages (an index page holds 64 kpool pools)
 PAGE_SIZE = 256
 
