@@ -147,6 +147,54 @@ def front(
     return out
 
 
+def front_sp(
+    x: torch.Tensor,
+    gate_w: torch.Tensor,
+    bias: torch.Tensor,
+    scale: float,
+    batch: dict,
+    row_off: int,
+    peer: list[int],
+    valid: torch.Tensor | None = None,
+) -> dict:
+    """The sequence-parallel front at TP2 (``moe_fused``'s build: the shared slot, no sorted scales): x [h, 4096] this
+    rank's rows of a 2 h-row batch, from row ``row_off`` (0 or h); ``valid`` counts rows of the batch. ``batch``: this
+    rank's persistent batch arrays of at least 2 h rows, mapped by the peer (topk_ids [., 9] i32, topk_weights f32,
+    a1 / a1_even [., 2048] u8, a1_scale / a1_even_scale [., 128] u8, moe_buf [., 4096] bf16); ``peer``: the peer's
+    batch arrays' addresses in that order, then the TP2 exchange's peer_flags, flags, gen and ticket. Writes the
+    whole batch's routes, quants, sort and zeroed output on both ranks, as ``front`` does on all 2 h rows."""
+    h = x.shape[0]
+    mf = 2 * h
+    k = TOPK + 1
+    dev = x.device
+    cap = capacity(mf, k)
+    r = (h + 15) // 16
+    i32, f32 = torch.int32, torch.float32
+    out = dict(
+        topk_ids=batch["topk_ids"][:mf],
+        topk_weights=batch["topk_weights"][:mf],
+        sorted_ids=torch.empty(cap, dtype=i32, device=dev),
+        sorted_weights=torch.empty(cap, dtype=f32, device=dev),
+        sorted_expert_ids=torch.empty(cap // BM, dtype=i32, device=dev),
+        num_valid_ids=torch.empty(2, dtype=i32, device=dev),
+        tile_target=torch.empty(MAX_ROWS // 16, dtype=i32, device=dev),
+        a1=batch["a1"][:mf],
+        a1_scale=batch["a1_scale"][:mf],
+        a1_even=batch["a1_even"][:mf],
+        a1_even_scale=batch["a1_even_scale"][:mf],
+        moe_buf=batch["moe_buf"][:mf],
+        logits=torch.empty(r * 16, E, dtype=f32, device=dev),
+    )
+    partial = torch.empty(partial_floats(h), dtype=f32, device=dev)
+    ops().front_sp(
+        x, gate_w, bias, float(scale), valid, partial, out["logits"], out["topk_ids"], out["topk_weights"],
+        out["sorted_ids"], out["sorted_weights"], out["sorted_expert_ids"], out["num_valid_ids"], out["tile_target"],
+        out["a1"], out["a1_scale"], out["a1_even"], out["a1_even_scale"], out["moe_buf"], _counters(dev),
+        int(row_off), [int(a) for a in peer],
+    )
+    return out
+
+
 def topk(logits: torch.Tensor, bias: torch.Tensor, scale: float) -> tuple[torch.Tensor, torch.Tensor]:
     """The front's top-k alone on bf16 logits [m, 288]: (weights [m, 8] f32, ids [m, 8] i32)."""
     m = logits.shape[0]

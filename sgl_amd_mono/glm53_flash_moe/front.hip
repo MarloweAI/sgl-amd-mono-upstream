@@ -24,6 +24,14 @@
 //
 // Hand-offs between CTAs: data stored and loaded at agent scope (sc1), then s_waitcnt vmcnt(0) and a barrier before
 // the counter's agent-scope add. Every counter and flag is put back to 0 by its last user, for graph replay.
+//
+// Sequence-parallel build (front_sp, TP2): x is this rank's own M rows of a 2 M-row batch (rank 0 rows [0, M), rank
+// 1 rows [M, 2 M)). The router, top-k and quant CTAs run on those rows as above and write the batch's arrays at
+// their own rows, write-through (sc0 sc1 / sc1); each top-k CTA then flags its quant rows in the peer's memory.
+// Mover CTAs (one per peer top-k CTA) wait for that flag and pull the peer's quant rows into the peer's half of this
+// rank's arrays (and zero the MoE output there). The sorting CTA flags its routes to the peer, waits for the peer's,
+// pulls them, and sorts all 2 M rows. Flags are the TP group's tp2_xchg epochs (gen + 1, never reset); the launch
+// advances gen once. Every value is the one the full-batch front writes: each op above is per row.
 #include <cstdint>
 
 #include <ATen/ATen.h>
@@ -95,7 +103,44 @@ struct Params {
     uint4          *out;         // the MoE output, zeroed: M x D bf16
     int            *counters;    // [N_COUNTERS * CL], 0 between launches
     int             M, R, RB, router_ctas, topk_ctas, scale_ctas, pad_id;
+    // the sequence-parallel build only
+    int             row_off, Mf, mover_ctas; // this rank's first row of the batch, the batch's rows, movers
+    int            *topk_ids_full;            // the batch's arrays, from row 0
+    float          *topk_w_full;
+    uint8_t        *a1_full, *a1_scale_full, *a1_even_full, *a1_even_scale_full;
+    uint4          *out_full;
+    const int      *peer_topk_ids;            // the peer's batch arrays (IPC-mapped), from row 0
+    const float    *peer_topk_w;
+    const uint8_t  *peer_a1, *peer_a1_scale, *peer_a1_even, *peer_a1_even_scale;
+    uint32_t       *peer_flags;               // tp2_xchg: the peer's flags, this rank's, the launch counter
+    const uint32_t *flags;
+    uint32_t       *gen, *ticket;
 };
+
+constexpr int SP_QF = 3072; // flags: a top-k CTA's quant rows are out (+ the CTA index)
+constexpr int SP_RF = 3200; // flags: the routes are out
+
+__device__ __forceinline__ uint32_t flag_ld(const uint32_t *p) {
+    return __hip_atomic_load(p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+__device__ __forceinline__ void flag_st(uint32_t *p, uint32_t v) {
+    __hip_atomic_store(p, v, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+// write-through stores (sc0 sc1): the peer reads them over the link
+__device__ __forceinline__ void st_wt8(void *p, uint2 v) {
+    __hip_atomic_store(reinterpret_cast<uint64_t *>(p), (uint64_t(v.y) << 32) | v.x, __ATOMIC_RELAXED,
+                       __HIP_MEMORY_SCOPE_SYSTEM);
+}
+__device__ __forceinline__ void st_wt1(uint8_t *p, uint8_t v) {
+    asm volatile("global_store_byte %0, %1, off sc0 sc1\n\ts_nop 1" ::"v"(p), "v"(uint32_t(v)) : "memory");
+}
+// 16 B of the peer's memory at system scope, as two 8 B loads the compiler waits for
+__device__ __forceinline__ uint4 ld_sys16(const void *ptr) {
+    const uint64_t *q  = reinterpret_cast<const uint64_t *>(ptr);
+    const uint64_t  lo = __hip_atomic_load(q, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    const uint64_t  hi = __hip_atomic_load(q + 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    return make_uint4(uint32_t(lo), uint32_t(lo >> 32), uint32_t(hi), uint32_t(hi >> 32));
+}
 
 __device__ __forceinline__ void st_dev(int *p, int v) {
     __hip_atomic_store(p, v, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
@@ -516,7 +561,9 @@ __device__ void router_cta(const Params &p, int b, FrontLds &lds, int &flag) {
 
 // ---- the activation quant and the zeroed output ----
 
-// Rows first .. last - 1: x (bf16) -> MXFP4 a1 and its per-token e8m0 scales; the MoE output rows zeroed.
+// Rows first .. last - 1: x (bf16) -> MXFP4 a1 and its per-token e8m0 scales; the MoE output rows zeroed. WT (the
+// sequence-parallel build): the quant stores are write-through, for the peer to pull.
+template <bool WT>
 __device__ void quant_rows(const Params &p, int first, int last, uint8_t *scale_lds) {
     const int tid = threadIdx.x, half = tid >> 8, t = tid & 255; // 2 rows a pass, 16 values a thread
     for (int row0 = first; row0 < last; row0 += 2) {
@@ -566,8 +613,13 @@ __device__ void quant_rows(const Params &p, int first, int last, uint8_t *scale_
                 e1 = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(e1, f[10], f[11], sc, 1);
                 e1 = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(e1, f[12], f[13], sc, 2);
                 e1 = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(e1, f[14], f[15], sc, 3);
-                *reinterpret_cast<uint2 *>(p.a1_even + int64_t(row) * (D / 2) + t * 8) = make_uint2(e0, e1);
-                if ((t & 1) == 0) p.a1_even_scale[int64_t(row) * SCOLS + t / 2] = uint8_t(ex);
+                if constexpr (WT) {
+                    st_wt8(p.a1_even + int64_t(row) * (D / 2) + t * 8, make_uint2(e0, e1));
+                    if ((t & 1) == 0) st_wt1(p.a1_even_scale + int64_t(row) * SCOLS + t / 2, uint8_t(ex));
+                } else {
+                    *reinterpret_cast<uint2 *>(p.a1_even + int64_t(row) * (D / 2) + t * 8) = make_uint2(e0, e1);
+                    if ((t & 1) == 0) p.a1_even_scale[int64_t(row) * SCOLS + t / 2] = uint8_t(ex);
+                }
             }
             uint32_t q0 = 0, q1 = 0;
             q0 = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(q0, f[0], f[1], scale, 0);
@@ -578,7 +630,10 @@ __device__ void quant_rows(const Params &p, int first, int last, uint8_t *scale_
             q1 = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(q1, f[10], f[11], scale, 1);
             q1 = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(q1, f[12], f[13], scale, 2);
             q1 = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(q1, f[14], f[15], scale, 3);
-            *reinterpret_cast<uint2 *>(p.a1 + int64_t(row) * (D / 2) + t * 8) = make_uint2(q0, q1);
+            if constexpr (WT)
+                st_wt8(p.a1 + int64_t(row) * (D / 2) + t * 8, make_uint2(q0, q1));
+            else
+                *reinterpret_cast<uint2 *>(p.a1 + int64_t(row) * (D / 2) + t * 8) = make_uint2(q0, q1);
             p.out[int64_t(row) * (D * 2 / 16) + t]       = make_uint4(0, 0, 0, 0);
             p.out[int64_t(row) * (D * 2 / 16) + 256 + t] = make_uint4(0, 0, 0, 0);
         }
@@ -600,17 +655,37 @@ __device__ void quant_rows(const Params &p, int first, int last, uint8_t *scale_
 // Top-k CTA tk: rows 8 tk .. 8 tk + 7. While the router runs it quantizes those rows (and zeroes their output);
 // then, a wave a row, once their row tile's 18 x 4 partial tiles are in: the K slices summed in slice order are the
 // logits. The last top-k CTA to finish sorts every route and publishes the sort.
-template <int K, int NE, bool GIVEN>
+// The sequence-parallel launch's CTAs that read gen count out here; the last one advances it.
+__device__ void sp_count_out(const Params &p, uint32_t gen) {
+    __builtin_amdgcn_s_waitcnt(0);
+    __syncthreads();
+    if (threadIdx.x == 0 &&
+        __hip_atomic_fetch_add(p.ticket, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) ==
+            uint32_t(p.topk_ctas + p.mover_ctas - 1)) {
+        __hip_atomic_store(p.ticket, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        __hip_atomic_store(p.gen, gen + 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    }
+}
+
+template <int K, int NE, bool GIVEN, bool SP>
 __device__ void topk_cta(const Params &p, int tk, FrontLds &lds, uint8_t *scale_lds, int &flag) {
     const int tid = threadIdx.x, wave = tid / WAVE, lane = tid & (WAVE - 1);
     const int r = tk / 2;
     float bias[2][4];
     lane_bias(p.bias, bias); // in flight while the router runs
-    quant_rows(p, tk * WAVES, min(tk * WAVES + WAVES, p.M), scale_lds);
+    uint32_t gen = 0;
+    if constexpr (SP) gen = __hip_atomic_load(p.gen, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    quant_rows<SP>(p, tk * WAVES, min(tk * WAVES + WAVES, p.M), scale_lds);
+    if constexpr (SP) { // this CTA's quant rows are out: the peer's mover tk may pull them
+        __builtin_amdgcn_s_waitcnt(0);
+        __syncthreads();
+        if (tid == 0) flag_st(p.peer_flags + SP_QF + tk, gen + 1u);
+    }
     if (tid == 0)
         while (ld_dev(p.counters + (C_R + r) * CL) < NT * KSPLIT) __builtin_amdgcn_s_sleep(1);
     __syncthreads();
-    const int valid = p.valid ? min(max(ld_dev(p.valid), 0), p.M) : p.M;
+    // valid counts rows of the batch; this launch's rows start at row_off (0 but in the sequence-parallel build)
+    const int valid = p.valid ? min(max(ld_dev(p.valid) - p.row_off, 0), p.M) : p.M;
     const int t     = tk * WAVES + wave;
     if (t < p.M) {
         int   id = -1;
@@ -654,9 +729,39 @@ __device__ void topk_cta(const Params &p, int tk, FrontLds &lds, uint8_t *scale_
             st_dev(p.topk_w + t * K + lane, wt);
         }
     }
-    if (!last_arrival(p.counters + C_TOP * CL, p.topk_ctas, flag)) return;
+    if (!last_arrival(p.counters + C_TOP * CL, p.topk_ctas, flag)) {
+        if constexpr (SP) sp_count_out(p, gen);
+        return;
+    }
     // every top-k CTA is past its wait: the row-tile counts go back to 0
     if (tid < p.R) st_dev(p.counters + (C_R + tid) * CL, 0);
+    if constexpr (SP) {
+        // this rank's routes are out (every top-k CTA drained its sc1 stores before counting): flag them, wait for
+        // the peer's, pull them into the peer's rows, then sort the whole batch
+        if (tid == 0) {
+            flag_st(p.peer_flags + SP_RF, gen + 1u);
+            while (flag_ld(p.flags + SP_RF) < gen + 1u) __builtin_amdgcn_s_sleep(1);
+        }
+        __syncthreads();
+        const int peer_off = p.Mf - p.M - p.row_off; // h - row_off
+        const int n = p.M * K;
+        for (int i = tid; i < n; i += THREADS) {
+            const int64_t q = int64_t(peer_off) * K + i;
+            st_dev(p.topk_ids_full + q, int(__hip_atomic_load(p.peer_topk_ids + q, __ATOMIC_RELAXED,
+                                                              __HIP_MEMORY_SCOPE_SYSTEM)));
+            st_dev(p.topk_w_full + q, __hip_atomic_load(p.peer_topk_w + q, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM));
+        }
+        __builtin_amdgcn_s_waitcnt(0);
+        __syncthreads();
+        Params ps   = p;
+        ps.M        = p.Mf;
+        ps.topk_ids = p.topk_ids_full;
+        ps.topk_w   = p.topk_w_full;
+        ps.pad_id   = (K << 24) | p.Mf;
+        sort_routes<K, NE>(ps, lds.sort);
+        sp_count_out(p, gen);
+        return;
+    }
     sort_routes<K, NE>(p, lds.sort);
     __builtin_amdgcn_s_waitcnt(0);
     __syncthreads();
@@ -699,7 +804,41 @@ __device__ void scale_cta(const Params &p, int sb, uint8_t *rows_lds, int &flag)
     }
 }
 
-template <int K, int NE, bool GIVEN>
+// Mover CTA j (sequence-parallel build): once the peer's top-k CTA j has flagged its quant rows, pull those 8 rows
+// of the peer's a1 / a1_scale / a1_even / a1_even_scale into the same rows here, and zero their MoE output rows.
+__device__ void mover_cta(const Params &p, int j) {
+    const int tid = threadIdx.x;
+    const uint32_t gen = __hip_atomic_load(p.gen, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    if (tid == 0)
+        while (flag_ld(p.flags + SP_QF + j) < gen + 1u) __builtin_amdgcn_s_sleep(1);
+    __syncthreads();
+    const int peer_off = p.Mf - p.M - p.row_off;
+    const int r0 = peer_off + j * WAVES, r1 = peer_off + min(j * WAVES + WAVES, p.M);
+    // a row: a1 128 vectors of 16 B, a1_even 128, a1_scale 8, a1_even_scale 8
+    constexpr int VR = (D / 2) / 16 * 2 + SCOLS / 16 * 2;
+    for (int i = tid; i < (r1 - r0) * VR; i += THREADS) {
+        const int64_t row = r0 + i / VR;
+        int v = i % VR;
+        const uint8_t *src;
+        uint8_t       *dst;
+        if (v < 128) {
+            src = p.peer_a1 + row * (D / 2) + v * 16, dst = p.a1_full + row * (D / 2) + v * 16;
+        } else if ((v -= 128) < 128) {
+            src = p.peer_a1_even + row * (D / 2) + v * 16, dst = p.a1_even_full + row * (D / 2) + v * 16;
+        } else if ((v -= 128) < 8) {
+            src = p.peer_a1_scale + row * SCOLS + v * 16, dst = p.a1_scale_full + row * SCOLS + v * 16;
+        } else {
+            v -= 8;
+            src = p.peer_a1_even_scale + row * SCOLS + v * 16, dst = p.a1_even_scale_full + row * SCOLS + v * 16;
+        }
+        *reinterpret_cast<uint4 *>(dst) = ld_sys16(src);
+    }
+    for (int i = tid; i < (r1 - r0) * (D * 2 / 16); i += THREADS)
+        p.out_full[int64_t(r0) * (D * 2 / 16) + i] = make_uint4(0, 0, 0, 0);
+    sp_count_out(p, gen);
+}
+
+template <int K, int NE, bool GIVEN, bool SP>
 __global__ __launch_bounds__(THREADS) void front_kernel(Params p) {
     __shared__ FrontLds  lds;
     __shared__ uint8_t   scale_lds[32 * SCOLS];
@@ -709,7 +848,9 @@ __global__ __launch_bounds__(THREADS) void front_kernel(Params p) {
     if (b < t0)
         router_cta(p, b, lds, flag);
     else if (b < s0)
-        topk_cta<K, NE, GIVEN>(p, b - t0, lds, scale_lds, flag);
+        topk_cta<K, NE, GIVEN, SP>(p, b - t0, lds, scale_lds, flag);
+    else if constexpr (SP)
+        mover_cta(p, b - s0);
     else
         scale_cta(p, b - s0, scale_lds, flag);
 }
@@ -842,13 +983,113 @@ void front(const at::Tensor &x, const at::Tensor &w, const at::Tensor &bias, dou
     const int grid = p.router_ctas + p.topk_ctas + p.scale_ctas;
     const bool given = p.given_ids != nullptr;
     if (K == TOPK && !given)
-        front_kernel<TOPK, E, false><<<grid, THREADS, 0, stream>>>(p);
+        front_kernel<TOPK, E, false, false><<<grid, THREADS, 0, stream>>>(p);
     else if (K == TOPK)
-        front_kernel<TOPK, E, true><<<grid, THREADS, 0, stream>>>(p);
+        front_kernel<TOPK, E, true, false><<<grid, THREADS, 0, stream>>>(p);
     else if (!given)
-        front_kernel<TOPK + 1, E + 1, false><<<grid, THREADS, 0, stream>>>(p);
+        front_kernel<TOPK + 1, E + 1, false, false><<<grid, THREADS, 0, stream>>>(p);
     else
-        front_kernel<TOPK + 1, E + 1, true><<<grid, THREADS, 0, stream>>>(p);
+        front_kernel<TOPK + 1, E + 1, true, false><<<grid, THREADS, 0, stream>>>(p);
+    C10_HIP_KERNEL_LAUNCH_CHECK();
+}
+
+// The sequence-parallel front at TP2 (moe_fused's build: the shared slot, no sorted scales, no given routes): x [M,
+// 4096] this rank's rows of a 2 M-row batch starting at row_off; the batch arrays (topk, a1, a1_scale, a1_even,
+// a1_even_scale, out) hold 2 M rows and are written whole on both ranks; ``peer``: the peer's batch arrays' device
+// addresses (topk_ids, topk_w, a1, a1_scale, a1_even, a1_even_scale) and tp2_xchg's (peer_flags, flags, gen, ticket).
+void front_sp(const at::Tensor &x, const at::Tensor &w, const at::Tensor &bias, double scale,
+              const c10::optional<at::Tensor> &valid, at::Tensor &partial, at::Tensor &logits, at::Tensor &topk_ids,
+              at::Tensor &topk_w, at::Tensor &sorted_ids, at::Tensor &sorted_w, at::Tensor &sorted_eids,
+              at::Tensor &num_valid, at::Tensor &tile_target, at::Tensor &a1, at::Tensor &a1_scale, at::Tensor &a1_even,
+              at::Tensor &a1_even_scale, at::Tensor &out, at::Tensor &counters, int64_t row_off,
+              at::IntArrayRef peer) {
+    const int64_t M = x.size(0), Mf = 2 * M;
+    constexpr int K = TOPK + 1, NE = E + 1;
+    TORCH_CHECK(x.dim() == 2 && x.size(1) == D && x.stride(1) == 1 && x.stride(0) % 8 == 0 &&
+                    x.scalar_type() == at::kBFloat16 && reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0,
+                "x: [M, 4096] bf16, unit column stride, 16 B aligned rows");
+    TORCH_CHECK(M >= 1 && Mf <= MAX_ROWS && (row_off == 0 || row_off == M), "1 to 128 rows a rank, row_off 0 or M");
+    TORCH_CHECK(peer.size() == 10, "peer: 6 array and 4 exchange addresses");
+    const int R = int((M + 15) / 16), RB = row_tiles_per_cta(R), G = (R + RB - 1) / RB;
+    check(w, at::kBFloat16, int64_t(E) * D, "w");
+    check(bias, at::kBFloat16, E, "bias");
+    check(partial, at::kFloat, int64_t(KSPLIT) * R * 16 * E, "partial");
+    check(logits, at::kFloat, int64_t(R) * 16 * E, "logits");
+    check(topk_ids, at::kInt, Mf * K, "topk_ids");
+    check(topk_w, at::kFloat, Mf * K, "topk_w");
+    const int64_t cap = sorted_ids.numel();
+    const int64_t P   = Mf * K;
+    TORCH_CHECK(cap % BM == 0 && cap >= P + std::min<int64_t>(NE, P) * (BM - 1), "sorted rows");
+    check(sorted_w, at::kFloat, cap, "sorted_w");
+    check(sorted_eids, at::kInt, cap / BM, "sorted_eids");
+    check(num_valid, at::kInt, 2, "num_valid");
+    check(tile_target, at::kInt, MAX_ROWS / 16, "tile_target");
+    for (const at::Tensor *t : {&a1, &a1_even})
+        TORCH_CHECK(t->is_cuda() && t->is_contiguous() && t->numel() * t->element_size() == Mf * D / 2, "a1 / a1_even");
+    for (const at::Tensor *t : {&a1_scale, &a1_even_scale})
+        TORCH_CHECK(t->is_cuda() && t->is_contiguous() && t->numel() * t->element_size() == Mf * SCOLS,
+                    "a1_scale / a1_even_scale");
+    TORCH_CHECK(out.is_cuda() && out.is_contiguous() && out.scalar_type() == at::kBFloat16 && out.numel() == Mf * D,
+                "out: [2 M, 4096] bf16");
+    check(counters, at::kInt, N_COUNTERS * CL, "counters");
+    auto u8 = [](const at::Tensor &t) { return reinterpret_cast<uint8_t *>(t.data_ptr()); };
+    Params p{};
+    p.x          = reinterpret_cast<const uint16_t *>(x.data_ptr());
+    p.x_stride   = x.stride(0);
+    p.w          = reinterpret_cast<const uint16_t *>(w.data_ptr());
+    p.bias       = reinterpret_cast<const uint16_t *>(bias.data_ptr());
+    p.scale      = float(scale);
+    p.partial    = partial.data_ptr<float>();
+    p.logits     = logits.data_ptr<float>();
+    p.topk_ids_full = topk_ids.data_ptr<int>();
+    p.topk_w_full   = topk_w.data_ptr<float>();
+    p.topk_ids   = p.topk_ids_full + row_off * K;
+    p.topk_w     = p.topk_w_full + row_off * K;
+    p.sorted_ids  = sorted_ids.data_ptr<int>();
+    p.sorted_w    = sorted_w.data_ptr<float>();
+    p.sorted_eids = sorted_eids.data_ptr<int>();
+    p.num_valid   = num_valid.data_ptr<int>();
+    p.tile_target = tile_target.data_ptr<int>();
+    p.a1_full            = u8(a1);
+    p.a1_scale_full      = u8(a1_scale);
+    p.a1_even_full       = u8(a1_even);
+    p.a1_even_scale_full = u8(a1_even_scale);
+    p.a1            = p.a1_full + row_off * (D / 2);
+    p.a1_scale      = p.a1_scale_full + row_off * SCOLS;
+    p.a1_even       = p.a1_even_full + row_off * (D / 2);
+    p.a1_even_scale = p.a1_even_scale_full + row_off * SCOLS;
+    p.out_full    = reinterpret_cast<uint4 *>(out.data_ptr());
+    p.out         = p.out_full + row_off * (D * 2 / 16);
+    p.counters    = counters.data_ptr<int>();
+    p.M           = int(M);
+    p.Mf          = int(Mf);
+    p.row_off     = int(row_off);
+    p.R           = R;
+    p.RB          = RB;
+    p.router_ctas = G * NT * KSPLIT;
+    p.topk_ctas   = int((M + WAVES - 1) / WAVES);
+    p.mover_ctas  = p.topk_ctas;
+    p.scale_ctas  = 0;
+    p.pad_id      = (K << 24) | int(M); // the sort uses the batch's, (K << 24) | 2 M
+    p.peer_topk_ids      = reinterpret_cast<const int *>(peer[0]);
+    p.peer_topk_w        = reinterpret_cast<const float *>(peer[1]);
+    p.peer_a1            = reinterpret_cast<const uint8_t *>(peer[2]);
+    p.peer_a1_scale      = reinterpret_cast<const uint8_t *>(peer[3]);
+    p.peer_a1_even       = reinterpret_cast<const uint8_t *>(peer[4]);
+    p.peer_a1_even_scale = reinterpret_cast<const uint8_t *>(peer[5]);
+    p.peer_flags = reinterpret_cast<uint32_t *>(peer[6]);
+    p.flags      = reinterpret_cast<const uint32_t *>(peer[7]);
+    p.gen        = reinterpret_cast<uint32_t *>(peer[8]);
+    p.ticket     = reinterpret_cast<uint32_t *>(peer[9]);
+    if (valid.has_value()) {
+        TORCH_CHECK(valid->is_cuda() && valid->numel() == 1 && valid->scalar_type() == at::kInt,
+                    "valid: one int32 on the GPU");
+        p.valid = valid->data_ptr<int>();
+    }
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA guard(x.device());
+    const hipStream_t stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA(x.device().index()).stream();
+    const int grid = p.router_ctas + p.topk_ctas + p.mover_ctas;
+    front_kernel<K, NE, false, true><<<grid, THREADS, 0, stream>>>(p);
     C10_HIP_KERNEL_LAUNCH_CHECK();
 }
 
@@ -883,6 +1124,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
           "Tensor(m!) counters, int topk_total, "
           "Tensor? given_ids=None, Tensor? given_w=None) -> ()");
     m.impl("front", at::kCUDA, &front);
+    m.def("front_sp(Tensor x, Tensor w, Tensor bias, float scale, Tensor? valid, Tensor(a!) partial, "
+          "Tensor(b!) logits, Tensor(c!) topk_ids, Tensor(d!) topk_w, Tensor(e!) sorted_ids, Tensor(f!) sorted_w, "
+          "Tensor(g!) sorted_eids, Tensor(h!) num_valid, Tensor(n!) tile_target, Tensor(i!) a1, Tensor(j!) a1_scale, "
+          "Tensor(o!) a1_even, Tensor(p!) a1_even_scale, Tensor(l!) out, Tensor(m!) counters, int row_off, "
+          "int[] peer) -> ()");
+    m.impl("front_sp", at::kCUDA, &front_sp);
     m.def("topk(Tensor logits, Tensor bias, float scale, Tensor(a!) ids, Tensor(b!) w) -> ()");
     m.impl("topk", at::kCUDA, &topk);
 }
