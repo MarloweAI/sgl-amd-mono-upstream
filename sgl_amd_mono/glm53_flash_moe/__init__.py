@@ -314,3 +314,52 @@ def moe_fused(
         push=push,
         push_slabs=push_slabs,
     )
+
+
+def moe_fused_sp(
+    x: torch.Tensor,
+    gate_w: torch.Tensor,
+    bias: torch.Tensor,
+    scale: float,
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    swiglu_limit: float,
+    shared_w13: torch.Tensor,
+    shared_w13_scale: torch.Tensor,
+    shared_w2: torch.Tensor,
+    shared_w2_scale: torch.Tensor,
+    batch: dict,
+    row_off: int,
+    peer: list[int],
+    valid: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """``moe_fused`` for a sequence-parallel batch at TP2: x [h, 4096] this rank's rows of a 2 h-row batch from
+    ``row_off``; ``front_sp`` (``batch`` / ``peer`` as there) gives both ranks the whole batch's routes and quants,
+    then the experts run on all 2 h rows as ``moe_fused``'s do. Returns this rank's partial [2 h, 4096] bf16 (a view of
+    ``batch["moe_buf"]``)."""
+    from .experts import experts
+
+    f = front_sp(x, gate_w, bias, scale, batch, row_off, peer, valid=valid)
+    return experts(
+        f["a1"],
+        f["a1_scale"],
+        f["a1_even"],
+        f["a1_even_scale"],
+        f["sorted_ids"],
+        f["sorted_weights"],
+        f["sorted_expert_ids"],
+        f["num_valid_ids"],
+        w13,
+        w2,
+        w13_scale,
+        w2_scale,
+        shared_w13,
+        shared_w13_scale,
+        shared_w2,
+        shared_w2_scale,
+        f["moe_buf"],
+        swiglu_limit,
+        f["tile_target"],
+    )
