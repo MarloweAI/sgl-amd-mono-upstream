@@ -44,12 +44,14 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from aiter.ops.flydsl.kernels import buffer_ops as bo
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Float32, Int32, Int64, T
 
 from sgl_amd_mono.common.mx import FP4, mfma_scaled
 from sgl_amd_mono.common.ops import CM_DEV, CM_NT, CM_SYS, bf16_round, global_ptr, hw_exp2, hw_rcp, ld_i32, rsrc
-from sgl_amd_mono.common.ops import uniform, xred
+from sgl_amd_mono.common.ops import uniform, uniform64, xred
 from sgl_amd_mono.common.plan import kernel_sources
 
 from . import BM, D, MAX_ROWS, TOPK, capacity
@@ -107,6 +109,13 @@ def _ld_agent(addr):
     return fx.generic_load(
         global_ptr(addr), dtype=fx.Int32, memory_order=fx.AtomicOrdering.Monotonic, syncscope="agent"
     )
+
+
+def _sld(ptr, i):
+    """Word ``i`` of a buffer that no thread writes during the launch, at a wave-uniform index: a scalar load (its
+    latency does not queue behind the CU's vector loads)."""
+    p = llvm.inttoptr(ir.Type.parse("!llvm.ptr<4>"), uniform64(fx.Int64(ptr) + fx.Int64(i) * 4).ir_value())
+    return fx.Int32(llvm.load(T.i32, p, alignment=4, invariant=True))
 
 
 def _st_agent(addr, v):
@@ -453,7 +462,7 @@ def _g1_tile(c, blk, nt, e, sh):
 @flyc.jit
 def gemm1(c, blk, nt):
     if blk * BM < c["nv"]:
-        ei = uniform(ld_i32(c["args"]["seids"], blk))
+        ei = _sld(c["args"]["seids"], blk)
         if ei == SHARED:
             _g1_tile(c, blk, nt, fx.Int64(ei), True)
         else:
@@ -638,7 +647,7 @@ def _g2_tile(c, blk, q, e, sh):
     pend = [_g2_loads(k, s) for s in range(pf)]
     rows = [blk * BM + rt * 16 + lane % 16 for rt in range(2)]
     toks = [ld_i32(a["sids"], r) & 0xFFFFFF for r in rows]
-    k["e32"] = uniform(ld_i32(a["seids"], blk))
+    k["e32"] = _sld(a["seids"], blk)
     wid = [ld_i32(a["sids"], blk * BM + c["tid"] // 16 + 16 * h) for h in range(2)]
     k["wrows"] = [(v & 0xFFFFFF, fx.min((v >> 24) & 0xFF, SLOTS - 1)) for v in wid]
     tws = [fx.Float32(bo.buffer_load(rsrc(a["sw"]), r, 1, T.f32)) for r in rows]
@@ -673,7 +682,7 @@ def _g2_tile(c, blk, q, e, sh):
 def gemm2(c, blk, q):
     """A routed block's G2 workgroup q (a shared-expert block's are ``gemm2_shared``'s)."""
     if blk * BM < c["nv"]:
-        ei = uniform(ld_i32(c["args"]["seids"], blk))
+        ei = _sld(c["args"]["seids"], blk)
         if ei != SHARED:
             _g2_tile(c, blk, q, fx.Int64(ei), False)
 
@@ -690,7 +699,7 @@ def gemm2_shared(c, p):
     nb, ns = _shared_blocks(c)
     if p // SH_WGS < ns:
         blk = nb - ns + p // SH_WGS
-        ei = uniform(ld_i32(c["args"]["seids"], blk))
+        ei = _sld(c["args"]["seids"], blk)
         if ei == SHARED:
             _g2_tile(c, blk, p % SH_WGS, fx.Int64(ei), True)
 
@@ -784,11 +793,11 @@ def build(kind: str, parts: bool = False, push: int = 0):
         }  # fmt: skip
         c = {
             "args": args, "tid": tid, "lane": tid % 64, "wave": uniform(tid // 64), "m": m, "blocks": blocks,
-            "limit": limit, "nv": uniform(ld_i32(nvalid, 0)), "lds": lds.words.ptr, "wide": wide,
+            "limit": limit, "nv": _sld(nvalid, 0), "lds": lds.words.ptr, "wide": wide,
             "pf": PREFETCH[kind], "parts": parts, "push": push,
         }  # fmt: skip
         if const_expr(push):
-            c["epoch"] = uniform(ld_i32(epoch_ptr, 0))
+            c["epoch"] = _sld(epoch_ptr, 0)
         _run(c, fx.Int32(fx.block_idx.x))
 
     @flyc.jit
